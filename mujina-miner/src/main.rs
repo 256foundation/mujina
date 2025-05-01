@@ -4,7 +4,7 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use mujina_miner::serial;
+use mujina_miner::scheduler;
 use mujina_miner::tracing::{self, prelude::*};
 
 #[tokio::main]
@@ -13,7 +13,7 @@ async fn main() {
 
     let running = CancellationToken::new();
     let tracker = TaskTracker::new();
-    tracker.spawn(serial::task(running.clone()));
+    tracker.spawn(scheduler::task(running.clone()));
     tracker.close();
     info!("Started.");
 

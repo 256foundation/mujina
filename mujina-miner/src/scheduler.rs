@@ -1,3 +1,10 @@
+//! The scheduler module manages the distribution of mining jobs to hash boards
+//! and ASIC chips.
+//!
+//! This is a work-in-progress. It's currently the main and initial place where
+//! functionality is added, after which the functionality is refactored out to
+//! where it belongs.
+
 use futures::sink::SinkExt;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{self, Duration};
@@ -9,7 +16,6 @@ use crate::chip::bm13xx;
 use crate::board::bitaxe;
 use crate::tracing::prelude::*;
 
-/// Task for handling serial port communication
 pub async fn task(running: CancellationToken) {
     trace!("Task started.");
 
