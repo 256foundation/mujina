@@ -11,7 +11,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use crate::tracing::prelude::*;
 use crate::chip::{MiningJob, ChipError};
-use super::crc::{crc5, crc5_is_valid};
+use super::crc::{crc5, crc5_is_valid, crc16};
 
 #[derive(FromRepr, Copy, Clone)]
 #[repr(u8)]
@@ -24,6 +24,7 @@ pub enum RegisterAddress {
     RegA8 = 0xa8,
 }
 
+#[derive(Debug)]
 pub enum Register {
     ChipAddress {
         chip_id: u16,
@@ -52,7 +53,7 @@ impl Register {
 
 #[repr(u8)]
 enum CommandFlagsType {
-    // Job = 1,
+    Job = 1,
     Command = 2,
 }
 
@@ -75,6 +76,49 @@ pub enum Command {
         chip_address: u8,
         register: Register,
     },
+    /// Send a job with full block header (BM1370/BM1366 style)
+    /// Chip calculates midstates internally
+    JobFull {
+        job_data: JobFullFormat,
+    },
+    /// Send a job with pre-calculated midstates (BM1397 style)
+    /// Host calculates midstates to save chip computation
+    JobMidstate {
+        job_data: JobMidstateFormat,
+    },
+}
+
+/// Full format job structure (BM1370/BM1366).
+/// The chip calculates midstates internally from the full block header.
+/// All multi-byte values are little-endian in the structure.
+/// Hash values (merkle_root, prev_block_hash) are stored in big-endian format.
+#[derive(Clone)]
+pub struct JobFullFormat {
+    pub job_id: u8,
+    pub num_midstates: u8,  // Typically 0x01 for BM1370
+    pub starting_nonce: [u8; 4],
+    pub nbits: [u8; 4],     // Difficulty target
+    pub ntime: [u8; 4],     // Timestamp
+    pub merkle_root: [u8; 32],     // Full merkle root (big-endian)
+    pub prev_block_hash: [u8; 32], // Full previous block hash (big-endian)
+    pub version: [u8; 4],   // Block version for version rolling
+}
+
+/// Midstate format job structure (BM1397).
+/// Host pre-calculates SHA256 midstates to reduce chip workload.
+/// Supports up to 4 midstates for version rolling.
+#[derive(Clone)]
+pub struct JobMidstateFormat {
+    pub job_id: u8,
+    pub num_midstates: u8,  // 1 or 4 typically
+    pub starting_nonce: [u8; 4],
+    pub nbits: [u8; 4],     // Difficulty target
+    pub ntime: [u8; 4],     // Timestamp
+    pub merkle4: [u8; 4],   // Last 4 bytes of merkle root
+    pub midstate0: [u8; 32], // Primary midstate
+    pub midstate1: Option<[u8; 32]>, // Optional for version rolling
+    pub midstate2: Option<[u8; 32]>, // Optional for version rolling
+    pub midstate3: Option<[u8; 32]>, // Optional for version rolling
 }
 
 
@@ -139,6 +183,70 @@ impl Command {
                     }
                 }
             }
+            Command::JobFull { job_data } => {
+                dst.put_u8(Self::build_flags(
+                    CommandFlagsType::Job,
+                    false,  // Jobs are never broadcast
+                    CommandFlagsCmd::WriteRegisterOrJob,
+                ));
+                
+                const JOB_DATA_LEN: u8 = 82;  // Size of JobFullFormat
+                const FLAGS_LEN: u8 = 1;
+                const LENGTH_FIELD_LEN: u8 = 1;
+                const CRC_LEN: u8 = 2;  // Jobs use CRC16, not CRC5
+                const TOTAL_LEN: u8 = FLAGS_LEN + LENGTH_FIELD_LEN + JOB_DATA_LEN + CRC_LEN;
+                
+                dst.put_u8(TOTAL_LEN);
+                
+                // Write job data
+                dst.put_u8(job_data.job_id);
+                dst.put_u8(job_data.num_midstates);
+                dst.put_slice(&job_data.starting_nonce);
+                dst.put_slice(&job_data.nbits);
+                dst.put_slice(&job_data.ntime);
+                dst.put_slice(&job_data.merkle_root);
+                dst.put_slice(&job_data.prev_block_hash);
+                dst.put_slice(&job_data.version);
+            }
+            Command::JobMidstate { job_data } => {
+                dst.put_u8(Self::build_flags(
+                    CommandFlagsType::Job,
+                    false,  // Jobs are never broadcast
+                    CommandFlagsCmd::WriteRegisterOrJob,
+                ));
+                
+                // Calculate data length based on number of midstates
+                const BASE_LEN: u8 = 18;  // job_id(1) + num_midstates(1) + nonce(4) + nbits(4) + ntime(4) + merkle4(4)
+                const MIDSTATE_LEN: u8 = 32;
+                let data_len = BASE_LEN + (job_data.num_midstates * MIDSTATE_LEN);
+                
+                const FLAGS_LEN: u8 = 1;
+                const LENGTH_FIELD_LEN: u8 = 1;
+                const CRC_LEN: u8 = 2;  // Jobs use CRC16
+                let total_len = FLAGS_LEN + LENGTH_FIELD_LEN + data_len + CRC_LEN;
+                
+                dst.put_u8(total_len);
+                
+                // Write job data
+                dst.put_u8(job_data.job_id);
+                dst.put_u8(job_data.num_midstates);
+                dst.put_slice(&job_data.starting_nonce);
+                dst.put_slice(&job_data.nbits);
+                dst.put_slice(&job_data.ntime);
+                dst.put_slice(&job_data.merkle4);
+                dst.put_slice(&job_data.midstate0);
+                
+                // Write optional midstates
+                if let Some(midstate) = &job_data.midstate1 {
+                    dst.put_slice(midstate);
+                }
+                if let Some(midstate) = &job_data.midstate2 {
+                    dst.put_slice(midstate);
+                }
+                if let Some(midstate) = &job_data.midstate3 {
+                    dst.put_slice(midstate);
+                }
+            }
         }
     }
 }
@@ -155,11 +263,16 @@ pub enum Response {
         chip_address: u8,
         register: Register,
     },
-    Nonce,
+    Nonce {
+        nonce: u32,
+        job_id: u8,
+        midstate_num: u8,
+        version: u16,
+    },
 }
 
 impl Response {
-    fn decode(bytes: &mut BytesMut, is_version_rolling: bool) -> Result<Response, String> {
+    fn decode(bytes: &mut BytesMut, _is_version_rolling: bool) -> Result<Response, String> {
         let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
         let type_repr = type_and_crc[5..].load::<u8>();
 
@@ -183,7 +296,21 @@ impl Response {
                 }
             }
             Some(ResponseType::Nonce) => {
-                panic!("not implemented")
+                // BM1370 nonce response format (11 bytes total, including preamble):
+                // Already consumed: preamble (2 bytes)
+                // Remaining: nonce(4) + midstate_num(1) + job_id(1) + version(2) + crc(1)
+                let nonce = bytes.get_u32();
+                let midstate_num = bytes.get_u8();
+                let job_id = bytes.get_u8();
+                let version = bytes.get_u16();
+                // CRC already consumed
+                
+                Ok(Response::Nonce {
+                    nonce,
+                    job_id,
+                    midstate_num,
+                    version,
+                })
             }
             None => Err(format!("unknown response type 0x{:x}.", type_repr)),
         }
@@ -204,10 +331,22 @@ impl Encoder<Command> for FrameCodec {
         const COMMAND_PREAMBLE: &[u8] = &[0x55, 0xaa];
         dst.put_slice(COMMAND_PREAMBLE);
 
+        let start_pos = dst.len();
         command.encode(dst);
 
-        let crc = crc5(&dst[2..]);
-        dst.put_u8(crc);
+        // Jobs use CRC16, other commands use CRC5
+        match &command {
+            Command::JobFull { .. } | Command::JobMidstate { .. } => {
+                // Calculate CRC16 over flags + length + data
+                let crc = crc16(&dst[start_pos..]);
+                dst.put_u16(crc);
+            }
+            _ => {
+                // Calculate CRC5 over everything after preamble
+                let crc = crc5(&dst[2..]);
+                dst.put_u8(crc);
+            }
+        }
 
         Ok(())
     }
@@ -388,13 +527,26 @@ impl BM13xxProtocol {
     
     /// Encode a mining job into a chip command.
     /// 
-    /// # Note
-    /// This is a placeholder - the actual job encoding format needs to be
-    /// implemented based on the BM13xx datasheet and reference implementations.
-    pub fn encode_mining_job(&self, job: &MiningJob, chip_address: u8) -> Command {
-        // TODO: Implement actual job encoding
-        // For now, return a placeholder
-        todo!("Implement mining job encoding for BM13xx")
+    /// For BM1370, this uses the full format where the chip calculates midstates.
+    /// Job IDs should be managed by the caller and cycled appropriately.
+    pub fn encode_mining_job(&self, job: &MiningJob, job_id: u8) -> Command {
+        // Convert MiningJob to JobFullFormat for BM1370
+        // Note: The caller is responsible for:
+        // - Converting hash values to big-endian format
+        // - Managing job ID assignment and cycling
+        
+        let job_data = JobFullFormat {
+            job_id,
+            num_midstates: 0x01,  // BM1370 typically uses 1
+            starting_nonce: [0x00, 0x00, 0x00, 0x00],  // Start at 0
+            nbits: job.nbits.to_le_bytes(),
+            ntime: job.ntime.to_le_bytes(),
+            merkle_root: job.merkle_root,  // Should be big-endian
+            prev_block_hash: job.prev_block_hash,  // Should be big-endian
+            version: job.version.to_le_bytes(),
+        };
+        
+        Command::JobFull { job_data }
     }
     
     /// Get the initialization sequence for a chip.
@@ -418,18 +570,27 @@ impl BM13xxProtocol {
     }
     
     /// Decode a response into a mining result.
-    pub fn decode_response(&self, response: Response, chip_address: u8) -> Result<MiningResult, ChipError> {
+    pub fn decode_response(&self, response: Response, _chip_address: u8) -> Result<MiningResult, ChipError> {
         match response {
             Response::ReadRegister { chip_address: _, register } => {
                 Ok(MiningResult::RegisterRead(register))
             }
-            Response::Nonce => {
-                // TODO: Decode nonce response properly
-                // Need to extract:
-                // - Job ID
-                // - Nonce value
-                // - Core that found it
-                Err(ChipError::InvalidResponse("Nonce decoding not implemented".to_string()))
+            Response::Nonce { nonce, job_id, midstate_num: _, version } => {
+                // Extract core ID from nonce (bits 25-31)
+                let core_id = ((nonce >> 25) & 0x7f) as u8;
+                
+                // Extract actual job ID (upper 7 bits of job_id field, shifted left by 1)
+                let actual_job_id = ((job_id & 0xf0) >> 1) as u64;
+                
+                // Combine version bits with nonce for version rolling
+                // Version bits come in bits 15:0, need to shift to 28:13
+                let _version_bits = (version as u32) << 13;
+                
+                Ok(MiningResult::NonceFound {
+                    job_id: actual_job_id,
+                    nonce,
+                    core_id,
+                })
             }
         }
     }

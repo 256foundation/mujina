@@ -8,10 +8,8 @@ pub(super) mod crc;  // Make visible to protocol module
 
 // Re-export commonly used types from protocol
 pub use protocol::{
-    Command,
     Response,
     Register,
-    RegisterAddress,
     FrameCodec,
 };
 

@@ -72,6 +72,45 @@ pub struct MiningJob {
     pub nonce_start: u32,
     /// Nonce range to search
     pub nonce_range: u32,
+    
+    // Parsed header fields for chips that need them separately
+    /// Block version (from header bytes 0-3)
+    pub version: u32,
+    /// Previous block hash (from header bytes 4-35, stored as big-endian)
+    pub prev_block_hash: [u8; 32],
+    /// Merkle root (from header bytes 36-67, stored as big-endian)
+    pub merkle_root: [u8; 32],
+    /// Timestamp (from header bytes 68-71)
+    pub ntime: u32,
+    /// Difficulty bits (from header bytes 72-75)
+    pub nbits: u32,
+}
+
+impl MiningJob {
+    /// Create a new mining job from a block header
+    pub fn from_header(job_id: u64, header: [u8; 80], target: [u8; 32], nonce_start: u32, nonce_range: u32) -> Self {
+        // Parse header fields
+        let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let mut prev_block_hash = [0u8; 32];
+        prev_block_hash.copy_from_slice(&header[4..36]);
+        let mut merkle_root = [0u8; 32];
+        merkle_root.copy_from_slice(&header[36..68]);
+        let ntime = u32::from_le_bytes(header[68..72].try_into().unwrap());
+        let nbits = u32::from_le_bytes(header[72..76].try_into().unwrap());
+        
+        Self {
+            job_id,
+            header,
+            target,
+            nonce_start,
+            nonce_range,
+            version,
+            prev_block_hash,
+            merkle_root,
+            ntime,
+            nbits,
+        }
+    }
 }
 
 /// Result of finding a valid nonce

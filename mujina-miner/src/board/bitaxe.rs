@@ -17,8 +17,10 @@ use crate::chip::bm13xx::{self, BM13xxProtocol};
 pub struct BitaxeBoard {
     /// Serial control channel for board management commands
     control: SerialStream,
-    /// Serial data channel for chip communication
-    data: SerialStream,
+    /// Writer for sending commands to chips
+    data_writer: FramedWrite<tokio::io::WriteHalf<SerialStream>, bm13xx::FrameCodec>,
+    /// Reader for receiving responses from chips (moved to event monitor during initialize)
+    data_reader: Option<FramedRead<tokio::io::ReadHalf<SerialStream>, bm13xx::FrameCodec>>,
     /// Protocol handler for chip communication
     protocol: BM13xxProtocol,
     /// Discovered chip information (passive record-keeping)
@@ -27,6 +29,8 @@ pub struct BitaxeBoard {
     event_tx: Option<tokio::sync::mpsc::Sender<BoardEvent>>,
     /// Current job ID
     current_job_id: Option<u64>,
+    /// Job ID counter for cycling through 0-127
+    next_job_id: u8,
 }
 
 impl BitaxeBoard {
@@ -43,13 +47,18 @@ impl BitaxeBoard {
     /// In the future, a DeviceManager will create boards when USB devices
     /// are detected (by VID/PID) and pass already-opened serial streams.
     pub fn new(control: SerialStream, data: SerialStream) -> Self {
+        // Split the data stream immediately
+        let (reader, writer) = tokio::io::split(data);
+        
         BitaxeBoard { 
             control,
-            data,
+            data_writer: FramedWrite::new(writer, bm13xx::FrameCodec::default()),
+            data_reader: Some(FramedRead::new(reader, bm13xx::FrameCodec::default())),
             protocol: BM13xxProtocol::new(false), // TODO: Make version rolling configurable
             chip_infos: Vec::new(),
             event_tx: None,
             current_job_id: None,
+            next_job_id: 0,
         }
     }
 
@@ -89,15 +98,14 @@ impl BitaxeBoard {
     /// Sends broadcast ReadRegister commands and collects responses
     /// to identify all chips on the serial bus.
     async fn discover_chips(&mut self) -> Result<(), BoardError> {
-        // Split the data stream for reading and writing
-        let (read_stream, write_stream) = tokio::io::split(&mut self.data);
-        let mut framed_read = FramedRead::new(read_stream, bm13xx::FrameCodec::default());
-        let mut framed_write = FramedWrite::new(write_stream, bm13xx::FrameCodec::default());
+        // Get a mutable reference to the reader
+        let reader = self.data_reader.as_mut()
+            .ok_or_else(|| BoardError::InitializationFailed("Data reader already taken".to_string()))?;
         
         // Send a broadcast read to discover chips
         let discover_cmd = BM13xxProtocol::discover_chips();
         
-        framed_write.send(discover_cmd).await
+        self.data_writer.send(discover_cmd).await
             .map_err(|e| BoardError::Communication(e))?;
         
         // Wait a bit for responses
@@ -106,7 +114,7 @@ impl BitaxeBoard {
         
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
-                response = framed_read.next() => {
+                response = reader.next() => {
                     match response {
                         Some(Ok(bm13xx::Response::ReadRegister {
                             chip_address: _,
@@ -145,16 +153,100 @@ impl BitaxeBoard {
         }
     }
     
+    /// Spawn a job completion timer task
+    fn spawn_job_timer(&self, job_id: Option<u64>) {
+        if let (Some(job_id), Some(tx)) = (job_id, &self.event_tx) {
+            let event_tx = tx.clone();
+            
+            tokio::spawn(async move {
+                // BM1370 at ~500 GH/s takes about 8.6 seconds to search 2^32 nonces
+                // Add some buffer time
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                
+                // Send job complete event
+                let _ = event_tx.send(BoardEvent::JobComplete {
+                    job_id,
+                    reason: JobCompleteReason::TimeoutEstimate,
+                }).await;
+            });
+        }
+    }
+    
     /// Spawn a task to monitor chip responses and emit events
     fn spawn_event_monitor(&mut self) {
-        // TODO: Implement event monitoring
-        // This task should:
-        // 1. Read responses from the data stream
-        // 2. Decode using protocol
-        // 3. Emit appropriate events (NonceFound, ChipError, etc.)
-        // 4. Track job completion (by timeout or chip signal)
+        let Some(event_tx) = self.event_tx.clone() else {
+            tracing::error!("Cannot spawn event monitor without event channel");
+            return;
+        };
         
-        tracing::warn!("Event monitor not yet implemented");
+        // Take ownership of the data reader for the monitoring task
+        let data_reader = self.data_reader.take()
+            .expect("Data reader should be available during initialization");
+        
+        // Clone current job ID for the task
+        let current_job_id = self.current_job_id;
+        
+        // Spawn the monitoring task
+        tokio::spawn(async move {
+            let mut reader = data_reader;
+            
+            loop {
+                match reader.next().await {
+                    Some(Ok(response)) => {
+                        match response {
+                            bm13xx::Response::Nonce { nonce, job_id, midstate_num: _, version } => {
+                                // Extract core ID from nonce (bits 25-31)
+                                let core_id = ((nonce >> 25) & 0x7f) as u8;
+                                
+                                // Extract actual job ID (upper 7 bits of job_id field, shifted left by 1)
+                                let actual_job_id = ((job_id & 0xf0) >> 1) as u64;
+                                
+                                // Send nonce found event
+                                let nonce_result = crate::chip::NonceResult {
+                                    job_id: actual_job_id,
+                                    nonce,
+                                    hash: [0; 32], // TODO: Calculate actual hash if needed
+                                };
+                                
+                                if event_tx.send(BoardEvent::NonceFound(nonce_result)).await.is_err() {
+                                    tracing::error!("Failed to send nonce event, receiver dropped");
+                                    break;
+                                }
+                                
+                                tracing::debug!(
+                                    "Nonce found: job_id={}, nonce=0x{:08x}, core={}, version=0x{:04x}",
+                                    actual_job_id, nonce, core_id, version
+                                );
+                            }
+                            bm13xx::Response::ReadRegister { chip_address, register } => {
+                                // Log register reads but don't emit events for them
+                                tracing::trace!("Register read from chip {}: {:?}", chip_address, register);
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("Error decoding response: {}", e);
+                        
+                        // Send chip error event
+                        if event_tx.send(BoardEvent::ChipError {
+                            chip_address: 0, // TODO: Get actual chip address
+                            error: format!("Decode error: {}", e),
+                        }).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::error!("Data stream closed unexpectedly");
+                        break;
+                    }
+                }
+            }
+            
+            tracing::info!("Event monitor task exiting");
+        });
+        
+        // Spawn job completion timer outside the main monitoring task
+        self.spawn_job_timer(current_job_id);
     }
 }
 
@@ -194,17 +286,24 @@ impl Board for BitaxeBoard {
     }
     
     async fn send_job(&mut self, job: &MiningJob) -> Result<(), BoardError> {
-        // TODO: Implement job distribution
-        // 1. Encode job using protocol
-        // 2. Send to each chip
-        // 3. Track job ID for completion
-        // 4. Start completion timer/estimation
+        // Encode the job for BM1370
+        let command = self.protocol.encode_mining_job(job, self.next_job_id);
         
-        // Store current job ID
+        // Send the job to all chips (BM1370 uses broadcast for jobs)
+        self.data_writer.send(command).await
+            .map_err(|e| BoardError::Communication(e))?;
+        
+        tracing::debug!("Sent job {} to chips with internal ID {}", job.job_id, self.next_job_id);
+        
+        // Store current job ID mapping
         self.current_job_id = Some(job.job_id);
         
-        // For now, just a placeholder
-        tracing::warn!("send_job not yet implemented");
+        // Increment job ID counter (cycles through 0-127 by steps of 24)
+        self.next_job_id = (self.next_job_id + 24) % 128;
+        
+        // Spawn a job completion timer
+        self.spawn_job_timer(Some(job.job_id));
+        
         Ok(())
     }
     

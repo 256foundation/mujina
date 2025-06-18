@@ -34,6 +34,29 @@ const CRC5: CrcAlgo<u8> = CrcAlgo::<u8>::new(
     false,     // reflect
 );
 
+/// Calculates a 16-bit CRC using the CRC-16-FALSE algorithm over a slice of bytes.
+///
+/// This is used for mining job packets in BM13xx chips. The algorithm uses:
+/// - Polynomial: 0x1021
+/// - Initial value: 0xFFFF
+/// - No output XOR
+/// - No bit reflection
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc = CRC16_INIT;
+    CRC16.update_crc(&mut crc, data);
+    CRC16.finish_crc(&crc)
+}
+
+const CRC16_INIT: u16 = 0xFFFF;
+
+const CRC16: CrcAlgo<u16> = CrcAlgo::<u16>::new(
+    0x1021,     // polynomial (CRC-16-CCITT-FALSE)
+    16,         // width
+    CRC16_INIT, // init
+    0,          // xorout
+    false,      // reflect
+);
+
 #[cfg(test)]
 mod tests {
     use test_case::test_case;
