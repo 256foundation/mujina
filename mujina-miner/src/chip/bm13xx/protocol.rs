@@ -861,6 +861,15 @@ impl Encoder<Command> for FrameCodec {
             }
         }
 
+        // Log the encoded frame for debugging
+        let frame_bytes = &dst[dst.len() - (dst.len() - start_pos + 2)..];
+        trace!(
+            "TX: {:?} ({} bytes) => {:02x?}",
+            command,
+            frame_bytes.len(),
+            frame_bytes
+        );
+
         Ok(())
     }
 }
@@ -917,7 +926,16 @@ impl Decoder for FrameCodec {
         }
 
         match Response::decode(&mut prospect, self.version_rolling) {
-            Ok(response) => Ok(Some(response)),
+            Ok(response) => {
+                // Log the received frame for debugging
+                trace!(
+                    "RX: {:?} ({} bytes) => {:02x?}",
+                    response,
+                    frame_len,
+                    &src[..frame_len]
+                );
+                Ok(Some(response))
+            },
             Err(err) => {
                 warn!("Failed to decode response: {}", err);
                 CALL_AGAIN

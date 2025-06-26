@@ -16,6 +16,7 @@ async fn main() {
     tracker.spawn(scheduler::task(running.clone()));
     tracker.close();
     info!("Started.");
+    info!("For hardware debugging, set RUST_LOG=mujina_miner=trace to see all serial communication");
 
     let mut sigint = unix::signal(SignalKind::interrupt()).unwrap();
     let mut sigterm = unix::signal(SignalKind::terminate()).unwrap();

@@ -82,10 +82,12 @@ impl BitaxeBoard {
         const RSTN_HI: &[u8] = &[0x07, 0x00, 0x00, 0x00, 0x06, 0x00, 0x01];
         const WAIT: Duration = Duration::from_millis(100);
 
+        tracing::debug!("Control TX: RSTN_LO => {:02x?}", RSTN_LO);
         self.control.write_all(RSTN_LO).await?;
         self.control.flush().await?;
         time::sleep(WAIT).await;
 
+        tracing::debug!("Control TX: RSTN_HI => {:02x?}", RSTN_HI);
         self.control.write_all(RSTN_HI).await?;
         self.control.flush().await?;
         time::sleep(WAIT).await;
@@ -306,11 +308,16 @@ impl Board for BitaxeBoard {
         // Encode the job for BM1370
         let command = self.protocol.encode_mining_job(job, self.next_job_id);
         
+        tracing::debug!(
+            "Sending job {} (internal ID {}) to chips - target: {:02x?}, ntime: {}, nbits: {:08x}",
+            job.job_id, self.next_job_id, &job.target[..8], job.ntime, job.nbits
+        );
+        
         // Send the job to all chips (BM1370 uses broadcast for jobs)
         self.data_writer.send(command).await
             .map_err(|e| BoardError::Communication(e))?;
         
-        tracing::debug!("Sent job {} to chips with internal ID {}", job.job_id, self.next_job_id);
+        tracing::debug!("Job {} sent successfully", job.job_id);
         
         // Store current job ID mapping
         self.current_job_id = Some(job.job_id);
