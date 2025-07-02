@@ -1,21 +1,48 @@
 [package]
 name = "mujina-miner"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+description = "Bitcoin mining software"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+default-run = "mujina-minerd"
 
 [dependencies]
-# Logging and tracing
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["time", "local-time"] }
-tracing-journald = { workspace = true }
-time = { workspace = true, features = ["macros"] }
-
-# Async runtime
-tokio = { workspace = true }
-tokio-util = { workspace = true, features = ["rt"] }
-
-bytes = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bitcoin = { workspace = true }
 bitvec = { workspace = true }
+bytes = { workspace = true }
 crc_all = { workspace = true }
-tokio-serial = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
+inventory = { workspace = true }
+modular-bitfield = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-serial = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-journald = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "mujina-minerd"
+path = "src/bin/minerd.rs"
+
+[[bin]]
+name = "mujina-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "mujina-tui"
+path = "src/bin/tui.rs"
+
+[dev-dependencies]
+test-case = { workspace = true }

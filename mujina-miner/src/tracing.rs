@@ -19,7 +19,7 @@ use tracing_subscriber::{
 
 pub mod prelude {
     #[allow(unused_imports)]
-    pub use tracing::{trace, debug, info, warn, error};
+    pub use tracing::{debug, error, info, trace, warn};
 }
 
 use prelude::*;
@@ -51,10 +51,7 @@ fn use_stdout() {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTimer),
-        )
+        .with(tracing_subscriber::fmt::layer().with_timer(LocalTimer))
         .init();
 }
 
@@ -65,8 +62,7 @@ struct LocalTimer;
 
 impl FormatTime for LocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        let now =
-            OffsetDateTime::now_local().unwrap_or(OffsetDateTime::now_utc());
+        let now = OffsetDateTime::now_local().unwrap_or(OffsetDateTime::now_utc());
         write!(
             w,
             "{}",
