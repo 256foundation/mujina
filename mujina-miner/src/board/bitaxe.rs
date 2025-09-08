@@ -105,13 +105,13 @@ pub struct BitaxeBoard {
 impl BitaxeBoard {
     /// GPIO pin number for ASIC reset control (active low)
     const ASIC_RESET_PIN: u8 = 0;
-    
+
     /// Bitaxe Gamma board configuration
     /// The Gamma uses a BM1370 chip and runs at 1Mbps after initialization
     const TARGET_BAUD_RATE: u32 = 1_000_000;
     const CHIP_BAUD_REGISTER: bm13xx::protocol::BaudRate = bm13xx::protocol::BaudRate::Baud1M;
     const EXPECTED_CHIP_ID: [u8; 2] = [0x13, 0x70]; // BM1370
-    
+
     /// Creates a new BitaxeBoard instance with the provided serial streams.
     ///
     /// # Arguments
@@ -177,7 +177,7 @@ impl BitaxeBoard {
 
         Ok(())
     }
-    
+
     /// Release the mining chips from reset state.
     async fn release_reset(&mut self) -> Result<(), BoardError> {
         // Get the ASIC reset pin
@@ -415,7 +415,7 @@ impl BitaxeBoard {
         // Spawn job completion timer outside the main monitoring task
         self.spawn_job_timer(current_job_id);
     }
-    
+
     /// Initialize the power controller
     async fn init_power_controller(&mut self) -> Result<(), BoardError> {
         // Set I2C frequency to 100kHz for PMBus devices
@@ -423,28 +423,28 @@ impl BitaxeBoard {
             .map_err(|e| BoardError::InitializationFailed(
                 format!("Failed to set I2C frequency: {}", e)
             ))?;
-        
+
         // Clone the I2C bus for the power controller
         let power_i2c = self.i2c.clone();
         let config = Tps546Config::bitaxe_gamma();
         let mut tps546 = Tps546::new(power_i2c, config);
-        
+
         // Initialize the TPS546
         match tps546.init().await {
             Ok(()) => {
                 info!("TPS546D24A power controller initialized");
-                
+
                 // Delay before setting voltage
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                
+
                 // Set initial output voltage (1.15V - BM1370 default from esp-miner)
                 match tps546.set_vout(1.15).await {
                     Ok(()) => {
                         info!("Core voltage set to 1.15V");
-                        
+
                         // Wait for voltage to stabilize
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        
+
                         // Verify voltage
                         match tps546.get_vout().await {
                             Ok(mv) => info!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
@@ -458,7 +458,7 @@ impl BitaxeBoard {
                         ));
                     }
                 }
-                
+
                 self.power_controller = Some(tps546);
                 Ok(())
             }
@@ -470,24 +470,24 @@ impl BitaxeBoard {
             }
         }
     }
-    
+
     /// Initialize the fan controller
     async fn init_fan_controller(&mut self) -> Result<(), BoardError> {
         // Clone the I2C bus for the fan controller
         let fan_i2c = self.i2c.clone();
         let mut fan = Emc2101::new(fan_i2c);
-        
+
         // Initialize the EMC2101
         match fan.init().await {
             Ok(()) => {
                 info!("EMC2101 fan controller initialized");
-                
+
                 // Set initial fan speed to 50%
                 const INITIAL_FAN_PERCENT: u8 = 50;
                 if let Err(e) = fan.set_pwm_percent(INITIAL_FAN_PERCENT).await {
                     warn!("Failed to set initial fan speed: {}", e);
                 }
-                
+
                 self.fan_controller = Some(fan);
                 Ok(())
             }
@@ -498,38 +498,38 @@ impl BitaxeBoard {
             }
         }
     }
-    
+
     /// Spawn a task to periodically log management statistics
     fn spawn_stats_monitor(&mut self) {
         // Clone what we need for the task
         let i2c = self.i2c.clone();
         let chip_count = self.chip_infos.len();
-        
+
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(30);
             let mut interval = tokio::time::interval(STATS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            
+
             // Create new controllers for the stats task
             let mut fan = Emc2101::new(i2c.clone());
             let config = Tps546Config::bitaxe_gamma();
             let mut power = Tps546::new(i2c, config);
-            
+
             loop {
                 interval.tick().await;
-                
+
                 // Read temperature
                 let temp = match fan.get_external_temperature().await {
                     Ok(t) => format!("{:.1}°C", t),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 // Read fan PWM duty
                 let fan_pwm = match fan.get_pwm_percent().await {
                     Ok(p) => format!("{}%", p),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 // Read fan RPM (if TACH is connected)
                 let fan_rpm = match fan.get_tach_count().await {
                     Ok(count) => {
@@ -545,13 +545,13 @@ impl BitaxeBoard {
                         "N/A".to_string()
                     }
                 };
-                
+
                 // Read power stats
                 let vin = match power.get_vin().await {
                     Ok(mv) => format!("{:.2}V", mv as f32 / 1000.0),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 let vout = match power.get_vout().await {
                     Ok(mv) => {
                         let volts = mv as f32 / 1000.0;
@@ -562,34 +562,34 @@ impl BitaxeBoard {
                     }
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 let iout = match power.get_iout().await {
                     Ok(ma) => format!("{:.2}A", ma as f32 / 1000.0),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 let power_w = match power.get_power().await {
                     Ok(mw) => format!("{:.1}W", mw as f32 / 1000.0),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 let vr_temp = match power.get_temperature().await {
                     Ok(t) => format!("{}°C", t),
                     Err(_) => "N/A".to_string(),
                 };
-                
+
                 // Check power status
                 if let Err(e) = power.check_status().await {
                     warn!("Power controller status check failed: {}", e);
                 }
-                
+
                 info!(
                     "Board stats - Chips: {}, ASIC: {}, Fan: {} ({}), VR: {}, Power: {} @ {} (Vin: {}, Vout: {})",
                     chip_count, temp, fan_pwm, fan_rpm, vr_temp, power_w, iout, vin, vout
                 );
             }
         });
-        
+
         self.stats_task_handle = Some(handle);
     }
 }
@@ -615,13 +615,13 @@ impl Board for BitaxeBoard {
         // Phase 1: Initialize power controller FIRST (before chip communication)
         // This ensures stable core voltage before chip configuration
         tracing::info!("Initializing power management");
-        
+
         // Initialize fan controller first to test I2C
         self.init_fan_controller().await?;
-        
+
         // Initialize power controller and set core voltage
         self.init_power_controller().await?;
-        
+
         // Wait for voltage to fully stabilize after PMIC init
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -646,7 +646,7 @@ impl Board for BitaxeBoard {
         self.discover_chips().await?;
 
         tracing::info!("Board initialized with {} chip(s)", self.chip_infos.len());
-        
+
         // Verify we found the expected BM1370 chip
         if let Some(first_chip) = self.chip_infos.first() {
             if first_chip.chip_id != Self::EXPECTED_CHIP_ID {
@@ -658,7 +658,7 @@ impl Board for BitaxeBoard {
             }
             tracing::debug!("Found expected BM1370 chip");
         }
-        
+
         // BM1370 requires additional initialization after chip discovery
         if self.chip_infos.len() > 0 {
             // Send core register control commands
@@ -670,7 +670,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(core_reg_cmd1).await?;
-            
+
             let core_reg_cmd2 = Command::WriteRegister {
                 all: true,
                 chip_address: 0x00,
@@ -679,8 +679,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(core_reg_cmd2).await?;
-            
-            // Add the missing third core register write (critical for nonce return)
+
             let core_reg_cmd3 = Command::WriteRegister {
                 all: true,
                 chip_address: 0x00,
@@ -689,7 +688,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(core_reg_cmd3).await?;
-            
+
             // Phase 3: Send baud rate change command to chip
             // Bitaxe Gamma always changes from 115200 to 1Mbps
             tracing::info!("Sending baud rate change command to BM1370 for {} baud", Self::TARGET_BAUD_RATE);
@@ -699,22 +698,22 @@ impl Board for BitaxeBoard {
                 register: bm13xx::protocol::Register::UartBaud(Self::CHIP_BAUD_REGISTER),
             };
             self.send_config_command(baud_cmd).await?;
-            
+
             // Give chip time to process baud rate change
             tokio::time::sleep(Duration::from_millis(50)).await;
-            
+
             // Phase 3: Change host baud rate to match
             tracing::info!("Changing host serial port from 115200 to {} baud", Self::TARGET_BAUD_RATE);
             self.data_control.set_baud_rate(Self::TARGET_BAUD_RATE)
                 .map_err(|e| BoardError::InitializationFailed(
                     format!("Failed to change baud rate: {}", e)
                 ))?;
-            
+
             // Wait for baud rate change to stabilize
             tokio::time::sleep(Duration::from_millis(100)).await;
-            
+
             tracing::info!("Baud rate change complete, continuing at {} baud", Self::TARGET_BAUD_RATE);
-            
+
             // Start with lower frequency like esp-miner does
             // esp-miner starts at 62.5MHz and ramps up to target
             let start_freq_config = bm13xx::protocol::PllConfig::new(
@@ -728,10 +727,10 @@ impl Board for BitaxeBoard {
                 register: bm13xx::protocol::Register::PllDivider(start_freq_config),
             };
             self.send_config_command(start_pll_cmd).await?;
-            
+
             // Small delay for initial PLL to stabilize
             tokio::time::sleep(Duration::from_millis(200)).await;
-            
+
             // Now set target frequency (200 MHz)
             let target_pll_config = bm13xx::protocol::PllConfig::new(
                 0x40A0, // Target: 200MHz (fb_div 0xA0 with 0x40 flag)
@@ -744,10 +743,10 @@ impl Board for BitaxeBoard {
                 register: bm13xx::protocol::Register::PllDivider(target_pll_config),
             };
             self.send_config_command(target_pll_cmd).await?;
-            
+
             // Longer delay for target frequency to stabilize
             tokio::time::sleep(Duration::from_millis(300)).await;
-            
+
             // Set ticket mask for difficulty
             // Register 0x14: ticket mask (difficulty control)
             let difficulty_mask = bm13xx::protocol::DifficultyMask::from_difficulty(256);
@@ -757,7 +756,7 @@ impl Board for BitaxeBoard {
                 register: bm13xx::protocol::Register::TicketMask(difficulty_mask),
             };
             self.send_config_command(ticket_mask_cmd).await?;
-            
+
             // Additional misc settings from esp-miner
             // Register 0xB9: Unknown misc settings
             let misc_b9_cmd = Command::WriteRegister {
@@ -768,7 +767,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(misc_b9_cmd).await?;
-            
+
             // Register 0x54: Analog mux control (temperature diode)
             let analog_mux_cmd = Command::WriteRegister {
                 all: true,
@@ -778,7 +777,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(analog_mux_cmd).await?;
-            
+
             // Send misc B9 again (esp-miner does this)
             let misc_b9_cmd2 = Command::WriteRegister {
                 all: true,
@@ -788,7 +787,7 @@ impl Board for BitaxeBoard {
                 },
             };
             self.send_config_command(misc_b9_cmd2).await?;
-            
+
             // Register 0x10: Hash counting register (nonce range)
             // Use S21 Pro value (0x1EB5) that esp-miner uses for BM1370
             // This is critical for proper nonce generation and return
@@ -810,7 +809,7 @@ impl Board for BitaxeBoard {
 
         // TODO: Spawn task to monitor chip responses and emit events
         self.spawn_event_monitor();
-        
+
         // Spawn statistics monitoring task
         self.spawn_stats_monitor();
 
@@ -841,7 +840,7 @@ impl Board for BitaxeBoard {
 
         // Update job tracking
         self.current_job_id = Some(job.job_id);
-        
+
         // Increment job ID counter
         self.next_job_id = (self.next_job_id + 24) % 128;
 
@@ -885,20 +884,20 @@ impl Board for BitaxeBoard {
     fn take_event_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<BoardEvent>> {
         self.event_rx.take()
     }
-    
+
     async fn shutdown(&mut self) -> Result<(), BoardError> {
         tracing::info!("Shutting down Bitaxe board");
-        
+
         // Send chain inactive command to stop all chips from hashing
         let command = Command::ChainInactive;
         self.send_config_command(command).await?;
-        
+
         // Give chips time to stop hashing
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         // Hold chips in reset to ensure they stay in a safe state
         self.hold_in_reset().await?;
-        
+
         // Turn off core voltage
         if let Some(ref mut power) = self.power_controller {
             match power.set_vout(0.0).await {
@@ -906,12 +905,12 @@ impl Board for BitaxeBoard {
                 Err(e) => warn!("Failed to turn off core voltage: {}", e),
             }
         }
-        
+
         // Cancel the statistics monitoring task
         if let Some(handle) = self.stats_task_handle.take() {
             handle.abort();
         }
-        
+
         tracing::info!("Bitaxe board shutdown complete");
         Ok(())
     }

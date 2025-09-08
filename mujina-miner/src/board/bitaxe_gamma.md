@@ -87,12 +87,6 @@ Standard I2C operations with 7-bit addressing:
   - Must be high for normal operation
   - Used during initialization and shutdown
 
-### Additional Peripherals (Not Yet Implemented)
-Based on typical Bitaxe designs, the board likely includes:
-- **TMP75** - Board temperature sensor (I2C)
-- **INA260** - Power monitor for input voltage/current (I2C)
-- **RGB LED** - Status indicator (GPIO controlled)
-
 ## Initialization Sequence
 
 1. Open both serial ports at 115200 baud
