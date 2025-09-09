@@ -146,5 +146,8 @@ Standard I2C operations with 7-bit addressing:
 - [Bitaxe Gamma Hardware](https://github.com/bitaxeorg/bitaxeGamma)
 - [bitaxe-raw Firmware](https://github.com/skot/bitaxe-raw)
 - [BM1370 Protocol Documentation](../../../asic/bm13xx/PROTOCOL.md)
-- [EMC2101 Datasheet](https://www.microchip.com/en-us/product/emc2101)
-- [TPS546D24A Datasheet](https://www.ti.com/product/TPS546D24A)
+
+## Components
+
+- EMC2101 - Fan controller and temperature sensor
+- TPS546D24A - Power management controller

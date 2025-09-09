@@ -3,6 +3,8 @@
 //! The EMC2101 is an I2C fan controller with integrated temperature sensing.
 //! It can monitor external temperature via a diode-connected transistor and
 //! control fan speed using PWM output.
+//!
+//! Datasheet: <https://www.microchip.com/en-us/product/emc2101>
 
 use crate::hw_trait::{Result, HwError};
 use crate::hw_trait::i2c::I2c;
