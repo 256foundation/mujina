@@ -12,15 +12,101 @@ use tracing::{debug, error, info, trace, warn};
 
 use super::pmbus::{self, Linear11, Linear16, StatusDecoder};
 
-/// TPS546 I2C address
-const TPS546_I2C_ADDR: u8 = 0x24;
+/// Protocol dissection utilities for TPS546
+pub mod protocol {
+    use super::pmbus;
 
-// TPS546-specific device IDs (not part of generic PMBus)
+    /// Default I2C address for TPS546
+    pub const DEFAULT_ADDRESS: u8 = 0x24;
 
-/// Expected device IDs for TPS546D24A variants
-const DEVICE_ID1: [u8; 6] = [0x54, 0x49, 0x54, 0x6B, 0x24, 0x41]; // TPS546D24A
-const DEVICE_ID2: [u8; 6] = [0x54, 0x49, 0x54, 0x6D, 0x24, 0x41]; // TPS546D24A
-const DEVICE_ID3: [u8; 6] = [0x54, 0x49, 0x54, 0x6D, 0x24, 0x62]; // TPS546D24S
+    /// Known device IDs for TPS546 variants
+    pub const DEVICE_ID1: [u8; 6] = [0x54, 0x49, 0x54, 0x6B, 0x24, 0x41]; // TPS546D24A
+    pub const DEVICE_ID2: [u8; 6] = [0x54, 0x49, 0x54, 0x6D, 0x24, 0x41]; // TPS546D24A
+    pub const DEVICE_ID3: [u8; 6] = [0x54, 0x49, 0x54, 0x6D, 0x24, 0x62]; // TPS546D24S
+
+    /// Get command name from PMBus command code
+    pub fn command_name(cmd: u8) -> &'static str {
+        match cmd {
+            0x01 => "OPERATION",
+            0x02 => "ON_OFF_CONFIG",
+            0x03 => "CLEAR_FAULTS",
+            0x20 => "VOUT_MODE",
+            0x21 => "VOUT_COMMAND",
+            0x79 => "STATUS_WORD",
+            0x88 => "READ_VIN",
+            0x8B => "READ_VOUT",
+            0x8C => "READ_IOUT",
+            0x8D => "READ_TEMPERATURE_1",
+            0x99 => "MFR_ID",
+            0x9A => "MFR_MODEL",
+            0x9B => "MFR_REVISION",
+            0xAD => "IC_DEVICE_ID",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Decode device ID to model string
+    pub fn decode_device_id(data: &[u8]) -> String {
+        if data.len() >= 6 {
+            let id = &data[0..6];
+            let model = if id == DEVICE_ID1 || id == DEVICE_ID2 {
+                "TPS546D24A"
+            } else if id == DEVICE_ID3 {
+                "TPS546D24S"
+            } else {
+                "Unknown"
+            };
+
+            let ascii: String = id
+                .iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect();
+
+            format!("\"{}\" ({})", ascii, model)
+        } else {
+            format!("{:02x?}", data)
+        }
+    }
+
+    /// Format a TPS546 I2C transaction
+    pub fn format_transaction(cmd: u8, data: Option<&[u8]>, is_read: bool) -> String {
+        let cmd_name = command_name(cmd);
+
+        if is_read {
+            if let Some(data) = data {
+                let decoded = match cmd {
+                    0xAD => decode_device_id(data), // IC_DEVICE_ID
+                    0x79 => {
+                        if data.len() >= 2 {
+                            let status = u16::from_le_bytes([data[0], data[1]]);
+                            let flags = pmbus::StatusDecoder::decode_status_word(status);
+                            if flags.is_empty() {
+                                format!("0x{:04x}", status)
+                            } else {
+                                format!("0x{:04x} ({})", status, flags.join(" | "))
+                            }
+                        } else {
+                            format!("{:02x?}", data)
+                        }
+                    }
+                    _ => format!("{:02x?}", data),
+                };
+                format!("READ {}={}", cmd_name, decoded)
+            } else {
+                format!("READ {}", cmd_name)
+            }
+        } else {
+            if let Some(data) = data {
+                format!("WRITE {}={:02x?}", cmd_name, data)
+            } else {
+                format!("WRITE CMD[0x{:02x}]", cmd)
+            }
+        }
+    }
+}
+
+// Use protocol constants for driver
+use protocol::{DEFAULT_ADDRESS as TPS546_I2C_ADDR, DEVICE_ID1, DEVICE_ID2, DEVICE_ID3};
 
 /// TPS546 configuration parameters
 #[derive(Debug, Clone)]

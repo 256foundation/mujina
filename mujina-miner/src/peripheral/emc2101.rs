@@ -12,58 +12,158 @@ use crate::hw_trait::{HwError, Result};
 /// Default I2C address for EMC2101
 pub const DEFAULT_ADDRESS: u8 = 0x4C;
 
-/// EMC2101 register addresses
-#[allow(dead_code)]
-mod regs {
-    /// Internal temperature reading
-    pub const INTERNAL_TEMP: u8 = 0x00;
-    /// External temperature reading high byte
-    pub const EXTERNAL_TEMP_HIGH: u8 = 0x01;
-    /// External temperature reading low byte  
-    pub const EXTERNAL_TEMP_LOW: u8 = 0x10;
-    /// Configuration register
-    pub const CONFIG: u8 = 0x03;
-    /// Conversion rate register
-    pub const CONVERSION_RATE: u8 = 0x04;
-    /// Internal temperature high limit
-    pub const INTERNAL_TEMP_LIMIT: u8 = 0x05;
-    /// External temperature high limit high byte
-    pub const EXTERNAL_TEMP_LIMIT_HIGH: u8 = 0x07;
-    /// External temperature high limit low byte
-    pub const EXTERNAL_TEMP_LIMIT_LOW: u8 = 0x13;
-    /// Fan configuration register
-    pub const FAN_CONFIG: u8 = 0x4A;
-    /// Fan spin-up configuration
-    pub const FAN_SPINUP: u8 = 0x4B;
-    /// PWM frequency register
-    pub const PWM_FREQ: u8 = 0x4C;
-    /// PWM frequency divide register
-    pub const PWM_DIV: u8 = 0x4D;
-    /// Fan minimum drive register
-    pub const FAN_MIN_DRIVE: u8 = 0x55;
-    /// Fan valid TACH count
-    pub const FAN_VALID_TACH: u8 = 0x58;
-    /// Fan drive fail band low byte
-    pub const FAN_FAIL_BAND_LOW: u8 = 0x5A;
-    /// Fan drive fail band high byte
-    pub const FAN_FAIL_BAND_HIGH: u8 = 0x5B;
-    /// TACH reading high byte
-    pub const TACH_HIGH: u8 = 0x46;
-    /// TACH reading low byte
-    pub const TACH_LOW: u8 = 0x47;
-    /// TACH limit high byte
-    pub const TACH_LIMIT_HIGH: u8 = 0x48;
-    /// TACH limit low byte
-    pub const TACH_LIMIT_LOW: u8 = 0x49;
-    /// Fan setting register (PWM duty cycle)
-    pub const FAN_SETTING: u8 = 0x4C;
-    /// Product ID register
-    pub const PRODUCT_ID: u8 = 0xFD;
-    /// Manufacturer ID register
-    pub const MFG_ID: u8 = 0xFE;
-    /// Revision register
-    pub const REVISION: u8 = 0xFF;
+/// Protocol dissection utilities for EMC2101
+pub mod protocol {
+    /// Default I2C address for EMC2101
+    pub const DEFAULT_ADDRESS: u8 = 0x4C;
+
+    /// Expected manufacturer ID
+    pub const EXPECTED_MFG_ID: u8 = 0x5D;
+
+    /// EMC2101 register addresses
+    pub mod regs {
+        /// Internal temperature reading
+        pub const INTERNAL_TEMP: u8 = 0x00;
+        /// External temperature reading high byte
+        pub const EXTERNAL_TEMP_HIGH: u8 = 0x01;
+        /// External temperature reading low byte
+        pub const EXTERNAL_TEMP_LOW: u8 = 0x10;
+        /// Configuration register
+        pub const CONFIG: u8 = 0x03;
+        /// Conversion rate register
+        pub const CONVERSION_RATE: u8 = 0x04;
+        /// Internal temperature high limit
+        pub const INTERNAL_TEMP_LIMIT: u8 = 0x05;
+        /// External temperature high limit high byte
+        pub const EXTERNAL_TEMP_LIMIT_HIGH: u8 = 0x07;
+        /// External temperature high limit low byte
+        pub const EXTERNAL_TEMP_LIMIT_LOW: u8 = 0x13;
+        /// Fan configuration register
+        pub const FAN_CONFIG: u8 = 0x4A;
+        /// Fan spin-up configuration
+        pub const FAN_SPINUP: u8 = 0x4B;
+        /// PWM frequency register
+        pub const PWM_FREQ: u8 = 0x4C;
+        /// PWM frequency divide register
+        pub const PWM_DIV: u8 = 0x4D;
+        /// Fan minimum drive register
+        pub const FAN_MIN_DRIVE: u8 = 0x55;
+        /// Fan valid TACH count
+        pub const FAN_VALID_TACH: u8 = 0x58;
+        /// Fan drive fail band low byte
+        pub const FAN_FAIL_BAND_LOW: u8 = 0x5A;
+        /// Fan drive fail band high byte
+        pub const FAN_FAIL_BAND_HIGH: u8 = 0x5B;
+        /// TACH reading high byte
+        pub const TACH_HIGH: u8 = 0x46;
+        /// TACH reading low byte
+        pub const TACH_LOW: u8 = 0x47;
+        /// TACH limit high byte
+        pub const TACH_LIMIT_HIGH: u8 = 0x48;
+        /// TACH limit low byte
+        pub const TACH_LIMIT_LOW: u8 = 0x49;
+        /// Fan setting register (PWM duty cycle)
+        pub const FAN_SETTING: u8 = 0x4C;
+        /// Product ID register
+        pub const PRODUCT_ID: u8 = 0xFD;
+        /// Manufacturer ID register
+        pub const MFG_ID: u8 = 0xFE;
+        /// Revision register
+        pub const REVISION: u8 = 0xFF;
+    }
+
+    /// Get register name from address
+    pub fn register_name(addr: u8) -> &'static str {
+        match addr {
+            0x00 => "INTERNAL_TEMP",
+            0x01 => "EXTERNAL_TEMP_HIGH",
+            0x10 => "EXTERNAL_TEMP_LOW",
+            0x03 => "CONFIG",
+            0x04 => "CONVERSION_RATE",
+            0x05 => "INTERNAL_TEMP_LIMIT",
+            0x07 => "EXTERNAL_TEMP_LIMIT_HIGH",
+            0x13 => "EXTERNAL_TEMP_LIMIT_LOW",
+            0x4A => "FAN_CONFIG",
+            0x4B => "FAN_SPINUP",
+            0x4C => "FAN_SETTING",
+            0x4D => "PWM_DIV",
+            0x55 => "FAN_MIN_DRIVE",
+            0x58 => "FAN_VALID_TACH",
+            0x5A => "FAN_FAIL_BAND_LOW",
+            0x5B => "FAN_FAIL_BAND_HIGH",
+            0x46 => "TACH_HIGH",
+            0x47 => "TACH_LOW",
+            0x48 => "TACH_LIMIT_HIGH",
+            0x49 => "TACH_LIMIT_LOW",
+            0xFD => "PRODUCT_ID",
+            0xFE => "MFG_ID",
+            0xFF => "REVISION",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Decode temperature value (signed 8-bit)
+    pub fn decode_temperature(value: u8) -> String {
+        let temp = value as i8;
+        format!("{}°C", temp)
+    }
+
+    /// Decode PWM duty cycle to percentage
+    pub fn decode_pwm_percent(value: u8) -> String {
+        let percent = (value as f32 / 255.0 * 100.0) as u8;
+        format!("{}% (0x{:02x})", percent, value)
+    }
+
+    /// Format an EMC2101 I2C transaction
+    pub fn format_transaction(reg: u8, data: Option<&[u8]>, is_read: bool) -> String {
+        let reg_name = register_name(reg);
+
+        if is_read {
+            if let Some(data) = data {
+                if data.len() == 1 {
+                    let decoded = match reg {
+                        regs::INTERNAL_TEMP | regs::EXTERNAL_TEMP_HIGH => {
+                            decode_temperature(data[0])
+                        }
+                        regs::FAN_SETTING | regs::FAN_MIN_DRIVE => decode_pwm_percent(data[0]),
+                        regs::MFG_ID => format!(
+                            "0x{:02x} ({})",
+                            data[0],
+                            if data[0] == EXPECTED_MFG_ID {
+                                "SMSC/Microchip"
+                            } else {
+                                "Unknown"
+                            }
+                        ),
+                        _ => format!("0x{:02x}", data[0]),
+                    };
+                    format!("READ {}={}", reg_name, decoded)
+                } else {
+                    format!("READ {}={:02x?}", reg_name, data)
+                }
+            } else {
+                format!("READ {}", reg_name)
+            }
+        } else {
+            if let Some(data) = data {
+                if data.len() == 1 {
+                    let decoded = match reg {
+                        regs::FAN_SETTING | regs::FAN_MIN_DRIVE => decode_pwm_percent(data[0]),
+                        _ => format!("0x{:02x}", data[0]),
+                    };
+                    format!("WRITE {}={}", reg_name, decoded)
+                } else {
+                    format!("WRITE {}={:02x?}", reg_name, data)
+                }
+            } else {
+                format!("WRITE REG[0x{:02x}]", reg)
+            }
+        }
+    }
 }
+
+// Re-export register constants for driver compatibility
+use protocol::regs;
 
 /// EMC2101 driver
 pub struct Emc2101<I: I2c> {
