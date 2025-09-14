@@ -793,6 +793,10 @@ impl Command {
 
     /// Parse a command from raw frame data for dissection
     /// Returns (command, crc_valid)
+    ///
+    /// TODO: Add Response::try_parse_frame() for parsing response frames (AA 55 preamble)
+    /// in the dissector. The runtime FrameCodec handles responses differently (streaming)
+    /// but dissector needs static analysis of complete response frames.
     pub fn try_parse_frame(data: &[u8]) -> Result<(Self, bool), ProtocolError> {
         if data.len() < 5 {
             return Err(ProtocolError::InvalidFrame);
