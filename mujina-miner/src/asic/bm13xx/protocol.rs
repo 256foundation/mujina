@@ -797,6 +797,11 @@ impl Command {
     /// TODO: Add Response::try_parse_frame() for parsing response frames (AA 55 preamble)
     /// in the dissector. The runtime FrameCodec handles responses differently (streaming)
     /// but dissector needs static analysis of complete response frames.
+    ///
+    /// TODO: Consider extracting shared frame validation logic (preamble checks, CRC validation,
+    /// length parsing) into common utilities that both runtime FrameCodec and dissection
+    /// parsing can use. The frame envelope handling is identical regardless of direction
+    /// or I/O model - only payload interpretation and error handling strategies differ.
     pub fn try_parse_frame(data: &[u8]) -> Result<(Self, bool), ProtocolError> {
         if data.len() < 5 {
             return Err(ProtocolError::InvalidFrame);
