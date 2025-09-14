@@ -26,9 +26,9 @@ struct Args {
     #[arg(short = 'x', long)]
     hex: bool,
 
-    /// Use relative timestamps (from start of capture)
-    #[arg(short = 'r', long)]
-    relative_time: bool,
+    /// Use absolute timestamps instead of relative (seconds from start)
+    #[arg(short = 'a', long)]
+    absolute_time: bool,
 
     /// Filter by channel (CI, RO, I2C)
     #[arg(short = 'f', long)]
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
     // Setup output configuration
     let mut output_config = OutputConfig {
         show_raw_hex: args.hex,
-        use_relative_time: args.relative_time,
+        use_relative_time: !args.absolute_time,
         start_time: None,
         use_color: !args.no_color && atty::is(atty::Stream::Stdout),
     };
@@ -170,8 +170,8 @@ fn main() -> Result<()> {
     // Sort events by timestamp
     all_events.sort_by(|a, b| a.timestamp().partial_cmp(&b.timestamp()).unwrap());
 
-    // Set start time for relative timestamps
-    if args.relative_time && !all_events.is_empty() {
+    // Set start time for relative timestamps (default behavior)
+    if !args.absolute_time && !all_events.is_empty() {
         output_config.start_time = Some(all_events[0].timestamp());
     }
 
