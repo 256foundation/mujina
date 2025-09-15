@@ -189,8 +189,8 @@ pub mod protocol {
                 PmbusCommand::Phase => decode_phase(data),
                 PmbusCommand::Capability => decode_capability(data),
 
-                // Data-less command that returns status
-                PmbusCommand::ClearFaults => decode_clear_faults(data),
+                // Data-less write-only command
+                PmbusCommand::ClearFaults => decode_clear_faults_read(data),
 
                 // Fault response bytes
                 PmbusCommand::VinOvFaultResponse
@@ -306,6 +306,9 @@ pub mod protocol {
                 | PmbusCommand::TonMaxFaultLimit
                 | PmbusCommand::ToffDelay
                 | PmbusCommand::ToffFall => decode_write_linear11_time(data),
+
+                // Data-less write-only command
+                PmbusCommand::ClearFaults => decode_clear_faults_write(data),
 
                 // Fault response bytes
                 PmbusCommand::VinOvFaultResponse
@@ -596,13 +599,23 @@ pub mod protocol {
         }
     }
 
-    /// Decode CLEAR_FAULTS command (data-less command that clears all fault bits)
-    fn decode_clear_faults(data: &[u8]) -> String {
+    /// Decode CLEAR_FAULTS read operation (should not exist)
+    fn decode_clear_faults_read(data: &[u8]) -> String {
+        format!(
+            "{:02x?} (ERROR: CLEAR_FAULTS is write-only per PMBus spec)",
+            data
+        )
+    }
+
+    /// Decode CLEAR_FAULTS write operation (should be data-less)
+    fn decode_clear_faults_write(data: &[u8]) -> String {
         if data.is_empty() {
             "data-less command (clears all fault bits)".to_string()
         } else {
-            // Shouldn't have data, but show what we got
-            format!("{:02x?} (unexpected data for CLEAR_FAULTS)", data)
+            format!(
+                "{:02x?} (ERROR: CLEAR_FAULTS should be data-less per PMBus spec)",
+                data
+            )
         }
     }
 
