@@ -66,6 +66,10 @@ pub enum PmbusCommand {
     CompensationConfig = 0xB1,
     SyncConfig = 0xE4,
     StackConfig = 0xEC,
+    // TODO: Refactor manufacturer-specific commands to be device-specific
+    // These TPS546-specific commands should be moved to a separate Tps546Command enum
+    // to avoid polluting the generic PMBus namespace and enable proper device-specific
+    // type safety. Other PMBus devices will have their own manufacturer commands.
     MiscOptions = 0xED,
     PinDetectOverride = 0xEE,
     SlaveAddress = 0xEF,
