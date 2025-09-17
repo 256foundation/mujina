@@ -212,6 +212,21 @@ pub mod protocol {
                     decode_linear11_current(data)
                 }
 
+                // Linear11 time values (milliseconds)
+                PmbusCommand::TonDelay
+                | PmbusCommand::TonRise
+                | PmbusCommand::TonMaxFaultLimit
+                | PmbusCommand::ToffDelay
+                | PmbusCommand::ToffFall => {
+                    if data.len() >= 2 {
+                        let value = u16::from_le_bytes([data[0], data[1]]);
+                        let time_ms = pmbus::Linear11::to_int(value);
+                        format!("{:02x?} ({}ms)", data, time_ms)
+                    } else {
+                        format!("{:02x?}", data)
+                    }
+                }
+
                 // Linear16 format readings (requires VOUT_MODE context)
                 PmbusCommand::ReadVout => decode_linear16_voltage(data),
 
