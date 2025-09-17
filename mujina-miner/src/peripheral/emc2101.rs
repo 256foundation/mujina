@@ -150,10 +150,10 @@ pub mod protocol {
                                 _ => "unknown",
                             };
                             format!("0x{:02x} ({})", data[0], rate_desc)
-                        },
+                        }
                         regs::INTERNAL_TEMP_LIMIT => {
                             format!("0x{:02x} ({}°C)", data[0], data[0] as i8)
-                        },
+                        }
                         _ => format!("0x{:02x}", data[0]),
                     };
                     format!("⟶ READ {}={}", reg_name, decoded)

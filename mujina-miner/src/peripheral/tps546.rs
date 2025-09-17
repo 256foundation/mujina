@@ -196,8 +196,9 @@ pub mod protocol {
                 | PmbusCommand::VinUvWarnLimit => decode_linear11_voltage(data),
 
                 // Linear11 current configuration reads
-                PmbusCommand::IoutOcWarnLimit
-                | PmbusCommand::IoutOcFaultLimit => decode_linear11_current(data),
+                PmbusCommand::IoutOcWarnLimit | PmbusCommand::IoutOcFaultLimit => {
+                    decode_linear11_current(data)
+                }
 
                 // Linear16 format readings (requires VOUT_MODE context)
                 PmbusCommand::ReadVout => decode_linear16_voltage(data),
@@ -318,12 +319,14 @@ pub mod protocol {
                 | PmbusCommand::VinUvWarnLimit => decode_write_linear11_voltage(data),
 
                 // Current values (Linear11 format)
-                PmbusCommand::IoutOcWarnLimit
-                | PmbusCommand::IoutOcFaultLimit => decode_write_linear11_current(data),
+                PmbusCommand::IoutOcWarnLimit | PmbusCommand::IoutOcFaultLimit => {
+                    decode_write_linear11_current(data)
+                }
 
                 // Temperature values (Linear11 format)
-                PmbusCommand::OtWarnLimit
-                | PmbusCommand::OtFaultLimit => decode_write_linear11(data), // TODO: Add temperature units
+                PmbusCommand::OtWarnLimit | PmbusCommand::OtFaultLimit => {
+                    decode_write_linear11(data)
+                } // TODO: Add temperature units
 
                 // Frequency in kHz (Linear11 format)
                 PmbusCommand::FrequencySwitch => decode_write_frequency(data),
