@@ -292,19 +292,19 @@ pub fn group_transactions(transactions: &[I2cTransaction]) -> Vec<I2cOperation> 
                 } else {
                     // Valid register read pattern: write register address, then read data
                     operations.push(I2cOperation {
-                    start_time: t1.start_time,
-                    address: t1.address,
-                    register: Some(command),
-                    write_data: if t1.data.len() > 1 {
-                        Some(t1.data[1..].to_vec())
-                    } else {
-                        None
-                    },
-                    read_data: Some(t2.data.clone()),
-                    was_naked: !t1.all_acked || !t2.all_acked,
-                });
-                i += 2;
-                continue;
+                        start_time: t1.start_time,
+                        address: t1.address,
+                        register: Some(command),
+                        write_data: if t1.data.len() > 1 {
+                            Some(t1.data[1..].to_vec())
+                        } else {
+                            None
+                        },
+                        read_data: Some(t2.data.clone()),
+                        was_naked: !t1.all_acked || !t2.all_acked,
+                    });
+                    i += 2;
+                    continue;
                 }
             }
         }
@@ -314,9 +314,9 @@ pub fn group_transactions(transactions: &[I2cTransaction]) -> Vec<I2cOperation> 
             // For writes, first byte is command/register, rest is data
             let cmd = t1.data[0];
             let data = if t1.data.len() > 1 {
-                Some(t1.data[1..].to_vec())  // Data after command
+                Some(t1.data[1..].to_vec()) // Data after command
             } else {
-                None  // Command-only (like CLEAR_FAULTS)
+                None // Command-only (like CLEAR_FAULTS)
             };
             (Some(cmd), data)
         } else if !t1.data.is_empty() {
@@ -529,7 +529,7 @@ mod tests {
             is_read,
             data,
             register: None,
-            all_acked: true,  // Default to all ACKed for tests
+            all_acked: true, // Default to all ACKed for tests
         }
     }
 
@@ -788,11 +788,13 @@ mod tests {
         });
 
         // Should have a single combined transaction
-        let transaction = assembler.next_transaction().expect("Should have transaction");
+        let transaction = assembler
+            .next_transaction()
+            .expect("Should have transaction");
         assert_eq!(transaction.address, 0x24);
         assert_eq!(transaction.is_read, true);
-        assert_eq!(transaction.register, Some(0x9A));  // Register from write phase
-        assert_eq!(transaction.data, vec![0x03, 0x00, 0x00]);  // Read data
+        assert_eq!(transaction.register, Some(0x9A)); // Register from write phase
+        assert_eq!(transaction.data, vec![0x03, 0x00, 0x00]); // Read data
         assert!(assembler.next_transaction().is_none());
     }
 
@@ -841,7 +843,7 @@ mod tests {
         assembler.process(&I2cEvent {
             event_type: I2cEventType::Address,
             timestamp: 1.004,
-            address: Some(0x4C),  // Different address
+            address: Some(0x4C), // Different address
             data: None,
             ack: true,
             read: true,
@@ -866,13 +868,17 @@ mod tests {
         });
 
         // Should have two separate transactions
-        let t1 = assembler.next_transaction().expect("Should have first transaction");
+        let t1 = assembler
+            .next_transaction()
+            .expect("Should have first transaction");
         assert_eq!(t1.address, 0x24);
         assert_eq!(t1.is_read, false);
         assert_eq!(t1.data, vec![0x9A]);
         assert_eq!(t1.register, None);
 
-        let t2 = assembler.next_transaction().expect("Should have second transaction");
+        let t2 = assembler
+            .next_transaction()
+            .expect("Should have second transaction");
         assert_eq!(t2.address, 0x4C);
         assert_eq!(t2.is_read, true);
         assert_eq!(t2.data, vec![0x42]);
@@ -960,13 +966,17 @@ mod tests {
         });
 
         // Should have two separate transactions
-        let t1 = assembler.next_transaction().expect("Should have first transaction");
+        let t1 = assembler
+            .next_transaction()
+            .expect("Should have first transaction");
         assert_eq!(t1.address, 0x24);
         assert_eq!(t1.is_read, false);
         assert_eq!(t1.data, vec![0x21, 0x66]);
         assert_eq!(t1.register, None);
 
-        let t2 = assembler.next_transaction().expect("Should have second transaction");
+        let t2 = assembler
+            .next_transaction()
+            .expect("Should have second transaction");
         assert_eq!(t2.address, 0x24);
         assert_eq!(t2.is_read, true);
         assert_eq!(t2.data, vec![0x42]);
