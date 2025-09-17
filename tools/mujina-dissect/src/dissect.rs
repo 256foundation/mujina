@@ -135,6 +135,7 @@ pub struct DissectedI2c {
     pub device: I2cDevice,
     pub operation: String,
     pub raw_data: Vec<u8>,
+    pub was_naked: bool,
 }
 
 /// I2C device contexts for state tracking
@@ -183,16 +184,24 @@ pub fn dissect_i2c_operation_with_context(
             }
             I2cDevice::Unknown => {
                 if let Some(data) = &op.read_data {
-                    format!("READ [0x{:02x}]={:02x?}", reg, data)
+                    format!("⟶ READ [0x{:02x}]={:02x?}", reg, data)
                 } else if let Some(data) = &op.write_data {
-                    format!("WRITE [0x{:02x}]={:02x?}", reg, data)
+                    format!("⟵ WRITE [0x{:02x}]={:02x?}", reg, data)
                 } else {
-                    format!("ACCESS [0x{:02x}]", reg)
+                    // Command-only write (no data after register/command byte)
+                    format!("⟵ WRITE [0x{:02x}]", reg)
                 }
             }
         }
     } else {
-        format!("I2C op @ 0x{:02x}", op.address)
+        // No register specified, but we can still describe the operation
+        if let Some(data) = &op.read_data {
+            format!("⟶ READ {:02x?} (no register)", data)
+        } else if let Some(data) = &op.write_data {
+            format!("⟵ WRITE {:02x?} (no register)", data)
+        } else {
+            format!("I2C op @ 0x{:02x}", op.address)
+        }
     };
 
     let raw_data = op
@@ -208,5 +217,6 @@ pub fn dissect_i2c_operation_with_context(
         device,
         operation,
         raw_data,
+        was_naked: op.was_naked,
     }
 }
