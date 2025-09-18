@@ -1286,18 +1286,24 @@ mod tests {
 
         // Document that signed decoder gives wrong result for this case
         // (This is expected since voltage readings should use unsigned mantissa)
-        println!("Signed decoder result: {:.3}V (incorrect for voltage)", signed_result);
-        println!("Unsigned decoder result: {:.3}V (correct for voltage)", unsigned_result);
+        println!(
+            "Signed decoder result: {:.3}V (incorrect for voltage)",
+            signed_result
+        );
+        println!(
+            "Unsigned decoder result: {:.3}V (correct for voltage)",
+            unsigned_result
+        );
     }
 
     #[test]
     fn test_linear11_mantissa_sign_boundary() {
         // Test mantissa values around the sign bit boundary (bit 10 = 0x400)
         let test_cases = [
-            (0x03FF, "Just below sign bit"),      // Mantissa 1023, should be positive
-            (0x0400, "At sign bit"),             // Mantissa 1024, should be positive
-            (0x0401, "Just above sign bit"),     // Mantissa 1025, should be positive
-            (0x07FF, "Maximum mantissa"),        // Mantissa 2047, should be positive
+            (0x03FF, "Just below sign bit"), // Mantissa 1023, should be positive
+            (0x0400, "At sign bit"),         // Mantissa 1024, should be positive
+            (0x0401, "Just above sign bit"), // Mantissa 1025, should be positive
+            (0x07FF, "Maximum mantissa"),    // Mantissa 2047, should be positive
         ];
 
         for (mantissa, description) in test_cases {
@@ -1311,14 +1317,17 @@ mod tests {
             assert!(
                 unsigned_result >= 0.0,
                 "{}: unsigned decoder should give positive result, got {}",
-                description, unsigned_result
+                description,
+                unsigned_result
             );
 
             // The unsigned result should equal the mantissa value (since exp=0)
             assert!(
                 (unsigned_result - mantissa as f32).abs() < 0.001,
                 "{}: expected {}, got {}",
-                description, mantissa, unsigned_result
+                description,
+                mantissa,
+                unsigned_result
             );
         }
     }
@@ -1332,7 +1341,11 @@ mod tests {
             (0xF800, 0.0, "Zero with negative exponent"),
             (0xC001, 1.0 / 256.0, "Small voltage with negative exponent"),
             (0x07FF, 2047.0, "Maximum mantissa with exp=0"),
-            (0x8001, 1.0 / 32768.0, "Small value with max negative exponent"),
+            (
+                0x8001,
+                1.0 / 32768.0,
+                "Small value with max negative exponent",
+            ),
         ];
 
         for (raw_value, expected_unsigned, description) in test_cases {
@@ -1342,7 +1355,9 @@ mod tests {
             assert!(
                 (unsigned_result - expected_unsigned).abs() < 0.001,
                 "{}: expected {:.3}V, got {:.3}V",
-                description, expected_unsigned, unsigned_result
+                description,
+                expected_unsigned,
+                unsigned_result
             );
         }
     }
@@ -1359,10 +1374,16 @@ mod tests {
         let unsigned_result = Linear11::to_float_unsigned(raw_value);
 
         // Signed should handle negative current correctly
-        assert!(signed_result < 0.0, "Signed decoder should handle negative current");
+        assert!(
+            signed_result < 0.0,
+            "Signed decoder should handle negative current"
+        );
 
         // Unsigned should always be positive
-        assert!(unsigned_result > 0.0, "Unsigned decoder should always be positive");
+        assert!(
+            unsigned_result > 0.0,
+            "Unsigned decoder should always be positive"
+        );
 
         // They should have different signs for this test case
         assert!(
