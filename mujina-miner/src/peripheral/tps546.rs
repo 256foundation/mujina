@@ -62,14 +62,8 @@ pub mod protocol {
     ) -> String {
         let cmd_name = pmbus::command_name(cmd);
 
-        // Update context based on this operation
-        if is_read && cmd == PmbusCommand::VoutMode.as_u8() {
-            if let Some(data) = data {
-                if data.len() >= 1 {
-                    context.vout_mode = Some(data[0]);
-                }
-            }
-        } else if !is_read && cmd == PmbusCommand::VoutMode.as_u8() {
+        // Update context based on this operation - cache VOUT_MODE for future use
+        if cmd == PmbusCommand::VoutMode.as_u8() {
             if let Some(data) = data {
                 if data.len() >= 1 {
                     context.vout_mode = Some(data[0]);
@@ -860,12 +854,18 @@ pub enum Tps546Error {
 pub struct Tps546<I2C> {
     i2c: I2C,
     config: Tps546Config,
+    /// Cached VOUT_MODE value to avoid redundant reads
+    cached_vout_mode: Option<u8>,
 }
 
 impl<I2C: I2c> Tps546<I2C> {
     /// Create a new TPS546 instance
     pub fn new(i2c: I2C, config: Tps546Config) -> Self {
-        Self { i2c, config }
+        Self {
+            i2c,
+            config,
+            cached_vout_mode: None,
+        }
     }
 
     /// Initialize the TPS546
@@ -1911,13 +1911,31 @@ impl<I2C: I2c> Tps546<I2C> {
         Linear11::from_int(value)
     }
 
+    /// Get VOUT_MODE with caching to avoid redundant I2C reads
+    async fn get_vout_mode(&mut self) -> Result<u8> {
+        if let Some(cached) = self.cached_vout_mode {
+            Ok(cached)
+        } else {
+            let vout_mode = self.read_byte(PmbusCommand::VoutMode).await?;
+            self.cached_vout_mode = Some(vout_mode);
+            debug!("Cached VOUT_MODE: 0x{:02x}", vout_mode);
+            Ok(vout_mode)
+        }
+    }
+
+    /// Invalidate VOUT_MODE cache (call after writing to VOUT_MODE register)
+    #[expect(dead_code)]
+    fn invalidate_vout_mode_cache(&mut self) {
+        self.cached_vout_mode = None;
+    }
+
     async fn ulinear16_to_float(&mut self, value: u16) -> Result<f32> {
-        let vout_mode = self.read_byte(PmbusCommand::VoutMode).await?;
+        let vout_mode = self.get_vout_mode().await?;
         Ok(Linear16::to_float(value, vout_mode))
     }
 
     async fn float_to_ulinear16(&mut self, value: f32) -> Result<u16> {
-        let vout_mode = self.read_byte(PmbusCommand::VoutMode).await?;
+        let vout_mode = self.get_vout_mode().await?;
         Linear16::from_float(value, vout_mode)
             .map_err(|e| anyhow::anyhow!("ULINEAR16 conversion error: {}", e))
     }
