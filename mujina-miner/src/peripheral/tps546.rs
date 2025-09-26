@@ -10,7 +10,7 @@ use anyhow::{bail, Result};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
-use super::pmbus::{self, linear11, linear16, PmbusCommand, StatusDecoder};
+use super::pmbus::{self, linear11, PmbusCommand, StatusDecoder, VoutMode};
 
 /// Constants for TPS546 device identification
 pub mod constants {
@@ -217,10 +217,10 @@ impl<I2C: I2c> Tps546<I2C> {
         )
         .await?;
 
-        // VIN_OV_FAULT_RESPONSE (0xB7 = shutdown with 4 retries, 182ms delay)
+        // VIN_OV_FAULT_RESPONSE (0xB7 = immediate shutdown, 6 retries, 7×TON_RISE delay)
         const VIN_OV_FAULT_RESPONSE: u8 = 0xB7;
         trace!(
-            "Setting VIN_OV_FAULT_RESPONSE: 0x{:02X} (shutdown, 4 retries, 182ms delay)",
+            "Setting VIN_OV_FAULT_RESPONSE: 0x{:02X} (immediate shutdown, 6 retries)",
             VIN_OV_FAULT_RESPONSE
         );
         self.write_byte(PmbusCommand::VinOvFaultResponse, VIN_OV_FAULT_RESPONSE)
@@ -235,16 +235,16 @@ impl<I2C: I2c> Tps546<I2C> {
         .await?;
 
         trace!("Setting VOUT_COMMAND: {:.2}V", self.config.vout_command);
-        let vout_command = self.float_to_ulinear16(self.config.vout_command).await?;
+        let vout_command = self.encode_voltage(self.config.vout_command).await?;
         self.write_word(PmbusCommand::VoutCommand, vout_command)
             .await?;
 
         trace!("Setting VOUT_MAX: {:.2}V", self.config.vout_max);
-        let vout_max = self.float_to_ulinear16(self.config.vout_max).await?;
+        let vout_max = self.encode_voltage(self.config.vout_max).await?;
         self.write_word(PmbusCommand::VoutMax, vout_max).await?;
 
         trace!("Setting VOUT_MIN: {:.2}V", self.config.vout_min);
-        let vout_min = self.float_to_ulinear16(self.config.vout_min).await?;
+        let vout_min = self.encode_voltage(self.config.vout_min).await?;
         self.write_word(PmbusCommand::VoutMin, vout_min).await?;
 
         // Output voltage protection
@@ -256,32 +256,32 @@ impl<I2C: I2c> Tps546<I2C> {
         const VOUT_UV_FAULT_LIMIT: f32 = 0.75; // 75% of VOUT_COMMAND
 
         trace!("Setting VOUT_OV_FAULT_LIMIT: {:.2}", VOUT_OV_FAULT_LIMIT);
-        let vout_ov_fault = self.float_to_ulinear16(VOUT_OV_FAULT_LIMIT).await?;
+        let vout_ov_fault = self.encode_voltage(VOUT_OV_FAULT_LIMIT).await?;
         self.write_word(PmbusCommand::VoutOvFaultLimit, vout_ov_fault)
             .await?;
 
         trace!("Setting VOUT_OV_WARN_LIMIT: {:.2}", VOUT_OV_WARN_LIMIT);
-        let vout_ov_warn = self.float_to_ulinear16(VOUT_OV_WARN_LIMIT).await?;
+        let vout_ov_warn = self.encode_voltage(VOUT_OV_WARN_LIMIT).await?;
         self.write_word(PmbusCommand::VoutOvWarnLimit, vout_ov_warn)
             .await?;
 
         trace!("Setting VOUT_MARGIN_HIGH: {:.2}", VOUT_MARGIN_HIGH);
-        let vout_margin_high = self.float_to_ulinear16(VOUT_MARGIN_HIGH).await?;
+        let vout_margin_high = self.encode_voltage(VOUT_MARGIN_HIGH).await?;
         self.write_word(PmbusCommand::VoutMarginHigh, vout_margin_high)
             .await?;
 
         trace!("Setting VOUT_MARGIN_LOW: {:.2}", VOUT_MARGIN_LOW);
-        let vout_margin_low = self.float_to_ulinear16(VOUT_MARGIN_LOW).await?;
+        let vout_margin_low = self.encode_voltage(VOUT_MARGIN_LOW).await?;
         self.write_word(PmbusCommand::VoutMarginLow, vout_margin_low)
             .await?;
 
         trace!("Setting VOUT_UV_WARN_LIMIT: {:.2}", VOUT_UV_WARN_LIMIT);
-        let vout_uv_warn = self.float_to_ulinear16(VOUT_UV_WARN_LIMIT).await?;
+        let vout_uv_warn = self.encode_voltage(VOUT_UV_WARN_LIMIT).await?;
         self.write_word(PmbusCommand::VoutUvWarnLimit, vout_uv_warn)
             .await?;
 
         trace!("Setting VOUT_UV_FAULT_LIMIT: {:.2}", VOUT_UV_FAULT_LIMIT);
-        let vout_uv_fault = self.float_to_ulinear16(VOUT_UV_FAULT_LIMIT).await?;
+        let vout_uv_fault = self.encode_voltage(VOUT_UV_FAULT_LIMIT).await?;
         self.write_word(PmbusCommand::VoutUvFaultLimit, vout_uv_fault)
             .await?;
 
@@ -440,7 +440,7 @@ impl<I2C: I2c> Tps546<I2C> {
             }
 
             // Set voltage
-            let value = self.float_to_ulinear16(volts).await?;
+            let value = self.encode_voltage(volts).await?;
             self.write_word(PmbusCommand::VoutCommand, value).await?;
             debug!("Output voltage set to {:.2}V", volts);
 
@@ -491,7 +491,7 @@ impl<I2C: I2c> Tps546<I2C> {
     /// Read output voltage in millivolts
     pub async fn get_vout(&mut self) -> Result<u32> {
         let value = self.read_word(PmbusCommand::ReadVout).await?;
-        let volts = self.ulinear16_to_float(value).await?;
+        let volts = self.decode_voltage(value).await?;
         Ok((volts * 1000.0) as u32)
     }
 
@@ -753,12 +753,12 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_max = self.read_word(PmbusCommand::VoutMax).await?;
         debug!(
             "VOUT_MAX: {:.2}V (raw: 0x{:04X})",
-            self.ulinear16_to_float(vout_max).await?,
+            self.decode_voltage(vout_max).await?,
             vout_max
         );
 
         let vout_ov_fault = self.read_word(PmbusCommand::VoutOvFaultLimit).await?;
-        let vout_ov_fault_v = self.ulinear16_to_float(vout_ov_fault).await?;
+        let vout_ov_fault_v = self.decode_voltage(vout_ov_fault).await?;
         debug!(
             "VOUT_OV_FAULT_LIMIT: {:.2}V (raw: 0x{:04X})",
             vout_ov_fault_v * self.config.vout_command,
@@ -766,7 +766,7 @@ impl<I2C: I2c> Tps546<I2C> {
         );
 
         let vout_ov_warn = self.read_word(PmbusCommand::VoutOvWarnLimit).await?;
-        let vout_ov_warn_v = self.ulinear16_to_float(vout_ov_warn).await?;
+        let vout_ov_warn_v = self.decode_voltage(vout_ov_warn).await?;
         debug!(
             "VOUT_OV_WARN_LIMIT: {:.2}V (raw: 0x{:04X})",
             vout_ov_warn_v * self.config.vout_command,
@@ -774,7 +774,7 @@ impl<I2C: I2c> Tps546<I2C> {
         );
 
         let vout_margin_high = self.read_word(PmbusCommand::VoutMarginHigh).await?;
-        let vout_margin_high_v = self.ulinear16_to_float(vout_margin_high).await?;
+        let vout_margin_high_v = self.decode_voltage(vout_margin_high).await?;
         debug!(
             "VOUT_MARGIN_HIGH: {:.2}V (raw: 0x{:04X})",
             vout_margin_high_v * self.config.vout_command,
@@ -784,12 +784,12 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_command = self.read_word(PmbusCommand::VoutCommand).await?;
         debug!(
             "VOUT_COMMAND: {:.2}V (raw: 0x{:04X})",
-            self.ulinear16_to_float(vout_command).await?,
+            self.decode_voltage(vout_command).await?,
             vout_command
         );
 
         let vout_margin_low = self.read_word(PmbusCommand::VoutMarginLow).await?;
-        let vout_margin_low_v = self.ulinear16_to_float(vout_margin_low).await?;
+        let vout_margin_low_v = self.decode_voltage(vout_margin_low).await?;
         debug!(
             "VOUT_MARGIN_LOW: {:.2}V (raw: 0x{:04X})",
             vout_margin_low_v * self.config.vout_command,
@@ -797,7 +797,7 @@ impl<I2C: I2c> Tps546<I2C> {
         );
 
         let vout_uv_warn = self.read_word(PmbusCommand::VoutUvWarnLimit).await?;
-        let vout_uv_warn_v = self.ulinear16_to_float(vout_uv_warn).await?;
+        let vout_uv_warn_v = self.decode_voltage(vout_uv_warn).await?;
         debug!(
             "VOUT_UV_WARN_LIMIT: {:.2}V (raw: 0x{:04X})",
             vout_uv_warn_v * self.config.vout_command,
@@ -805,7 +805,7 @@ impl<I2C: I2c> Tps546<I2C> {
         );
 
         let vout_uv_fault = self.read_word(PmbusCommand::VoutUvFaultLimit).await?;
-        let vout_uv_fault_v = self.ulinear16_to_float(vout_uv_fault).await?;
+        let vout_uv_fault_v = self.decode_voltage(vout_uv_fault).await?;
         debug!(
             "VOUT_UV_FAULT_LIMIT: {:.2}V (raw: 0x{:04X})",
             vout_uv_fault_v * self.config.vout_command,
@@ -815,7 +815,7 @@ impl<I2C: I2c> Tps546<I2C> {
         let vout_min = self.read_word(PmbusCommand::VoutMin).await?;
         debug!(
             "VOUT_MIN: {:.2}V (raw: 0x{:04X})",
-            self.ulinear16_to_float(vout_min).await?,
+            self.decode_voltage(vout_min).await?,
             vout_min
         );
 
@@ -871,10 +871,7 @@ impl<I2C: I2c> Tps546<I2C> {
         debug!("READ_VIN: {:.2}V", self.slinear11_to_float(read_vin));
 
         let read_vout = self.read_word(PmbusCommand::ReadVout).await?;
-        debug!(
-            "READ_VOUT: {:.2}V",
-            self.ulinear16_to_float(read_vout).await?
-        );
+        debug!("READ_VOUT: {:.2}V", self.decode_voltage(read_vout).await?);
 
         let read_iout = self.read_word(PmbusCommand::ReadIout).await?;
         debug!("READ_IOUT: {:.2}A", self.slinear11_to_float(read_iout));
@@ -1173,14 +1170,17 @@ impl<I2C: I2c> Tps546<I2C> {
         self.cached_vout_mode = None;
     }
 
-    async fn ulinear16_to_float(&mut self, value: u16) -> Result<f32> {
-        let vout_mode = self.get_vout_mode().await?;
-        Ok(linear16::to_float(value, vout_mode))
+    /// Convert f32 to Linear16 format using cached VOUT_MODE
+    async fn encode_voltage(&mut self, volts: f32) -> Result<u16> {
+        let vout_mode = VoutMode::new(self.get_vout_mode().await?);
+        vout_mode
+            .encode_linear16(volts)
+            .map_err(|e| anyhow::anyhow!("Voltage encoding error: {}", e))
     }
 
-    async fn float_to_ulinear16(&mut self, value: f32) -> Result<u16> {
-        let vout_mode = self.get_vout_mode().await?;
-        linear16::from_float(value, vout_mode)
-            .map_err(|e| anyhow::anyhow!("ULINEAR16 conversion error: {}", e))
+    /// Convert Linear16 format to f32 using cached VOUT_MODE
+    async fn decode_voltage(&mut self, value: u16) -> Result<f32> {
+        let vout_mode = VoutMode::new(self.get_vout_mode().await?);
+        Ok(vout_mode.decode_linear16(value))
     }
 }

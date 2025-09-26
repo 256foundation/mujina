@@ -664,14 +664,12 @@ fn parse_voltage_value(
         ReadVin | VinOn | VinOff | VinOvFaultLimit | VinUvWarnLimit => {
             parse_u16_le(data).map(|v| PmbusValue::Voltage(PmbusVoltage::from_linear11(v)))
         }
-        VoutScaleLoop => {
-            parse_u16_le(data).map(|v| {
-                let linear11 = Linear11::new(v);
-                PmbusValue::ScaleFactor(linear11.to_f32())
-            })
-        }
-        ReadVout | VoutCommand | VoutMax | VoutMarginHigh | VoutMarginLow
-        | VoutMin | VoutOvFaultLimit | VoutOvWarnLimit | VoutUvWarnLimit | VoutUvFaultLimit => {
+        VoutScaleLoop => parse_u16_le(data).map(|v| {
+            let linear11 = Linear11::new(v);
+            PmbusValue::ScaleFactor(linear11.to_f32())
+        }),
+        ReadVout | VoutCommand | VoutMax | VoutMarginHigh | VoutMarginLow | VoutMin
+        | VoutOvFaultLimit | VoutOvWarnLimit | VoutUvWarnLimit | VoutUvFaultLimit => {
             parse_u16_le(data).map(|v| {
                 let mode = vout_mode.unwrap_or(DEFAULT_VOUT_MODE);
                 PmbusValue::Voltage(PmbusVoltage::from_linear16(v, mode))
@@ -776,18 +774,14 @@ fn parse_status_value(cmd: PmbusCommand, data: &[u8]) -> Option<PmbusValue> {
             let flags = StatusDecoder::decode_capability(data[0]);
             Some(PmbusValue::Capability(data[0], flags))
         }
-        StackConfig => {
-            parse_u16_le(data).map(|v| {
-                let desc = StatusDecoder::decode_stack_config(v);
-                PmbusValue::ConfigWord(v, desc)
-            })
-        }
-        Interleave => {
-            parse_u16_le(data).map(|v| {
-                let desc = StatusDecoder::decode_interleave(v);
-                PmbusValue::ConfigWord(v, desc)
-            })
-        }
+        StackConfig => parse_u16_le(data).map(|v| {
+            let desc = StatusDecoder::decode_stack_config(v);
+            PmbusValue::ConfigWord(v, desc)
+        }),
+        Interleave => parse_u16_le(data).map(|v| {
+            let desc = StatusDecoder::decode_interleave(v);
+            PmbusValue::ConfigWord(v, desc)
+        }),
         SyncConfig if !data.is_empty() => {
             let desc = StatusDecoder::decode_sync_config(data[0]);
             Some(PmbusValue::ConfigBytes(vec![data[0]], desc))
@@ -796,12 +790,10 @@ fn parse_status_value(cmd: PmbusCommand, data: &[u8]) -> Option<PmbusValue> {
             let desc = StatusDecoder::decode_compensation_config(data);
             Some(PmbusValue::ConfigBytes(data.to_vec(), desc))
         }
-        PinDetectOverride => {
-            parse_u16_le(data).map(|v| {
-                let desc = StatusDecoder::decode_pin_detect_override(v);
-                PmbusValue::ConfigWord(v, desc)
-            })
-        }
+        PinDetectOverride => parse_u16_le(data).map(|v| {
+            let desc = StatusDecoder::decode_pin_detect_override(v);
+            PmbusValue::ConfigWord(v, desc)
+        }),
         FrequencySwitch => {
             parse_u16_le(data).map(|v| PmbusValue::Frequency(PmbusFrequency::from_linear11(v)))
         }
@@ -1078,15 +1070,15 @@ impl StatusDecoder {
     }
 
     pub fn decode_fault_response(response: u8) -> String {
-        let response_type = (response >> 6) & 0x03;  // Bits 7:6 (correct format)
-        let retry_count = (response >> 3) & 0x07;    // Bits 5:3 (correct format)
-        let delay_time = response & 0x07;            // Bits 2:0
+        let response_type = (response >> 6) & 0x03; // Bits 7:6 (correct format)
+        let retry_count = (response >> 3) & 0x07; // Bits 5:3 (correct format)
+        let delay_time = response & 0x07; // Bits 2:0
 
         let response_desc = match response_type {
             0b00 => "ignore",
             0b01 => "delayed shutdown",
             0b10 => "immediate shutdown",
-            0b11 => "special shutdown",  // varies by command
+            0b11 => "special shutdown", // varies by command
             _ => "unknown",
         };
 
@@ -1111,7 +1103,6 @@ impl StatusDecoder {
             format!("{}, {}, {}", response_desc, retries_desc, delay_desc)
         }
     }
-
 
     pub fn decode_operation(value: u8) -> String {
         match Operation::try_from(value) {
@@ -1201,7 +1192,11 @@ impl StatusDecoder {
         // TPS546D24A pattern: MODE field is 2 bits (6:5), only supports 00b=linear
         // and has REL field in bit 7, with exponent range -4 to -12
         if mode_field_tps546 == 0b00 && exp_signed >= -12 && exp_signed <= -4 {
-            let format_type = if rel_field == 1 { "relative" } else { "absolute" };
+            let format_type = if rel_field == 1 {
+                "relative"
+            } else {
+                "absolute"
+            };
             format!("{}, ULINEAR16, ^{}", format_type, exp_signed)
         } else {
             // Fall back to standard PMBus format interpretation
@@ -1219,10 +1214,20 @@ impl StatusDecoder {
     pub fn decode_capability(value: u8) -> Vec<&'static str> {
         let mut flags = Vec::new();
 
-        if value & 0x80 != 0 { flags.push("PEC supported"); }
-        if value & 0x40 != 0 { flags.push("400kHz max"); } else { flags.push("100kHz max"); }
-        if value & 0x20 != 0 { flags.push("SMBALERT supported"); }
-        if value & 0x10 != 0 { flags.push("Bus info command"); }
+        if value & 0x80 != 0 {
+            flags.push("PEC supported");
+        }
+        if value & 0x40 != 0 {
+            flags.push("400kHz max");
+        } else {
+            flags.push("100kHz max");
+        }
+        if value & 0x20 != 0 {
+            flags.push("SMBALERT supported");
+        }
+        if value & 0x10 != 0 {
+            flags.push("Bus info command");
+        }
 
         let version = value & 0x0F;
         match version {
@@ -1320,7 +1325,7 @@ impl StatusDecoder {
 /// Extract 5-bit two's complement exponent from PMBus format
 fn extract_5bit_exponent(raw_exp: u8) -> i8 {
     if raw_exp & 0x10 != 0 {
-        (raw_exp | 0xE0) as i8  // Sign extend
+        (raw_exp | 0xE0) as i8 // Sign extend
     } else {
         raw_exp as i8
     }
@@ -1392,7 +1397,7 @@ pub mod linear11 {
 
 /// ULINEAR16 data format conversion
 pub mod linear16 {
-    use super::{PMBusError, extract_5bit_exponent};
+    use super::{extract_5bit_exponent, PMBusError};
 
     /// Convert ULINEAR16 format to floating point
     pub fn to_float(value: u16, vout_mode: u8) -> f32 {
@@ -1520,23 +1525,23 @@ mod tests {
     #[test]
     fn test_pmbus_voltage_trait_implementations() {
         let v1 = PmbusVoltage::new(2.5);
-        let v2 = v1;  // Test Copy
-        assert_eq!(v1, v2);  // Test PartialEq
+        let v2 = v1; // Test Copy
+        assert_eq!(v1, v2); // Test PartialEq
 
-        let f: f32 = v1.into();  // Test Into<f32>
+        let f: f32 = v1.into(); // Test Into<f32>
         assert_eq!(f, 2.5);
 
-        let v3 = PmbusVoltage::default();  // Test Default
+        let v3 = PmbusVoltage::default(); // Test Default
         assert_eq!(v3.value(), 0.0);
 
-        println!("{:?}", v1);  // Test Debug
-        println!("{}", v1);    // Test Display
+        println!("{:?}", v1); // Test Debug
+        println!("{}", v1); // Test Display
     }
 
     #[test]
     fn test_pmbus_voltage_precision_preservation() {
         // Test that we maintain precision by keeping the original encoding
-        let l11_raw = 0xD2E6;  // Known Linear11 value: 11.59375
+        let l11_raw = 0xD2E6; // Known Linear11 value: 11.59375
         let voltage = PmbusVoltage::from_linear11(l11_raw);
 
         // Converting back to Linear11 should give exact same value
