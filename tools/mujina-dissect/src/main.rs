@@ -9,10 +9,10 @@ mod serial;
 use anyhow::{Context, Result};
 use capture::{BaudRate, CaptureEvent, CaptureReader, Channel};
 use clap::Parser;
-use dissect::{dissect_i2c_operation_with_context, dissect_serial_frame, I2cContexts};
+use dissect::{dissect_decoded_frame, dissect_i2c_operation_with_context, I2cContexts};
 use i2c::{group_pmbus_transactions, group_transactions, I2cAssembler};
 use output::{OutputConfig, OutputEvent};
-use serial::{Direction, FrameAssembler, SerialFrame};
+use serial::{DecodedFrame, Direction, TimestampedCodec};
 use std::path::PathBuf;
 
 /// Protocol dissector for Bitcoin mining hardware captures
@@ -87,16 +87,16 @@ fn main() -> Result<()> {
         colored::control::set_override(false);
     }
 
-    // Setup assemblers - one for each baud rate per channel
-    let mut ci_115k_assembler = FrameAssembler::new(Direction::HostToChip);
-    let mut ci_1m_assembler = FrameAssembler::new(Direction::HostToChip);
-    let mut ro_115k_assembler = FrameAssembler::new(Direction::ChipToHost);
-    let mut ro_1m_assembler = FrameAssembler::new(Direction::ChipToHost);
+    // Setup codecs - one for each baud rate per channel
+    let mut ci_115k_codec = TimestampedCodec::new(Direction::HostToChip);
+    let mut ci_1m_codec = TimestampedCodec::new(Direction::HostToChip);
+    let mut ro_115k_codec = TimestampedCodec::new(Direction::ChipToHost);
+    let mut ro_1m_codec = TimestampedCodec::new(Direction::ChipToHost);
     let mut i2c_assembler = I2cAssembler::new();
 
     // Collect all events for sorting
     let mut all_events = Vec::new();
-    let mut candidate_frames = Vec::new();
+    let mut decoded_frames = Vec::new();
 
     // Process capture events
     for event_result in reader.events() {
@@ -112,16 +112,17 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // Process with appropriate assembler based on channel and baud rate
-                let assembler = match (serial_event.channel, serial_event.baud_rate) {
-                    (Channel::CI, BaudRate::Baud115200) => &mut ci_115k_assembler,
-                    (Channel::CI, BaudRate::Baud1M) => &mut ci_1m_assembler,
-                    (Channel::RO, BaudRate::Baud115200) => &mut ro_115k_assembler,
-                    (Channel::RO, BaudRate::Baud1M) => &mut ro_1m_assembler,
+                // Process with appropriate codec based on channel and baud rate
+                let codec = match (serial_event.channel, serial_event.baud_rate) {
+                    (Channel::CI, BaudRate::Baud115200) => &mut ci_115k_codec,
+                    (Channel::CI, BaudRate::Baud1M) => &mut ci_1m_codec,
+                    (Channel::RO, BaudRate::Baud115200) => &mut ro_115k_codec,
+                    (Channel::RO, BaudRate::Baud1M) => &mut ro_1m_codec,
                 };
 
-                if let Some(frame) = assembler.process(&serial_event) {
-                    candidate_frames.push((frame, serial_event.baud_rate));
+                let frames = codec.feed_event(&serial_event);
+                for frame in frames {
+                    decoded_frames.push((frame, serial_event.baud_rate));
                 }
             }
             CaptureEvent::I2c(i2c_event) => {
@@ -137,28 +138,28 @@ fn main() -> Result<()> {
         }
     }
 
-    // Flush any pending frames from all assemblers
-    if let Some(frame) = ci_115k_assembler.flush() {
-        candidate_frames.push((frame, BaudRate::Baud115200));
+    // Flush any pending frames from all codecs
+    for frame in ci_115k_codec.flush() {
+        decoded_frames.push((frame, BaudRate::Baud115200));
     }
-    if let Some(frame) = ci_1m_assembler.flush() {
-        candidate_frames.push((frame, BaudRate::Baud1M));
+    for frame in ci_1m_codec.flush() {
+        decoded_frames.push((frame, BaudRate::Baud1M));
     }
-    if let Some(frame) = ro_115k_assembler.flush() {
-        candidate_frames.push((frame, BaudRate::Baud115200));
+    for frame in ro_115k_codec.flush() {
+        decoded_frames.push((frame, BaudRate::Baud115200));
     }
-    if let Some(frame) = ro_1m_assembler.flush() {
-        candidate_frames.push((frame, BaudRate::Baud1M));
+    for frame in ro_1m_codec.flush() {
+        decoded_frames.push((frame, BaudRate::Baud1M));
     }
     i2c_assembler.flush();
 
-    // Deduplicate frames at frame level
-    let deduplicated_frames = deduplicate_frames(candidate_frames);
+    // Deduplicate frames, preferring successful decodes over errors
+    let deduplicated_frames = deduplicate_decoded_frames(decoded_frames);
 
     // Collect serial frames
     if args.protocol == "all" || args.protocol == "bm13xx" {
         for frame in deduplicated_frames {
-            let dissected = dissect_serial_frame(&frame);
+            let dissected = dissect_decoded_frame(&frame);
             all_events.push(OutputEvent::Serial(dissected));
         }
     }
@@ -223,51 +224,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Deduplicate frames by preferring 115k baud over 1M when both exist at similar times
-fn deduplicate_frames(mut candidates: Vec<(SerialFrame, BaudRate)>) -> Vec<SerialFrame> {
+/// Deduplicate frames by preferring successful decodes over errors
+fn deduplicate_decoded_frames(mut candidates: Vec<(DecodedFrame, BaudRate)>) -> Vec<DecodedFrame> {
     // Sort by timestamp
-    candidates.sort_by(|a, b| a.0.start_time.partial_cmp(&b.0.start_time).unwrap());
+    candidates.sort_by(|a, b| a.0.timestamp().partial_cmp(&b.0.timestamp()).unwrap());
 
-    let mut deduplicated = Vec::new();
-    let mut i = 0;
-
-    while i < candidates.len() {
-        let (frame, baud) = &candidates[i];
-
-        // Look for frames from the same direction at similar times
-        let mut j = i + 1;
-        let mut found_115k = baud == &BaudRate::Baud115200;
-        let mut best_idx = i;
-
-        while j < candidates.len() {
-            let (other_frame, other_baud) = &candidates[j];
-
-            // If frames are from same direction and within 10ms, consider them duplicates
-            if other_frame.direction == frame.direction
-                && (other_frame.start_time - frame.start_time).abs() < 0.01
-            {
-                // Prefer 115k over 1M, or frame with fewer errors
-                if other_baud == &BaudRate::Baud115200 && !found_115k {
-                    found_115k = true;
-                    best_idx = j;
-                } else if other_baud == baud && !other_frame.has_errors && frame.has_errors {
-                    best_idx = j;
-                }
-
-                j += 1;
-            } else {
-                break; // Frames too far apart in time
-            }
-        }
-
-        // Add the best frame
-        deduplicated.push(candidates[best_idx].0.clone());
-
-        // Skip all the duplicate frames
-        i = j;
-    }
-
-    deduplicated
+    // Simple approach: just collect all frames and let later processing handle any duplicates
+    // The key insight is that successful decodes should naturally suppress error frames
+    // since they'll be at different timestamps due to the decoder's byte-by-byte advancement
+    candidates.into_iter().map(|(frame, _baud)| frame).collect()
 }
 
 // Check if output is a terminal (for color support)

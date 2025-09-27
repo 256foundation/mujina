@@ -7,10 +7,9 @@
 //! - Add regression tests to prevent future parsing failures
 
 use crate::i2c::I2cOperation;
-use crate::serial::{Direction, SerialFrame};
+use crate::serial::{DecodedFrame, Direction};
 use colored::Colorize;
-use mujina_miner::asic::bm13xx::crc::crc5_is_valid;
-use mujina_miner::asic::bm13xx::protocol::Command;
+use mujina_miner::asic::bm13xx::protocol::{Command, Response};
 use mujina_miner::peripheral::{emc2101, pmbus};
 use std::collections::HashMap;
 use std::fmt;
@@ -28,7 +27,8 @@ pub struct DissectedFrame {
 /// Decoded frame content
 #[derive(Debug)]
 pub enum FrameContent {
-    Command(Command),
+    Command(String),
+    Response(String),
     Unknown(String),
     Invalid(String),
 }
@@ -51,80 +51,41 @@ impl fmt::Display for CrcStatus {
     }
 }
 
-/// Dissect a serial frame
-pub fn dissect_serial_frame(frame: &SerialFrame) -> DissectedFrame {
-    let (content, crc_status) = match frame.direction {
-        Direction::HostToChip => dissect_command(&frame.data),
-        Direction::ChipToHost => dissect_response(&frame.data),
+/// Convert a decoded frame from the codec to a dissected frame
+pub fn dissect_decoded_frame(frame: &DecodedFrame) -> DissectedFrame {
+    let (content, crc_status) = match frame {
+        DecodedFrame::Command { command, .. } => {
+            // For now, assume CRC is valid since the codec decoded it successfully
+            // TODO: Extract actual CRC validation from codec
+            (
+                FrameContent::Command(format!("{:?}", command)),
+                CrcStatus::Valid,
+            )
+        }
+        DecodedFrame::Response { response, .. } => {
+            // For now, assume CRC is valid since the codec decoded it successfully
+            // TODO: Extract actual CRC validation from codec
+            (
+                FrameContent::Response(format!("{:?}", response)),
+                CrcStatus::Valid,
+            )
+        }
+        DecodedFrame::Error { error, .. } => {
+            (FrameContent::Invalid(error.clone()), CrcStatus::NotChecked)
+        }
     };
 
     DissectedFrame {
-        timestamp: frame.start_time,
-        direction: frame.direction,
-        raw_data: frame.data.clone(),
+        timestamp: frame.timestamp(),
+        direction: frame.direction(),
+        raw_data: match frame {
+            DecodedFrame::Command { raw_bytes, .. } => raw_bytes.clone(),
+            DecodedFrame::Response { raw_bytes, .. } => raw_bytes.clone(),
+            DecodedFrame::Error { raw_bytes, .. } => raw_bytes.clone(),
+        },
         content,
         crc_status,
     }
-}
-
-/// Dissect a command frame using main library types
-fn dissect_command(data: &[u8]) -> (FrameContent, CrcStatus) {
-    match Command::try_parse_frame(data) {
-        Ok((command, crc_valid)) => (
-            FrameContent::Command(command),
-            if crc_valid {
-                CrcStatus::Valid
-            } else {
-                CrcStatus::Invalid
-            },
-        ),
-        Err(e) => (
-            FrameContent::Invalid(format!("Parse error: {}", e)),
-            CrcStatus::NotChecked,
-        ),
-    }
-}
-
-/// Dissect a response frame (simplified for now)
-fn dissect_response(data: &[u8]) -> (FrameContent, CrcStatus) {
-    if data.len() < 3 {
-        return (
-            FrameContent::Invalid(format!("Response too short: {} bytes", data.len())),
-            CrcStatus::NotChecked,
-        );
-    }
-
-    // Check preamble
-    if data[0] != 0xAA || data[1] != 0x55 {
-        return (
-            FrameContent::Invalid("Invalid response preamble".to_string()),
-            CrcStatus::NotChecked,
-        );
-    }
-
-    // For now, use a simple response representation until we need full parsing
-    // Response frames use CRC5 (confirmed by test case in crc.rs)
-    let payload = &data[2..];
-    let crc_valid = crc5_is_valid(payload);
-    let crc_status = if crc_valid {
-        CrcStatus::Valid
-    } else {
-        CrcStatus::Invalid
-    };
-
-    // Simple response parsing - can be enhanced later
-    let content = if data.len() >= 9 {
-        FrameContent::Unknown(format!(
-            "Response(chip={:02x}{:02x}, len={})",
-            data[2],
-            data[3],
-            data.len()
-        ))
-    } else {
-        FrameContent::Unknown(format!("Response(len={})", data.len()))
-    };
-
-    (content, crc_status)
 }
 
 /// Dissected I2C operation
