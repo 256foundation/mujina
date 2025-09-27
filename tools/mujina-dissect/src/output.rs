@@ -34,7 +34,8 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
     };
 
     let content_str = match &frame.content {
-        FrameContent::Command(cmd) => format!("{:?}", cmd), // Use Debug for now since we added Display to main lib
+        FrameContent::Command(cmd) => cmd.clone(),
+        FrameContent::Response(resp) => resp.clone(),
         FrameContent::Unknown(msg) => msg.clone(),
         FrameContent::Invalid(msg) => {
             if config.use_color {
@@ -47,12 +48,24 @@ pub fn format_serial_frame(frame: &DissectedFrame, config: &OutputConfig) -> Str
 
     let mut result = format!("[{}] {}: {}", timestamp, direction_str, content_str);
 
-    if config.show_raw_hex {
-        result.push_str(&format!(" [{}]", format_hex(&frame.raw_data)));
-    }
-
     if frame.crc_status != CrcStatus::NotChecked {
         result.push_str(&format!(" [{}]", frame.crc_status));
+    }
+
+    if config.show_raw_hex && !frame.raw_data.is_empty() {
+        let hex_lines = format_hex_multiline(&frame.raw_data);
+        let formatted_hex = if config.use_color {
+            hex_lines
+                .lines()
+                .map(|line| format!("\n        {}", line.white().dimmed()))
+                .collect::<String>()
+        } else {
+            hex_lines
+                .lines()
+                .map(|line| format!("\n        {}", line))
+                .collect::<String>()
+        };
+        result.push_str(&formatted_hex);
     }
 
     result
@@ -145,6 +158,24 @@ fn format_hex(data: &[u8]) -> String {
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Format hex data with line wrapping at 16 bytes per line
+fn format_hex_multiline(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    for chunk in data.chunks(16) {
+        let hex_line = chunk
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(hex_line);
+    }
+    lines.join("\n")
 }
 
 /// Event type for unified output
