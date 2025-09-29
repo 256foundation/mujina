@@ -206,7 +206,6 @@ fn format_timestamp(timestamp: f64, config: &OutputConfig) -> String {
     }
 }
 
-
 /// Format hex data with line wrapping at 16 bytes per line
 fn format_hex_multiline(data: &[u8]) -> String {
     if data.is_empty() {
