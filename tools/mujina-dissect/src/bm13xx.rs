@@ -4,6 +4,11 @@
 //! frames from captured logic analyzer data. It feeds raw bytes to the same
 //! codec used during runtime to ensure consistency between dissection and
 //! live operation.
+//!
+//! Note: Any codec implementation specific to the dissector is a candidate for
+//! replacing the mujina-miner codec. The dissector currently experiments with
+//! different parsing strategies, but the goal is to converge on a single codec
+//! implementation shared between the dissector and the main miner.
 
 use crate::capture::{BaudRate, Channel, SerialEvent};
 use bytes::{Buf, BytesMut};
