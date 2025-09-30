@@ -78,6 +78,41 @@ RUST_LOG=mujina_miner=debug cargo run --bin mujina-minerd
 RUST_LOG=mujina_miner=trace cargo run --bin mujina-minerd
 ```
 
+## Protocol Analysis Tool
+
+The `mujina-dissect` tool analyzes captured communication between the host and
+mining hardware, providing detailed protocol-level insights.
+
+### Features
+
+- **BM13xx ASIC Protocol**: Dissects serial commands and responses with CRC
+  validation
+- **PMBus/I2C Analysis**: Decodes power management operations with Linear11/
+  Linear16 format conversion
+- **TPS546 Power Controller**: Context-aware state tracking including
+  VOUT_MODE interpretation
+- **Human-Readable Output**: Color-coded, formatted display of protocol
+  transactions
+
+### Usage
+
+The dissector reads CSV files exported from Saleae Logic analyzers:
+
+```bash
+# Analyze a capture file
+cargo run --bin mujina-dissect -- path/to/capture.csv
+
+# Filter by protocol
+cargo run --bin mujina-dissect -- path/to/capture.csv -p bm13xx
+cargo run --bin mujina-dissect -- path/to/capture.csv -f I2C
+
+# Show hexdump alongside decoded output
+cargo run --bin mujina-dissect -- path/to/capture.csv -x
+```
+
+The tool reuses the same protocol parsing code as the miner itself, ensuring
+consistency between analysis and runtime behavior.
+
 ## Architecture
 
 The miner follows a layered architecture:
