@@ -1,0 +1,39 @@
+#!/bin/sh
+# Pre-commit hook
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+FAILED=0
+
+echo "Running .githooks/pre-commit..."
+
+# Check for whitespace errors
+if git diff --cached --check; then
+    echo "${GREEN}✓${NC} No git whitespace errors"
+else
+    echo "${RED}✗${NC} Whitespace errors detected by git. Fix them with:"
+    echo "  git diff --cached --name-only | xargs sed -i 's/[[:space:]]*$//'"
+    FAILED=1
+fi
+
+# Check if any Rust files are being committed
+if git diff --cached --name-only | grep -q '\.rs$'; then
+    if cargo fmt -- --check 2>/dev/null; then
+        echo "${GREEN}✓${NC} cargo fmt --check passes"
+    else
+        echo -e "${RED}✗${NC} cargo fmt --check issues detected. Fix them with:"
+        echo "  cargo fmt"
+        FAILED=1
+    fi
+fi
+
+if [ $FAILED -eq 1 ]; then
+    echo ""
+    echo -e "${RED}Commit aborted due to errors above.${NC}"
+    exit 1
+fi
+
+exit 0

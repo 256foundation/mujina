@@ -1,4 +1,4 @@
-pub(crate) mod bm13xx;
+pub mod bm13xx;
 
 use async_trait::async_trait;
 use std::error::Error;
@@ -126,6 +126,9 @@ pub struct NonceResult {
     pub job_id: u64,
     /// The nonce value found
     pub nonce: u32,
+    /// Version bits used by the chip (for version rolling)
+    /// This is the lower 16 bits of the version field that the chip may have modified
+    pub version: u16,
     /// Hash of the block with this nonce
     pub hash: [u8; 32],
 }

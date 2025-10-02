@@ -5,7 +5,7 @@
 //! via file watching.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main configuration structure for the miner.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -94,7 +94,7 @@ impl Config {
     }
 
     /// Load configuration from a specific file.
-    pub fn load_from(_path: &PathBuf) -> anyhow::Result<Self> {
+    pub fn load_from(_path: &Path) -> anyhow::Result<Self> {
         // TODO: Implement TOML parsing
         unimplemented!("Config loading not yet implemented")
     }

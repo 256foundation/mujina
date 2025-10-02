@@ -56,6 +56,7 @@ All frames follow this basic structure:
 - **Preamble**: `0xAA 0x55` (2 bytes, reversed from commands)
 - **Payload**: Response-specific data
 - **CRC**: CRC5 in last byte (bits 0-4), with response type in bits 5-7
+  - Confirmed: Response frames use CRC5 validation (verified in test cases)
 
 ## Byte Order (Endianness)
 
@@ -77,42 +78,84 @@ Special cases:
 - **chip_id in responses**: The 2-byte chip_id field that appears in all read 
 register responses should be treated as a fixed byte sequence `[0x13, 0x70]` 
 rather than as an integer value
-- **Hash values** (merkle_root, prev_block_hash): These are byte arrays that 
+- **Hash values** (merkle_root, prev_block_hash): These are byte arrays that
 should be transmitted as-is without endianness conversion
 - **Single bytes**: No endianness applies (job_id, midstate_num, etc.)
+- **CRC16 in work frames**: Unlike other 16-bit values, CRC16 in work frames
+is stored in big-endian format (MSB first)
 
 ## Command Types
 
 The Type/Flags byte (3rd byte in command frames) encodes multiple fields:
 
 ```
-Bit 7: TYPE (0=command, 1=work)  
-Bit 6: BROADCAST (0=single chip, 1=all chips)
-Bit 5: Always 0
-Bits 4-0: CMD value
+Bit 6: TYPE (1=register ops, 0=work)
+Bit 4: BROADCAST (0=single chip, 1=all chips)
+Bits 3-0: CMD value
+Bits 7,5: Reserved/undefined in observed examples
 ```
 
+**Implementation Note**: In our code, we use the field name `broadcast` for this
+bit. Reference implementations may use different names (such as `all`), but they
+all refer to the same protocol bit.
+
 Common Type/Flags values:
-- `0x40` = TYPE=0, BROADCAST=0, CMD=0 (set chip address)
-- `0x41` = TYPE=0, BROADCAST=0, CMD=1 (write register to specific chip)
-- `0x42` = TYPE=0, BROADCAST=0, CMD=2 (read register from specific chip)
-- `0x51` = TYPE=0, BROADCAST=1, CMD=1 (write register to all chips)
-- `0x52` = TYPE=0, BROADCAST=1, CMD=2 (read register from all chips - chip discovery)
-- `0x53` = TYPE=0, BROADCAST=1, CMD=3 (chain inactive - prepare for addressing)
-- `0x21` = TYPE=1, BROADCAST=0, CMD=1 (send work/job)
+- `0x40` = TYPE=1, BROADCAST=0, CMD=0 (set chip address)
+- `0x41` = TYPE=1, BROADCAST=0, CMD=1 (write register to specific chip)
+- `0x42` = TYPE=1, BROADCAST=0, CMD=2 (read register from specific chip)
+- `0x51` = TYPE=1, BROADCAST=1, CMD=1 (write register to all chips)
+- `0x52` = TYPE=1, BROADCAST=1, CMD=2 (read register from all chips - chip discovery)
+- `0x53` = TYPE=1, BROADCAST=1, CMD=3 (chain inactive - prepare for addressing)
+- `0x21` = TYPE=0, BROADCAST=0, CMD=1 (send work/job)
 
 ### Set Chip Address (CMD=0)
-Assigns an address to a chip in the serial chain.
+Assigns an address to a chip in the serial chain via daisy-chain forwarding.
 
 **Request Format:**
 ```
-| 0x55 0xAA | Type/Flags | Length | Chip_Addr | Reg_Addr | CRC5 |
+| 0x55 0xAA | Type/Flags | Length | New_Addr | Reserved | CRC5 |
 ```
 - Length: Always `0x05` (5 bytes excluding preamble)
-- Type/Flags: `0x40` (single chip addressing)
-- Chip_Addr: The address to assign (typically increments by 2: 0x00, 0x02, 0x04...)
-- Reg_Addr: Always `0x00`
+- Type/Flags: `0x40` (NOT broadcast - uses daisy-chain forwarding)
+- New_Addr: The address to assign (typically increments by 2: 0x00, 0x02, 0x04...)
+- Reserved: Always `0x00` (no semantic meaning, possibly padding)
 - Example: `55 AA 40 05 04 00 15` (assign address 0x04)
+
+**How Daisy-Chain Addressing Works:**
+
+After sending the ChainInactive command (CMD=3), all chips enter a special
+addressing mode where they forward commands they don't respond to downstream:
+
+1. Host sends ChainInactive (broadcast) - all chips enter addressing mode
+2. Host sends SetChipAddress with new address (NOT broadcast)
+3. First unaddressed chip in chain intercepts command and adopts that address
+4. Now-addressed chip passes subsequent SetChipAddress commands downstream
+5. Next unaddressed chip receives the command and adopts its address
+6. Process repeats until all chips are addressed
+
+This mechanism allows the host to sequentially address chips without knowing the
+chain length beforehand. The command is NOT broadcast (BROADCAST bit = 0) because
+it should only be processed by one chip at a time, but it doesn't target an
+existing chip address - instead, it's intercepted by the first unaddressed chip
+through forwarding.
+
+### Chain Inactive (CMD=3)
+Puts all chips into addressing mode, enabling the daisy-chain forwarding
+mechanism used by SetChipAddress.
+
+**Request Format:**
+```
+| 0x55 0xAA | Type/Flags | Length | Reserved | Reserved | CRC5 |
+```
+- Length: Always `0x05` (5 bytes excluding preamble)
+- Type/Flags: `0x53` (broadcast to all chips)
+- Both data bytes: Always `0x00 0x00`
+- Example: `55 AA 53 05 00 00 03`
+
+This command is broadcast to all chips before address assignment. In addressing
+mode, chips that don't recognize a command (because it's not for them) will
+forward it to the next chip in the chain. This enables the sequential addressing
+mechanism described in SetChipAddress above.
 
 ### Read Register (CMD=2)
 Reads a 4-byte register from the ASIC.
@@ -154,11 +197,12 @@ components. This format is used by the chips mujina-miner supports.
 | 0x55 0xAA | 0x21 | Length | Job_Data | CRC16 |
 ```
 - **Preamble**: `0x55 0xAA` (2 bytes)
-- **Type/Flags**: `0x21` = TYPE=1 (work), BROADCAST=0, CMD=1
+- **Type/Flags**: `0x21` = TYPE=0 (work), BROADCAST=0, CMD=1
 - **Length**: `0x56` (86 decimal) = 82 bytes job_data + 2 bytes CRC16 + 2 bytes 
 for type/length
 - **Job_Data**: 82 bytes of mining work (see below)
-- **CRC16**: 16-bit CRC calculated over type/flags + length + job_data
+- **CRC16**: 16-bit CRC calculated over type/flags + length + job_data, stored in
+big-endian format (MSB first)
 
 **Job_Data Structure (82 bytes):**
 ```
@@ -314,7 +358,7 @@ Key registers used across BM13xx chips:
 | 0x08 | PLL_DIVIDER | Frequency control registers for hash clock |
 | 0x10 | NONCE_RANGE | Controls nonce search range per core |
 | 0x14 | TICKET_MASK | Difficulty mask for share submission |
-| 0x18 | MISC_CONTROL | UART settings and miscellaneous control |
+| 0x18 | MISC_CONTROL | UART settings and GPIO pin configuration |
 | 0x28 | UART_BAUD | UART baud rate configuration |
 | 0x2C | UART_RELAY | UART relay configuration (multi-chip chains) |
 | 0x3C | CORE_REGISTER | Core configuration and control |
@@ -356,8 +400,19 @@ Controls nonce search space distribution (format not fully documented):
 #### 0x14 - TICKET_MASK (Difficulty)
 Sets the difficulty mask (4 bytes, little-endian):
 - Each byte is bit-reversed
-- Example: difficulty 256 = 0xFF000000 → transmitted as [0xFF, 0x00, 0x00, 
+- Example: difficulty 256 = 0xFF000000 → transmitted as [0xFF, 0x00, 0x00,
 0x00]
+
+#### 0x18 - MISC_CONTROL
+UART and GPIO pin configuration (32-bit register, documented in BM1366):
+- **Reset value**: `0x0000C100`
+- **Upper 16 bits (0xC100)**: Always preserved across implementations
+- **Lower 16 bits**: Chip-specific configuration
+- Common values:
+  - BM1362: `0x00C100B0` (both broadcast and per-chip)
+  - BM1366/68: `0x00C10FFF` broadcast, `0x00C100F0` per-chip
+  - BM1370: `0x00C100F0` (S21 Pro) or `0x00C10FFF` (S21)
+- Lower bytes likely control UART pin routing and GPIO functions
 
 #### 0x2C - UART_RELAY
 Controls UART signal relay in multi-chip chains (4 bytes):
@@ -366,16 +421,18 @@ Controls UART signal relay in multi-chip chains (4 bytes):
 - Example values from S21 Pro: 0x00130003, 0x00180003, etc.
 
 #### 0x3C - CORE_REGISTER
-Requires multiple writes during initialization. Values differ by chip type:
+Indirect access to core registers (documented in BM1397):
+- **Format**: Upper 16 bits = core register address, Lower 16 bits = value
+- **Bit 31**: Always set (0x80) in observed implementations
+- Initialization requires 2-3 sequential writes with chip-specific magic values:
 
-**BM1362 sequence:**
-1. Write 0x80008540
-2. Write 0x80008008
+**Broadcast sequence** (2 writes):
+- BM1362: `0x80008540`, `0x80008008`
+- BM1366: `0x80008540`, `0x80008020`
+- BM1368/70: `0x80008B00`, `0x8000800C` or `0x80008018`
 
-**BM1370 sequence:**
-1. Write 0x80008B00
-2. Write 0x8000800C
-3. Write 0x800082AA (per chip configuration)
+**Per-chip sequence** (adds 3rd write):
+- All chips add: `0x800082AA` as final write
 
 #### 0x54 - ANALOG_MUX
 Controls analog multiplexer, possibly for temperature sensing:
@@ -395,16 +452,23 @@ PLL3 configuration for multi-chip chains:
 - Only used in multi-chip configurations
 
 #### 0xA4 - VERSION_MASK
-Controls which bits of the version field can be rolled:
-- Lower 16 bits typically enabled for rolling
-- Set via Stratum configuration (e.g., 0x1FFFE000)
-- Initial enable: 0xFFFF0090 (from captures)
+Controls version rolling for AsicBoost optimization (32-bit register):
+- **Bits 0-15 (control)**: Always `0x0090` - fixed enable pattern in all implementations
+- **Bits 16-31 (mask)**: Which version bits can be rolled (from Stratum's version_mask >> 13)
+- Common values:
+  - Initial: `0xFFFF0090` (full rolling enabled)
+  - Stratum: `0x3FFF0090` (from version_mask=0x1FFFE000)
 
 #### 0xA8 - INIT_CONTROL
-Initialization control register with chip-specific values:
-- BM1362: 0x00000000
-- BM1370 single-chip: 0x00070000
-- BM1370 multi-chip: 0x00070000 initially, then 0xF0010700 per chip
+Initialization control register requiring specific magic values (purpose undocumented):
+- **Initial broadcast** (all chips):
+  - BM1362: `0x00000000`
+  - BM1366/68/70: `0x00070000`
+- **Per-chip configuration**:
+  - BM1362: `0x02000000`
+  - BM1366/68/70: `0xF0010700`
+- Written twice: first broadcast to all chips, then individually to each chip
+- Values appear fixed across all implementations, suggesting required magic values
 
 #### 0xB9 - MISC_SETTINGS (BM1370 only)
 Undocumented miscellaneous settings register:
@@ -451,9 +515,12 @@ Undocumented miscellaneous settings register:
    - Send chain inactive command (0x53)
 
 3. **Address Assignment**
-   - Assign addresses incrementing by 2 (0x00, 0x02, 0x04...)
-   - Use command 0x40 for each address
-   - Typically assign 128 addresses regardless of actual chip count
+   - Chain inactive command (0x53) puts chips in addressing mode
+   - Send SetChipAddress commands (0x40) with addresses incrementing by 2
+   - Each command assigns address to first unaddressed chip via daisy-chain
+     forwarding (see SetChipAddress command documentation for details)
+   - Typically send 128 address commands regardless of actual chip count
+   - Example sequence: 0x00, 0x02, 0x04, 0x06... up to 0xFE
 
 4. **Domain Configuration** (BM1370 chains)
    - Configure IO driver strength on domain-end chips

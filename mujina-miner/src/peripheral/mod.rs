@@ -5,4 +5,6 @@
 //! (EMC2101), and other board management ICs. All drivers are generic
 //! over the hw_trait interfaces.
 
-// TODO: Implement peripheral chip drivers
+pub mod emc2101;
+pub mod pmbus;
+pub mod tps546;

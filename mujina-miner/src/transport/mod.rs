@@ -5,9 +5,14 @@
 //! implementation provides device discovery and emits transport-specific
 //! events when devices are connected or disconnected.
 
+pub mod serial;
 pub mod usb;
 
 // Re-export transport implementations
+pub use serial::{
+    Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
+    SerialWriter,
+};
 pub use usb::{UsbDeviceInfo, UsbTransport};
 
 /// Generic transport event that can represent different transport types.

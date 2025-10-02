@@ -12,6 +12,7 @@ default-run = "mujina-minerd"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bitcoin = { workspace = true }
+bitflags = { workspace = true }
 bitvec = { workspace = true }
 bytes = { workspace = true }
 crc_all = { workspace = true }
@@ -31,6 +32,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+parking_lot = { workspace = true }
+rustix = { workspace = true }
 
 [[bin]]
 name = "mujina-minerd"
@@ -43,6 +47,10 @@ path = "src/bin/cli.rs"
 [[bin]]
 name = "mujina-tui"
 path = "src/bin/tui.rs"
+
+[features]
+default = []
+skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
 
 [dev-dependencies]
 test-case = { workspace = true }

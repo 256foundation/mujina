@@ -4,4 +4,8 @@
 //! such as bitaxe-raw protocol. These protocols handle GPIO control, I2C
 //! passthrough, ADC readings, and other board management functions.
 
-// TODO: Implement bitaxe-raw protocol and protocol traits
+pub mod bitaxe_raw;
+
+// Re-export commonly used types
+pub use bitaxe_raw::channel::ControlChannel;
+pub use bitaxe_raw::gpio::BitaxeRawGpio;

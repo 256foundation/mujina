@@ -2,10 +2,22 @@
 //!
 //! This module handles the encoding and decoding of commands and responses
 //! for BM13xx family chips (BM1366, BM1370, etc).
+//!
+//! TODO: Build unit tests based on known serial captures
+//! - Test Command::try_parse_frame with actual captured work frames
+//! - Test CRC16 big-endian validation with known good/bad frames
+//! - Test JobFull parsing with real mining job data from captures
+//! - Add response frame parsing tests when Response::try_parse_frame is implemented
+//!
+//! TODO: Remove redundancy in BM13xx protocol implementation
+//! - Consolidate CRC validation logic between decoder and dissector code paths
+//! - Extract common frame parsing utilities to reduce duplication
+//! - Consider shared frame validation traits/interfaces
+//! - Unify endianness handling across different frame types
 
 use bitvec::prelude::*;
 use bytes::{Buf, BufMut, BytesMut};
-use std::io;
+use std::{fmt, io};
 use strum::FromRepr;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -22,21 +34,25 @@ pub struct Frequency {
 
 impl Frequency {
     /// Minimum supported frequency in MHz
+    #[allow(dead_code)]
     pub const MIN_MHZ: f32 = 50.0;
-    /// Maximum supported frequency in MHz  
+    /// Maximum supported frequency in MHz
+    #[allow(dead_code)]
     pub const MAX_MHZ: f32 = 800.0;
     /// Base crystal frequency in MHz
     const CRYSTAL_MHZ: f32 = 25.0;
 
-    /// Create a new frequency with validation
+    /// Create frequency from MHz value with validation
+    #[allow(dead_code)]
     pub fn from_mhz(mhz: f32) -> Result<Self, ProtocolError> {
-        if mhz < Self::MIN_MHZ || mhz > Self::MAX_MHZ {
+        if !(Self::MIN_MHZ..=Self::MAX_MHZ).contains(&mhz) {
             return Err(ProtocolError::InvalidFrequency { mhz: mhz as u32 });
         }
         Ok(Self { mhz })
     }
 
     /// Get frequency in MHz
+    #[allow(dead_code)]
     pub fn mhz(&self) -> f32 {
         self.mhz
     }
@@ -61,9 +77,9 @@ impl Frequency {
                         let fb_div_f =
                             (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
                                 / Self::CRYSTAL_MHZ;
-                        let fb_div = fb_div_f.round() as u16;
+                        let fb_div = fb_div_f.round() as u8;
 
-                        if fb_div >= 0xa0 && fb_div <= 0xef {
+                        if (0xa0..=0xef).contains(&fb_div) {
                             // Calculate actual frequency with these settings
                             let actual_freq = Self::CRYSTAL_MHZ * fb_div as f32
                                 / (ref_div as f32 * post_div1 as f32 * post_div2 as f32);
@@ -88,18 +104,31 @@ impl Frequency {
 /// PLL configuration for frequency control
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PllConfig {
-    /// Main feedback divider
-    pub fb_div: u16,
-    /// Reference divider
+    /// VCO control flag (0x40 for VCO < 2400 MHz, 0x50 for VCO >= 2400 MHz)
+    pub flag: u8,
+    /// Feedback divider (0xa0-0xef = 160-239)
+    pub fb_div: u8,
+    /// Reference divider (1 or 2)
     pub ref_div: u8,
-    /// Post divider flags
+    /// Post divider encoded value
     pub post_div: u8,
 }
 
 impl PllConfig {
     /// Create a new PLL configuration
-    pub fn new(fb_div: u16, ref_div: u8, post_div: u8) -> Self {
+    ///
+    /// Automatically calculates the VCO control flag based on frequency:
+    /// - 0x40 if VCO frequency < 2400 MHz
+    /// - 0x50 if VCO frequency >= 2400 MHz
+    ///
+    /// where VCO frequency = fb_div * 25.0 / ref_div
+    pub fn new(fb_div: u8, ref_div: u8, post_div: u8) -> Self {
+        // Calculate VCO frequency to determine flag
+        let vco_freq = (fb_div as f32) * 25.0 / (ref_div as f32);
+        let flag = if vco_freq >= 2400.0 { 0x50 } else { 0x40 };
+
         Self {
+            flag,
             fb_div,
             ref_div,
             post_div,
@@ -110,7 +139,8 @@ impl PllConfig {
 impl From<u32> for PllConfig {
     fn from(raw: u32) -> Self {
         Self {
-            fb_div: (raw & 0xffff) as u16,
+            flag: (raw & 0xff) as u8,
+            fb_div: ((raw >> 8) & 0xff) as u8,
             ref_div: ((raw >> 16) & 0xff) as u8,
             post_div: ((raw >> 24) & 0xff) as u8,
         }
@@ -119,11 +149,7 @@ impl From<u32> for PllConfig {
 
 impl From<PllConfig> for [u8; 4] {
     fn from(config: PllConfig) -> Self {
-        let mut bytes = [0u8; 4];
-        bytes[0..2].copy_from_slice(&config.fb_div.to_le_bytes());
-        bytes[2] = config.ref_div;
-        bytes[3] = config.post_div;
-        bytes
+        [config.flag, config.fb_div, config.ref_div, config.post_div]
     }
 }
 
@@ -136,7 +162,7 @@ pub enum ChipType {
     /// BM1366 - Newer generation chip
     BM1366,
     /// BM1370 - Used in Bitaxe Gamma and Antminer S21 Pro
-    /// 80 main cores × 16 sub-cores = 1,280 total hashing units
+    /// 1,280 hash engines organized as 80 domains of 16 engines each
     BM1370,
     /// BM1397 - Previous generation chip
     BM1397,
@@ -156,10 +182,10 @@ impl ChipType {
         }
     }
 
-    /// Get expected core count for this chip type, if known
+    /// Get expected hash engine count for this chip type, if known
     pub fn core_count(&self) -> Option<u32> {
         match self {
-            Self::BM1370 => Some(1280), // 80 × 16
+            Self::BM1370 => Some(1280), // 80 domains × 16 engines
             _ => None,
         }
     }
@@ -224,6 +250,14 @@ impl NonceRangeConfig {
         };
         Self { bytes }
     }
+
+    /// Create config from raw 32-bit value (little-endian)
+    /// Used for exact configuration from protocol captures
+    pub fn from_raw(value: u32) -> Self {
+        Self {
+            bytes: value.to_le_bytes(),
+        }
+    }
 }
 
 impl From<NonceRangeConfig> for [u8; 4] {
@@ -232,30 +266,189 @@ impl From<NonceRangeConfig> for [u8; 4] {
     }
 }
 
-/// Difficulty mask for share submission
+/// ASIC hashrate in hashes per second
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DifficultyMask {
-    /// Each byte is bit-reversed
-    bytes: [u8; 4],
+pub struct Hashrate {
+    hps: f64, // Hashrate in hashes per second
 }
 
-impl DifficultyMask {
-    /// Create from difficulty value
-    pub fn from_difficulty(difficulty: u32) -> Self {
-        // For now, simple mapping
-        // Difficulty 256 means the first byte (most significant) should be 0xff
-        let bytes = match difficulty {
-            256 => [0x00, 0x00, 0x00, 0xff], // As seen in captures
-            _ => [0xff, 0xff, 0xff, 0x00],
-        };
-        Self { bytes }
+impl Hashrate {
+    /// Create hashrate from gibihashes per second (GiH/s = 2^30 H/s)
+    ///
+    /// # Arguments
+    /// * `n` - Number of gibihashes/sec (any value accepted)
+    ///
+    /// # Example
+    /// ```
+    /// use mujina_miner::asic::bm13xx::protocol::Hashrate;
+    /// let hr = Hashrate::gibihashes_per_sec(500.0); // 500 GiH/s
+    /// ```
+    pub fn gibihashes_per_sec(n: f64) -> Self {
+        Self {
+            hps: n * 2f64.powi(30),
+        }
+    }
+
+    /// Create hashrate from tebihashes per second (TiH/s = 2^40 H/s)
+    ///
+    /// # Arguments
+    /// * `n` - Number of tebihashes/sec (any value accepted)
+    ///
+    /// # Example
+    /// ```
+    /// use mujina_miner::asic::bm13xx::protocol::Hashrate;
+    /// let hr = Hashrate::tebihashes_per_sec(1.0); // 1 TiH/s
+    /// ```
+    pub fn tebihashes_per_sec(n: f64) -> Self {
+        Self {
+            hps: n * 2f64.powi(40),
+        }
+    }
+
+    /// Get log2 of the hashrate (for internal calculations)
+    pub fn log2(&self) -> f64 {
+        self.hps.log2()
     }
 }
 
-impl From<DifficultyMask> for [u8; 4] {
-    fn from(mask: DifficultyMask) -> Self {
-        mask.bytes // Already in the correct format
+/// Desired nonce reporting rate
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportingRate {
+    nonces_per_sec: f64,
+}
+
+impl ReportingRate {
+    /// Create reporting rate from nonces per second
+    ///
+    /// # Example
+    /// ```
+    /// use mujina_miner::asic::bm13xx::protocol::ReportingRate;
+    /// let rate = ReportingRate::nonces_per_sec(1.0); // 1 nonce/sec
+    /// ```
+    pub const fn nonces_per_sec(n: f64) -> Self {
+        Self { nonces_per_sec: n }
     }
+
+    pub const fn nonces_per_sec_value(&self) -> f64 {
+        self.nonces_per_sec
+    }
+}
+
+/// Reporting interval: report 1 nonce per 2^exponent hashes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportingInterval {
+    exponent: u8, // N in "report 1 nonce per 2^N hashes"
+}
+
+impl ReportingInterval {
+    const fn from_exponent(exponent: u8) -> Self {
+        assert!(exponent >= 32 && exponent <= 56, "Exponent must be 32-56");
+        Self { exponent }
+    }
+
+    /// Calculate reporting interval from hashrate and desired reporting rate
+    ///
+    /// The result is rounded to the nearest power-of-2 interval to match
+    /// hardware constraints.
+    ///
+    /// # Example
+    /// ```
+    /// use mujina_miner::asic::bm13xx::protocol::{Hashrate, ReportingRate, ReportingInterval};
+    /// let interval = ReportingInterval::from_rate(
+    ///     Hashrate::gibihashes_per_sec(500.0),
+    ///     ReportingRate::nonces_per_sec(1.0)
+    /// );
+    /// ```
+    pub fn from_rate(hashrate: Hashrate, rate: ReportingRate) -> Self {
+        let total_bits = (hashrate.log2() - rate.nonces_per_sec_value().log2()).ceil() as u8;
+        Self::from_exponent(total_bits.clamp(32, 56))
+    }
+
+    pub const fn exponent(&self) -> u8 {
+        self.exponent
+    }
+}
+
+impl std::fmt::Display for ReportingInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "2^{}", self.exponent)
+    }
+}
+
+/// Ticket mask controlling ASIC nonce reporting
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TicketMask {
+    // Number of additional zero bits required in the bit-reversed hash,
+    // beyond the base 32 bits. The chip always requires bits 0-31 of the
+    // bit-reversed hash to be zero. This parameter adds bits 32..(32+zero_bits)
+    // that must also be zero.
+    zero_bits: u8,
+}
+
+impl TicketMask {
+    /// Create ticket mask from reporting interval
+    ///
+    /// # Example
+    /// ```
+    /// use mujina_miner::asic::bm13xx::protocol::{Hashrate, ReportingRate, ReportingInterval, TicketMask};
+    /// let interval = ReportingInterval::from_rate(
+    ///     Hashrate::gibihashes_per_sec(512.0),
+    ///     ReportingRate::nonces_per_sec(1.0)
+    /// );
+    /// let mask = TicketMask::new(interval);
+    /// ```
+    pub const fn new(interval: ReportingInterval) -> Self {
+        Self {
+            zero_bits: interval.exponent.saturating_sub(32),
+        }
+    }
+
+    /// Encode ticket mask to wire format bytes
+    pub fn to_wire_bytes(&self) -> [u8; 4] {
+        if self.zero_bits == 0 {
+            return [0, 0, 0, 0];
+        }
+
+        // Create mask value: 2^zero_bits - 1
+        let mask_value = (1u32 << self.zero_bits) - 1;
+
+        // Encode to wire format with bit-reversal and byte-reversal
+        let mut bytes = [0u8; 4];
+        for i in 0..4 {
+            let byte = ((mask_value >> (8 * i)) & 0xFF) as u8;
+            bytes[3 - i] = reverse_bits(byte);
+        }
+
+        bytes
+    }
+}
+
+impl From<TicketMask> for [u8; 4] {
+    fn from(mask: TicketMask) -> Self {
+        mask.to_wire_bytes()
+    }
+}
+
+/// Helper function to reverse bits in a byte
+fn reverse_bits(byte: u8) -> u8 {
+    let mut result = 0u8;
+    let mut b = byte;
+    for _ in 0..8 {
+        result = (result << 1) | (b & 1);
+        b >>= 1;
+    }
+    result
+}
+
+/// Helper function to decode ticket mask bytes back to mask value
+fn decode_ticket_mask_bytes(bytes: &[u8; 4]) -> u32 {
+    // Reverse the encoding process: undo byte reversal and bit reversal
+    let mut mask_value = 0u32;
+    for i in 0..4 {
+        let byte = reverse_bits(bytes[3 - i]);
+        mask_value |= (byte as u32) << (8 * i);
+    }
+    mask_value
 }
 
 /// UART baud rate configuration
@@ -274,9 +467,13 @@ pub enum BaudRate {
 impl From<BaudRate> for [u8; 4] {
     fn from(baud: BaudRate) -> Self {
         let value = match baud {
-            BaudRate::Baud115200 => 0x00000271, // From ESP-miner
-            BaudRate::Baud1M => 0x00000130,
-            BaudRate::Baud3M => 0x00003001, // From captures
+            // From esp-miner BM1370/BM1366/BM1368 default baud config
+            BaudRate::Baud115200 => 0x00000271,
+            // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
+            // All three chips use identical register value for 1Mbaud
+            BaudRate::Baud1M => 0x00023011,
+            // From S21 Pro captures (BM1370 multi-chip chains)
+            BaudRate::Baud3M => 0x00003001,
             BaudRate::Custom(val) => val,
         };
         value.to_le_bytes()
@@ -329,7 +526,7 @@ impl IoDriverStrength {
 }
 
 /// Version mask for version rolling
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct VersionMask {
     /// Which bits can be rolled
     mask: u16,
@@ -340,15 +537,29 @@ pub struct VersionMask {
 impl VersionMask {
     /// Full 16-bit mask for version rolling
     const FULL_MASK: u16 = 0xffff;
-    /// Control bits to enable version rolling
-    const CONTROL_ENABLE: u16 = 0x0090;
+    /// Fixed control pattern used by all implementations to enable version rolling
+    const ENABLE_ROLLING: u16 = 0x0090;
 
     /// Create version mask with all lower 16 bits enabled
     pub fn full_rolling() -> Self {
         Self {
             mask: Self::FULL_MASK,
-            control: Self::CONTROL_ENABLE,
+            control: Self::ENABLE_ROLLING,
         }
+    }
+}
+
+impl fmt::Debug for VersionMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let control_str = if self.control == Self::ENABLE_ROLLING {
+            "ENABLE_ROLLING".to_string()
+        } else {
+            format!("{:#06x}", self.control)
+        };
+        f.debug_struct("VersionMask")
+            .field("mask", &format_args!("{:#06x}", self.mask))
+            .field("control", &control_str)
+            .finish()
     }
 }
 
@@ -371,7 +582,7 @@ pub enum RegisterAddress {
     MiscControl = 0x18,
     UartBaud = 0x28,
     UartRelay = 0x2C,
-    CoreRegister = 0x3C,
+    Core = 0x3C,
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
     Pll3Parameter = 0x68,
@@ -380,7 +591,7 @@ pub enum RegisterAddress {
     MiscSettings = 0xB9,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Register {
     ChipId {
         chip_type: ChipType, // Chip type identifier
@@ -389,7 +600,7 @@ pub enum Register {
     },
     PllDivider(PllConfig),
     NonceRange(NonceRangeConfig),
-    TicketMask(DifficultyMask),
+    TicketMask(TicketMask),
     MiscControl {
         raw_value: u32,
     },
@@ -397,7 +608,7 @@ pub enum Register {
     UartRelay {
         raw_value: u32, // Domain relay configuration (complex format)
     },
-    CoreRegister {
+    Core {
         raw_value: u32,
     },
     AnalogMux {
@@ -417,7 +628,7 @@ pub enum Register {
 }
 
 impl Register {
-    fn decode(address: RegisterAddress, bytes: &[u8; 4]) -> Register {
+    pub fn decode(address: RegisterAddress, bytes: &[u8; 4]) -> Register {
         let raw_value = u32::from_le_bytes(*bytes);
         match address {
             RegisterAddress::ChipId => Register::ChipId {
@@ -427,7 +638,13 @@ impl Register {
             },
             RegisterAddress::PllDivider => Register::PllDivider(raw_value.into()),
             RegisterAddress::NonceRange => Register::NonceRange(NonceRangeConfig { bytes: *bytes }),
-            RegisterAddress::TicketMask => Register::TicketMask(DifficultyMask { bytes: *bytes }),
+            RegisterAddress::TicketMask => {
+                // Decode wire bytes to TicketMask
+                // Wire bytes are in encoded format; decode to extract zero_bits value
+                let mask_value = decode_ticket_mask_bytes(bytes);
+                let zero_bits = mask_value.count_ones() as u8;
+                Register::TicketMask(TicketMask { zero_bits })
+            }
             RegisterAddress::MiscControl => Register::MiscControl { raw_value },
             RegisterAddress::UartBaud => {
                 // Decode known baud rates
@@ -440,13 +657,13 @@ impl Register {
                 Register::UartBaud(baud)
             }
             RegisterAddress::UartRelay => Register::UartRelay { raw_value },
-            RegisterAddress::CoreRegister => Register::CoreRegister { raw_value },
+            RegisterAddress::Core => Register::Core { raw_value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value },
             RegisterAddress::IoDriverStrength => {
                 // Parse driver strength from raw value
                 let mut strengths = [0u8; 8];
-                for i in 0..8 {
-                    strengths[i] = ((raw_value >> (i * 4)) & 0xf) as u8;
+                for (i, strength) in strengths.iter_mut().enumerate() {
+                    *strength = ((raw_value >> (i * 4)) & 0xf) as u8;
                 }
                 Register::IoDriverStrength(IoDriverStrength { strengths })
             }
@@ -471,7 +688,7 @@ impl Register {
             Register::MiscControl { .. } => RegisterAddress::MiscControl,
             Register::UartBaud(_) => RegisterAddress::UartBaud,
             Register::UartRelay { .. } => RegisterAddress::UartRelay,
-            Register::CoreRegister { .. } => RegisterAddress::CoreRegister,
+            Register::Core { .. } => RegisterAddress::Core,
             Register::AnalogMux { .. } => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
             Register::Pll3Parameter { .. } => RegisterAddress::Pll3Parameter,
@@ -509,9 +726,12 @@ impl Register {
                 let bytes: [u8; 4] = (*baud).into();
                 dst.put_slice(&bytes);
             }
+            Register::Core { raw_value } => {
+                // Core register needs big-endian encoding
+                dst.put_u32(*raw_value);
+            }
             Register::MiscControl { raw_value }
             | Register::UartRelay { raw_value }
-            | Register::CoreRegister { raw_value }
             | Register::AnalogMux { raw_value }
             | Register::Pll3Parameter { raw_value }
             | Register::InitControl { raw_value }
@@ -525,6 +745,52 @@ impl Register {
             Register::VersionMask(mask) => {
                 let bytes: [u8; 4] = (*mask).into();
                 dst.put_slice(&bytes);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Register {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Register::ChipId {
+                chip_type,
+                core_count,
+                address,
+            } => f
+                .debug_struct("ChipId")
+                .field("chip_type", chip_type)
+                .field("core_count", core_count)
+                .field("address", address)
+                .finish(),
+            Register::PllDivider(config) => f.debug_tuple("PllDivider").field(config).finish(),
+            Register::NonceRange(config) => f.debug_tuple("NonceRange").field(config).finish(),
+            Register::TicketMask(mask) => f.debug_tuple("TicketMask").field(mask).finish(),
+            Register::UartBaud(baud) => f.debug_tuple("UartBaud").field(baud).finish(),
+            Register::IoDriverStrength(strength) => {
+                f.debug_tuple("IoDriverStrength").field(strength).finish()
+            }
+            Register::VersionMask(mask) => f.debug_tuple("VersionMask").field(mask).finish(),
+            Register::MiscControl { raw_value }
+            | Register::UartRelay { raw_value }
+            | Register::AnalogMux { raw_value }
+            | Register::Pll3Parameter { raw_value }
+            | Register::InitControl { raw_value }
+            | Register::Core { raw_value }
+            | Register::MiscSettings { raw_value } => {
+                let register_name = match self {
+                    Register::MiscControl { .. } => "MiscControl",
+                    Register::UartRelay { .. } => "UartRelay",
+                    Register::AnalogMux { .. } => "AnalogMux",
+                    Register::Pll3Parameter { .. } => "Pll3Parameter",
+                    Register::InitControl { .. } => "InitControl",
+                    Register::Core { .. } => "Core",
+                    Register::MiscSettings { .. } => "MiscSettings",
+                    _ => unreachable!(),
+                };
+                f.debug_struct(register_name)
+                    .field("raw_value", &format_args!("0x{:08x}", raw_value))
+                    .finish()
             }
         }
     }
@@ -545,24 +811,20 @@ enum CommandFlagsCmd {
 }
 
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "JobMidstate variant will be used for BM1397 support"
-)]
 pub enum Command {
-    /// Set address for a chip in the chain
+    /// Assign an address to the first unaddressed chip via daisy-chain forwarding
     SetChipAddress { chip_address: u8 },
-    /// Prepare chain for address assignment
+    /// Put all chips into addressing mode (enables daisy-chain forwarding)
     ChainInactive,
     /// Read a register from chip(s)
     ReadRegister {
-        all: bool,
+        broadcast: bool,
         chip_address: u8,
         register_address: RegisterAddress,
     },
     /// Write a register to chip(s)
     WriteRegister {
-        all: bool,
+        broadcast: bool,
         chip_address: u8,
         register: Register,
     },
@@ -608,11 +870,11 @@ pub struct JobMidstateFormat {
 }
 
 impl Command {
-    fn build_flags(typ: CommandFlagsType, all: bool, cmd: CommandFlagsCmd) -> u8 {
+    fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> u8 {
         let mut flags = 0u8;
         let field = flags.view_bits_mut::<Lsb0>();
         field[5..7].store(typ as u8);
-        field[4..5].store(all as u8);
+        field[4..5].store(broadcast as u8);
         field[0..4].store(cmd as u8);
         flags
     }
@@ -636,7 +898,7 @@ impl Command {
 
                 dst.put_u8(TOTAL_LEN);
                 dst.put_u8(*chip_address);
-                dst.put_u8(0x00); // Register address is always 0x00
+                dst.put_u8(0x00); // Reserved byte (always 0x00)
             }
             Command::ChainInactive => {
                 dst.put_u8(Self::build_flags(
@@ -654,17 +916,17 @@ impl Command {
                 const TOTAL_LEN: u8 = FLAGS_LEN + CHIP_ADDR_LEN + REG_ADDR_LEN + CRC_LEN + 1; // +1 for length field
 
                 dst.put_u8(TOTAL_LEN);
-                dst.put_u8(0x00); // Chip address
-                dst.put_u8(0x00); // Register address
+                dst.put_u8(0x00); // Reserved byte
+                dst.put_u8(0x00); // Reserved byte
             }
             Command::ReadRegister {
-                all,
+                broadcast,
                 chip_address,
                 register_address,
             } => {
                 dst.put_u8(Self::build_flags(
                     CommandFlagsType::Command,
-                    *all,
+                    *broadcast,
                     CommandFlagsCmd::ReadRegister,
                 ));
 
@@ -681,13 +943,13 @@ impl Command {
                 dst.put_u8(*register_address as u8);
             }
             Command::WriteRegister {
-                all,
+                broadcast,
                 chip_address,
                 register,
             } => {
                 dst.put_u8(Self::build_flags(
                     CommandFlagsType::Command,
-                    *all,
+                    *broadcast,
                     CommandFlagsCmd::WriteRegisterOrJob,
                 ));
 
@@ -1009,7 +1271,7 @@ mod init_tests {
         assert!(matches!(
             &commands[0],
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
                 register: Register::VersionMask(_),
             }
@@ -1096,7 +1358,7 @@ mod init_tests {
                 cmd,
                 Command::WriteRegister {
                     register: Register::PllDivider(_),
-                    all: true,
+                    broadcast: true,
                     ..
                 }
             ));
@@ -1184,7 +1446,7 @@ mod init_tests {
         assert_eq!(commands.len(), 1);
         if let Command::WriteRegister {
             register: Register::NonceRange(config),
-            all: true,
+            broadcast: true,
             ..
         } = &commands[0]
         {
@@ -1287,7 +1549,7 @@ mod command_tests {
     fn read_register() {
         assert_frame_eq(
             Command::ReadRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0,
                 register_address: RegisterAddress::ChipId,
             },
@@ -1299,7 +1561,7 @@ mod command_tests {
     fn write_register_chip_address() {
         assert_frame_eq(
             Command::WriteRegister {
-                all: false,
+                broadcast: false,
                 chip_address: 0x01,
                 register: Register::ChipId {
                     chip_type: ChipType::BM1370,
@@ -1319,7 +1581,7 @@ mod command_tests {
         // From S21 Pro capture: TX: 55 AA 51 09 00 A4 90 00 FF FF 1C
         assert_frame_eq(
             Command::WriteRegister {
-                all: true, // 0x51 = broadcast
+                broadcast: true, // 0x51 = broadcast
                 chip_address: 0x00,
                 register: Register::VersionMask(VersionMask::full_rolling()),
             },
@@ -1335,7 +1597,7 @@ mod command_tests {
         // Value 0x00 07 00 00 in little-endian = 0x00000700
         assert_frame_eq(
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
                 register: Register::InitControl {
                     raw_value: 0x00000700,
@@ -1352,7 +1614,7 @@ mod command_tests {
         // From Bitaxe capture: TX: 55 AA 51 09 00 18 F0 00 C1 00 04
         assert_frame_eq(
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
                 register: Register::MiscControl {
                     raw_value: 0x00C100F0,
@@ -1385,12 +1647,13 @@ mod command_tests {
     #[test]
     fn write_core_register_sequence() {
         // From Bitaxe capture: TX: 55 AA 51 09 00 3C 80 00 8B 00 12
+        // Core register uses big-endian encoding
         assert_frame_eq(
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
-                register: Register::CoreRegister {
-                    raw_value: 0x008B0080,
+                register: Register::Core {
+                    raw_value: 0x80008B00, // Big-endian: produces bytes 80 00 8B 00
                 },
             },
             &[
@@ -1402,11 +1665,16 @@ mod command_tests {
     #[test]
     fn write_ticket_mask_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 14 00 00 00 FF 08
+        // This is 8 zero_bits (40 total bits, i.e., 2^40 hashes per nonce)
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(1.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
         assert_frame_eq(
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
-                register: Register::TicketMask(DifficultyMask::from_difficulty(256)),
+                register: Register::TicketMask(TicketMask::new(interval)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x14, 0x00, 0x00, 0x00, 0xff, 0x08,
@@ -1419,7 +1687,7 @@ mod command_tests {
         // From S21 Pro capture: TX: 55 AA 51 09 00 10 00 00 1E B5 0F
         assert_frame_eq(
             Command::WriteRegister {
-                all: true,
+                broadcast: true,
                 chip_address: 0x00,
                 register: Register::NonceRange(NonceRangeConfig::multi_chip(65)),
             },
@@ -1904,6 +2172,158 @@ mod response_tests {
     }
 }
 
+#[cfg(test)]
+mod ticket_mask_tests {
+    use super::*;
+
+    #[test]
+    fn test_hashrate_gibihashes() {
+        let hr = Hashrate::gibihashes_per_sec(512.0);
+        // 512 GiH/s = 2^39 H/s (2^9 * 2^30)
+        assert_eq!(hr.log2().round() as u8, 39);
+
+        let hr = Hashrate::gibihashes_per_sec(1.0);
+        // 1 GiH/s = 2^30 H/s
+        assert_eq!(hr.log2().round() as u8, 30);
+
+        let hr = Hashrate::gibihashes_per_sec(1024.0);
+        // 1024 GiH/s = 2^40 H/s (2^10 * 2^30)
+        assert_eq!(hr.log2().round() as u8, 40);
+
+        // Test non-power-of-2 value
+        let hr = Hashrate::gibihashes_per_sec(500.0);
+        // 500 GiH/s ≈ 2^38.9 H/s, rounds to 39
+        assert_eq!(hr.log2().round() as u8, 39);
+    }
+
+    #[test]
+    fn test_hashrate_tebihashes() {
+        let hr = Hashrate::tebihashes_per_sec(1.0);
+        // 1 TiH/s = 2^40 H/s
+        assert_eq!(hr.log2().round() as u8, 40);
+
+        let hr = Hashrate::tebihashes_per_sec(8.0);
+        // 8 TiH/s = 2^43 H/s (2^3 * 2^40)
+        assert_eq!(hr.log2().round() as u8, 43);
+    }
+
+    #[test]
+    fn test_reporting_interval_from_rate() {
+        // 512 GiH/s (2^39), want 1 nonce/sec (2^0)
+        // Interval = 2^39 / 2^0 = 2^39
+        let interval = ReportingInterval::from_rate(
+            Hashrate::gibihashes_per_sec(512.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 39);
+
+        // 1 TiH/s (2^40), want 1 nonce/sec
+        // Interval = 2^40 / 2^0 = 2^40
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(1.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 40);
+
+        // 512 GiH/s (2^39), want 2 nonces/sec (2^1)
+        // Interval = 2^39 / 2^1 = 2^38
+        let interval = ReportingInterval::from_rate(
+            Hashrate::gibihashes_per_sec(512.0),
+            ReportingRate::nonces_per_sec(2.0),
+        );
+        assert_eq!(interval.exponent(), 38);
+
+        // Non-power-of-2: 500 GiH/s, want 1 nonce/sec
+        // 500 GiH/s ≈ 2^38.9, rounds to 2^39
+        let interval = ReportingInterval::from_rate(
+            Hashrate::gibihashes_per_sec(500.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 39);
+    }
+
+    #[test]
+    fn test_reporting_interval_display() {
+        let interval = ReportingInterval::from_rate(
+            Hashrate::gibihashes_per_sec(512.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(format!("{}", interval), "2^39");
+    }
+
+    #[test]
+    fn test_ticket_mask_wire_encoding() {
+        // Test case 1: 40 bits total (8 zero_bits)
+        // Should produce [00, 00, 00, FF]
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(1.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 40);
+        let mask = TicketMask::new(interval);
+        let bytes = mask.to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+
+        // Test case 2: 42 bits total (10 zero_bits)
+        // Should produce [00, 00, C0, FF]
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(4.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 42);
+        let mask = TicketMask::new(interval);
+        let bytes = mask.to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0xC0, 0xFF]);
+
+        // Test case 3: 48 bits total (16 zero_bits)
+        // Should produce [00, 00, FF, FF]
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(256.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 48);
+        let mask = TicketMask::new(interval);
+        let bytes = mask.to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_ticket_mask_zero_bits() {
+        // 32 bits total = 0 zero_bits
+        // Should produce [00, 00, 00, 00]
+        let interval = ReportingInterval::from_rate(
+            Hashrate::gibihashes_per_sec(4.0), // 2^32
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        assert_eq!(interval.exponent(), 32);
+        let mask = TicketMask::new(interval);
+        let bytes = mask.to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_reverse_bits() {
+        assert_eq!(reverse_bits(0x00), 0x00);
+        assert_eq!(reverse_bits(0xFF), 0xFF);
+        assert_eq!(reverse_bits(0x01), 0x80);
+        assert_eq!(reverse_bits(0x80), 0x01);
+        assert_eq!(reverse_bits(0x03), 0xC0);
+        assert_eq!(reverse_bits(0x0F), 0xF0);
+    }
+
+    #[test]
+    fn test_ticket_mask_from_trait() {
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(1.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        let mask = TicketMask::new(interval);
+
+        let bytes: [u8; 4] = mask.into();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+    }
+}
+
 // Bytes go out on the wire least-significant byte first.
 // Multi-byte fields are sent most-significant byte first, i.e., big-endian.
 
@@ -1912,6 +2332,12 @@ mod response_tests {
 /// Encodes high-level operations into chip-specific commands and
 /// decodes chip responses into meaningful results.
 pub struct BM13xxProtocol {}
+
+impl Default for BM13xxProtocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BM13xxProtocol {
     /// Create a new protocol instance.
@@ -1922,7 +2348,7 @@ impl BM13xxProtocol {
     /// Helper to create a broadcast write command
     fn broadcast_write(&self, register: Register) -> Command {
         Command::WriteRegister {
-            all: true,
+            broadcast: true,
             chip_address: 0x00,
             register,
         }
@@ -1932,7 +2358,7 @@ impl BM13xxProtocol {
     #[cfg_attr(not(test), allow(dead_code))]
     fn write_to(&self, chip_address: u8, register: Register) -> Command {
         Command::WriteRegister {
-            all: false,
+            broadcast: false,
             chip_address,
             register,
         }
@@ -1998,7 +2424,8 @@ impl BM13xxProtocol {
         const CORE_REG_INIT_2: u32 = 0x0c800080;
         const ADDRESS_INCREMENT: u8 = 2;
 
-        let mut commands = Vec::new();
+        // Pre-allocate for efficiency (rough estimate of commands)
+        let mut commands = Vec::with_capacity(10 + chain_length);
 
         // Step 1: Enable version rolling on all chips (broadcast)
         commands.push(self.broadcast_write(Register::VersionMask(VersionMask::full_rolling())));
@@ -2025,16 +2452,20 @@ impl BM13xxProtocol {
         }
 
         // Step 6: Configure core registers on all chips
-        commands.push(self.broadcast_write(Register::CoreRegister {
+        commands.push(self.broadcast_write(Register::Core {
             raw_value: CORE_REG_INIT_1,
         }));
-        commands.push(self.broadcast_write(Register::CoreRegister {
+        commands.push(self.broadcast_write(Register::Core {
             raw_value: CORE_REG_INIT_2,
         }));
 
         // Step 7: Set ticket mask (difficulty)
-        commands
-            .push(self.broadcast_write(Register::TicketMask(DifficultyMask::from_difficulty(256))));
+        // Use 2^40 reporting interval (8 zero_bits)
+        let interval = ReportingInterval::from_rate(
+            Hashrate::tebihashes_per_sec(1.0),
+            ReportingRate::nonces_per_sec(1.0),
+        );
+        commands.push(self.broadcast_write(Register::TicketMask(TicketMask::new(interval))));
 
         // Step 8: Configure IO driver strength on all chips
         commands.push(self.broadcast_write(Register::IoDriverStrength(IoDriverStrength::normal())));
@@ -2055,7 +2486,7 @@ impl BM13xxProtocol {
         const ADDRESS_INCREMENT: u8 = 2;
 
         let mut commands = Vec::new();
-        let num_domains = (chain_length + chips_per_domain - 1) / chips_per_domain;
+        let num_domains = chain_length.div_ceil(chips_per_domain);
 
         // Configure IO driver strength at domain boundaries
         for domain in 0..num_domains {
@@ -2139,6 +2570,7 @@ impl BM13xxProtocol {
     /// Generate frequency ramping sequence for gradual clock increase.
     ///
     /// This prevents power spikes and thermal stress during startup.
+    #[allow(dead_code)]
     pub fn frequency_ramp(
         &self,
         start: Frequency,
@@ -2170,10 +2602,6 @@ impl BM13xxProtocol {
     }
 
     /// Decode a response into a mining result.
-    #[expect(
-        dead_code,
-        reason = "Will be used for nonce verification when pool is connected"
-    )]
     pub fn decode_response(
         &self,
         response: Response,
@@ -2214,20 +2642,18 @@ impl BM13xxProtocol {
     }
 
     /// Create a command to read a register.
-    #[expect(dead_code, reason = "Will be used for chip diagnostics and monitoring")]
     pub fn read_register(&self, chip_address: u8, register: RegisterAddress) -> Command {
         Command::ReadRegister {
-            all: false,
+            broadcast: false,
             chip_address,
             register_address: register,
         }
     }
 
     /// Set UART baud rate on all chips
-    #[expect(dead_code, reason = "Will be used for baud rate negotiation")]
     pub fn set_baudrate(&self, baudrate: BaudRate) -> Command {
         Command::WriteRegister {
-            all: true,
+            broadcast: true,
             chip_address: 0x00,
             register: Register::UartBaud(baudrate),
         }
@@ -2236,7 +2662,6 @@ impl BM13xxProtocol {
     /// Create a command to write a register.
     ///
     /// Note: This is a placeholder - actual register encoding depends on the register type
-    #[expect(dead_code, reason = "Will be used for chip configuration")]
     pub fn write_register(
         &self,
         chip_address: u8,
@@ -2254,18 +2679,21 @@ impl BM13xxProtocol {
             RegisterAddress::NonceRange => Register::NonceRange(NonceRangeConfig {
                 bytes: value.to_le_bytes(),
             }),
-            RegisterAddress::TicketMask => Register::TicketMask(DifficultyMask {
-                bytes: value.to_le_bytes(),
-            }),
+            RegisterAddress::TicketMask => {
+                let bytes = value.to_le_bytes();
+                let mask_value = decode_ticket_mask_bytes(&bytes);
+                let zero_bits = mask_value.count_ones() as u8;
+                Register::TicketMask(TicketMask { zero_bits })
+            }
             RegisterAddress::MiscControl => Register::MiscControl { raw_value: value },
             RegisterAddress::UartBaud => Register::UartBaud(BaudRate::Custom(value)),
             RegisterAddress::UartRelay => Register::UartRelay { raw_value: value },
-            RegisterAddress::CoreRegister => Register::CoreRegister { raw_value: value },
+            RegisterAddress::Core => Register::Core { raw_value: value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value: value },
             RegisterAddress::IoDriverStrength => {
                 let mut strengths = [0u8; 8];
-                for i in 0..8 {
-                    strengths[i] = ((value >> (i * 4)) & 0xf) as u8;
+                for (i, strength) in strengths.iter_mut().enumerate() {
+                    *strength = ((value >> (i * 4)) & 0xf) as u8;
                 }
                 Register::IoDriverStrength(IoDriverStrength { strengths })
             }
@@ -2280,7 +2708,7 @@ impl BM13xxProtocol {
         };
 
         Ok(Command::WriteRegister {
-            all: false,
+            broadcast: false,
             chip_address,
             register: register_value,
         })
@@ -2289,7 +2717,7 @@ impl BM13xxProtocol {
     /// Create a broadcast command to discover all chips.
     pub fn discover_chips() -> Command {
         Command::ReadRegister {
-            all: true, // Broadcast
+            broadcast: true,
             chip_address: 0,
             register_address: RegisterAddress::ChipId,
         }
@@ -2297,7 +2725,6 @@ impl BM13xxProtocol {
 }
 
 /// Results from protocol operations
-#[expect(dead_code, reason = "Will be used when pool connection is implemented")]
 pub enum MiningResult {
     /// A register was read
     RegisterRead(Register),

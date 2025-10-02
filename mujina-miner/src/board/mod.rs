@@ -34,6 +34,13 @@ pub enum BoardEvent {
         temperature_c: Option<f32>,
         frequency_mhz: Option<u32>,
     },
+
+    /// A critical board fault occurred
+    BoardFault {
+        component: String, // e.g., "power_controller", "temperature_sensor"
+        fault: String,     // Description of the fault
+        recoverable: bool, // Whether the board might recover
+    },
 }
 
 /// Reasons why a mining job completed.
@@ -79,10 +86,10 @@ pub trait Board: Send {
     /// Returns a receiver for board events.
     async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError>;
 
-    /// Get the number of discovered chips on this board.
+    /// Number of discovered chips on this board.
     fn chip_count(&self) -> usize;
 
-    /// Get information about discovered chips.
+    /// Information about discovered chips.
     fn chip_infos(&self) -> &[ChipInfo];
 
     /// Send a mining job to all chips on this board.
@@ -99,14 +106,21 @@ pub trait Board: Send {
     /// This will trigger a `BoardEvent::JobComplete` with reason `Cancelled`.
     async fn cancel_job(&mut self, job_id: u64) -> Result<(), BoardError>;
 
-    /// Get board identification/info
+    /// Board identification and metadata.
     fn board_info(&self) -> BoardInfo;
 
-    /// Get the event receiver for this board.
+    /// Take ownership of the event receiver for this board.
     ///
-    /// This should be called after initialization to receive board events.
-    /// Returns None if the board hasn't been initialized yet.
+    /// Must be called after initialization to receive board events.
+    /// Returns None if the board hasn't been initialized or receiver was already taken.
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>>;
+
+    /// Gracefully shutdown the board.
+    ///
+    /// This should stop all mining activity and put the hardware in a safe
+    /// state. The exact implementation is board-specific but typically includes
+    /// stopping hashing and ensuring chips are in a low-power or reset state.
+    async fn shutdown(&mut self) -> Result<(), BoardError>;
 }
 
 /// Information about a board
@@ -166,6 +180,10 @@ impl From<ChipError> for BoardError {
 /// Helper type for async board factory functions
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Type alias for board factory function
+pub type BoardFactoryFn =
+    fn(UsbDeviceInfo) -> BoxFuture<'static, crate::error::Result<Box<dyn Board + Send>>>;
+
 /// Board descriptor that gets collected by inventory.
 ///
 /// Board implementors use `inventory::submit!` to register their board type
@@ -179,8 +197,7 @@ pub struct BoardDescriptor {
     /// Human-readable board name (e.g., "Bitaxe Gamma")
     pub name: &'static str,
     /// Factory function to create the board from USB device info
-    pub create_fn:
-        fn(UsbDeviceInfo) -> BoxFuture<'static, crate::error::Result<Box<dyn Board + Send>>>,
+    pub create_fn: BoardFactoryFn,
 }
 
 // This creates the inventory collection for board descriptors

@@ -38,6 +38,7 @@ impl BoardRegistry {
 /// Board manager that handles board lifecycle.
 pub struct BoardManager {
     registry: BoardRegistry,
+    #[expect(dead_code, reason = "Will track boards for hotplug removal")]
     boards: HashMap<String, Box<dyn Board + Send>>,
     event_rx: mpsc::Receiver<TransportEvent>,
     /// Channel to send initialized boards to the scheduler
