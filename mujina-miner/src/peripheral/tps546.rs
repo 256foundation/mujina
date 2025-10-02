@@ -527,7 +527,7 @@ impl<I2C: I2c> Tps546<I2C> {
             return Ok(());
         }
 
-        // Track if we have critical faults that should fail the check
+        // Track critical faults that should fail the check
         let mut critical_faults = Vec::new();
         let mut warnings = Vec::new();
 
@@ -1121,7 +1121,7 @@ impl<I2C: I2c> Tps546<I2C> {
             .write_read(TPS546_I2C_ADDR, &[command.as_u8()], &mut buffer)
             .await?;
 
-        // First byte is the length, verify it matches what we expect
+        // First byte is the length; verify it matches expected value
         let reported_length = buffer[0] as usize;
         if reported_length != length {
             warn!(

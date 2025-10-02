@@ -639,8 +639,7 @@ impl Register {
             RegisterAddress::NonceRange => Register::NonceRange(NonceRangeConfig { bytes: *bytes }),
             RegisterAddress::TicketMask => {
                 // Decode wire bytes to TicketMask
-                // Wire bytes are already in the encoded format, we need to decode them
-                // to determine the zero_bits value
+                // Wire bytes are in encoded format; decode to extract zero_bits value
                 let mask_value = decode_ticket_mask_bytes(bytes);
                 let zero_bits = mask_value.count_ones() as u8;
                 Register::TicketMask(TicketMask { zero_bits })
@@ -1037,8 +1036,6 @@ impl Command {
             }
         }
     }
-
-    // try_parse_frame method removed - use encoder/decoder pattern instead
 }
 
 #[derive(FromRepr)]

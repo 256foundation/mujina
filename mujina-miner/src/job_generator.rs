@@ -40,9 +40,9 @@ impl JobGenerator {
     /// - 1.0 = Bitcoin difficulty 1.0 (for testing)
     /// - Higher values = harder (for production use)
     pub fn new(difficulty: f64) -> Self {
-        // For production use during outages, we might want to use
-        // a higher difficulty to avoid flooding logs with "found block!"
-        // messages that can't actually be submitted
+        // For production use during outages, consider using higher difficulty
+        // to avoid flooding logs with "found block!" messages that can't be
+        // submitted
         let target = Self::difficulty_to_target(difficulty);
 
         Self {
@@ -95,8 +95,8 @@ impl JobGenerator {
             return Target::from_compact(diff_1_compact);
         }
 
-        // For other difficulties, we adjust the compact representation
-        // This is simplified - production code would use proper calculations
+        // For other difficulties, adjust the compact representation
+        // Simplified calculation; production code would use proper math
         if difficulty < 1.0 {
             // Easier than diff 1 - use a higher target value
             // Max target is roughly 0x1d7fffff
@@ -171,7 +171,7 @@ impl JobGenerator {
 
     /// Create a header for fallback mode (pool disconnected)
     fn create_fallback_header(&mut self) -> BlockHeader {
-        // Use recognizable pattern so we know these are fallback blocks
+        // Use recognizable pattern to identify fallback blocks
         let mut prev_hash = [0u8; 32];
         prev_hash[0..8].copy_from_slice(b"FALLBACK");
 

@@ -839,8 +839,6 @@ mod tests {
         }
     }
 
-    // Removed test_set_baud_rate_with_timeout since timeout is now internal
-
     #[tokio::test]
     async fn test_reset_stats() {
         use test_support::create_virtual_pair;

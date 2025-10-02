@@ -49,7 +49,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
         // Call the inner reader
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
 
-        // If we read some bytes, trace them
+        // Trace any bytes received
         if let Poll::Ready(Ok(())) = &result {
             let after_len = buf.filled().len();
             if after_len > before_len {
@@ -85,7 +85,7 @@ pub struct BitaxeBoard {
     power_controller: Option<Tps546<BitaxeRawI2c>>,
     /// Writer for sending commands to chips
     data_writer: FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-    /// Reader for receiving responses from chips (moved to event monitor during initialize)
+    /// Reader for receiving responses from chips (transferred to event monitor during initialize)
     data_reader: Option<FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>>,
     /// Control handle for data channel (for baud rate changes)
     data_control: SerialControl,
@@ -95,7 +95,7 @@ pub struct BitaxeBoard {
     chip_infos: Vec<ChipInfo>,
     /// Channel for sending board events
     event_tx: Option<tokio::sync::mpsc::Sender<BoardEvent>>,
-    /// Channel for receiving board events (stored after initialization)
+    /// Channel for receiving board events (populated during initialization)
     event_rx: Option<tokio::sync::mpsc::Receiver<BoardEvent>>,
     /// Current job ID
     current_job_id: Option<u64>,
@@ -540,7 +540,7 @@ impl BitaxeBoard {
 
             current += step_mhz;
 
-            // Ensure we don't overshoot but always include the target
+            // Prevent overshoot while ensuring target is included
             if current > target_mhz && (current - step_mhz) < target_mhz {
                 current = target_mhz;
             }
@@ -561,7 +561,7 @@ impl BitaxeBoard {
     /// Formula: freq = 25 * fb_div / (ref_div * post_div1 * post_div2)
     ///
     /// Note: esp-miner uses a "first-found" algorithm rather than finding the optimal
-    /// configuration, and we need to match its behavior for consistency.
+    /// configuration. This implementation matches that behavior for consistency.
     fn calculate_pll_for_frequency(target_freq: f32) -> Option<bm13xx::protocol::PllConfig> {
         const CRYSTAL_FREQ: f32 = 25.0;
         const MAX_FREQ_ERROR: f32 = 1.0; // Maximum acceptable frequency error in MHz
@@ -573,11 +573,11 @@ impl BitaxeBoard {
         let mut min_error = 10.0; // esp-miner starts with min_difference = 10
 
         // Follow esp-miner's exact loop order to get same results
-        // It stops at first solution under max_diff (1.0 MHz)
+        // Stops at first solution under max_diff (1.0 MHz)
         for ref_div in [2, 1] {
             if best_fb_div != 0 {
                 break;
-            } // Stop once we find a solution
+            } // Stop once solution is found
 
             for post_div1 in (1..=7).rev() {
                 if best_fb_div != 0 {
@@ -635,7 +635,7 @@ impl BitaxeBoard {
 
     /// Spawn a task to periodically log management statistics
     fn spawn_stats_monitor(&mut self) {
-        // Clone what we need for the task
+        // Clone data needed for the monitoring task
         let i2c = self.i2c.clone();
         let chip_count = self.chip_infos.len();
 
@@ -827,7 +827,7 @@ impl Board for BitaxeBoard {
 
         tracing::info!("Discovered {} chip(s)", self.chip_infos.len());
 
-        // Verify we found the expected BM1370 chip
+        // Verify expected BM1370 chip was found
         if let Some(first_chip) = self.chip_infos.first() {
             if first_chip.chip_id != Self::EXPECTED_CHIP_ID {
                 return Err(BoardError::InitializationFailed(format!(
@@ -985,7 +985,7 @@ impl Board for BitaxeBoard {
         // Step 6: Additional Settings
         tracing::debug!("Sending additional settings");
 
-        // MiscSettings = 0x80440000 (note: different from current 0x00004480)
+        // MiscSettings = 0x80440000 (bytes: 00 00 44 80)
         let misc_b9_cmd = Command::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
@@ -1057,7 +1057,7 @@ impl Board for BitaxeBoard {
         // Step 8: Final Configuration
         // After frequency ramping is complete
 
-        // NonceRange = 0xB51E0000 (correct value from reference)
+        // NonceRange = 0xB51E0000 (value from reference implementation)
         let nonce_range_value = 0xB51E0000; // Raw value from captures
         let nonce_range_cmd = Command::WriteRegister {
             broadcast: true,
@@ -1070,7 +1070,7 @@ impl Board for BitaxeBoard {
         };
         self.send_config_command(nonce_range_cmd).await?;
 
-        // UartBaud = 0x00023011 (1M baud) - NOW after frequency ramping
+        // UartBaud = 0x00023011 (1M baud) - sent after frequency ramping
         tracing::info!(
             "Sending baud rate change command to BM1370 for {} baud",
             Self::TARGET_BAUD_RATE
@@ -1127,8 +1127,8 @@ impl Board for BitaxeBoard {
         // Spawn statistics monitoring task
         self.spawn_stats_monitor();
 
-        // Return a dummy receiver for backward compatibility
-        // The real receiver is stored and can be retrieved with take_event_receiver()
+        // Return a dummy receiver for trait compatibility
+        // Actual receiver is retrieved via take_event_receiver()
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
         drop(dummy_tx);
         Ok(dummy_rx)
@@ -1263,8 +1263,7 @@ async fn create_from_usb(
         .await
         .map_err(|e| crate::error::Error::Hardware(format!("Failed to initialize board: {}", e)))?;
 
-    // The real event receiver is stored in the board and can be retrieved
-    // by the scheduler using take_event_receiver()
+    // Event receiver is retrieved by the scheduler using take_event_receiver()
 
     tracing::info!(
         "Bitaxe board initialized successfully with {} chips",
@@ -1351,7 +1350,7 @@ mod tests {
 
     #[test]
     fn test_frequency_ramp_generation() {
-        // Test that we generate the correct number of steps
+        // Verify correct number of steps are generated
         let steps = BitaxeBoard::generate_frequency_ramp_steps(56.25, 525.0, 6.25);
 
         // Should have steps from 56.25 to 525.0 in 6.25 MHz increments
@@ -1396,7 +1395,7 @@ mod tests {
         let high_freq = BitaxeBoard::calculate_pll_for_frequency(525.0).unwrap();
         assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 525 MHz");
 
-        // The 0x40 flag would be used for configurations with VCO < 2400 MHz
-        // which aren't typically reached in the 56.25-525 MHz output range we use
+        // The 0x40 flag would be used for configurations with VCO < 2400 MHz,
+        // which aren't typically reached in the 56.25-525 MHz output range
     }
 }

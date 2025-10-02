@@ -169,8 +169,6 @@ define_pmbus_commands! {
     FusionId1 = 0xFD, "FUSION_ID1", "fusion ID 1",
 }
 
-// [Rest of file remains unchanged from line 324 onward...]
-
 // ============================================================================
 // Typed PMBus Values
 // ============================================================================
@@ -1540,7 +1538,7 @@ mod tests {
 
     #[test]
     fn test_pmbus_voltage_precision_preservation() {
-        // Test that we maintain precision by keeping the original encoding
+        // Verify precision is maintained by keeping the original encoding
         let l11_raw = 0xD2E6; // Known Linear11 value: 11.59375
         let voltage = PmbusVoltage::from_linear11(l11_raw);
 

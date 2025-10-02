@@ -86,10 +86,10 @@ pub trait Board: Send {
     /// Returns a receiver for board events.
     async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError>;
 
-    /// Get the number of discovered chips on this board.
+    /// Number of discovered chips on this board.
     fn chip_count(&self) -> usize;
 
-    /// Get information about discovered chips.
+    /// Information about discovered chips.
     fn chip_infos(&self) -> &[ChipInfo];
 
     /// Send a mining job to all chips on this board.
@@ -106,13 +106,13 @@ pub trait Board: Send {
     /// This will trigger a `BoardEvent::JobComplete` with reason `Cancelled`.
     async fn cancel_job(&mut self, job_id: u64) -> Result<(), BoardError>;
 
-    /// Get board identification/info
+    /// Board identification and metadata.
     fn board_info(&self) -> BoardInfo;
 
-    /// Get the event receiver for this board.
+    /// Take ownership of the event receiver for this board.
     ///
-    /// This should be called after initialization to receive board events.
-    /// Returns None if the board hasn't been initialized yet.
+    /// Must be called after initialization to receive board events.
+    /// Returns None if the board hasn't been initialized or receiver was already taken.
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<BoardEvent>>;
 
     /// Gracefully shutdown the board.

@@ -49,13 +49,6 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
         }
     };
 
-    // Configure chips for mining
-    // TODO: This needs to be moved into board-specific initialization
-    // if let Err(e) = configure_chips_for_mining(&mut board).await {
-    //     error!("Failed to configure chips: {e}");
-    //     return;
-    // }
-
     // Create job generator for testing (using difficulty 1 for easy verification)
     let difficulty = 1.0;
     let mut job_generator = JobGenerator::new(difficulty);
@@ -197,75 +190,6 @@ pub async fn task(running: CancellationToken, mut board_rx: mpsc::Receiver<Box<d
     trace!("Scheduler task stopped.");
 }
 
-// // TODO: Move board-specific configuration into board implementations
-// // /// Configure discovered chips for mining operation.
-// // ///
-// // /// This includes:
-// // /// - Setting initial PLL frequency (with ramping)
-// // /// - Enabling version rolling
-// // /// - Configuring other chip-specific settings
-// // async fn configure_chips_for_mining(board: &mut BitaxeBoard) -> Result<(), BoardError> {
-//     info!("Configuring chips for mining...");
-//
-//     // Get chip info to determine chip type
-//     let chip_infos = board.chip_infos();
-//     if chip_infos.is_empty() {
-//         return Err(BoardError::InitializationFailed("No chips discovered".to_string()));
-//     }
-//
-//     // Check what type of chips we have
-//     let chip_type = ChipType::from(chip_infos[0].chip_id);
-//     info!("Detected chip type: {:?}", chip_type);
-//
-//     // Create protocol handler
-//     let protocol = BM13xxProtocol::new();
-//
-//     // Get initialization commands for single chip (Bitaxe has one chip)
-//     let init_freq = Frequency::from_mhz(INITIAL_FREQUENCY_MHZ)
-//         .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
-//
-//     let init_commands = protocol.single_chip_init(init_freq);
-//
-//     // Send initialization commands
-//     info!("Sending {} initialization commands", init_commands.len());
-//     board.send_config_commands(init_commands).await?;
-//
-//     // Wait for chip to stabilize at initial frequency
-//     tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
-//
-//     // Perform frequency ramping if needed
-//     if TARGET_FREQUENCY_MHZ > INITIAL_FREQUENCY_MHZ {
-//         info!("Starting frequency ramp from {} MHz to {} MHz",
-//               INITIAL_FREQUENCY_MHZ, TARGET_FREQUENCY_MHZ);
-//
-//         let mut current_freq = INITIAL_FREQUENCY_MHZ;
-//         while current_freq < TARGET_FREQUENCY_MHZ {
-//             current_freq = (current_freq + FREQUENCY_STEP_MHZ).min(TARGET_FREQUENCY_MHZ);
-//
-//             let freq = Frequency::from_mhz(current_freq)
-//                 .map_err(|e| BoardError::InitializationFailed(format!("Invalid frequency: {}", e)))?;
-//
-//             // Generate PLL commands for new frequency
-//             let pll_commands = protocol.frequency_ramp(
-//                 Frequency::from_mhz(current_freq - FREQUENCY_STEP_MHZ).unwrap(),
-//                 freq,
-//                 1  // Single step since we're doing it manually
-//             );
-//
-//             info!("Setting frequency to {} MHz", current_freq);
-//             board.send_config_commands(pll_commands).await?;
-//
-//             // Wait for chip to stabilize
-//             tokio::time::sleep(Duration::from_millis(FREQUENCY_STEP_DELAY_MS)).await;
-//         }
-//
-//         info!("Frequency ramp complete");
-//     }
-//
-//     info!("Chip configuration complete");
-//     Ok(())
-// }
-//
 /// Mining statistics tracker
 struct MiningStats {
     nonces_found: u64,
@@ -300,7 +224,7 @@ impl MiningStats {
 
         // Calculate hashrate based on nonce finding rate (Poisson process)
         // At difficulty D, probability of finding a valid nonce is 1/(D × 2^32)
-        // So if we find N nonces in time T, estimated hashes = N × D × 2^32
+        // Finding N nonces in time T means estimated hashes = N × D × 2^32
         // This accounts for early job termination when nonces are found
 
         let hashrate_total = if elapsed > 0.0 && self.valid_nonces > 0 {
@@ -390,16 +314,3 @@ impl MiningStats {
         }
     }
 }
-
-// /// Shutdown chips by sending chain inactive command
-// async fn shutdown_chips(board: &mut BitaxeBoard) -> Result<(), BoardError> {
-//     info!("Sending chain inactive command to stop hashing");
-//
-//     // Chain inactive command stops all chips from hashing
-//     let command = Command::ChainInactive;
-//
-//     board.send_config_command(command).await?;
-//
-//     info!("Chips commanded to stop hashing");
-//     Ok(())
-// }
