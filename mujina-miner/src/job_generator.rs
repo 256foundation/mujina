@@ -20,11 +20,9 @@ use bitcoin::pow::{CompactTarget, Target};
 pub struct JobGenerator {
     /// Current block height (incremented for each job)
     block_height: u32,
-    /// Base timestamp (incremented to ensure unique jobs)  
+    /// Base timestamp (incremented to ensure unique jobs)
     base_time: u32,
-    /// Target difficulty for generated jobs (as integer)
-    difficulty: u64,
-    /// Cached target corresponding to difficulty
+    /// Target for generated jobs
     target: Target,
     /// Version field for block header
     version: i32,
@@ -54,7 +52,6 @@ impl JobGenerator {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as u32,
-            difficulty,
             target,
             version: bitcoin::blockdata::block::Version::TWO.to_consensus(),
             job_id_counter: 0,

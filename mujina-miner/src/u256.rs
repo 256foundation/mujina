@@ -17,9 +17,6 @@ pub struct U256 {
 }
 
 impl U256 {
-    /// Zero value
-    pub const ZERO: Self = Self { low: 0, high: 0 };
-
     /// Create from little-endian bytes
     pub fn from_le_bytes(bytes: [u8; 32]) -> Self {
         let low = u128::from_le_bytes(bytes[0..16].try_into().unwrap());
@@ -33,14 +30,6 @@ impl U256 {
         bytes[0..16].copy_from_slice(&self.low.to_le_bytes());
         bytes[16..32].copy_from_slice(&self.high.to_le_bytes());
         bytes
-    }
-
-    /// Create from a u64 value
-    pub fn from_u64(val: u64) -> Self {
-        Self {
-            low: val as u128,
-            high: 0,
-        }
     }
 
     /// Divide by a u64 value
