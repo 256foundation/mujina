@@ -1,47 +1,45 @@
 # Code Style Guide
 
-This document defines the coding standards for the mujina-miner project.
-Following these guidelines ensures consistency and maintainability across
-the codebase.
+This document defines the formatting and mechanical style rules for the
+mujina-miner project. For best practices and design patterns, see
+CODING_GUIDELINES.md.
 
-## General Principles
-
-1. **Clarity over cleverness** - Write code that is easy to understand
-2. **Consistency** - Follow existing patterns in the codebase
-3. **Simplicity** - Prefer simple solutions over complex ones
-4. **Documentation** - Document why, not what
+Rules are labeled with stable identifiers (e.g., `S.fmt`, `D.md.wrap`) for
+easy reference in code reviews and discussions.
 
 ## Rust Code Style
 
-### Formatting
+### Formatting [S.fmt](#S.fmt)
 
 We use `rustfmt` with default settings. Always run before committing:
 ```bash
 cargo fmt
 ```
 
-### Linting
+### Linting [S.lint](#S.lint)
 
 We use `clippy` to catch common mistakes. Fix all warnings:
 ```bash
 cargo clippy -- -D warnings
 ```
 
-### Naming Conventions
+### Naming Conventions [S.name](#S.name)
 
 Follow Rust naming conventions:
-- **Types**: `UpperCamelCase` (e.g., `BoardConfig`, `ChipType`)
-- **Functions/Methods**: `snake_case` (e.g., `send_work`, `get_status`)
-- **Variables**: `snake_case` (e.g., `hash_rate`, `temp_sensor`)
-- **Constants**: `SCREAMING_SNAKE_CASE` (e.g., `MAX_CHIPS`, `DEFAULT_FREQ`)
-- **Modules**: `snake_case` (e.g., `board`, `chip`, `pool`)
+- Types use `UpperCamelCase` (e.g., `BoardConfig`, `ChipType`)
+- Functions/Methods use `snake_case` (e.g., `send_work`, `get_status`)
+- Variables use `snake_case` (e.g., `hash_rate`, `temp_sensor`)
+- Constants use `SCREAMING_SNAKE_CASE` (e.g., `MAX_CHIPS`, `DEFAULT_FREQ`)
+- Modules use `snake_case` (e.g., `board`, `chip`, `pool`)
 
-### Module Organization
+### Module Organization [S.mod](#S.mod)
+
+Organize module contents in this order:
 
 ```rust
 // 1. Module documentation
 //! Brief module description.
-//! 
+//!
 //! Longer explanation if needed.
 
 // 2. Imports (grouped and sorted)
@@ -87,38 +85,7 @@ mod tests {
 }
 ```
 
-### Error Handling
-
-Use appropriate error handling patterns:
-
-```rust
-// Application code: use anyhow
-use anyhow::{Context, Result};
-
-pub async fn connect_to_pool(url: &str) -> Result<PoolClient> {
-    let client = PoolClient::connect(url)
-        .await
-        .context("Failed to connect to mining pool")?;
-    Ok(client)
-}
-
-// Library code: use thiserror
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ProtocolError {
-    #[error("Invalid frame: {0}")]
-    InvalidFrame(String),
-    
-    #[error("CRC mismatch")]
-    CrcMismatch,
-    
-    #[error("Timeout waiting for response")]
-    Timeout,
-}
-```
-
-### Lint Attributes
+### Lint Attributes [S.expect](#S.expect)
 
 Use `#[expect(...)]` instead of `#[allow(...)]` for intentional lint suppressions.
 This makes the intent explicit and will warn if the suppression becomes unnecessary:
@@ -148,183 +115,46 @@ The `expect` attribute requires a reason, making code reviews easier and helping
 future maintainers understand why the suppression exists. When the code changes
 and the suppression is no longer needed, the compiler will warn about it.
 
-### Async Code
+## Documentation Format
 
-Follow Tokio best practices:
-
-```rust
-// Good: Concurrent operations
-let (result1, result2) = tokio::join!(
-    fetch_pool_work(),
-    check_board_status()
-);
-
-// Good: Proper cancellation
-async fn long_running_task(shutdown: CancellationToken) {
-    tokio::select! {
-        _ = do_work() => {},
-        _ = shutdown.cancelled() => {
-            info!("Task cancelled");
-        }
-    }
-}
-
-// Bad: Sequential when could be concurrent
-let result1 = fetch_pool_work().await;
-let result2 = check_board_status().await;
-```
-
-### Comments and Documentation
-
-```rust
-/// Sends a job to the specified chip.
-/// 
-/// # Arguments
-/// 
-/// * `chip_id` - The target chip identifier
-/// * `job` - The mining job to send
-/// 
-/// # Returns
-/// 
-/// Returns `Ok(())` if the job was sent successfully, or an error if
-/// communication failed.
-/// 
-/// # Example
-/// 
-/// ```
-/// let job = Job::new(block_header, target);
-/// board.send_job(0, job).await?;
-/// ```
-pub async fn send_job(&mut self, chip_id: u8, job: Job) -> Result<()> {
-    // Implementation
-}
-```
-
-### Testing
-
-Write comprehensive tests:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Unit test
-    #[test]
-    fn test_crc_calculation() {
-        let data = b"test data";
-        let crc = calculate_crc(data);
-        assert_eq!(crc, 0x1234);
-    }
-
-    // Async test
-    #[tokio::test]
-    async fn test_board_connection() {
-        let board = Board::connect("/dev/ttyUSB0").await.unwrap();
-        assert!(board.is_connected());
-    }
-
-    // Test with fixtures
-    #[test]
-    fn test_frame_parsing() {
-        let frame_data = include_bytes!("../test_data/valid_frame.bin");
-        let frame = Frame::parse(frame_data).unwrap();
-        assert_eq!(frame.command, Command::ReadReg);
-    }
-}
-```
-
-## Documentation Style
-
-### Markdown Files
+### Markdown Files [D.md](#D.md)
 
 - Wrap lines at 79 characters (enforced by .editorconfig)
 - Use hard line breaks, not soft wrapping
 - Use proper heading hierarchy (don't skip levels)
 - Include code examples where helpful
+- Nest code blocks using more backticks in outer block than inner block
 
-### Code Documentation
+### Code Documentation [D.code](#D.code)
 
-Document all public APIs:
+Use standard Rust documentation format:
 - Module-level documentation with `//!`
 - Item documentation with `///`
 - Include examples for complex functionality
 - Document panics, errors, and safety requirements
 
-### Commit Messages
+See CODING_GUIDELINES.md for guidance on what to document and comment
+style.
 
-Follow conventional commits:
+### Commit Messages [D.commit](#D.commit)
+
+Follow conventional commits with prose body paragraphs:
 ```
 feat(board): add temperature monitoring
 
-Implements continuous temperature monitoring for all connected boards.
-Readings are cached and updated every 5 seconds.
-
-- Add TemperatureMonitor struct
-- Integrate with board lifecycle
-- Expose readings via API
+Implement continuous temperature monitoring for all connected boards.
+Readings are cached and updated every 5 seconds to reduce I2C bus
+traffic. The TemperatureMonitor struct integrates with the board
+lifecycle and exposes readings via the REST API.
 
 Closes #45
 ```
 
-## Project-Specific Conventions
-
-### Hardware Interaction
-
-```rust
-// Always trace hardware communication
-trace!("Sending to chip: {:02x?}", data);
-
-// Use timeouts for hardware operations
-timeout(Duration::from_secs(5), chip.send_work(job))
-    .await
-    .context("Timeout sending work to chip")?;
-
-// Check hardware state before operations
-if !board.is_ready() {
-    return Err(anyhow!("Board not ready"));
-}
+Use bulleted lists only when items are truly independent:
 ```
+chore: update dependencies
 
-### Protocol Implementation
-
-```rust
-// Define protocol constants clearly
-pub mod constants {
-    pub const FRAME_HEADER: u8 = 0xAA;
-    pub const FRAME_TAIL: u8 = 0x55;
-    pub const MAX_FRAME_SIZE: usize = 256;
-}
-
-// Use builders for complex protocol messages
-let command = CommandBuilder::new()
-    .with_register(Register::Frequency)
-    .with_value(600_000_000)
-    .build();
+Update the following dependencies to address security advisories:
+- tokio 1.35 -> 1.36 (RUSTSEC-2024-001)
+- serde 1.0.195 -> 1.0.196 (RUSTSEC-2024-002)
 ```
-
-### Safety and Resource Management
-
-```rust
-// Always implement Drop for hardware resources
-impl Drop for Board {
-    fn drop(&mut self) {
-        if let Err(e) = self.shutdown() {
-            error!("Failed to shutdown board: {}", e);
-        }
-    }
-}
-
-// Use RAII patterns
-let _guard = board.lock_communication().await;
-// Communication automatically unlocked when guard drops
-```
-
-## Continuous Improvement
-
-This style guide is a living document. If you find patterns that work well
-or identify areas for improvement, please propose changes through the
-normal contribution process.
-
-Remember: the goal is to make the code easy to understand, maintain, and
-extend. When in doubt, favor clarity and consistency.

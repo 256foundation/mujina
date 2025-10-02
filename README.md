@@ -25,7 +25,9 @@ Debian-based embedded Linux distribution optimized for Bitcoin mining hardware.
 - [Architecture Overview](docs/architecture.md) - System design and component
   interaction
 - [Contributing Guide](CONTRIBUTING.md) - How to contribute to the project
-- [Code Style Guide](CODE_STYLE.md) - Coding standards and conventions
+- [Code Style Guide](CODE_STYLE.md) - Formatting and style rules
+- [Coding Guidelines](CODING_GUIDELINES.md) - Best practices and design
+  patterns
 
 ### Protocol Documentation
 
