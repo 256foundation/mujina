@@ -237,7 +237,7 @@ impl ResponseStreamingParser {
         }
 
         // Remove invalid leading bytes that aren't response preamble
-        while self.buffer.len() >= 1 && self.buffer[0] != 0xaa {
+        while !self.buffer.is_empty() && self.buffer[0] != 0xaa {
             if let Some((byte, timestamp)) = self.byte_queue.pop_front() {
                 self.invalid_accumulator.push((byte, timestamp));
                 self.buffer.advance(1);

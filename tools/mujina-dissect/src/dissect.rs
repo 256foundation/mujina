@@ -124,9 +124,9 @@ pub fn dissect_i2c_operation_with_context(
 
         // Get data directly - PMBus parser already separated command from data
         let data = if is_read {
-            op.read_data.as_ref().map(|v| v.as_slice())
+            op.read_data.as_deref()
         } else {
-            op.write_data.as_ref().map(|v| v.as_slice())
+            op.write_data.as_deref()
         };
 
         match device {
@@ -138,9 +138,7 @@ pub fn dissect_i2c_operation_with_context(
                 // Update VOUT_MODE cache if this is a VOUT_MODE operation
                 if reg == pmbus::PmbusCommand::VoutMode.as_u8() {
                     if let Some(data) = data {
-                        if data.len() >= 1 && !is_read {
-                            contexts.tps546_vout_modes.insert(op.address, data[0]);
-                        } else if data.len() >= 1 && is_read {
+                        if !data.is_empty() {
                             contexts.tps546_vout_modes.insert(op.address, data[0]);
                         }
                     }
@@ -207,7 +205,7 @@ pub fn dissect_i2c_operation_with_context(
 
     // Handle write operations (including register select operations)
     if op.write_data.is_some() || (op.register.is_some() && op.read_data.is_none()) {
-        raw_data.push((op.address << 1) | 0); // Address + Write bit
+        raw_data.push(op.address << 1); // Address + Write bit
         if let Some(reg) = op.register {
             raw_data.push(reg); // Register byte
         }

@@ -1367,8 +1367,8 @@ mod tests {
         if let Some(first) = steps.first() {
             let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
             let post_div2 = (first.post_div & 0xF) + 1;
-            let first_freq = 25.0 * (first.fb_div & 0xFF) as f32
-                / (first.ref_div * post_div1 * post_div2) as f32;
+            let first_freq =
+                25.0 * first.fb_div as f32 / (first.ref_div * post_div1 * post_div2) as f32;
             assert!(
                 (first_freq - 56.25).abs() < 1.0,
                 "First frequency should be ~56.25 MHz"
@@ -1379,7 +1379,7 @@ mod tests {
             let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
             let post_div2 = (last.post_div & 0xF) + 1;
             let last_freq =
-                25.0 * (last.fb_div & 0xFF) as f32 / (last.ref_div * post_div1 * post_div2) as f32;
+                25.0 * last.fb_div as f32 / (last.ref_div * post_div1 * post_div2) as f32;
             assert!(
                 (last_freq - 525.0).abs() < 1.0,
                 "Last frequency should be ~525 MHz"

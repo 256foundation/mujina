@@ -292,9 +292,10 @@ pub fn group_transactions(transactions: &[I2cTransaction]) -> Vec<I2cOperation> 
         }
 
         // Check if this is a register write that should be grouped with a subsequent read
-        if !t1.is_read && t1.data.len() >= 1 {
+        if !t1.is_read && !t1.data.is_empty() {
             // Look for the next read transaction to the same address within a reasonable time window
             let mut found_read = None;
+            #[allow(clippy::needless_range_loop)]
             for j in (i + 1)..(i + 10).min(transactions.len()) {
                 // Look ahead up to 10 transactions
                 let t2 = &transactions[j];
@@ -656,14 +657,14 @@ mod tests {
     #[test]
     fn test_single_read_operation() {
         let transactions = vec![
-            create_test_transaction(1.0, 0x24, true, vec![0x42, 0x00]), // STATUS read response
+            create_test_transaction(1.0, 0x24, true, vec![0x42, 0x00]), // Standalone read response
         ];
 
         let operations = group_transactions(&transactions);
         assert_eq!(operations.len(), 1);
 
         let op = &operations[0];
-        assert_eq!(op.register, Some(0x42)); // First byte treated as register for read
+        assert_eq!(op.register, None); // No register for standalone read
         assert!(op.write_data.is_none());
         assert_eq!(op.read_data, Some(vec![0x42, 0x00]));
     }
@@ -822,7 +823,7 @@ mod tests {
             .next_transaction()
             .expect("Should have transaction");
         assert_eq!(transaction.address, 0x24);
-        assert_eq!(transaction.is_read, true);
+        assert!(transaction.is_read);
         assert_eq!(transaction.register, Some(0x9A)); // Register from write phase
         assert_eq!(transaction.data, vec![0x03, 0x00, 0x00]); // Read data
         assert!(assembler.next_transaction().is_none());
@@ -902,7 +903,7 @@ mod tests {
             .next_transaction()
             .expect("Should have first transaction");
         assert_eq!(t1.address, 0x24);
-        assert_eq!(t1.is_read, false);
+        assert!(!t1.is_read);
         assert_eq!(t1.data, vec![0x9A]);
         assert_eq!(t1.register, None);
 
@@ -910,7 +911,7 @@ mod tests {
             .next_transaction()
             .expect("Should have second transaction");
         assert_eq!(t2.address, 0x4C);
-        assert_eq!(t2.is_read, true);
+        assert!(t2.is_read);
         assert_eq!(t2.data, vec![0x42]);
         assert_eq!(t2.register, None);
 
@@ -1000,7 +1001,7 @@ mod tests {
             .next_transaction()
             .expect("Should have first transaction");
         assert_eq!(t1.address, 0x24);
-        assert_eq!(t1.is_read, false);
+        assert!(!t1.is_read);
         assert_eq!(t1.data, vec![0x21, 0x66]);
         assert_eq!(t1.register, None);
 
@@ -1008,7 +1009,7 @@ mod tests {
             .next_transaction()
             .expect("Should have second transaction");
         assert_eq!(t2.address, 0x24);
-        assert_eq!(t2.is_read, true);
+        assert!(t2.is_read);
         assert_eq!(t2.data, vec![0x42]);
         assert_eq!(t2.register, None);
 
