@@ -18,11 +18,11 @@ use bitcoin::block::Version;
 #[derive(Debug, Clone)]
 pub struct VersionTemplate {
     /// Block version number and soft-fork signaling field.
-    version: Version,
+    pub version: Version,
 
     /// Bitmask indicating which version bits may be rolled.
     ///
     /// Each bit set to 1 indicates that bit position may be modified during
     /// mining. None indicates version rolling is not permitted for this job.
-    mask: Option<u32>,
+    pub mask: Option<u32>,
 }
