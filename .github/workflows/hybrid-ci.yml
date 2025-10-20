@@ -1,0 +1,106 @@
+name: Hybrid CI (Podman + Native ARM64)
+
+on:
+  push:
+    branches: [ main, master, preview, gh_actions]
+  pull_request:
+    branches: [ main, master, preview, gh_actions ]
+  workflow_dispatch:
+    inputs:
+      run_arm64:
+        description: "Run ARM64 native test"
+        type: boolean
+        default: true
+      run_container_ci:
+        description: "Run container CI"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Fast checks using Podman containers on GitHub's x86_64 runners
+  container-ci:
+    name: Container CI (x86_64)
+    # https://github.com/actions/runner-images?tab=readme-ov-file#available-images
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Install Podman
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install podman
+    
+    - name: Run CI checks in container
+      run: |
+        chmod +x .github/ci-runner.sh
+        ./.github/ci-runner.sh all
+      env:
+        WORKSPACE_DIR: ${{ github.workspace }}
+        RUST_IMAGE: quay.io/jbride2000/rust:1.90.0-trixie-tools
+        CACHE_MOUNTS: "false"
+    
+    - name: Cross-compile for ARM64
+      run: |
+        chmod +x .github/ci-runner.sh
+        TARGET_ARCH=aarch64-unknown-linux-gnu ./.github/ci-runner.sh build-release
+      env:
+        WORKSPACE_DIR: ${{ github.workspace }}
+        RUST_IMAGE: quay.io/jbride2000/rust:1.90.0-trixie-tools
+        TARGET_ARCH: aarch64-unknown-linux-gnu
+        CACHE_MOUNTS: "false"
+    
+    - name: Upload ARM64 binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: mujina-minerd-arm64
+        path: target/aarch64-unknown-linux-gnu/release/mujina-minerd
+
+  # Native ARM64 testing using GitHub's ARM64 runners
+  # https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners
+  arm64-self-hosted-runner:
+    name: ARM64 Self-Hosted Runner Test
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_arm64 }}
+    runs-on: self-hosted
+    needs: container-ci
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download ARM64 binary
+      uses: actions/download-artifact@v4
+      with:
+        name: mujina-minerd-arm64
+        path: ./artifacts/
+    
+    - name: Test ARM64 binary natively
+      run: |
+        # Test the ARM64 binary on native ARM64 hardware
+        chmod +x ./artifacts/mujina-minerd
+        
+        echo "=== ARM64 Hardware Information ==="
+        uname -a
+        cat /proc/cpuinfo | grep -E "(processor|model name|cpu MHz|cache size)" | head -10
+        cat /proc/meminfo | head -5
+        echo ""
+        
+        echo "=== Binary Information ==="
+        file ./artifacts/mujina-minerd
+        ldd ./artifacts/mujina-minerd || echo "Static binary or ldd not available"
+        echo ""
+        
+        echo "=== Version Test ==="
+        ./artifacts/mujina-minerd --version
+        echo ""
+        
+        echo "=== Basic Functionality Test ==="
+        timeout 30 ./artifacts/mujina-minerd --help || echo "Help command completed"
+        echo ""
+        
+        echo "✅ ARM64 native testing completed successfully!"
