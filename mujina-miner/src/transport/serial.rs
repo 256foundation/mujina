@@ -340,10 +340,7 @@ impl AsyncRead for SerialReader {
                     }
                     Err(rustix::io::Errno::IO) => {
                         // EIO can mean various hardware errors, not just disconnection
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            SerialError::HardwareError,
-                        ))
+                        Err(io::Error::other(SerialError::HardwareError))
                     }
                     Err(rustix::io::Errno::PIPE) => {
                         // EPIPE is more likely to indicate disconnection
@@ -390,10 +387,7 @@ impl AsyncWrite for SerialWriter {
                     }
                     Err(rustix::io::Errno::IO) => {
                         // EIO can mean various hardware errors, not just disconnection
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            SerialError::HardwareError,
-                        ))
+                        Err(io::Error::other(SerialError::HardwareError))
                     }
                     Err(rustix::io::Errno::PIPE) => {
                         // EPIPE is more likely to indicate disconnection
