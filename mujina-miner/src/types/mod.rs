@@ -103,3 +103,7 @@ mod tests {
         assert_eq!(rate.to_human_readable(), "500.00 GH/s");
     }
 }
+
+mod display_difficulty;
+
+pub use display_difficulty::DisplayDifficulty;
