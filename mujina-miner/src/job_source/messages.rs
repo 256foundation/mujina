@@ -117,10 +117,26 @@ impl Eq for SourceHandle {}
 /// Events are passive notifications—they report what happened, not request action.
 #[derive(Debug)]
 pub enum SourceEvent {
-    /// New job template is available.
-    NewJob(JobTemplate),
+    /// Update with new job (immediate preemption, old shares still valid).
+    ///
+    /// Scheduler immediately preempts all tasks from this source and assigns new
+    /// work. Late-arriving shares from previous jobs should still be submitted.
+    /// Typical case: pool sends updated job (difficulty change, new transactions
+    /// in mempool).
+    UpdateJob(JobTemplate),
 
-    /// Clear all previous jobs (e.g., Stratum clean_jobs flag).
+    /// Replace all jobs (hard invalidation).
+    ///
+    /// Old work is no longer valid - discard current tasks and start fresh
+    /// immediately. Don't submit shares from previous jobs. Used when blockchain
+    /// tip changes (new prevhash) or pool signals clean_jobs.
+    ReplaceJob(JobTemplate),
+
+    /// Clear all jobs (no replacement).
+    ///
+    /// All current work is invalid, but source has no new job available yet.
+    /// Scheduler should cancel all work from this source and wait for new job.
+    /// Used during pool disconnection or when awaiting new block.
     ClearJobs,
 }
 

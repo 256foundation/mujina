@@ -45,7 +45,7 @@ mod extranonce2;
 mod job;
 mod merkle;
 mod messages;
-mod test_blocks;
+pub mod test_blocks;
 mod version;
 
 // Re-export types from submodules

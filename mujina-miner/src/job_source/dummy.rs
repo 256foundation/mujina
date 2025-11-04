@@ -117,7 +117,7 @@ impl DummySource {
                     debug!("Dummy: emitting job {}", self.job_template.id);
                     self.event_tx.send((
                         self.handle.clone(),
-                        SourceEvent::NewJob(self.job_template.clone())
+                        SourceEvent::UpdateJob(self.job_template.clone())
                     )).await?;
                 }
 
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(recv_handle, handle);
 
         match event {
-            SourceEvent::NewJob(job) => {
+            SourceEvent::UpdateJob(job) => {
                 assert_eq!(job.id, "dummy-0");
                 assert_eq!(job.prev_blockhash, *block_881423::PREV_BLOCKHASH);
                 assert_eq!(job.bits, *block_881423::BITS);
