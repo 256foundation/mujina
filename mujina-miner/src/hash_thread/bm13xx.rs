@@ -44,6 +44,7 @@ enum ThreadCommand {
     },
 
     /// Shutdown the thread
+    #[expect(unused)]
     Shutdown,
 }
 
@@ -558,7 +559,7 @@ mod tests {
         let chip_responses = mock_response_stream(responses);
         let chip_commands = mock_command_sink();
 
-        let mut thread = BM13xxThread::new(chip_responses, chip_commands, removal_rx);
+        let thread = BM13xxThread::new(chip_responses, chip_commands, removal_rx);
 
         // Give actor time to process the nonce
         tokio::time::sleep(Duration::from_millis(50)).await;

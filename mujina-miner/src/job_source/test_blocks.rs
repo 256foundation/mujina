@@ -90,7 +90,7 @@ pub mod block_881423 {
     // HEADER_BYTES and the typed field constants produce this hash.
 
     /// Block hash
-    pub const BLOCK_HASH: LazyLock<BlockHash> = LazyLock::new(|| {
+    pub static BLOCK_HASH: LazyLock<BlockHash> = LazyLock::new(|| {
         BlockHash::from_str("0000000000000000000269d52c24ea451225613aab095d90d771d4e29aa96cdd")
             .unwrap()
     });

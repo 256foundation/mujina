@@ -93,10 +93,10 @@ impl ControlChannel {
 
         // Check for protocol errors
         if let Some(error) = response.error() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Control protocol error: {:?}", error),
-            ));
+            return Err(io::Error::other(format!(
+                "Control protocol error: {:?}",
+                error
+            )));
         }
 
         Ok(response)
