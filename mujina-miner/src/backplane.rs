@@ -35,9 +35,19 @@ impl BoardRegistry {
     /// Create a board from USB device info.
     pub async fn create_board(&self, device: UsbDeviceInfo) -> Result<Box<dyn Board + Send>> {
         let desc = self.find_descriptor(&device).ok_or_else(|| {
+            let mfr = device
+                .manufacturer
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("None");
+            let prod = device
+                .product
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("None");
             crate::error::Error::Other(format!(
-                "No board registered for VID={:04x} PID={:04x} Manufacturer={:?} Product={:?}",
-                device.vid, device.pid, device.manufacturer, device.product
+                "No board registered for VID={:04x} PID={:04x} Manufacturer={} Product={}",
+                device.vid, device.pid, mfr, prod
             ))
         })?;
 

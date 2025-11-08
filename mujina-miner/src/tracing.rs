@@ -85,8 +85,14 @@ impl tracing::field::Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(format!("{:?}", value));
         } else {
-            self.fields
-                .push((field.name().to_string(), format!("{:?}", value)));
+            let formatted = format!("{:?}", value);
+            // Clean up Option formatting: Some("foo") -> foo, None -> None
+            let cleaned = if let Some(inner) = formatted.strip_prefix("Some(") {
+                inner.strip_suffix(')').unwrap_or(inner).to_string()
+            } else {
+                formatted
+            };
+            self.fields.push((field.name().to_string(), cleaned));
         }
     }
 }
@@ -137,13 +143,12 @@ where
         // If there are structured fields, write them on a second line
         if !visitor.fields.is_empty() {
             writeln!(writer)?;
-            // Indent 2 spaces after where module starts
+            // Indent to align with module column
             // Timestamp (8 chars) + space + level (5 chars) + space = 15
-            // Module starts at 15, so fields at 15 + 2 = 17
-            write!(writer, "\x1b[2m                 ")?; // 17 spaces, dim
+            write!(writer, "\x1b[90m               ")?; // 15 spaces, bright black (dark gray)
             for (i, (key, value)) in visitor.fields.iter().enumerate() {
                 if i > 0 {
-                    write!(writer, " ")?;
+                    write!(writer, ", ")?;
                 }
                 // Strip quotes from string values
                 let clean_value = value.trim_matches('"');
