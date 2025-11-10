@@ -67,11 +67,37 @@ impl Backplane {
             match event {
                 TransportEvent::Usb(usb_event) => {
                     self.handle_usb_event(usb_event).await?;
-                } // Future: handle other transport types
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Shutdown all boards managed by this backplane.
+    pub async fn shutdown_all_boards(&mut self) {
+        let board_ids: Vec<String> = self.boards.keys().cloned().collect();
+
+        for board_id in board_ids {
+            if let Some(mut board) = self.boards.remove(&board_id) {
+                let model = board.board_info().model;
+                debug!(board = %model, serial = %board_id, "Shutting down board");
+
+                match board.shutdown().await {
+                    Ok(()) => {
+                        info!(board = %model, serial = %board_id, "Board shutdown complete");
+                    }
+                    Err(e) => {
+                        error!(
+                            board = %model,
+                            serial = %board_id,
+                            error = %e,
+                            "Failed to shutdown board"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Handle USB transport events.

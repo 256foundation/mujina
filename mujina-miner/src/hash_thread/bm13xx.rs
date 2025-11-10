@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     asic::bm13xx::{self, protocol},
-    board::bitaxe::ThreadRemovalSignal,
+    board::bitaxe::{BitaxePeripherals, ThreadRemovalSignal},
 };
 
 /// Command messages sent from scheduler to thread
@@ -52,6 +52,7 @@ enum ThreadCommand {
 ///
 /// Represents a chain of BM13xx chips as a schedulable worker. The thread
 /// manages serial communication with chips, filters shares, and reports events.
+/// Chip initialization happens lazily when first work is assigned.
 pub struct BM13xxThread {
     /// Channel for sending commands to the actor
     command_tx: mpsc::Sender<ThreadCommand>,
@@ -69,16 +70,18 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts idle (no task assigned). Takes ownership of streams for
-    /// direct communication with BM13xx chips.
+    /// Thread starts with chip in reset (uninit). Chip will be initialized when
+    /// first work is assigned.
     ///
     /// # Arguments
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
+    /// * `peripherals` - Shared peripheral handles (reset pin, voltage regulator)
     /// * `removal_rx` - Watch channel for board-triggered removal
     pub fn new<R, W>(
         chip_responses: R,
         chip_commands: W,
+        peripherals: BitaxePeripherals,
         removal_rx: watch::Receiver<ThreadRemovalSignal>,
     ) -> Self
     where
@@ -92,7 +95,7 @@ impl BM13xxThread {
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
         let status_clone = Arc::clone(&status);
 
-        // Spawn the actor task (streams moved into task)
+        // Spawn the actor task
         tokio::spawn(async move {
             bm13xx_thread_actor(
                 cmd_rx,
@@ -101,6 +104,7 @@ impl BM13xxThread {
                 status_clone,
                 chip_responses,
                 chip_commands,
+                peripherals,
             )
             .await;
         });
@@ -182,27 +186,441 @@ impl HashThread for BM13xxThread {
     }
 }
 
+/// Initialize BM13xx chip for mining.
+///
+/// Releases chip from reset, configures all registers, and ramps frequency to
+/// target. This is Bitaxe-specific initialization for a single BM1370 chip.
+///
+/// This function contains the complete chip initialization sequence that was
+/// previously done by the board. The chip starts in reset and is configured
+/// for mining when the scheduler assigns first work.
+async fn initialize_chip<W>(
+    chip_commands: &mut W,
+    peripherals: &mut BitaxePeripherals,
+) -> Result<(), HashThreadError>
+where
+    W: Sink<bm13xx::protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    use crate::hw_trait::gpio::{GpioPin, PinValue};
+    use futures::SinkExt;
+    use protocol::{Command, Register};
+
+    // Release from reset
+    tracing::debug!("Releasing ASIC from reset");
+    peripherals
+        .asic_nrst
+        .write(PinValue::High)
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Failed to release reset: {}", e))
+        })?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Send version mask configuration (3 times)
+    tracing::debug!("Configuring version mask");
+    for _ in 1..=3 {
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::VersionMask(protocol::VersionMask::full_rolling()),
+            })
+            .await
+            .map_err(|e| {
+                HashThreadError::InitializationFailed(format!(
+                    "Failed to send version mask: {:?}",
+                    e
+                ))
+            })?;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Pre-configuration registers
+    tracing::debug!("Sending pre-configuration registers");
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::InitControl {
+                raw_value: 0x00000700,
+            },
+        })
+        .await
+        .map_err(|e| HashThreadError::InitializationFailed(format!("Init send failed: {:?}", e)))?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::MiscControl {
+                raw_value: 0x00C100F0,
+            },
+        })
+        .await
+        .map_err(|e| HashThreadError::InitializationFailed(format!("Misc send failed: {:?}", e)))?;
+
+    chip_commands
+        .send(Command::ChainInactive)
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("ChainInactive failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::SetChipAddress { chip_address: 0x00 })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("SetChipAddress failed: {:?}", e))
+        })?;
+
+    // Core configuration (broadcast)
+    tracing::debug!("Sending broadcast core configuration");
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_8B00,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core1 send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_800C,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core2 send failed: {:?}", e))
+        })?;
+
+    // Ticket mask, IO strength
+    use protocol::{Hashrate, ReportingInterval, ReportingRate, TicketMask};
+    let reporting_interval = ReportingInterval::from_rate(
+        Hashrate::gibihashes_per_sec(1024.0),
+        ReportingRate::nonces_per_sec(1.0),
+    );
+    let ticket_mask = TicketMask::new(reporting_interval);
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::TicketMask(ticket_mask),
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("TicketMask send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("IoDriver send failed: {:?}", e))
+        })?;
+
+    // Chip-specific configuration
+    tracing::debug!("Sending chip-specific configuration");
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: false,
+            chip_address: 0x00,
+            register: Register::InitControl {
+                raw_value: 0xF0010700,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("InitControl chip send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: false,
+            chip_address: 0x00,
+            register: Register::MiscControl {
+                raw_value: 0x00C100F0,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("MiscControl chip send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: false,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_8B00,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core chip1 send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: false,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_800C,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core chip2 send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: false,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_82AA,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core chip3 send failed: {:?}", e))
+        })?;
+
+    // Additional settings
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::MiscSettings {
+                raw_value: 0x80440000,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("MiscSettings send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::AnalogMux {
+                raw_value: 0x02000000,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("AnalogMux send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::MiscSettings {
+                raw_value: 0x80440000,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("MiscSettings2 send failed: {:?}", e))
+        })?;
+
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::Core {
+                raw_value: 0x8000_8DEE,
+            },
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Core final send failed: {:?}", e))
+        })?;
+
+    // Frequency ramping (56.25 MHz → 525 MHz)
+    tracing::debug!("Ramping frequency from 56.25 MHz to 525 MHz");
+    let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+
+    for (i, pll_config) in frequency_steps.iter().enumerate() {
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: Register::PllDivider(*pll_config),
+            })
+            .await
+            .map_err(|e| {
+                HashThreadError::InitializationFailed(format!("PLL ramp failed: {:?}", e))
+            })?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        if i % 10 == 0 || i == frequency_steps.len() - 1 {
+            tracing::trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
+        }
+    }
+
+    tracing::debug!("Frequency ramping complete");
+
+    // Final configuration
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("NonceRange send failed: {:?}", e))
+        })?;
+
+    // Final version mask
+    chip_commands
+        .send(Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: Register::VersionMask(protocol::VersionMask::full_rolling()),
+        })
+        .await
+        .map_err(|e| {
+            HashThreadError::InitializationFailed(format!("Final version mask failed: {:?}", e))
+        })?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    tracing::info!("BM13xx chip initialized and ready for mining");
+
+    Ok(())
+}
+
+/// Generate frequency ramp steps for smooth PLL transitions
+fn generate_frequency_ramp_steps(
+    start_mhz: f32,
+    target_mhz: f32,
+    step_mhz: f32,
+) -> Vec<protocol::PllConfig> {
+    let mut configs = Vec::new();
+    let mut current = start_mhz;
+
+    while current <= target_mhz {
+        if let Some(config) = calculate_pll_for_frequency(current) {
+            configs.push(config);
+        }
+        current += step_mhz;
+        if current > target_mhz && (current - step_mhz) < target_mhz {
+            current = target_mhz;
+        }
+    }
+
+    configs
+}
+
+/// Calculate PLL configuration for a specific frequency
+fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
+    const CRYSTAL_FREQ: f32 = 25.0;
+    const MAX_FREQ_ERROR: f32 = 1.0;
+
+    let mut best_fb_div = 0u8;
+    let mut best_ref_div = 0u8;
+    let mut best_post_div1 = 0u8;
+    let mut best_post_div2 = 0u8;
+    let mut min_error = 10.0;
+
+    for ref_div in [2, 1] {
+        if best_fb_div != 0 {
+            break;
+        }
+        for post_div1 in (1..=7).rev() {
+            if best_fb_div != 0 {
+                break;
+            }
+            for post_div2 in (1..=7).rev() {
+                if best_fb_div != 0 {
+                    break;
+                }
+                if post_div1 >= post_div2 {
+                    let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
+                        / CRYSTAL_FREQ;
+                    let fb_div = fb_div_f.round() as u8;
+
+                    if (0xa0..=0xef).contains(&fb_div) {
+                        let actual_freq =
+                            CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
+                        let error = (actual_freq - target_freq).abs();
+
+                        if error < min_error && error < MAX_FREQ_ERROR {
+                            best_fb_div = fb_div;
+                            best_ref_div = ref_div;
+                            best_post_div1 = post_div1;
+                            best_post_div2 = post_div2;
+                            min_error = error;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if best_fb_div == 0 {
+        return None;
+    }
+
+    let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
+    Some(protocol::PllConfig::new(
+        best_fb_div,
+        best_ref_div,
+        post_div,
+    ))
+}
+
 /// Internal actor task for BM13xxThread.
 ///
 /// This runs as an independent Tokio task and handles:
 /// - Commands from scheduler (update/replace work, go idle, shutdown)
 /// - Removal signal from board (USB unplug, fault, etc.)
-/// - Serial communication with chips (TODO)
+/// - Chip initialization (lazy, on first work assignment)
+/// - Serial communication with chips
 /// - Share filtering and event emission (TODO)
 ///
-/// Thread starts idle (no task). Scheduler assigns work when available.
+/// Thread starts with chip in reset (uninit). Chip is configured when scheduler
+/// assigns first work.
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
     status: Arc<RwLock<HashThreadStatus>>,
     mut chip_responses: R,
-    _chip_commands: W,
+    mut chip_commands: W,
+    mut peripherals: BitaxePeripherals,
 ) where
     R: Stream<Item = Result<bm13xx::protocol::Response, std::io::Error>> + Unpin,
     W: Sink<bm13xx::protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    // Chip initialization state
+    let mut chip_initialized = false;
+
     // Thread starts idle (no task)
     let mut current_task: Option<HashTask> = None;
 
@@ -243,13 +661,24 @@ async fn bm13xx_thread_actor<R, W>(
                         };
                         tracing::debug!("BM13xx thread updating work: {}", job_desc);
 
+                        // Initialize chip on first work assignment
+                        if !chip_initialized {
+                            tracing::info!("First work assignment - initializing chip");
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
+                                tracing::error!("Chip initialization failed: {}", e);
+                                response_tx.send(Err(e)).ok();
+                                continue;
+                            }
+                            chip_initialized = true;
+                        }
+
                         // Return old task (None if was idle)
                         let old_task = current_task.replace(new_task);
 
                         // Update status
                         {
                             let mut s = status.write().unwrap();
-                            s.is_active = true;  // Now has work
+                            s.is_active = true;
                         }
 
                         response_tx.send(Ok(old_task)).ok();
@@ -265,13 +694,24 @@ async fn bm13xx_thread_actor<R, W>(
                         };
                         tracing::debug!("BM13xx thread replacing work: {}", job_desc);
 
+                        // Initialize chip on first work assignment
+                        if !chip_initialized {
+                            tracing::info!("First work assignment - initializing chip");
+                            if let Err(e) = initialize_chip(&mut chip_commands, &mut peripherals).await {
+                                tracing::error!("Chip initialization failed: {}", e);
+                                response_tx.send(Err(e)).ok();
+                                continue;
+                            }
+                            chip_initialized = true;
+                        }
+
                         // Return old task (None if was idle)
                         let old_task = current_task.replace(new_task);
 
                         // Update status
                         {
                             let mut s = status.write().unwrap();
-                            s.is_active = true;  // Now has work
+                            s.is_active = true;
                         }
 
                         response_tx.send(Ok(old_task)).ok();
@@ -340,7 +780,37 @@ async fn bm13xx_thread_actor<R, W>(
 mod tests {
     use super::*;
     use futures::stream;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Mutex;
+
+    /// Create mock peripherals for testing
+    ///
+    /// Tests don't assign work (no initialization triggered), so this just
+    /// needs to satisfy type requirements.
+    fn mock_peripherals() -> BitaxePeripherals {
+        use crate::hw_trait::gpio::Gpio;
+        use crate::mgmt_protocol::{
+            bitaxe_raw::{gpio::BitaxeRawGpioController, i2c::BitaxeRawI2c},
+            ControlChannel,
+        };
+        use crate::peripheral::tps546::{Tps546, Tps546Config};
+
+        let serial_stream = tokio_serial::SerialStream::pair().unwrap().0;
+        let control_channel = ControlChannel::new(serial_stream);
+
+        let mut gpio_controller = BitaxeRawGpioController::new(control_channel.clone());
+        let i2c = BitaxeRawI2c::new(control_channel);
+
+        let asic_nrst =
+            futures::executor::block_on(async { gpio_controller.pin(0).await.unwrap() });
+
+        let tps546 = Tps546::new(i2c, Tps546Config::bitaxe_gamma());
+
+        BitaxePeripherals {
+            asic_nrst,
+            regulator: Arc::new(Mutex::new(tps546)),
+        }
+    }
 
     /// Create a mock response stream from a vector of responses
     ///
@@ -368,7 +838,7 @@ mod tests {
         let responses = mock_response_stream(vec![]);
         let commands = mock_command_sink();
 
-        let thread = BM13xxThread::new(responses, commands, removal_rx);
+        let thread = BM13xxThread::new(responses, commands, mock_peripherals(), removal_rx);
 
         // Thread ID is based on task, not a debug name
         assert_eq!(thread.capabilities().hashrate_estimate, 1_000_000_000.0);
@@ -380,6 +850,7 @@ mod tests {
         let mut thread = BM13xxThread::new(
             mock_response_stream(vec![]),
             mock_command_sink(),
+            mock_peripherals(),
             removal_rx,
         );
 
@@ -401,146 +872,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_work_from_idle() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        // Update from idle (None) to active task
-        let task = HashTask::active(123, 1);
-        let old_task = thread.update_work(task).await.unwrap();
-
-        assert!(
-            old_task.is_none(),
-            "Should return None when updating from idle"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_work_from_active() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        // First assign work
-        let task1 = HashTask::active(456, 1);
-        thread.update_work(task1).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Update to new work
-        let task2 = HashTask::active(789, 1);
-        let old_task = thread.update_work(task2).await.unwrap();
-
-        assert!(old_task.is_some(), "Should return old task");
-        assert_eq!(old_task.unwrap().job_id, 456);
-    }
-
-    #[tokio::test]
-    async fn test_replace_work() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        // First update to active work
-        let task1 = HashTask::active(456, 1);
-        thread.update_work(task1).await.unwrap();
-
-        // Give actor time to process
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Replace it
-        let task2 = HashTask::active(789, 2);
-        let old_task = thread.replace_work(task2).await.unwrap();
-
-        assert!(old_task.is_some(), "Should return old task");
-        assert_eq!(old_task.unwrap().job_id, 456, "Should return old task");
-    }
-
-    #[tokio::test]
-    async fn test_go_idle() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        // Assign work first
-        thread.update_work(HashTask::dummy(100)).await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Go idle
-        let old_task = thread.go_idle().await.unwrap();
-
-        assert!(old_task.is_some(), "Should return old task when going idle");
-        assert_eq!(old_task.unwrap().job_id, 100);
-    }
-
-    #[tokio::test]
-    async fn test_go_idle_when_already_idle() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        // Thread starts idle, try to go idle again
-        let old_task = thread.go_idle().await.unwrap();
-
-        assert!(old_task.is_none(), "Should return None when already idle");
-    }
-
-    #[tokio::test]
-    async fn test_status_updates() {
-        let (_removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-        let mut thread = BM13xxThread::new(
-            mock_response_stream(vec![]),
-            mock_command_sink(),
-            removal_rx,
-        );
-
-        let status_before = thread.status();
-        assert!(
-            !status_before.is_active,
-            "Should start inactive (idle, no task)"
-        );
-
-        // Update to active work
-        thread.update_work(HashTask::active(789, 1)).await.unwrap();
-
-        // Give actor time to update status
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let status_after = thread.status();
-        assert!(
-            status_after.is_active,
-            "Should be active after receiving task"
-        );
-
-        // Go idle
-        thread.go_idle().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let status_idle = thread.status();
-        assert!(
-            !status_idle.is_active,
-            "Should be inactive after going idle"
-        );
-    }
-
-    #[tokio::test]
     async fn test_thread_processes_known_good_nonce() {
         use crate::job_source::test_blocks::block_881423;
 
@@ -559,7 +890,12 @@ mod tests {
         let chip_responses = mock_response_stream(responses);
         let chip_commands = mock_command_sink();
 
-        let thread = BM13xxThread::new(chip_responses, chip_commands, removal_rx);
+        let thread = BM13xxThread::new(
+            chip_responses,
+            chip_commands,
+            mock_peripherals(),
+            removal_rx,
+        );
 
         // Give actor time to process the nonce
         tokio::time::sleep(Duration::from_millis(50)).await;

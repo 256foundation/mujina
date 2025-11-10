@@ -8,4 +8,4 @@ pub mod bitaxe_raw;
 
 // Re-export commonly used types
 pub use bitaxe_raw::channel::ControlChannel;
-pub use bitaxe_raw::gpio::BitaxeRawGpio;
+pub use bitaxe_raw::gpio::{BitaxeRawGpioController, BitaxeRawGpioPin};

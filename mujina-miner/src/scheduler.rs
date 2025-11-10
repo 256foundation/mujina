@@ -44,10 +44,7 @@ pub async fn task(
             info!("Received {} hash thread(s) from backplane", threads.len());
             threads
         }
-        None => {
-            debug!("Thread channel closed before receiving any threads");
-            return;
-        }
+        None => return,
     };
 
     // Store threads and get their event receivers

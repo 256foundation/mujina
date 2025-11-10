@@ -8,11 +8,16 @@ use crate::hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue};
 use crate::hw_trait::{HwError, Result};
 
 /// GPIO controller using bitaxe-raw control protocol.
-pub struct BitaxeRawGpio {
+///
+/// The controller provides access to individual GPIO pins. For shared access
+/// to specific pins (e.g., between board and thread), create pin handles and
+/// clone them rather than sharing the controller.
+#[derive(Clone)]
+pub struct BitaxeRawGpioController {
     channel: ControlChannel,
 }
 
-impl BitaxeRawGpio {
+impl BitaxeRawGpioController {
     /// Create a new GPIO controller using the given control channel.
     pub fn new(channel: ControlChannel) -> Self {
         Self { channel }
@@ -20,7 +25,7 @@ impl BitaxeRawGpio {
 }
 
 #[async_trait]
-impl Gpio for BitaxeRawGpio {
+impl Gpio for BitaxeRawGpioController {
     type Pin = BitaxeRawGpioPin;
 
     async fn pin(&mut self, number: u8) -> Result<Self::Pin> {
@@ -31,7 +36,12 @@ impl Gpio for BitaxeRawGpio {
     }
 }
 
-/// GPIO pin using bitaxe-raw control protocol.
+/// GPIO pin handle using bitaxe-raw control protocol.
+///
+/// Pin handles are stateless and Clone-able - they wrap a shared ControlChannel
+/// and a pin number. Multiple handles to the same pin can coexist safely since
+/// operations coordinate through the underlying synchronized channel.
+#[derive(Clone)]
 pub struct BitaxeRawGpioPin {
     channel: ControlChannel,
     number: u8,

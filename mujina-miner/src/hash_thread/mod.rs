@@ -106,6 +106,9 @@ pub enum HashThreadError {
 
     #[error("Shutdown timeout")]
     ShutdownTimeout,
+
+    #[error("Chip initialization failed: {0}")]
+    InitializationFailed(String),
 }
 
 /// HashThread trait - the scheduler's view of a schedulable worker.

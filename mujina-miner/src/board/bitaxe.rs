@@ -2,12 +2,13 @@ use async_trait::async_trait;
 use futures::sink::SinkExt;
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, ReadBuf},
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Mutex},
     time,
 };
 use tokio_stream::StreamExt;
@@ -15,19 +16,21 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::{
     asic::{
-        bm13xx::{
-            self,
-            protocol::{Command, Hashrate, ReportingInterval, ReportingRate, TicketMask},
-            BM13xxProtocol,
-        },
-        ChipInfo, MiningJob, NonceResult,
+        bm13xx::{self, protocol::Command, BM13xxProtocol},
+        ChipInfo, MiningJob,
     },
     hash_thread::{bm13xx::BM13xxThread, HashThread},
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
     },
-    mgmt_protocol::{bitaxe_raw::i2c::BitaxeRawI2c, BitaxeRawGpio, ControlChannel},
+    mgmt_protocol::{
+        bitaxe_raw::{
+            gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
+            i2c::BitaxeRawI2c,
+        },
+        ControlChannel,
+    },
     peripheral::{
         emc2101::Emc2101,
         tps546::{Tps546, Tps546Config},
@@ -65,6 +68,20 @@ pub enum ThreadRemovalSignal {
 
     /// Remove: Graceful system shutdown
     Shutdown,
+}
+
+/// Peripheral handles shared between board and hash thread.
+///
+/// Board-specific design choice for Bitaxe: the thread needs direct access to
+/// the reset pin and voltage regulator for real-time chip control. Other boards
+/// may use different cooperation patterns.
+#[derive(Clone)]
+pub struct BitaxePeripherals {
+    /// ASIC reset (active low)
+    pub asic_nrst: BitaxeRawGpioPin,
+
+    /// Voltage regulator for core voltage tuning (cached state requires Mutex)
+    pub regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
 }
 
 /// A wrapper around AsyncRead that traces raw bytes as they're read
@@ -114,16 +131,15 @@ impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
 /// hashboard, including GPIO reset control and board initialization sequences.
 pub struct BitaxeBoard {
     /// Control channel for board management
-    #[expect(dead_code, reason = "Will be used for direct control protocol access")]
     control_channel: ControlChannel,
-    /// GPIO controller
-    gpio: BitaxeRawGpio,
+    /// ASIC reset (active low)
+    asic_nrst: Option<BitaxeRawGpioPin>,
     /// I2C bus controller
     i2c: BitaxeRawI2c,
-    /// Fan controller (EMC2101)
+    /// Fan controller (board-controlled only, not shared with thread)
     fan_controller: Option<Emc2101<BitaxeRawI2c>>,
-    /// Power management controller (TPS546D24A)
-    power_controller: Option<Tps546<BitaxeRawI2c>>,
+    /// Voltage regulator (shared with thread, cached state)
+    regulator: Option<Arc<Mutex<Tps546<BitaxeRawI2c>>>>,
     /// Writer for sending commands to chips (transferred to hash thread)
     data_writer: Option<FramedWrite<SerialWriter, bm13xx::FrameCodec>>,
     /// Reader for receiving responses from chips (transferred to hash thread)
@@ -174,9 +190,8 @@ impl BitaxeBoard {
     /// In the future, a DeviceManager will create boards when USB devices
     /// are detected (by VID/PID) and pass already-opened serial streams.
     pub fn new(control: tokio_serial::SerialStream, data_path: &str) -> Result<Self, BoardError> {
-        // Create control channel, GPIO and I2C controllers
+        // Create control channel and I2C controller
         let control_channel = ControlChannel::new(control);
-        let gpio = BitaxeRawGpio::new(control_channel.clone());
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Create SerialStream for data channel at initial baud rate
@@ -190,10 +205,10 @@ impl BitaxeBoard {
 
         Ok(BitaxeBoard {
             control_channel,
-            gpio,
+            asic_nrst: None,
             i2c,
             fan_controller: None,
-            power_controller: None,
+            regulator: None,
             data_writer: Some(FramedWrite::new(data_writer, bm13xx::FrameCodec::default())),
             data_reader: Some(FramedRead::new(
                 tracing_reader,
@@ -231,15 +246,14 @@ impl BitaxeBoard {
 
     /// Release the mining chips from reset state.
     async fn release_reset(&mut self) -> Result<(), BoardError> {
-        // Get the ASIC reset pin
-        let mut reset_pin =
-            self.gpio.pin(Self::ASIC_RESET_PIN).await.map_err(|e| {
-                BoardError::HardwareControl(format!("Failed to get reset pin: {}", e))
-            })?;
+        let reset_pin = self
+            .asic_nrst
+            .as_mut()
+            .ok_or_else(|| BoardError::HardwareControl("Reset pin not initialized".to_string()))?;
 
-        // Set reset high (inactive)
+        // Set reset high (inactive - active low signal)
         debug!(
-            "De-asserting ASIC reset (GPIO {} = high)",
+            "De-asserting ASIC nRST (GPIO {} = high)",
             Self::ASIC_RESET_PIN
         );
         reset_pin.write(PinValue::High).await.map_err(|e| {
@@ -255,13 +269,12 @@ impl BitaxeBoard {
     /// effectively disabling all connected mining chips. This is used
     /// during shutdown to ensure chips are in a safe, non-hashing state.
     pub async fn hold_in_reset(&mut self) -> Result<(), BoardError> {
-        // Get the ASIC reset pin
-        let mut reset_pin =
-            self.gpio.pin(Self::ASIC_RESET_PIN).await.map_err(|e| {
-                BoardError::HardwareControl(format!("Failed to get reset pin: {}", e))
-            })?;
+        let reset_pin = self
+            .asic_nrst
+            .as_mut()
+            .ok_or_else(|| BoardError::HardwareControl("Reset pin not initialized".to_string()))?;
 
-        // Hold reset low (active)
+        // Hold reset low (active - active low signal)
         reset_pin
             .write(PinValue::Low)
             .await
@@ -383,100 +396,6 @@ impl BitaxeBoard {
         }
     }
 
-    /// Spawn a task to monitor chip responses and emit events
-    fn spawn_event_monitor(&mut self) {
-        let Some(event_tx) = self.event_tx.clone() else {
-            error!("Cannot spawn event monitor without event channel");
-            return;
-        };
-
-        // Take ownership of the data reader for the monitoring task
-        let data_reader = self
-            .data_reader
-            .take()
-            .expect("Data reader should be available during initialization");
-
-        // Clone current job ID for the task
-        let current_job_id = self.current_job_id;
-
-        // Spawn the monitoring task
-        tokio::spawn(async move {
-            let mut reader = data_reader;
-
-            loop {
-                match reader.next().await {
-                    Some(Ok(response)) => {
-                        match response {
-                            bm13xx::Response::Nonce {
-                                nonce,
-                                job_id,
-                                midstate_num: _,
-                                version,
-                                subcore_id: _,
-                            } => {
-                                // Extract core ID from nonce (bits 25-31)
-                                let core_id = ((nonce >> 25) & 0x7f) as u8;
-
-                                // Send nonce found event
-                                let nonce_result = NonceResult {
-                                    job_id: job_id as u64,
-                                    nonce,
-                                    version,
-                                    hash: [0; 32], // TODO: Calculate actual hash if needed
-                                };
-
-                                if event_tx
-                                    .send(BoardEvent::NonceFound(nonce_result))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("Failed to send nonce event, receiver dropped");
-                                    break;
-                                }
-
-                                debug!(
-                                    "Nonce found: job_id={}, nonce=0x{:08x}, core={}, version=0x{:04x}",
-                                    job_id, nonce, core_id, version
-                                );
-                            }
-                            bm13xx::Response::ReadRegister {
-                                chip_address,
-                                register,
-                            } => {
-                                // Log register reads but don't emit events for them
-                                trace!("Register read from chip {}: {:?}", chip_address, register);
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!("Error decoding response: {}", e);
-
-                        // Send chip error event
-                        if event_tx
-                            .send(BoardEvent::ChipError {
-                                chip_address: 0, // TODO: Get actual chip address
-                                error: format!("Decode error: {}", e),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => {
-                        error!("Data stream closed unexpectedly");
-                        break;
-                    }
-                }
-            }
-
-            info!("Event monitor task exiting");
-        });
-
-        // Spawn job completion timer outside the main monitoring task
-        self.spawn_job_timer(current_job_id);
-    }
-
     /// Initialize the power controller
     async fn init_power_controller(&mut self) -> Result<(), BoardError> {
         // Clone the I2C bus for the power controller
@@ -521,7 +440,7 @@ impl BitaxeBoard {
                     }
                 }
 
-                self.power_controller = Some(tps546);
+                self.regulator = Some(Arc::new(Mutex::new(tps546)));
                 Ok(())
             }
             Err(e) => {
@@ -545,10 +464,10 @@ impl BitaxeBoard {
             Ok(()) => {
                 info!("EMC2101 fan controller initialized");
 
-                // Set initial fan speed to 50%
-                const INITIAL_FAN_PERCENT: u8 = 50;
-                if let Err(e) = fan.set_pwm_percent(INITIAL_FAN_PERCENT).await {
-                    warn!("Failed to set initial fan speed: {}", e);
+                // Set fan to full speed until closed-loop control is implemented
+                const FULL_SPEED: u8 = 100;
+                if let Err(e) = fan.set_pwm_percent(FULL_SPEED).await {
+                    warn!("Failed to set fan speed: {}", e);
                 }
 
                 self.fan_controller = Some(fan);
@@ -566,6 +485,7 @@ impl BitaxeBoard {
     ///
     /// Calculates PLL configurations for each frequency step from start to target.
     /// Uses the same algorithm as esp-miner for BM1370 chips.
+    #[cfg(test)]
     fn generate_frequency_ramp_steps(
         start_mhz: f32,
         target_mhz: f32,
@@ -606,6 +526,7 @@ impl BitaxeBoard {
     ///
     /// Note: esp-miner uses a "first-found" algorithm rather than finding the optimal
     /// configuration. This implementation matches that behavior for consistency.
+    #[cfg(test)]
     fn calculate_pll_for_frequency(target_freq: f32) -> Option<bm13xx::protocol::PllConfig> {
         const CRYSTAL_FREQ: f32 = 25.0;
         const MAX_FREQ_ERROR: f32 = 1.0; // Maximum acceptable frequency error in MHz
@@ -801,58 +722,52 @@ impl BitaxeBoard {
 #[async_trait]
 impl Board for BitaxeBoard {
     async fn reset(&mut self) -> Result<(), BoardError> {
-        // Use the existing momentary_reset method
         self.momentary_reset().await?;
         Ok(())
     }
 
     async fn hold_in_reset(&mut self) -> Result<(), BoardError> {
-        // Call the inherent method, not the trait method
         BitaxeBoard::hold_in_reset(self).await?;
         Ok(())
     }
 
     async fn initialize(&mut self) -> Result<mpsc::Receiver<BoardEvent>, BoardError> {
+        // Create GPIO controller and get reset pin handle
+        let mut gpio_controller = BitaxeRawGpioController::new(self.control_channel.clone());
+        let reset_pin = gpio_controller
+            .pin(Self::ASIC_RESET_PIN)
+            .await
+            .map_err(|e| {
+                BoardError::InitializationFailed(format!("Failed to get reset pin: {}", e))
+            })?;
+        self.asic_nrst = Some(reset_pin);
+
         // Phase 1: Hold ASIC in reset during power configuration
         debug!("Holding ASIC in reset during power initialization");
         self.hold_in_reset().await?;
 
         // Phase 2: Initialize power controller while ASIC is in reset
-        // This ensures stable core voltage before chip operation
-
-        // Set I2C bus frequency to 100kHz for all devices
         self.i2c.set_frequency(100_000).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to set I2C frequency: {}", e))
         })?;
 
-        // Initialize fan controller first to test I2C
         self.init_fan_controller().await?;
-
-        // Initialize power controller and set core voltage
         self.init_power_controller().await?;
 
-        // Wait for voltage to fully stabilize after PMIC init
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Phase 3: Release ASIC from reset now that power is stable
-        debug!("Releasing ASIC from reset");
+        // Phase 3: Release ASIC from reset for discovery
+        debug!("Releasing ASIC from reset for discovery");
         self.release_reset().await?;
 
-        // Give ASIC time to stabilize after reset release
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // Phase 4: Initial communication at 115200 baud
-        debug!("Starting chip initialization at 115200 baud");
-
-        // Step 1: Version Mask Configuration (Enable 11-bit responses)
-        // The very first commands sent are to configure the version mask.
-        // This MUST be done before chip discovery to enable 11-bit response frames.
-        // Send 3 times as per reference implementation
+        // Phase 4: Version mask and chip discovery
         debug!("Sending version mask configuration (3 times)");
         for i in 1..=3 {
             trace!("Version mask send {}/3", i);
             let version_cmd = Command::WriteRegister {
-                broadcast: true, // Broadcast to all chips
+                broadcast: true,
                 chip_address: 0x00,
                 register: bm13xx::protocol::Register::VersionMask(
                     bm13xx::protocol::VersionMask::full_rolling(),
@@ -862,10 +777,8 @@ impl Board for BitaxeBoard {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
-        // Small delay after version rolling configuration
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Step 2: Chip Discovery
         self.discover_chips().await?;
 
         debug!("Discovered {} chip(s)", self.chip_infos.len());
@@ -882,268 +795,19 @@ impl Board for BitaxeBoard {
             debug!("Found expected BM1370 chip");
         }
 
-        // Step 3: Pre-Configuration (after 1-second pause per reference)
-        debug!("Waiting 1 second before configuration...");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Send version mask again
-        debug!("Sending version mask again after discovery");
-        let version_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        self.send_config_command(version_cmd).await?;
-
-        // InitControl register = 0x0700
-        let init_control_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::InitControl {
-                raw_value: 0x00000700,
-            },
-        };
-        self.send_config_command(init_control_cmd).await?;
-
-        // MiscControl register = 0xC100F0
-        let misc_control_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::MiscControl {
-                raw_value: 0x00C100F0,
-            },
-        };
-        self.send_config_command(misc_control_cmd).await?;
-
-        // ChainInactive command
-        self.send_config_command(Command::ChainInactive).await?;
-
-        // SetChipAddress command for addr=0x00
-        let set_addr_cmd = Command::SetChipAddress { chip_address: 0x00 };
-        self.send_config_command(set_addr_cmd).await?;
-
-        // BM1370 requires additional initialization after chip discovery
-        // Step 4: Core Configuration (Broadcast)
-        debug!("Sending broadcast core configuration");
-
-        // CoreRegister = 0x8B0080 (sent as big-endian: 0x80 0x00 0x8B 0x00)
-        let core_reg_cmd1 = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_8B00, // Big-endian encoding
-            },
-        };
-        self.send_config_command(core_reg_cmd1).await?;
-
-        // CoreRegister = 0x0C8080 (sent as big-endian: 0x80 0x00 0x80 0x0C)
-        let core_reg_cmd2 = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_800C, // Big-endian encoding
-            },
-        };
-        self.send_config_command(core_reg_cmd2).await?;
-
-        // Set ticket mask for nonce reporting
-        // Bitaxe Gamma: use 1024 GH/s to get zero_bits=8 matching esp-miner
-        let reporting_interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(1024.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        let ticket_mask = TicketMask::new(reporting_interval);
-        let ticket_mask_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::TicketMask(ticket_mask),
-        };
-        self.send_config_command(ticket_mask_cmd).await?;
-
-        // IoDriverStrength = 0x11110100
-        let io_strength_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::IoDriverStrength(
-                bm13xx::protocol::IoDriverStrength::normal(),
-            ),
-        };
-        self.send_config_command(io_strength_cmd).await?;
-
-        // Step 5: Chip-Specific Configuration (addr=0x00)
-        debug!("Sending chip-specific configuration for address 0x00");
-
-        // InitControl = 0xF0010700 (chip-specific, not broadcast)
-        let init_control_specific = Command::WriteRegister {
-            broadcast: false, // Not broadcast - specific to chip 0x00
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::InitControl {
-                raw_value: 0xF0010700,
-            },
-        };
-        self.send_config_command(init_control_specific).await?;
-
-        // MiscControl = 0xC100F0 (chip-specific)
-        let misc_control_specific = Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::MiscControl {
-                raw_value: 0x00C100F0,
-            },
-        };
-        self.send_config_command(misc_control_specific).await?;
-
-        // CoreRegister = 0x8B0080 (chip-specific)
-        let core_reg_specific1 = Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_8B00, // Big-endian
-            },
-        };
-        self.send_config_command(core_reg_specific1).await?;
-
-        // CoreRegister = 0x0C8080 (chip-specific)
-        let core_reg_specific2 = Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_800C, // Big-endian
-            },
-        };
-        self.send_config_command(core_reg_specific2).await?;
-
-        // CoreRegister = 0xAA820080 (chip-specific)
-        let core_reg_specific3 = Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_82AA, // Big-endian encoding
-            },
-        };
-        self.send_config_command(core_reg_specific3).await?;
-
-        // Step 6: Additional Settings
-        debug!("Sending additional settings");
-
-        // MiscSettings = 0x80440000 (bytes: 00 00 44 80)
-        let misc_b9_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::MiscSettings {
-                raw_value: 0x80440000, // Little-endian: bytes 00 00 44 80
-            },
-        };
-        self.send_config_command(misc_b9_cmd).await?;
-
-        // Register 0x54: Analog mux control (temperature diode)
-        let analog_mux_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::AnalogMux {
-                raw_value: 0x02000000, // Little-endian: bytes 00 00 00 02
-            },
-        };
-        self.send_config_command(analog_mux_cmd).await?;
-
-        // Send misc B9 again (esp-miner does this)
-        let misc_b9_cmd2 = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::MiscSettings {
-                raw_value: 0x80440000, // Little-endian: bytes 00 00 44 80
-            },
-        };
-        self.send_config_command(misc_b9_cmd2).await?;
-
-        // Additional CoreRegister = 0xEE8D0080 (after misc settings)
-        let core_reg_final = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::Core {
-                raw_value: 0x8000_8DEE, // Big-endian encoding
-            },
-        };
-        self.send_config_command(core_reg_final).await?;
-
-        // Step 7: Frequency Ramping (56.25 MHz → 525 MHz)
-        // The frequency is ramped up gradually through many steps
-        // Following esp-miner's approach: 6.25 MHz steps with 100ms delays
-        debug!("Starting frequency ramping from 56.25 MHz to 525 MHz");
-        let frequency_steps = Self::generate_frequency_ramp_steps(56.25, 525.0, 6.25);
-
-        for (i, pll_config) in frequency_steps.iter().enumerate() {
-            let pll_cmd = Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::PllDivider(*pll_config),
-            };
-            self.send_config_command(pll_cmd).await?;
-
-            // Wait ~100ms between frequency steps (matching esp-miner)
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            if i % 10 == 0 || i == frequency_steps.len() - 1 {
-                trace!("Frequency ramp step {}/{}", i + 1, frequency_steps.len());
-            }
-        }
-
-        debug!("Frequency ramping complete");
-
-        // Step 8: Final Configuration
-        // After frequency ramping is complete
-
-        // NonceRange = 0xB51E0000 (value from reference implementation)
-        let nonce_range_value = 0xB51E0000; // Raw value from captures
-        let nonce_range_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::NonceRange(
-                // Create NonceRangeConfig with the exact value
-                // Note: This might need a custom constructor in the protocol module
-                bm13xx::protocol::NonceRangeConfig::from_raw(nonce_range_value),
-            ),
-        };
-        self.send_config_command(nonce_range_cmd).await?;
-
-        // TODO: Implement baud rate change to 1M baud after frequency ramping
-        // Linux CDC ACM driver doesn't appear to send SET_LINE_CODING USB control
-        // requests, so bitaxe-raw firmware never changes UART baud rate. Need to either:
-        // 1. Use rusb to send SET_LINE_CODING directly, or
-        // 2. Implement a bitaxe-raw control channel command for baud rate changes
-        warn!("Skipping baud rate change, staying at 115200");
-
-        // Step 9: Version Mask Re-Send (final)
-        // After all configuration, send version mask once more
-        debug!("Sending final version mask configuration");
-        let version_cmd_final = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        self.send_config_command(version_cmd_final).await?;
-
-        // Allow PLL and chip configuration to settle before sending jobs
-        debug!("Waiting for chip configuration to settle");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Put chip back in reset
+        debug!("Putting ASIC back in reset");
+        self.hold_in_reset().await?;
 
         // Create event channel
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         self.event_tx = Some(tx);
         self.event_rx = Some(rx);
 
-        // TODO: Spawn task to monitor chip responses and emit events
-        self.spawn_event_monitor();
-
         // Spawn statistics monitoring task
         self.spawn_stats_monitor();
 
         // Return a dummy receiver for trait compatibility
-        // Actual receiver is retrieved via take_event_receiver()
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
         drop(dummy_tx);
         Ok(dummy_rx)
@@ -1227,26 +891,26 @@ impl Board for BitaxeBoard {
                 warn!("Failed to send shutdown signal to threads: {}", e);
             } else {
                 debug!("Sent shutdown signal to hash threads");
-                // Give threads time to exit gracefully
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
 
-        // Send chain inactive command to stop all chips from hashing
-        let command = Command::ChainInactive;
-        self.send_config_command(command).await?;
-
-        // Give chips time to stop hashing
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Hold chips in reset to ensure they stay in a safe state
+        // Hold chips in reset
         self.hold_in_reset().await?;
 
         // Turn off core voltage
-        if let Some(ref mut power) = self.power_controller {
-            match power.set_vout(0.0).await {
+        if let Some(ref regulator) = self.regulator {
+            match regulator.lock().await.set_vout(0.0).await {
                 Ok(()) => info!("Core voltage turned off"),
                 Err(e) => warn!("Failed to turn off core voltage: {}", e),
+            }
+        }
+
+        // Reduce fan speed (no more heat generation)
+        if let Some(ref mut fan) = self.fan_controller {
+            const SHUTDOWN_FAN_SPEED: u8 = 25;
+            if let Err(e) = fan.set_pwm_percent(SHUTDOWN_FAN_SPEED).await {
+                warn!("Failed to set fan speed: {}", e);
             }
         }
 
@@ -1281,8 +945,24 @@ impl Board for BitaxeBoard {
                 "No data writer available - already taken or not initialized".into(),
             ))?;
 
-        // Create BM13xxThread with the streams
-        let thread = BM13xxThread::new(data_reader, data_writer, removal_rx);
+        // Create peripheral bundle for thread
+        let peripherals = BitaxePeripherals {
+            asic_nrst: self
+                .asic_nrst
+                .clone()
+                .ok_or(BoardError::InitializationFailed(
+                    "Reset pin not initialized".into(),
+                ))?,
+            regulator: self
+                .regulator
+                .clone()
+                .ok_or(BoardError::InitializationFailed(
+                    "Voltage regulator not initialized".into(),
+                ))?,
+        };
+
+        // Create BM13xxThread with streams and peripherals
+        let thread = BM13xxThread::new(data_reader, data_writer, peripherals, removal_rx);
 
         info!("Created BM13xx hash thread from BitaxeBoard");
 

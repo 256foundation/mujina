@@ -306,7 +306,18 @@ Hash board implementations that compose all hardware elements:
 - `bitaxe.rs` - Original Bitaxe board implementation
 - `ember_one.rs` - EmberOne board using layered architecture
 - `registry.rs` - Board type registry for dynamic instantiation
-- Manages: ASIC chains, cooling, power delivery, monitoring
+
+Board responsibilities:
+- Hardware initialization and lifecycle management
+- Creating hash threads for work assignment
+- Providing threads with chip communication mechanisms (implementation-specific)
+- Optionally sharing peripheral access to enable thread autonomy
+- Monitoring hardware health (temperature, power, faults)
+- Coordinating shutdown and cleanup
+
+The board-thread relationship is intentionally board-specific to allow diverse
+hardware designs. Some boards may give threads direct hardware access, while
+others may mediate all hardware operations.
 
 #### `asic/`
 Mining ASIC drivers:
@@ -315,13 +326,46 @@ Mining ASIC drivers:
 - Handles: work distribution, nonce collection, frequency control
 - Communicates through hw_trait layer for maximum flexibility
 
+#### Hash Threads
+
+Hash threads are the scheduler's abstraction for mining work assignment. The
+`HashThread` trait defines only the minimal interface the scheduler needs:
+- Work assignment methods (`update_work()`, `replace_work()`, `go_idle()`)
+- Event reporting channel for shares and status updates
+- Capability and status queries
+- Future: Scheduler will control thread hashrate for power management
+
+Everything else---chip communication, peripheral access, internal
+architecture---is board-specific implementation detail. This design allows
+radically different board architectures:
+
+**Communication with chips**: Boards may transfer serial I/O ownership to
+threads, use message passing, share a communication bus, or any other pattern
+that suits the hardware.
+
+**Peripheral access**: Threads may need direct access to board peripherals for
+real-time optimization (voltage tuning, thermal throttling, fault recovery).
+Boards may provide this access via shared references (e.g., Arc-wrapped
+peripherals), message-based requests, or keep all peripheral control
+board-mediated. The choice depends on the hardware design and optimization
+requirements.
+
+**Shutdown coordination**: Board-to-thread shutdown signaling is
+implementation-specific, using watch channels, cancellation tokens, or custom
+mechanisms as appropriate.
+
+This flexibility enables diverse hardware designs without requiring scheduler
+changes. The scheduler sees only a uniform HashThread interface, while boards
+and threads collaborate in hardware-appropriate ways.
+
 #### `backplane.rs`
 Communication substrate between boards and scheduler:
 - Listens to `transport` discovery events
 - Identifies board types (USB VID/PID or probing)
 - Creates/destroys board instances
 - Maintains active board registry
-- Routes board events and threads to scheduler
+- Extracts hash threads from boards and routes to scheduler
+- Boards remain active for hardware lifecycle management
 - Coordinates emergency shutdowns and hotplug
 
 #### `job_source/`

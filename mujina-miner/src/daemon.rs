@@ -55,6 +55,9 @@ impl Daemon {
                     }
                     _ = shutdown.cancelled() => {}
                 }
+
+                // Shutdown all boards regardless of which arm completed
+                backplane.shutdown_all_boards().await;
             }
         });
 
