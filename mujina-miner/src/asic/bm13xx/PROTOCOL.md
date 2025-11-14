@@ -81,9 +81,9 @@ otherwise little-endian protocols.
 
 ### Special Cases
 
-- **Hash values** (merkle_root, prev_block_hash): 32-byte SHA-256 hashes
-  transmitted in big-endian byte order as received from Bitcoin libraries, without
-  endianness conversion
+- **Hash values** (merkle_root, prev_block_hash): Convert from Bitcoin internal
+  32-byte little-endian format by splitting into 8 4-byte words and reversing
+  their order (word 0 with 7, 1 with 6, 2 with 5, 3 with 4).
 - **chip_id in responses**: Treat as fixed byte sequence `[0x13, 0x70]` rather
   than an integer value
 - **Single bytes**: No endianness applies (job_id, chip_address, etc.)
@@ -227,9 +227,13 @@ merkle_root[32] | prev_block_hash[32] | version[4] |
 - **ntime** (4 bytes): Block timestamp (little-endian)
   - Unix timestamp
 - **merkle_root** (32 bytes): Root of transaction merkle tree
-  - SHA256 hash, transmitted as-is (no endianness conversion)
+  - Convert from Bitcoin internal 32-byte little-endian format by splitting
+    into 8 4-byte words and reversing their order (word 0 with 7, 1 with 6, 2
+    with 5, 3 with 4)
 - **prev_block_hash** (32 bytes): Hash of previous block
-  - SHA256 hash, transmitted as-is (no endianness conversion)
+  - Convert from Bitcoin internal 32-byte little-endian format by splitting
+    into 8 4-byte words and reversing their order (word 0 with 7, 1 with 6, 2
+    with 5, 3 with 4)
 - **version** (4 bytes): Block version (little-endian)
   - Example: 0x20000000 → transmitted as [0x00, 0x00, 0x00, 0x20]
   - Lower bits may be modified if version rolling enabled
