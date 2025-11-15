@@ -2,6 +2,13 @@
 
 Open source Bitcoin mining software written in Rust for ASIC mining hardware.
 
+> **Developer Preview**: This software is under heavy development and not ready
+> for production use. The code is made available for developers interested in
+> contributing, learning about Bitcoin mining protocols, or evaluating the
+> architecture. APIs, protocols, and features are subject to change without
+> notice. Documentation is incomplete and may be inaccurate. Use at your own
+> risk.
+
 ## Overview
 
 mujina-miner is a modern, async Rust implementation of Bitcoin mining software
@@ -134,20 +141,6 @@ cargo run --bin mujina-dissect -- path/to/capture.csv -x
 The tool reuses the same protocol parsing code as the miner itself, ensuring
 consistency between analysis and runtime behavior.
 
-## Development Status
-
-This is an active development project. Current focus areas:
-- [x] USB device discovery and hotplug monitoring
-- [x] Basic board initialization and chip discovery
-- [x] GPIO control for ASIC reset
-- [x] I2C peripheral control implementation
-- [x] EMC2101 fan controller with temperature monitoring
-- [x] TPS546 power management controller
-- [ ] Additional temperature sensors (TMP75)
-- [ ] Power monitoring (INA260)
-- [ ] Stratum pool communication
-- [ ] Production-ready error handling and recovery
-
 ## License
 
 This project is licensed under the GNU General Public License v3.0 or later -
@@ -155,8 +148,12 @@ see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md)
-for details on how to get started.
+We welcome contributions! Whether you're fixing bugs, adding features, improving
+documentation, or simply exploring the codebase to learn about Bitcoin mining
+protocols and hardware, your involvement is valued.
+
+Please see our [Contributing Guide](CONTRIBUTING.md) for details on how to get
+started.
 
 ## Related Projects
 
