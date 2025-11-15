@@ -1443,28 +1443,6 @@ mod init_tests {
     }
 
     #[test]
-    fn frequency_ramp_sequence() {
-        let protocol = BM13xxProtocol::new();
-        let start = Frequency::from_mhz(400.0).unwrap();
-        let target = Frequency::from_mhz(600.0).unwrap();
-        let commands = protocol.frequency_ramp(start, target, 5);
-
-        assert_eq!(commands.len(), 5);
-
-        // Verify it's a gradual increase - check that PLL configs are generated
-        for cmd in commands.iter() {
-            assert!(matches!(
-                cmd,
-                Command::WriteRegister {
-                    register: Register::PllDivider(_),
-                    broadcast: true,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
     fn pll_calculation_produces_valid_frequencies() {
         // Test cases from serial captures showing PLL values sent by esp-miner
         // Note: esp-miner uses first-found algorithm while we find optimal settings
@@ -2750,40 +2728,6 @@ impl BM13xxProtocol {
 
         // Write nonce range to all chips
         commands.push(self.broadcast_write(Register::NonceRange(nonce_config)));
-
-        commands
-    }
-
-    /// Generate frequency ramping sequence for gradual clock increase.
-    ///
-    /// This prevents power spikes and thermal stress during startup.
-    #[allow(dead_code)]
-    pub fn frequency_ramp(
-        &self,
-        start: Frequency,
-        target: Frequency,
-        steps: usize,
-    ) -> Vec<Command> {
-        let mut commands = Vec::new();
-
-        if steps <= 1 {
-            // Direct jump to target frequency
-            commands.push(self.broadcast_write(Register::PllDivider(target.calculate_pll())));
-            return commands;
-        }
-
-        // Calculate frequency steps
-        let start_mhz = start.mhz();
-        let target_mhz = target.mhz();
-        let freq_delta = (target_mhz - start_mhz) / (steps as f32 - 1.0);
-
-        for i in 0..steps {
-            let freq_mhz = start_mhz + freq_delta * i as f32;
-            // Safe to unwrap because we're interpolating between valid frequencies
-            let freq =
-                Frequency::from_mhz(freq_mhz).expect("Interpolated frequency should be valid");
-            commands.push(self.broadcast_write(Register::PllDivider(freq.calculate_pll())));
-        }
 
         commands
     }
