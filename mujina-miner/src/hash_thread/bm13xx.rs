@@ -900,7 +900,7 @@ async fn bm13xx_thread_actor<R, W>(
                                                     hash,
                                                     version: full_version,
                                                     ntime: task.ntime,
-                                                    extranonce2: task.en2.clone(),
+                                                    extranonce2: task.en2,
                                                 };
 
                                                 // Emit event

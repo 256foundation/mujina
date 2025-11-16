@@ -327,13 +327,9 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
                             }
 
                             tokio_udev::EventType::Remove => {
-                                if let Some(syspath) = device.syspath().to_str() {
-                                    Some(UsbEvent::UsbDeviceDisconnected {
-                                        device_path: syspath.to_string(),
-                                    })
-                                } else {
-                                    None
-                                }
+                                device.syspath().to_str().map(|syspath| UsbEvent::UsbDeviceDisconnected {
+                                    device_path: syspath.to_string(),
+                                })
                             }
 
                             // Ignore other event types (change, bind, unbind, etc.)
