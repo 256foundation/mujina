@@ -840,24 +840,23 @@ pub fn hash_from_wire_bytes(wire_bytes: &[u8; 32]) -> [u8; 32] {
     hash
 }
 
-/// Version rolling field from BM13xx nonce responses.
+/// Rolled version bits from BM13xx nonce responses.
 ///
-/// The chip returns a 16-bit version rolling value that occupies bits 13-28
-/// of the block version when shifted left 13 positions. This value is OR'd
-/// with the base version to produce the final block header version.
-///
-/// Wire format: 2 bytes, big-endian
+/// The chip returns a 2-byte bit pattern representing the version bits it
+/// rolled when finding the nonce. These bits occupy positions 13-28 of the
+/// block version when shifted left 13 positions. This pattern is OR'd with
+/// the base version to produce the final block header version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VersionRolling(u16);
+pub struct RolledVersionBits([u8; 2]);
 
-impl VersionRolling {
-    /// Create from raw u16 value
-    pub fn new(value: u16) -> Self {
-        Self(value)
+impl RolledVersionBits {
+    /// Create from byte array
+    pub fn new(bytes: [u8; 2]) -> Self {
+        Self(bytes)
     }
 
-    /// Get raw u16 value
-    pub fn value(self) -> u16 {
+    /// Get raw bytes
+    pub fn bytes(self) -> [u8; 2] {
         self.0
     }
 
@@ -868,19 +867,20 @@ impl VersionRolling {
         self,
         base_version: bitcoin::block::Version,
     ) -> bitcoin::block::Version {
+        let bits = u16::from_be_bytes(self.0);
         let base = base_version.to_consensus();
-        let rolled = base | ((self.0 as i32) << 13);
+        let rolled = base | ((bits as i32) << 13);
         bitcoin::block::Version::from_consensus(rolled)
     }
 
-    /// Decode from wire bytes (big-endian)
+    /// Decode from wire bytes
     pub fn from_wire_bytes(bytes: [u8; 2]) -> Self {
-        Self(u16::from_be_bytes(bytes))
+        Self(bytes)
     }
 
-    /// Encode to wire bytes (big-endian)
+    /// Encode to wire bytes
     pub fn to_wire_bytes(self) -> [u8; 2] {
-        self.0.to_be_bytes()
+        self.0
     }
 }
 
@@ -1151,7 +1151,7 @@ pub enum Response {
         nonce: u32,
         job_id: u8,
         midstate_num: u8,
-        version: VersionRolling,
+        version: RolledVersionBits,
         subcore_id: u8,
     },
 }
@@ -1195,7 +1195,7 @@ impl Response {
                 // Version rolling field: 2 bytes, big-endian
                 // Occupies bits 13-28 of block version when shifted left 13
                 let version_bytes = [bytes.get_u8(), bytes.get_u8()];
-                let version = VersionRolling::from_wire_bytes(version_bytes);
+                let version = RolledVersionBits::from_wire_bytes(version_bytes);
                 // CRC already consumed
 
                 // Extract job_id and subcore_id from result_header
@@ -2033,8 +2033,8 @@ mod response_tests {
         assert_eq!(job_id, 9);
         assert_eq!(subcore_id, 9);
 
-        // Version: 0xF922 (big-endian bytes [0x22, 0xF9])
-        assert_eq!(version, VersionRolling::new(0x22f9));
+        // Version
+        assert_eq!(version, RolledVersionBits::new([0x22, 0xF9]));
 
         // Verify main core extraction
         let main_core = (nonce >> 25) & 0x7f;
@@ -2056,7 +2056,7 @@ mod response_tests {
                 0x02,
                 5,
                 14,
-                VersionRolling::new(0x002e),
+                RolledVersionBits::new([0x00, 0x2E]),
             ),
             // RX: AA 55 46 03 32 E7 00 C3 2C 83 99
             // result_header=0xc3: bits[7:4]=12, bits[3:0]=3
@@ -2069,7 +2069,7 @@ mod response_tests {
                 0x00,
                 12,
                 3,
-                VersionRolling::new(0x2c83),
+                RolledVersionBits::new([0x2C, 0x83]),
             ),
         ];
 
@@ -2367,17 +2367,56 @@ mod response_tests {
         assert_eq!(midstate_num, *esp_miner_job::wire_rx::MIDSTATE_NUM);
         assert_eq!(job_id, *esp_miner_job::wire_rx::JOB_ID);
         assert_eq!(subcore_id, *esp_miner_job::wire_rx::SUBCORE_ID);
-        assert_eq!(
-            version,
-            VersionRolling::new(*esp_miner_job::wire_rx::VERSION_ROLLING_FIELD)
-        );
+        // VERSION_ROLLING_FIELD is u16, convert to big-endian bytes
+        let expected_bytes = esp_miner_job::wire_rx::VERSION_ROLLING_FIELD.to_be_bytes();
+        assert_eq!(version, RolledVersionBits::new(expected_bytes));
 
         // Verify version rolling field shifted left 13 matches submit VERSION
-        let version_shifted = (version.value() as u32) << 13;
+        let bits_as_u16 = u16::from_be_bytes(version.bytes());
+        let version_shifted = (bits_as_u16 as u32) << 13;
         assert_eq!(
             version_shifted,
             *esp_miner_job::submit::VERSION,
             "Version rolling field << 13 should match mining.submit version"
+        );
+    }
+}
+
+#[cfg(test)]
+mod version_rolling_tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_to_version() {
+        // Test with zero base (rolling field alone)
+        let rolling = RolledVersionBits::new([0x05, 0xA2]);
+        let zero_base = bitcoin::block::Version::from_consensus(0);
+        let full = rolling.apply_to_version(zero_base);
+        assert_eq!(full.to_consensus(), 0x00B4_4000);
+
+        // Test with typical base
+        let base_version = bitcoin::block::Version::from_consensus(0x2000_0000);
+        let full_version = rolling.apply_to_version(base_version);
+        assert_eq!(full_version.to_consensus(), 0x20B4_4000);
+
+        // Test with max rolling field (0xFFFF = bytes [0xFF, 0xFF])
+        let max_rolling = RolledVersionBits::new([0xFF, 0xFF]);
+        let full_max = max_rolling.apply_to_version(base_version);
+        assert_eq!(full_max.to_consensus(), 0x3FFF_E000);
+    }
+
+    #[test]
+    fn test_apply_to_version_preserves_base_bits() {
+        // Version rolling should only modify bits 13-28, preserving all other bits
+        let base = bitcoin::block::Version::from_consensus(0xE000_1FFFu32 as i32); // Bits outside 13-28
+        let rolling = RolledVersionBits::new([0xFF, 0xFF]);
+        let full = rolling.apply_to_version(base);
+
+        // Original bits outside 13-28 should be preserved
+        assert_eq!(
+            full.to_consensus() & (0xE000_1FFFu32 as i32),
+            0xE000_1FFFu32 as i32,
+            "Base bits outside 13-28 should be preserved"
         );
     }
 }
