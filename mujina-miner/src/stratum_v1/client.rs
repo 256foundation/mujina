@@ -964,5 +964,292 @@ mod tests {
         assert!(subscribed, "Should have received subscription");
         assert!(received_job, "Should have received at least one job");
         assert!(received_difficulty, "Should have received difficulty");
+
+        println!("\n=== Test complete ===");
+    }
+
+    /// Helper to create a minimal client for testing notification handlers.
+    fn test_client() -> (StratumV1Client, mpsc::Receiver<ClientEvent>) {
+        let (event_tx, event_rx) = mpsc::channel(10);
+        let shutdown = CancellationToken::new();
+
+        let config = PoolConfig {
+            url: "test:3333".to_string(),
+            username: "test".to_string(),
+            password: "x".to_string(),
+            user_agent: "test".to_string(),
+            suggested_difficulty: 1024,
+        };
+
+        let client = StratumV1Client::new(config, event_tx, shutdown);
+        (client, event_rx)
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_difficulty_valid() {
+        use serde_json::json;
+
+        let (mut client, mut event_rx) = test_client();
+
+        let params = json!([2048]);
+        let result = client.handle_set_difficulty(&params).await;
+
+        assert!(result.is_ok());
+
+        // Verify event was emitted
+        let event = event_rx
+            .try_recv()
+            .expect("Expected DifficultyChanged event");
+        match event {
+            ClientEvent::DifficultyChanged(diff) => {
+                assert_eq!(diff, 2048);
+            }
+            _ => panic!("Expected DifficultyChanged event, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_difficulty_invalid_params() {
+        use serde_json::json;
+
+        let (mut client, _event_rx) = test_client();
+
+        // Empty array
+        let params = json!([]);
+        let result = client.handle_set_difficulty(&params).await;
+        assert!(result.is_err());
+
+        // Not an array
+        let params = json!(2048);
+        let result = client.handle_set_difficulty(&params).await;
+        assert!(result.is_err());
+
+        // Not a number
+        let params = json!(["not a number"]);
+        let result = client.handle_set_difficulty(&params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_version_mask_valid() {
+        use serde_json::json;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Without 0x prefix
+        let params = json!(["1fffe000"]);
+        let result = client.handle_set_version_mask(&params).await;
+        assert!(result.is_ok());
+
+        let event = event_rx.try_recv().expect("Expected VersionMaskSet event");
+        match event {
+            ClientEvent::VersionMaskSet(mask) => {
+                assert_eq!(mask, 0x1fffe000);
+            }
+            _ => panic!("Expected VersionMaskSet event, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_version_mask_with_0x_prefix() {
+        use serde_json::json;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // With 0x prefix
+        let params = json!(["0x1fffe000"]);
+        let result = client.handle_set_version_mask(&params).await;
+        assert!(result.is_ok());
+
+        let event = event_rx.try_recv().expect("Expected VersionMaskSet event");
+        match event {
+            ClientEvent::VersionMaskSet(mask) => {
+                assert_eq!(mask, 0x1fffe000);
+            }
+            _ => panic!("Expected VersionMaskSet event, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_version_mask_invalid_params() {
+        use serde_json::json;
+
+        let (mut client, _event_rx) = test_client();
+
+        // Empty array
+        let params = json!([]);
+        let result = client.handle_set_version_mask(&params).await;
+        assert!(result.is_err());
+
+        // Not an array
+        let params = json!("1fffe000");
+        let result = client.handle_set_version_mask(&params).await;
+        assert!(result.is_err());
+
+        // Invalid hex
+        let params = json!(["not-hex"]);
+        let result = client.handle_set_version_mask(&params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_submit_share_accepted() {
+        use super::super::connection::Connection;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Create mock server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = Connection::new(socket);
+
+            // Read the submit request
+            let msg = conn.read_message().await.unwrap().unwrap();
+
+            // Send acceptance response
+            let response = JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: Some(json!(true)),
+                error: None,
+            };
+            conn.write_message(&response).await.unwrap();
+        });
+
+        // Connect to mock server
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = Connection::new(stream);
+
+        let params = SubmitParams {
+            username: "worker".to_string(),
+            job_id: "job123".to_string(),
+            extranonce2: vec![0x01, 0x02, 0x03, 0x04],
+            ntime: 0x12345678,
+            nonce: 0xdeadbeef,
+            version_bits: Some(0x20000000),
+        };
+
+        let accepted = client.submit(&mut conn, params).await.unwrap();
+        assert!(accepted);
+
+        // Verify ShareAccepted event was emitted
+        let event = event_rx.try_recv().expect("Expected ShareAccepted event");
+        match event {
+            ClientEvent::ShareAccepted { job_id } => {
+                assert_eq!(job_id, "job123");
+            }
+            _ => panic!("Expected ShareAccepted, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_share_rejected_with_error() {
+        use super::super::connection::Connection;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Create mock server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = Connection::new(socket);
+
+            // Read the submit request
+            let msg = conn.read_message().await.unwrap().unwrap();
+
+            // Send rejection response with error
+            let response = JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: None,
+                error: Some(json!([23, "Low difficulty share", null])),
+            };
+            conn.write_message(&response).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = Connection::new(stream);
+
+        let params = SubmitParams {
+            username: "worker".to_string(),
+            job_id: "job456".to_string(),
+            extranonce2: vec![0x01, 0x02, 0x03, 0x04],
+            ntime: 0x12345678,
+            nonce: 0xdeadbeef,
+            version_bits: None,
+        };
+
+        let accepted = client.submit(&mut conn, params).await.unwrap();
+        assert!(!accepted);
+
+        // Verify ShareRejected event was emitted with reason
+        let event = event_rx.try_recv().expect("Expected ShareRejected event");
+        match event {
+            ClientEvent::ShareRejected { job_id, reason } => {
+                assert_eq!(job_id, "job456");
+                assert_eq!(reason, "Low difficulty share");
+            }
+            _ => panic!("Expected ShareRejected, got {:?}", event),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_share_rejected_with_false_result() {
+        use super::super::connection::Connection;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Create mock server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = Connection::new(socket);
+
+            let msg = conn.read_message().await.unwrap().unwrap();
+
+            // Send rejection as false result (some pools do this)
+            let response = JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: Some(json!(false)),
+                error: None,
+            };
+            conn.write_message(&response).await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = Connection::new(stream);
+
+        let params = SubmitParams {
+            username: "worker".to_string(),
+            job_id: "job789".to_string(),
+            extranonce2: vec![0x01, 0x02, 0x03, 0x04],
+            ntime: 0x12345678,
+            nonce: 0xdeadbeef,
+            version_bits: None,
+        };
+
+        let accepted = client.submit(&mut conn, params).await.unwrap();
+        assert!(!accepted);
+
+        // Verify ShareRejected event was emitted
+        let event = event_rx.try_recv().expect("Expected ShareRejected event");
+        match event {
+            ClientEvent::ShareRejected { job_id, reason } => {
+                assert_eq!(job_id, "job789");
+                assert_eq!(reason, "Pool returned false");
+            }
+            _ => panic!("Expected ShareRejected, got {:?}", event),
+        }
     }
 }
