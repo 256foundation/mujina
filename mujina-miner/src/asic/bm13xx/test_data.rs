@@ -455,6 +455,127 @@ pub mod esp_miner_job {
     mod tests {
         use super::*;
 
+        /// Rosetta stone test: validate raw JSON matches broken-out constants.
+        ///
+        /// This validates that stratum_json::MINING_NOTIFY contains the same
+        /// values as the manually-extracted notify::* constants.
+        #[test]
+        fn test_mining_notify_json_matches_constants() {
+            // Parse the raw JSON message
+            let json: serde_json::Value =
+                serde_json::from_str(super::super::stratum_json::MINING_NOTIFY)
+                    .expect("Failed to parse MINING_NOTIFY JSON");
+
+            // Extract params array
+            let params = json["params"].as_array().expect("params not an array");
+
+            // Validate each field matches the broken-out constants
+            assert_eq!(
+                params[0].as_str().unwrap(),
+                notify::JOB_ID_STRING,
+                "job_id mismatch"
+            );
+
+            assert_eq!(
+                params[1].as_str().unwrap(),
+                notify::PREV_BLOCKHASH_STRING,
+                "prev_blockhash mismatch"
+            );
+
+            assert_eq!(
+                params[2].as_str().unwrap(),
+                notify::COINBASE1,
+                "coinbase1 mismatch"
+            );
+
+            assert_eq!(
+                params[3].as_str().unwrap(),
+                notify::COINBASE2,
+                "coinbase2 mismatch"
+            );
+
+            // Validate merkle branches
+            let branches = params[4].as_array().expect("merkle_branches not an array");
+            assert_eq!(
+                branches.len(),
+                notify::MERKLE_BRANCH_STRINGS.len(),
+                "merkle branch count mismatch"
+            );
+            for (i, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch.as_str().unwrap(),
+                    notify::MERKLE_BRANCH_STRINGS[i],
+                    "merkle branch {} mismatch",
+                    i
+                );
+            }
+
+            assert_eq!(
+                params[5].as_str().unwrap(),
+                notify::VERSION_STRING,
+                "version mismatch"
+            );
+
+            assert_eq!(
+                params[6].as_str().unwrap(),
+                notify::NBITS_STRING,
+                "nbits mismatch"
+            );
+
+            assert_eq!(
+                params[7].as_str().unwrap(),
+                notify::NTIME_STRING,
+                "ntime mismatch"
+            );
+
+            assert_eq!(
+                params[8].as_bool().unwrap(),
+                notify::CLEAN_JOBS,
+                "clean_jobs mismatch"
+            );
+        }
+
+        /// Rosetta stone test: validate raw JSON matches broken-out constants.
+        #[test]
+        fn test_mining_submit_json_matches_constants() {
+            let json: serde_json::Value =
+                serde_json::from_str(super::super::stratum_json::MINING_SUBMIT)
+                    .expect("Failed to parse MINING_SUBMIT JSON");
+
+            let params = json["params"].as_array().expect("params not an array");
+
+            // params[0] is username (redacted in capture)
+            assert_eq!(
+                params[1].as_str().unwrap(),
+                submit::JOB_ID_STRING,
+                "job_id mismatch"
+            );
+
+            assert_eq!(
+                params[2].as_str().unwrap(),
+                submit::EXTRANONCE2_STRING,
+                "extranonce2 mismatch"
+            );
+
+            assert_eq!(
+                params[3].as_str().unwrap(),
+                submit::NTIME_STRING,
+                "ntime mismatch"
+            );
+
+            assert_eq!(
+                params[4].as_str().unwrap(),
+                submit::NONCE_STRING,
+                "nonce mismatch"
+            );
+
+            assert_eq!(
+                params[5].as_str().unwrap(),
+                submit::VERSION_STRING,
+                "version_bits mismatch"
+            );
+        }
+
         #[test]
         fn test_stratum_header_fields_match_wire() {
             // Compare parsed Stratum values with wire frame values
