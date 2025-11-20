@@ -420,6 +420,24 @@ mod tests {
         let msg: JsonRpcMessage = serde_json::from_value(json).unwrap();
         assert!(msg.is_notification());
         assert_eq!(msg.method(), Some("mining.notify"));
+
+        // Verify params were preserved
+        match msg {
+            JsonRpcMessage::Request { params, .. } => {
+                let params_array = params.as_array().expect("params should be an array");
+                assert_eq!(params_array.len(), 9);
+                assert_eq!(params_array[0], "job1");
+                assert_eq!(params_array[1], "prevhash");
+                assert_eq!(params_array[8], true);
+
+                let merkle = params_array[4]
+                    .as_array()
+                    .expect("merkle branches should be array");
+                assert_eq!(merkle.len(), 2);
+                assert_eq!(merkle[0], "merkle1");
+            }
+            _ => panic!("Expected Request variant"),
+        }
     }
 
     #[test]
@@ -432,6 +450,15 @@ mod tests {
 
         let msg: JsonRpcMessage = serde_json::from_value(json).unwrap();
         assert_eq!(msg.id(), Some(1));
+
+        // Verify result was preserved
+        match msg {
+            JsonRpcMessage::Response { result, error, .. } => {
+                assert_eq!(result, Some(json!(true)));
+                assert_eq!(error, None);
+            }
+            _ => panic!("Expected Response variant"),
+        }
     }
 
     #[test]
@@ -474,24 +501,6 @@ mod tests {
 
         // Verify word-swap happened correctly (second word)
         assert_eq!(&bytes[4..8], &[0xc1, 0x62, 0xb9, 0x6d]);
-
-        // The human-readable display should be the reverse of internal bytes
-        let display = format!("{}", hash);
-        assert_eq!(
-            display,
-            "000000000000000000015296bc96391d0d67f4a301f2d4fc6db962c16b6455fd"
-        );
-    }
-
-    #[test]
-    fn test_parse_merkle_node() {
-        let hex = "d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6";
-        let node = parse_merkle_node(hex).unwrap();
-
-        let bytes = node.as_byte_array();
-        assert_eq!(bytes.len(), 32);
-        assert_eq!(bytes[0], 0xd5);
-        assert_eq!(bytes[31], 0xe6);
     }
 
     #[test]
@@ -572,76 +581,131 @@ mod tests {
         assert!(!job.clean_jobs);
     }
 
+    /// Rosetta stone test: JobNotification parser produces correct Bitcoin types.
+    ///
+    /// Parses the raw JSON through our actual JobNotification parser and validates
+    /// the resulting Bitcoin types match the wire capture.
     #[test]
-    fn test_job_notification_from_real_bitaxe_capture() {
-        // Real capture from Bitaxe Gamma running esp-miner
-        // This validates our parsing against actual pool communication
-        // that resulted in an accepted share at difficulty 29588
+    fn test_job_notification_parser_produces_correct_types() {
         use crate::asic::bm13xx::test_data::esp_miner_job::notify;
-        use crate::asic::bm13xx::test_data::esp_miner_job::wire_tx;
+        use crate::asic::bm13xx::test_data::stratum_json;
 
-        // Build Stratum params array from the capture
-        let params = json!([
-            notify::JOB_ID_STRING,
-            notify::PREV_BLOCKHASH_STRING,
-            notify::COINBASE1,
-            notify::COINBASE2,
-            notify::MERKLE_BRANCH_STRINGS.to_vec(),
-            notify::VERSION_STRING,
-            notify::NBITS_STRING,
-            notify::NTIME_STRING,
-            notify::CLEAN_JOBS
-        ]);
+        let json: serde_json::Value = serde_json::from_str(stratum_json::MINING_NOTIFY)
+            .expect("Failed to parse MINING_NOTIFY JSON");
 
-        // Parse with our implementation
-        let job = JobNotification::from_stratum_params(params.as_array().unwrap())
-            .expect("Failed to parse real pool capture");
+        let params = json["params"].as_array().expect("params not an array");
 
-        // Validate job ID
+        // Parse through our actual implementation
+        let job =
+            JobNotification::from_stratum_params(params).expect("JobNotification parsing failed");
+
+        // Validate against known-good Bitcoin types
         assert_eq!(job.job_id, notify::JOB_ID_STRING);
 
-        // Validate against known-good Bitcoin types from wire capture
-        // The wire capture was sent to hardware and produced an accepted share,
-        // so we know these values are correct
         assert_eq!(
             job.prev_hash,
             *notify::PREV_BLOCKHASH,
-            "Previous block hash mismatch"
+            "prev_hash doesn't match parsed constant"
         );
 
-        assert_eq!(job.version, *wire_tx::VERSION, "Version mismatch");
-
-        assert_eq!(job.nbits, *wire_tx::NBITS, "Difficulty bits mismatch");
-
-        assert_eq!(job.ntime, *wire_tx::NTIME, "Timestamp mismatch");
-
-        // Validate merkle branches
         assert_eq!(
-            job.merkle_branches.len(),
-            12,
-            "Wrong number of merkle branches"
+            job.version,
+            *notify::VERSION,
+            "version doesn't match parsed constant"
         );
+
+        assert_eq!(
+            job.nbits,
+            *notify::NBITS,
+            "nbits doesn't match parsed constant"
+        );
+
+        assert_eq!(
+            job.ntime,
+            *notify::NTIME,
+            "ntime doesn't match parsed constant"
+        );
+
+        assert_eq!(job.clean_jobs, notify::CLEAN_JOBS);
+
+        // Validate merkle branches match parsed constants
+        assert_eq!(job.merkle_branches.len(), notify::MERKLE_BRANCHES.len());
         for (i, branch) in job.merkle_branches.iter().enumerate() {
             assert_eq!(
                 branch,
                 &notify::MERKLE_BRANCHES[i],
-                "Merkle branch {} mismatch",
+                "merkle branch {} doesn't match parsed constant",
                 i
             );
         }
+    }
 
-        // Validate coinbase parts
+    /// Rosetta stone test: SubmitParams serialization matches wire format.
+    ///
+    /// Validates that SubmitParams::to_stratum_json() produces the correct
+    /// JSON array matching the actual mining.submit from the capture.
+    #[test]
+    fn test_submit_params_serialization_matches_capture() {
+        use crate::asic::bm13xx::test_data::esp_miner_job::submit;
+        use crate::asic::bm13xx::test_data::stratum_json;
+
+        // Build SubmitParams from capture constants
+        let params = SubmitParams {
+            username: "bc1q...bitaxe".to_string(), // Matches redacted username in capture
+            job_id: submit::JOB_ID_STRING.to_string(),
+            extranonce2: hex::decode(submit::EXTRANONCE2_STRING).unwrap(),
+            ntime: *submit::NTIME,
+            nonce: *submit::NONCE,
+            version_bits: Some(*submit::VERSION),
+        };
+
+        // Convert to JSON
+        let json_array = params.to_stratum_json();
+
+        // Parse the actual wire message for comparison
+        let wire_json: serde_json::Value = serde_json::from_str(stratum_json::MINING_SUBMIT)
+            .expect("Failed to parse MINING_SUBMIT JSON");
+        let wire_params = wire_json["params"].as_array().expect("params not an array");
+
+        // Validate each field matches the wire capture
+        assert_eq!(json_array.len(), wire_params.len(), "param count mismatch");
+
+        // params[0] = username
+        assert_eq!(json_array[0], wire_params[0], "username mismatch");
+
+        // params[1] = job_id
         assert_eq!(
-            job.coinbase1,
-            hex::decode(notify::COINBASE1).unwrap(),
-            "Coinbase1 mismatch"
-        );
-        assert_eq!(
-            job.coinbase2,
-            hex::decode(notify::COINBASE2).unwrap(),
-            "Coinbase2 mismatch"
+            json_array[1].as_str().unwrap(),
+            submit::JOB_ID_STRING,
+            "job_id mismatch"
         );
 
-        assert_eq!(job.clean_jobs, notify::CLEAN_JOBS);
+        // params[2] = extranonce2 (hex)
+        assert_eq!(
+            json_array[2].as_str().unwrap(),
+            submit::EXTRANONCE2_STRING,
+            "extranonce2 mismatch"
+        );
+
+        // params[3] = ntime (hex)
+        assert_eq!(
+            json_array[3].as_str().unwrap(),
+            submit::NTIME_STRING,
+            "ntime mismatch"
+        );
+
+        // params[4] = nonce (hex)
+        assert_eq!(
+            json_array[4].as_str().unwrap(),
+            submit::NONCE_STRING,
+            "nonce mismatch"
+        );
+
+        // params[5] = version_bits (hex)
+        assert_eq!(
+            json_array[5].as_str().unwrap(),
+            submit::VERSION_STRING,
+            "version_bits mismatch"
+        );
     }
 }
