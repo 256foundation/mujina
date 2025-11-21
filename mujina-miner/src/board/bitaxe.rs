@@ -481,8 +481,13 @@ impl BitaxeBoard {
             Ok(()) => {
                 // Set fan to full speed until closed-loop control is implemented
                 const FULL_SPEED: u8 = 100;
-                if let Err(e) = fan.set_pwm_percent(FULL_SPEED).await {
-                    warn!("Failed to set fan speed: {}", e);
+                match fan.set_pwm_percent(FULL_SPEED).await {
+                    Ok(()) => {
+                        debug!("Fan speed set to {}%", FULL_SPEED);
+                    }
+                    Err(e) => {
+                        warn!("Failed to set fan speed: {}", e);
+                    }
                 }
 
                 self.fan_controller = Some(fan);
