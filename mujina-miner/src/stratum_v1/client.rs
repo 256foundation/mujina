@@ -264,7 +264,7 @@ impl StratumV1Client {
                         StratumError::InvalidMessage("Invalid version mask hex".to_string())
                     })?;
 
-                info!(
+                debug!(
                     mask = format!("{:#x}", mask),
                     "Pool authorized version rolling"
                 );
@@ -413,6 +413,7 @@ impl StratumV1Client {
         use serde_json::Value;
 
         let job_id = params.job_id.clone();
+        let nonce = params.nonce;
 
         // Convert to Stratum JSON format
         let submit_json = params.to_stratum_json();
@@ -431,7 +432,7 @@ impl StratumV1Client {
                 let accepted = result.as_bool().unwrap_or(false);
                 if accepted {
                     self.event_tx
-                        .send(ClientEvent::ShareAccepted { job_id })
+                        .send(ClientEvent::ShareAccepted { job_id, nonce })
                         .await
                         .map_err(|_| StratumError::Disconnected)?;
                 } else {
@@ -608,7 +609,7 @@ impl StratumV1Client {
             .map_err(|_| StratumError::Disconnected)?;
 
         // Subscribe
-        info!("Subscribing to pool");
+        debug!("Subscribing to pool");
         self.subscribe(&mut conn, authorized_mask).await?;
 
         let state = self.state.as_ref().unwrap();
@@ -631,12 +632,11 @@ impl StratumV1Client {
             .map_err(|_| StratumError::Disconnected)?;
 
         // Authorize
-        info!(username = %self.config.username, "Authorizing");
         self.authorize(&mut conn).await?;
-        info!("Authorized");
+        debug!("Authorized");
 
         // Suggest difficulty
-        info!(difficulty = %self.config.suggested_difficulty, "Suggesting difficulty to pool");
+        trace!(difficulty = %self.config.suggested_difficulty, "Suggesting difficulty to pool");
         if let Err(e) = self
             .suggest_difficulty(&mut conn, self.config.suggested_difficulty)
             .await
@@ -713,7 +713,6 @@ impl StratumV1Client {
 
                 // Shutdown signal
                 _ = self.shutdown.cancelled() => {
-                    info!("Shutdown requested");
                     self.event_tx.send(ClientEvent::Disconnected).await.ok();
                     return Ok(());
                 }
@@ -1139,8 +1138,9 @@ mod tests {
         // Verify ShareAccepted event was emitted
         let event = event_rx.try_recv().expect("Expected ShareAccepted event");
         match event {
-            ClientEvent::ShareAccepted { job_id } => {
+            ClientEvent::ShareAccepted { job_id, nonce } => {
                 assert_eq!(job_id, "job123");
+                assert_eq!(nonce, 0xdeadbeef);
             }
             _ => panic!("Expected ShareAccepted, got {:?}", event),
         }

@@ -47,6 +47,8 @@ pub enum ClientEvent {
     ShareAccepted {
         /// Job ID that was accepted
         job_id: String,
+        /// Nonce that was accepted
+        nonce: u32,
     },
 
     /// Share was rejected by pool
