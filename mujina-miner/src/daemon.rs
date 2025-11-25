@@ -83,7 +83,7 @@ impl Daemon {
                 username: pool_user,
                 password: pool_pass,
                 user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-                suggested_difficulty: 1024,
+                suggested_difficulty: Some(1024),
             };
 
             let stratum_source = StratumV1Source::new(

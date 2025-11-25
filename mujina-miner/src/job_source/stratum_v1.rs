@@ -393,7 +393,7 @@ mod tests {
             username: "testworker".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),
-            suggested_difficulty: 1024,
+            suggested_difficulty: Some(1024),
         };
 
         let mut source = StratumV1Source::new(config, command_rx, event_tx, shutdown);

@@ -27,11 +27,10 @@ pub struct PoolConfig {
 
     /// Suggested starting difficulty
     ///
-    /// Sent via mining.suggest_difficulty after authorization to request work
-    /// at an appropriate difficulty for the miner's hashrate.
-    ///
-    /// Recommended: ~1 share per 30 seconds
-    pub suggested_difficulty: u64,
+    /// If Some, sent via mining.suggest_difficulty after authorization to
+    /// request work at an appropriate difficulty for the miner's hashrate.
+    /// If None, the pool chooses difficulty.
+    pub suggested_difficulty: Option<u64>,
 }
 
 impl Default for PoolConfig {
@@ -41,7 +40,7 @@ impl Default for PoolConfig {
             username: String::new(),
             password: String::new(),
             user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-            suggested_difficulty: 2048,
+            suggested_difficulty: None,
         }
     }
 }
@@ -635,13 +634,12 @@ impl StratumV1Client {
         self.authorize(&mut conn).await?;
         debug!("Authorized");
 
-        // Suggest difficulty
-        trace!(difficulty = %self.config.suggested_difficulty, "Suggesting difficulty to pool");
-        if let Err(e) = self
-            .suggest_difficulty(&mut conn, self.config.suggested_difficulty)
-            .await
-        {
-            warn!(error = %e, "Failed to suggest difficulty (non-fatal)");
+        // Suggest difficulty if configured
+        if let Some(difficulty) = self.config.suggested_difficulty {
+            trace!(difficulty, "Suggesting difficulty to pool");
+            if let Err(e) = self.suggest_difficulty(&mut conn, difficulty).await {
+                warn!(error = %e, "Failed to suggest difficulty (non-fatal)");
+            }
         }
 
         // Main event loop
@@ -866,7 +864,7 @@ mod tests {
             username: username.to_string(),
             password: "x".to_string(),
             user_agent: "mujina-miner/0.1.0-test".to_string(),
-            suggested_difficulty: 4096,
+            suggested_difficulty: Some(4096),
         };
 
         println!("\n=== Connecting to {} ===", pool_url);
@@ -1029,7 +1027,7 @@ mod tests {
             username: "test".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),
-            suggested_difficulty: 1024,
+            suggested_difficulty: Some(1024),
         };
 
         let client = StratumV1Client::new(config, event_tx, shutdown);
