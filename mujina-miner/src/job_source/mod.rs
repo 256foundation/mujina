@@ -38,6 +38,18 @@
 //! The scheduler generates many `HeaderTemplate` instances from each
 //! `JobTemplate` by allocating extranonce2 space and rolling extranonce2 and
 //! ntime. Hardware then searches for valid nonces within each header template.
+//!
+//! ## Share Difficulty
+//!
+//! Sources receive share difficulty from their upstream (pool, node, etc.).
+//! We avoid suggesting difficulty because some pools (notably Ocean)
+//! disconnect clients that suggest inappropriately low values.
+//!
+//! Instead, sources apply an **internal minimum difficulty** to prevent share
+//! flooding when upstream difficulty is lower than appropriate for our hashrate.
+//! The scheduler informs sources of expected hashrate via [`SourceCommand::UpdateHashRate`],
+//! and sources use `max(upstream_difficulty, min_difficulty)` where
+//! `min_difficulty` targets roughly one share per 10 seconds.
 
 // Submodules
 pub mod dummy;
