@@ -19,7 +19,7 @@ use crate::{
         bm13xx::{self, protocol::Command, BM13xxProtocol},
         ChipInfo,
     },
-    hash_thread::{bm13xx::BM13xxThread, HashThread},
+    hash_thread::{bm13xx::BM13xxThread, HashThread, ThreadRemovalSignal},
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -43,32 +43,6 @@ use super::{
     pattern::{Match, StringMatch},
     Board, BoardError, BoardEvent, BoardInfo,
 };
-
-/// Thread removal signal sent via watch channel from board to thread.
-///
-/// BitaxeBoard monitors hardware and sends removal signals to BM13xxThread when
-/// shutdown is needed. The signal starts as `Running` and changes to a specific
-/// removal reason when shutdown is triggered.
-///
-/// This is an implementation detail between BitaxeBoard and BM13xxThread, not
-/// part of the HashThread abstraction.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ThreadRemovalSignal {
-    /// Thread should continue running normally
-    Running,
-
-    /// Remove: Board was unplugged from USB
-    BoardDisconnected,
-
-    /// Remove: Board detected hardware fault (overheating, power issue, etc.)
-    HardwareFault { description: String },
-
-    /// Remove: User requested board disable via API
-    UserRequested,
-
-    /// Remove: Graceful system shutdown
-    Shutdown,
-}
 
 /// Peripheral handles shared between board and hash thread.
 ///

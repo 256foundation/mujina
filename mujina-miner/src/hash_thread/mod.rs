@@ -118,6 +118,31 @@ pub enum HashThreadError {
     InitializationFailed(String),
 }
 
+/// Signal from board to hash thread for shutdown coordination.
+///
+/// Board sends this via watch channel to signal thread shutdown. Thread checks
+/// in its select loop and exits when signal changes from Running.
+///
+/// The reason is useful for logging but thread behavior is identical for all
+/// non-Running variants: clean up and exit.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ThreadRemovalSignal {
+    /// Thread should continue running normally
+    Running,
+
+    /// Board was unplugged from USB
+    BoardDisconnected,
+
+    /// Board detected hardware fault (overheating, power issue, etc.)
+    HardwareFault { description: String },
+
+    /// User requested board disable via API
+    UserRequested,
+
+    /// Graceful system shutdown
+    Shutdown,
+}
+
 /// HashThread trait - the scheduler's view of a schedulable worker.
 ///
 /// A HashThread represents a group of hashing engines that can be assigned work

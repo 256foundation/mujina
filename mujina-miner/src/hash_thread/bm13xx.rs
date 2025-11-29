@@ -17,11 +17,11 @@ use tokio_stream::StreamExt;
 
 use super::{
     task::HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-    HashThreadStatus,
+    HashThreadStatus, ThreadRemovalSignal,
 };
 use crate::{
     asic::bm13xx::{self, protocol},
-    board::bitaxe::{BitaxePeripherals, ThreadRemovalSignal},
+    board::bitaxe::BitaxePeripherals,
     hw_trait::gpio::{GpioPin, PinValue},
     tracing::prelude::*,
     types::{Difficulty, HashRate},
