@@ -118,6 +118,33 @@ pub enum HashThreadError {
     InitializationFailed(String),
 }
 
+// ---------------------------------------------------------------------------
+// Hardware abstraction traits for hash threads
+// ---------------------------------------------------------------------------
+
+/// ASIC enable/disable control.
+///
+/// Hash threads use this to enable chips during initialization and disable
+/// them during shutdown. The underlying mechanism (reset pin, power gate,
+/// etc.) is an implementation detail.
+#[async_trait]
+pub trait AsicEnable: Send + Sync {
+    /// Enable the ASIC (allow it to run).
+    async fn enable(&mut self) -> anyhow::Result<()>;
+
+    /// Disable the ASIC (put it in a safe, non-hashing state).
+    async fn disable(&mut self) -> anyhow::Result<()>;
+}
+
+/// Voltage regulator control for ASIC core voltage.
+///
+/// Hash threads may use this to adjust voltage for tuning.
+#[async_trait]
+pub trait VoltageRegulator: Send + Sync {
+    /// Set output voltage in volts.
+    async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()>;
+}
+
 /// Signal from board to hash thread for shutdown coordination.
 ///
 /// Board sends this via watch channel to signal thread shutdown. Thread checks
