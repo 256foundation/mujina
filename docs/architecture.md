@@ -27,7 +27,7 @@ src/
 |   `-- tui.rs        # mujina-tui - Terminal UI
 +-- lib.rs            # Library root
 +-- error.rs          # Common error types
-+-- types.rs          # Core types (Job, Share, Nonce, etc.)
++-- types/            # Core types (Difficulty, HashRate, Job, Share)
 +-- config.rs         # Configuration loading and validation
 +-- daemon.rs         # Daemon lifecycle management
 +-- board/            # Hash board implementations
@@ -38,7 +38,7 @@ src/
 +-- asic/             # Mining ASIC drivers
 +-- backplane.rs      # Backplane: board communication and lifecycle
 +-- scheduler.rs      # Work scheduling and distribution
-+-- pool/             # Mining pool connectivity [deprecated]
++-- stratum_v1/       # Stratum v1 pool client
 +-- job_source/       # Unified mining job sources (pools, solo, testing)
 +-- api/              # HTTP API and WebSocket
 +-- api_client/       # Shared API client library
@@ -76,11 +76,16 @@ Terminal user interface for interactive monitoring:
 Centralized error types using `thiserror`. Provides a unified `Error` enum
 for the entire crate with conversions from underlying error types.
 
-#### `types.rs` (new)
+#### `types/`
 Core domain types shared across modules. This module re-exports commonly
 used types from rust-bitcoin and defines mining-specific types. Using
 rust-bitcoin provides battle-tested implementations of Bitcoin primitives
 while avoiding reinventing fundamental types.
+
+The types module is organized into submodules:
+- `difficulty.rs` - Integer difficulty type with Target conversion
+- `hash_rate.rs` - Hashrate measurement with unit conversions
+- `bitcoin_impls.rs` - U256-bitcoin type conversions
 
 #### `config.rs` (new)
 Configuration management:
@@ -369,17 +374,19 @@ Communication substrate between boards and scheduler:
 
 #### `job_source/`
 Unified interface for all mining job sources:
-- `traits.rs` - `JobSource` trait for all sources
-- `stratum_v1.rs` - Stratum v1 pool client
-- `stratum_v2.rs` - Stratum v2 pool client (next-gen protocol)
-- `solo.rs` - Direct Bitcoin node connection for solo mining
-- `dummy.rs` - Synthetic job generator for power/thermal load management
+- `messages.rs` - Source-scheduler communication (SourceEvent, SourceCommand)
+- `job.rs` - JobTemplate and Share types
+- `stratum_v1.rs` - Stratum v1 job source adapter (wraps stratum_v1 module)
+- `dummy.rs` - Synthetic job generator for testing and load management
+- `version.rs`, `extranonce2.rs`, `merkle.rs` - Work generation helpers
 - Provides consistent interface for scheduler regardless of job origin
 
-#### `pool/` (Deprecated - Moving to job_source)
-Mining pool client implementations:
-- Being replaced by `job_source/stratum_v1` and `job_source/stratum_v2`
-- Retained temporarily for backward compatibility
+#### `stratum_v1/`
+Stratum v1 pool client implementation:
+- `client.rs` - Main client with connection management and message handling
+- `connection.rs` - TCP connection handling
+- `messages.rs` - Stratum protocol message types
+- Supports version rolling and share difficulty management
 
 #### `scheduler.rs`
 Orchestrates the mining operation:

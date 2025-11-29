@@ -11,7 +11,6 @@ pub mod hw_trait;
 pub mod job_source;
 pub mod mgmt_protocol;
 pub mod peripheral;
-pub mod pool;
 pub mod scheduler;
 pub mod stratum_v1;
 pub mod tracing;
