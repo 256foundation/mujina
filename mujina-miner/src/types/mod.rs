@@ -6,7 +6,6 @@
 
 mod bitcoin_impls;
 mod difficulty;
-mod display_difficulty;
 mod hash_rate;
 
 use bitcoin::hashes::sha256d;
@@ -16,7 +15,6 @@ use std::time::Duration;
 pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 pub use difficulty::Difficulty;
-pub use display_difficulty::DisplayDifficulty;
 pub use hash_rate::HashRate;
 
 /// A mining job sent to ASIC chips.

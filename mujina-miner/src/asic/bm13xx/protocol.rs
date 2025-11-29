@@ -2341,7 +2341,7 @@ mod response_tests {
     #[test]
     fn test_full_mining_round_trip() {
         use crate::asic::bm13xx::test_data::esp_miner_job;
-        use crate::types::DisplayDifficulty;
+        use crate::types::Difficulty;
         use bitcoin::block::Header as BlockHeader;
 
         // Build JobFullFormat, encode to wire, decode nonce response,
@@ -2404,14 +2404,17 @@ mod response_tests {
         };
 
         let hash = header.block_hash();
-        let difficulty = DisplayDifficulty::from_hash(&hash).as_f64();
+        let difficulty = Difficulty::from_hash(&hash);
 
+        // Allow +/-1 tolerance for integer division rounding
+        let expected = Difficulty::new(esp_miner_job::EXPECTED_HASH_DIFFICULTY as u64);
         assert!(
-            (difficulty - esp_miner_job::EXPECTED_HASH_DIFFICULTY).abs() < 0.1,
+            difficulty >= Difficulty::new(u64::from(expected) - 1)
+                && difficulty <= Difficulty::new(u64::from(expected) + 1),
             "Hash difficulty should match esp-miner result"
         );
         assert!(
-            difficulty >= esp_miner_job::POOL_SHARE_DIFFICULTY,
+            difficulty >= Difficulty::new(esp_miner_job::POOL_SHARE_DIFFICULTY_INT),
             "Hash should meet pool difficulty"
         );
     }

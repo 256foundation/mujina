@@ -654,7 +654,7 @@ pub mod esp_miner_job {
 
         #[test]
         fn test_block_hash_validation() {
-            use crate::types::DisplayDifficulty;
+            use crate::types::Difficulty;
             use bitcoin::block::Header as BlockHeader;
 
             // Build full version: base version OR'd with version rolling field shifted left 13
@@ -676,26 +676,28 @@ pub mod esp_miner_job {
 
             // Compute block hash and difficulty
             let hash = header.block_hash();
-            let difficulty = DisplayDifficulty::from_hash(&hash).as_f64();
+            let difficulty = Difficulty::from_hash(&hash);
 
             println!("Block hash: {}", hash);
-            println!("Difficulty: {:.1}", difficulty);
+            println!("Difficulty: {}", difficulty);
 
             // Verify difficulty matches expected value from esp-miner logs
-            let tolerance = 0.1;
+            // Allow +/-1 tolerance for integer division rounding
+            let expected = Difficulty::new(EXPECTED_HASH_DIFFICULTY as u64);
             assert!(
-                (difficulty - EXPECTED_HASH_DIFFICULTY).abs() < tolerance,
-                "Hash difficulty mismatch: computed={:.1}, expected={:.1}",
+                difficulty >= Difficulty::new(u64::from(expected) - 1)
+                    && difficulty <= Difficulty::new(u64::from(expected) + 1),
+                "Hash difficulty mismatch: computed={}, expected={}",
                 difficulty,
-                EXPECTED_HASH_DIFFICULTY
+                expected
             );
 
             // Verify this would be a valid pool share
             assert!(
-                difficulty >= POOL_SHARE_DIFFICULTY,
-                "Hash difficulty {:.1} should exceed pool difficulty {:.1}",
+                difficulty >= Difficulty::new(POOL_SHARE_DIFFICULTY_INT),
+                "Hash difficulty {} should exceed pool difficulty {}",
                 difficulty,
-                POOL_SHARE_DIFFICULTY
+                POOL_SHARE_DIFFICULTY_INT
             );
         }
     }
