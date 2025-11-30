@@ -39,7 +39,9 @@ use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
-use crate::job_source::{JobTemplate, MerkleRootKind, SourceCommand, SourceEvent};
+use crate::job_source::{
+    JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
+};
 use crate::tracing::prelude::*;
 use crate::types::{expected_time_to_share_from_target, HashRate};
 
@@ -425,14 +427,7 @@ pub async fn task(
 
                     // Submit share to originating source
                     if let Some(source) = sources.get(task_entry.source_id) {
-                        use crate::job_source::Share as SourceShare;
-                        let source_share = SourceShare {
-                            job_id: task_entry.template.id.clone(),
-                            nonce: share.nonce,
-                            time: share.ntime,
-                            version: share.version,
-                            extranonce2: share.extranonce2,
-                        };
+                        let source_share = SourceShare::from((share, task_entry.template.id.clone()));
 
                         if let Err(e) = source.command_tx.send(SourceCommand::SubmitShare(source_share)).await {
                             error!(

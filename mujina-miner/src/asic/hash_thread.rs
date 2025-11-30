@@ -337,3 +337,15 @@ pub struct Share {
     /// work regardless of its actual hash difficulty (which is luck).
     pub threshold_difficulty: f64,
 }
+
+impl From<(Share, String)> for crate::job_source::Share {
+    fn from((share, job_id): (Share, String)) -> Self {
+        Self {
+            job_id,
+            nonce: share.nonce,
+            time: share.ntime,
+            version: share.version,
+            extranonce2: share.extranonce2,
+        }
+    }
+}
