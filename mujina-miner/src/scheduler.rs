@@ -292,7 +292,7 @@ impl Scheduler {
             };
 
             if let Err(e) = result {
-                error!(thread_id = ?thread_id, error = %e, "Failed to assign task");
+                error!(thread = %thread.name(), error = %e, "Failed to assign task");
             } else {
                 let task_id = self.tasks.insert(TaskEntry {
                     source_id,
@@ -381,22 +381,28 @@ impl Scheduler {
 
     /// Handle an event from a hash thread.
     fn handle_thread_event(&mut self, thread_id: ThreadId, event: HashThreadEvent) {
+        let thread_name = self
+            .threads
+            .get(thread_id)
+            .map(|t| t.name())
+            .unwrap_or("unknown");
+
         match event {
             HashThreadEvent::WorkExhausted { en2_searched } => {
-                info!(thread_id = ?thread_id, en2_searched, "Work exhausted");
+                info!(thread = %thread_name, en2_searched, "Work exhausted");
                 // TODO: Assign new work to this thread
             }
 
             HashThreadEvent::WorkDepletionWarning {
                 estimated_remaining_ms,
             } => {
-                debug!(thread_id = ?thread_id, remaining_ms = estimated_remaining_ms, "Work depletion warning");
+                debug!(thread = %thread_name, remaining_ms = estimated_remaining_ms, "Work depletion warning");
                 // TODO: Prepare next work assignment
             }
 
             HashThreadEvent::StatusUpdate(status) => {
                 trace!(
-                    thread_id = ?thread_id,
+                    thread = %thread_name,
                     hashrate = %status.hashrate.to_human_readable(),
                     active = status.is_active,
                     "Thread status"
@@ -416,9 +422,10 @@ impl Scheduler {
             .take_event_receiver()
             .expect("Thread missing event receiver");
 
+        let thread_name = thread.name().to_string();
         let thread_id = self.threads.insert(thread);
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
-        debug!(thread_id = ?thread_id, "Thread registered");
+        debug!(thread = %thread_name, "Thread registered");
 
         // Broadcast updated hashrate to all sources
         let hashrate = self.total_hashrate();
@@ -457,7 +464,7 @@ impl Scheduler {
                 .get_mut(thread_id)
                 .expect("Just inserted thread");
             if let Err(e) = thread.update_task(hash_task).await {
-                error!(thread_id = ?thread_id, error = %e, "Failed to assign cached job");
+                error!(thread = %thread.name(), error = %e, "Failed to assign cached job");
             } else {
                 let task_id = self.tasks.insert(TaskEntry {
                     source_id,
@@ -466,7 +473,7 @@ impl Scheduler {
                 });
                 share_channels.insert(task_id, ReceiverStream::new(share_rx));
                 debug!(
-                    thread_id = ?thread_id,
+                    thread = %thread.name(),
                     source = %source.name,
                     job_id = %template.id,
                     "Assigned cached job to new thread"

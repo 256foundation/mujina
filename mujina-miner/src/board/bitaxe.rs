@@ -890,8 +890,20 @@ impl Board for BitaxeBoard {
             voltage_regulator: None, // Not used by hash thread yet
         };
 
+        // Build thread name from board model and serial
+        let thread_name = match &self.serial_number {
+            Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
+            None => "Bitaxe-Gamma".to_string(),
+        };
+
         // Create BM13xxThread with streams and peripherals
-        let thread = BM13xxThread::new(data_reader, data_writer, peripherals, removal_rx);
+        let thread = BM13xxThread::new(
+            thread_name,
+            data_reader,
+            data_writer,
+            peripherals,
+            removal_rx,
+        );
 
         debug!("Created BM13xx hash thread from BitaxeBoard");
 

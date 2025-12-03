@@ -93,6 +93,9 @@ enum ThreadCommand {
 /// manages serial communication with chips, filters shares, and reports events.
 /// Chip initialization happens lazily when first work is assigned.
 pub struct BM13xxThread {
+    /// Human-readable name for logging
+    name: String,
+
     /// Channel for sending commands to the actor
     command_tx: mpsc::Sender<ThreadCommand>,
 
@@ -113,11 +116,13 @@ impl BM13xxThread {
     /// work is assigned.
     ///
     /// # Arguments
+    /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
     pub fn new<R, W>(
+        name: String,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
@@ -149,6 +154,7 @@ impl BM13xxThread {
         });
 
         Self {
+            name,
             command_tx: cmd_tx,
             event_rx: Some(evt_rx),
             capabilities: HashThreadCapabilities {
@@ -161,6 +167,10 @@ impl BM13xxThread {
 
 #[async_trait]
 impl HashThread for BM13xxThread {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn capabilities(&self) -> &HashThreadCapabilities {
         &self.capabilities
     }

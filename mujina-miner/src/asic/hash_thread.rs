@@ -198,6 +198,9 @@ pub enum ThreadRemovalSignal {
 /// - Report events asynchronously
 #[async_trait]
 pub trait HashThread: Send {
+    /// Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
+    fn name(&self) -> &str;
+
     /// Get thread capabilities for scheduling decisions
     fn capabilities(&self) -> &HashThreadCapabilities;
 
