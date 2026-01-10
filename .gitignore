@@ -1,2 +1,3 @@
 Cargo.lock
 /target/
+scripts/local_ci/arm-deployment.env
