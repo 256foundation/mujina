@@ -109,10 +109,10 @@ pub mod protocol {
         pub const FAN_FAIL_BAND_LOW: u8 = 0x5A;
         /// Fan drive fail band high byte
         pub const FAN_FAIL_BAND_HIGH: u8 = 0x5B;
-        /// TACH reading high byte
-        pub const TACH_HIGH: u8 = 0x46;
-        /// TACH reading low byte
-        pub const TACH_LOW: u8 = 0x47;
+        /// TACH reading low byte (LSB)
+        pub const TACH_LOW: u8 = 0x46;
+        /// TACH reading high byte (MSB)
+        pub const TACH_HIGH: u8 = 0x47;
         /// TACH limit high byte
         pub const TACH_LIMIT_HIGH: u8 = 0x48;
         /// TACH limit low byte
@@ -145,8 +145,8 @@ pub mod protocol {
             0x58 => "FAN_VALID_TACH".to_string(),
             0x5A => "FAN_FAIL_BAND_LOW".to_string(),
             0x5B => "FAN_FAIL_BAND_HIGH".to_string(),
-            0x46 => "TACH_HIGH".to_string(),
-            0x47 => "TACH_LOW".to_string(),
+            0x46 => "TACH_LOW".to_string(),
+            0x47 => "TACH_HIGH".to_string(),
             0x48 => "TACH_LIMIT_HIGH".to_string(),
             0x49 => "TACH_LIMIT_LOW".to_string(),
             0xFD => "PRODUCT_ID".to_string(),
