@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/mujina-minerd /usr/local/bin/
 
+LABEL org.opencontainers.image.source=https://github.com/256foundation/mujina
+
 USER mujina
 EXPOSE 7785
 
