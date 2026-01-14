@@ -35,6 +35,10 @@ on:
 
 Modify the list of branches to support your development efforts as necessary.
 
+### 2.1. Skipping Clippy Tests
+
+You can skip clippy lints when manually triggering the workflow via the GitHub UI. Check the "Skip clippy lints" option when running the workflow manually. By default, clippy is enabled.
+
 ## 3. Local testing
 
 This project also includes a [Makefile](../scripts/local_ci/Makefile.ci) that can be run in your local dev environment.
@@ -58,9 +62,16 @@ All compilation and tests occur in a linux container using podman.
 
 ### 3.2. Execute
 
-```bash
-make -f scripts/local_ci/Makefile.ci ci-containers-arm64-cross-compilation
-```
+1. OPTIONAL: To skip clippy lints locally, set the `SKIP_CLIPPY` environment variable:
+    ```bash
+    export SKIP_CLIPPY=true
+    ```
+
+
+2. Execute:
+    ```bash
+    make -f scripts/local_ci/Makefile.ci ci-containers-arm64-cross-compilation
+    ```
 
 ## 4. Local Setup (ARM64 deploy)
 

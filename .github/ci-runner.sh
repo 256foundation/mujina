@@ -12,6 +12,7 @@ TARGET_ARCH="${TARGET_ARCH:-}"
 HYBRID_MODE="${HYBRID_MODE:-false}"
 ARM_HOST="${ARM_HOST:-}"
 ARM_USER="${ARM_USER:-}"
+SKIP_CLIPPY="${SKIP_CLIPPY:-false}"
 
 # Function to run a command in the container
 run_in_container() {
@@ -81,7 +82,11 @@ case "${1:-all}" in
         run_in_container "cargo fmt --all -- --check" "formatting check"
         ;;
     "clippy")
-        run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        if [ "$SKIP_CLIPPY" = "true" ]; then
+            echo "⏭️  Skipping clippy check (SKIP_CLIPPY=true)"
+        else
+            run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        fi
         ;;
     "build")
         run_in_container "cargo build --verbose" "build"
@@ -97,16 +102,24 @@ case "${1:-all}" in
         ;;
     "all")
         run_in_container "cargo fmt --all -- --check" "formatting check"
-        run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        if [ "$SKIP_CLIPPY" = "true" ]; then
+            echo "⏭️  Skipping clippy check (SKIP_CLIPPY=true)"
+        else
+            run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        fi
         run_in_container "cargo build --verbose" "build"
         run_in_container "cargo test --verbose" "tests"
         ;;
     "hybrid")
         echo "🔄 Running hybrid CI (containers + ARM deployment)..."
-        
+
         # Step 1: Container-based checks
         run_in_container "cargo fmt --all -- --check" "formatting check"
-        run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        if [ "$SKIP_CLIPPY" = "true" ]; then
+            echo "⏭️  Skipping clippy check (SKIP_CLIPPY=true)"
+        else
+            run_in_container "cargo clippy --all-targets --all-features -- -D warnings" "clippy check"
+        fi
         
         # Step 2: Cross-compile for ARM64
         TARGET_ARCH=aarch64-unknown-linux-gnu
@@ -139,6 +152,7 @@ case "${1:-all}" in
         echo "  RUST_IMAGE: Rust container image (default: quay.io/jbride2000/rust:1.90.0-trixie-tools)"
         echo "  TARGET_ARCH: Target architecture (e.g., aarch64-unknown-linux-gnu)"
         echo "  CACHE_MOUNTS: Enable cache mounts (default: true)"
+        echo "  SKIP_CLIPPY: Skip clippy lints (default: false)"
         echo "  HYBRID_MODE: Enable ARM deployment (default: false)"
         echo "  ARM_HOST: ARM64 host IP address"
         echo "  ARM_USER: SSH username for ARM host"

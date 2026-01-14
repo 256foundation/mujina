@@ -15,6 +15,10 @@ on:
         description: "Run container CI"
         type: boolean
         default: true
+      skip_clippy:
+        description: "Skip clippy lints"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,6 +48,7 @@ jobs:
         WORKSPACE_DIR: ${{ github.workspace }}
         RUST_IMAGE: quay.io/jbride2000/rust:1.90.0-trixie-tools
         CACHE_MOUNTS: "false"
+        SKIP_CLIPPY: ${{ github.event.inputs.skip_clippy || 'false' }}
     
     - name: Cross-compile for ARM64
       run: |

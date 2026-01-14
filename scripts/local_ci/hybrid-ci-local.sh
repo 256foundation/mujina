@@ -77,6 +77,7 @@ echo "📦 Step 1: Running container-based CI checks..."
 export RUST_IMAGE="$RUST_IMAGE"
 export WORKSPACE_DIR="$(pwd)"
 export CACHE_MOUNTS="true"
+export SKIP_CLIPPY="${SKIP_CLIPPY:-false}"
 
 # Run all container-based checks
 ./.github/ci-runner.sh all
