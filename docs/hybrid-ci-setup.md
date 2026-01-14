@@ -38,12 +38,17 @@ Modify the list of branches to support your development efforts as necessary.
 ## 3. Local testing
 
 This project also includes a [Makefile](../scripts/local_ci/Makefile.ci) that can be run in your local dev environment.
-These commands are for local use only and are not used by GitHub Actions.
+These Makefile commands are for local use only and are not used by GitHub Actions.
 
-On a x86_64 based development environment, verify that all compilation and testing is successful on both the of the following:
+On a x86_64 based development environment, you can use the Makefile for the following:
 
-* x86_64 environment
-* ARM64 environment using cross-compilation toolchain.
+1. Full CI checks in containers:
+    * Formatting check (cargo fmt --all -- --check)
+    * Clippy lints (cargo clippy --all-targets --all-features -- -D warnings)
+    * Debug build (cargo build --verbose)
+    * Tests (cargo test --verbose)
+
+2. ARM64 cross-compilation
 
 All compilation and tests occur in a linux container using podman.
 
@@ -54,10 +59,12 @@ All compilation and tests occur in a linux container using podman.
 ### 3.2. Execute
 
 ```bash
-$ make -f scripts/local_ci/Makefile.ci ci-containers-arm64-cross-compilation
+make -f scripts/local_ci/Makefile.ci ci-containers-arm64-cross-compilation
 ```
 
 ## 4. Local Setup (ARM64 deploy)
+
+The CI functionality also allows for deploying and testing cross-compiled mujina to an ARM64 target environment.
 
 ### 4.1. Prerequisites
 
@@ -79,7 +86,7 @@ vi scripts/local_ci/arm-deployment.env
 ### 4.3. Usage
 
 ```bash
-$ make -f scripts/local_ci/Makefile.ci deploy-arm
+make -f scripts/local_ci/Makefile.ci deploy-arm
 ```
 
 ### 4.4. Volume Management
