@@ -5,10 +5,12 @@
 //! implementation provides device discovery and emits transport-specific
 //! events when devices are connected or disconnected.
 
+pub mod cpu;
 pub mod serial;
 pub mod usb;
 
 // Re-export transport implementations
+pub use cpu::CpuDeviceInfo;
 pub use serial::{
     Parity, SerialConfig, SerialControl, SerialError, SerialReader, SerialStats, SerialStream,
     SerialWriter,
@@ -20,12 +22,9 @@ pub use usb::{UsbDeviceInfo, UsbTransport};
 pub enum TransportEvent {
     /// USB device event
     Usb(usb::TransportEvent),
-    // Future transport types:
-    // /// PCIe device event
-    // Pcie(pcie::TransportEvent),
-    //
-    // /// Ethernet device event
-    // Ethernet(ethernet::TransportEvent),
+
+    /// CPU miner virtual device event
+    Cpu(cpu::TransportEvent),
 }
 
 /// Common trait for transport discovery (future enhancement).

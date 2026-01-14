@@ -109,10 +109,10 @@ pub mod protocol {
         pub const FAN_FAIL_BAND_LOW: u8 = 0x5A;
         /// Fan drive fail band high byte
         pub const FAN_FAIL_BAND_HIGH: u8 = 0x5B;
-        /// TACH reading high byte
-        pub const TACH_HIGH: u8 = 0x46;
-        /// TACH reading low byte
-        pub const TACH_LOW: u8 = 0x47;
+        /// TACH reading low byte (LSB)
+        pub const TACH_LOW: u8 = 0x46;
+        /// TACH reading high byte (MSB)
+        pub const TACH_HIGH: u8 = 0x47;
         /// TACH limit high byte
         pub const TACH_LIMIT_HIGH: u8 = 0x48;
         /// TACH limit low byte
@@ -128,30 +128,30 @@ pub mod protocol {
     /// Get register name from address
     pub fn register_name(addr: u8) -> String {
         match addr {
-            0x00 => "INTERNAL_TEMP".to_string(),
-            0x01 => "EXTERNAL_TEMP_HIGH".to_string(),
-            0x10 => "EXTERNAL_TEMP_LOW".to_string(),
-            0x03 => "CONFIG".to_string(),
-            0x04 => "CONVERSION_RATE".to_string(),
-            0x05 => "INTERNAL_TEMP_LIMIT".to_string(),
-            0x07 => "EXTERNAL_TEMP_LIMIT_HIGH".to_string(),
-            0x13 => "EXTERNAL_TEMP_LIMIT_LOW".to_string(),
-            0x4A => "FAN_CONFIG".to_string(),
-            0x4B => "FAN_SPINUP".to_string(),
-            0x4C => "FAN_SETTING".to_string(),
-            0x4D => "PWM_FREQ".to_string(),
-            0x4E => "PWM_DIV".to_string(),
-            0x55 => "FAN_MIN_DRIVE".to_string(),
-            0x58 => "FAN_VALID_TACH".to_string(),
-            0x5A => "FAN_FAIL_BAND_LOW".to_string(),
-            0x5B => "FAN_FAIL_BAND_HIGH".to_string(),
-            0x46 => "TACH_HIGH".to_string(),
-            0x47 => "TACH_LOW".to_string(),
-            0x48 => "TACH_LIMIT_HIGH".to_string(),
-            0x49 => "TACH_LIMIT_LOW".to_string(),
-            0xFD => "PRODUCT_ID".to_string(),
-            0xFE => "MFG_ID".to_string(),
-            0xFF => "REVISION".to_string(),
+            regs::INTERNAL_TEMP => "INTERNAL_TEMP".to_string(),
+            regs::EXTERNAL_TEMP_HIGH => "EXTERNAL_TEMP_HIGH".to_string(),
+            regs::EXTERNAL_TEMP_LOW => "EXTERNAL_TEMP_LOW".to_string(),
+            regs::CONFIG => "CONFIG".to_string(),
+            regs::CONVERSION_RATE => "CONVERSION_RATE".to_string(),
+            regs::INTERNAL_TEMP_LIMIT => "INTERNAL_TEMP_LIMIT".to_string(),
+            regs::EXTERNAL_TEMP_LIMIT_HIGH => "EXTERNAL_TEMP_LIMIT_HIGH".to_string(),
+            regs::EXTERNAL_TEMP_LIMIT_LOW => "EXTERNAL_TEMP_LIMIT_LOW".to_string(),
+            regs::FAN_CONFIG => "FAN_CONFIG".to_string(),
+            regs::FAN_SPINUP => "FAN_SPINUP".to_string(),
+            regs::FAN_SETTING => "FAN_SETTING".to_string(),
+            regs::PWM_FREQ => "PWM_FREQ".to_string(),
+            regs::PWM_DIV => "PWM_DIV".to_string(),
+            regs::FAN_MIN_DRIVE => "FAN_MIN_DRIVE".to_string(),
+            regs::FAN_VALID_TACH => "FAN_VALID_TACH".to_string(),
+            regs::FAN_FAIL_BAND_LOW => "FAN_FAIL_BAND_LOW".to_string(),
+            regs::FAN_FAIL_BAND_HIGH => "FAN_FAIL_BAND_HIGH".to_string(),
+            regs::TACH_LOW => "TACH_LOW".to_string(),
+            regs::TACH_HIGH => "TACH_HIGH".to_string(),
+            regs::TACH_LIMIT_HIGH => "TACH_LIMIT_HIGH".to_string(),
+            regs::TACH_LIMIT_LOW => "TACH_LIMIT_LOW".to_string(),
+            regs::PRODUCT_ID => "PRODUCT_ID".to_string(),
+            regs::MFG_ID => "MFG_ID".to_string(),
+            regs::REVISION => "REVISION".to_string(),
             _ => format!("UNKNOWN[0x{:02x}]", addr),
         }
     }

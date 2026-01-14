@@ -4,15 +4,13 @@
 //! abstraction. It handles the conversion between Stratum protocol messages and
 //! the internal JobTemplate/Share types used by the scheduler.
 
-use std::time::Duration;
-
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::stratum_v1::{ClientEvent, JobNotification, PoolConfig};
-use crate::types::{difficulty_for_share_interval, Difficulty, HashRate};
+use crate::types::{Difficulty, HashRate};
 
 use super::{
     Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
@@ -112,11 +110,8 @@ impl StratumV1Source {
 
         let version_template = VersionTemplate::new(job.version, gp_bits_mask)?;
 
-        // Determine share difficulty with internal minimum
-        let pool_difficulty = state.share_difficulty.unwrap_or(Difficulty::new(1));
-        let min_difficulty =
-            difficulty_for_share_interval(Duration::from_secs(10), self.expected_hashrate);
-        let share_difficulty = pool_difficulty.max(min_difficulty);
+        // Use pool's share difficulty directly (scheduler handles rate limiting)
+        let share_difficulty = state.share_difficulty.unwrap_or(Difficulty::from(1));
         let share_target = share_difficulty.to_target();
 
         Ok(JobTemplate {
@@ -205,7 +200,7 @@ impl StratumV1Source {
             }
 
             ClientEvent::DifficultyChanged(diff) => {
-                let difficulty = Difficulty::new(diff);
+                let difficulty = Difficulty::from(diff);
                 debug!(difficulty = %difficulty, "Pool difficulty changed");
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
@@ -425,7 +420,7 @@ mod tests {
         source.state = Some(ProtocolState {
             extranonce1,
             extranonce2_size,
-            share_difficulty: share_difficulty.map(Difficulty::new),
+            share_difficulty: share_difficulty.map(Difficulty::from),
             version_mask,
         });
 
@@ -795,57 +790,6 @@ mod tests {
             merkle_root,
             *notify::MERKLE_ROOT,
             "Computed merkle root doesn't match capture"
-        );
-    }
-
-    /// Test internal minimum difficulty when expected hashrate is set.
-    ///
-    /// When the scheduler provides an expected hashrate, the source should
-    /// apply an internal minimum difficulty to prevent share flooding, even
-    /// if the pool sets a lower difficulty.
-    #[test]
-    fn test_job_to_template_internal_minimum_difficulty() {
-        use crate::types::{difficulty_for_share_interval, HashRate};
-
-        let extranonce1 = hex::decode(STRATUM_EXTRANONCE1).unwrap();
-        let mut source = source_with_state(
-            extranonce1,
-            STRATUM_EXTRANONCE2_SIZE,
-            Some(1), // Pool sets very low difficulty
-            Some(VERSION_MASK),
-        );
-
-        // Set expected hashrate to 1 TH/s
-        source.expected_hashrate = HashRate::from_terahashes(1.0);
-
-        let params = json!([
-            "jobid",
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "aa",
-            "bb",
-            [],
-            "20000000",
-            "1d00ffff",
-            "5a5a5a5a",
-            false
-        ]);
-
-        let job = JobNotification::from_stratum_params(params.as_array().unwrap()).unwrap();
-        let template = source.job_to_template(job).unwrap();
-
-        // Calculate expected minimum difficulty for 1 TH/s at 10s interval
-        let expected_min =
-            difficulty_for_share_interval(Duration::from_secs(10), HashRate::from_terahashes(1.0));
-
-        // The share_target should reflect the minimum, not the pool's difficulty 1
-        let actual_difficulty = template.share_target.difficulty_float();
-        let expected_difficulty = u64::from(expected_min) as f64;
-
-        assert!(
-            actual_difficulty >= expected_difficulty * 0.9,
-            "Internal minimum not applied: got {}, expected >= {}",
-            actual_difficulty,
-            expected_difficulty
         );
     }
 }

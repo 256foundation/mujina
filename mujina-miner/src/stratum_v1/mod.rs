@@ -47,7 +47,68 @@ mod connection;
 mod error;
 mod messages;
 
-// Public exports
+use crate::types::ShareRate;
+use std::time::Duration;
+
 pub use client::{PoolConfig, StratumV1Client};
 pub use error::{StratumError, StratumResult};
 pub use messages::{ClientCommand, ClientEvent, JobNotification, SubmitParams};
+
+/// Safety cap to prevent flooding pools during startup or misconfiguration.
+///
+/// # Purpose
+///
+/// This cap exists solely for flood prevention---it's a safety net for
+/// pathological cases like:
+/// - Pool starts us at difficulty 1 with high-hashrate hardware
+/// - Misconfigured pool sends absurdly low difficulty
+/// - Bug in difficulty handling
+///
+/// It is NOT intended to interact with or assist pool vardiff algorithms.
+/// The goal is to be permissive enough that normal vardiff operation is
+/// unaffected while still catching catastrophic misconfiguration.
+///
+/// # Why not set it at the pool's target rate?
+///
+/// It's tempting to set this at a typical pool's target share rate (e.g.,
+/// ckpool targets ~3.33 sec/share). However, this would defeat vardiff:
+///
+/// Vardiff algorithms like ckpool's work by measuring actual share arrival
+/// rate and adjusting difficulty to converge on a target rate. If we
+/// client-side rate limit at exactly the target rate, the pool sees the
+/// capped rate and thinks difficulty is correct---it can never increase
+/// difficulty because it never sees the "natural" share flood that would
+/// indicate difficulty is too low.
+///
+/// Example: ckpool's vardiff triggers after 72 shares or 240 seconds and
+/// adjusts based on the ratio of actual vs target share rate. With client-
+/// side capping at the target rate, the pool would see perfect behavior
+/// and never raise difficulty, leaving us doing unnecessary local work
+/// filtering shares.
+///
+/// # Why 10 shares/second?
+///
+/// - **Server load**: 10 req/sec from a single client is modest. Pools
+///   routinely handle many concurrent miners, so per-client rates at this
+///   level shouldn't cause concern.
+/// - **Headroom for vardiff**: At 10/sec, a pool targeting 0.3/sec (3.33 sec
+///   interval) sees ~33x higher than desired rate, clearly signaling that
+///   difficulty needs to increase dramatically. Vardiff algorithms converge
+///   quickly under such clear signal.
+/// - **Still prevents real floods**: Without any cap, very low difficulty
+///   combined with high hashrate could overwhelm both our CPU (verifying
+///   hashes) and the pool. 10/sec provides a hard ceiling.
+///
+/// # Interaction with ckpool vardiff
+///
+/// ckpool's vardiff (from `src/stratifier.c`):
+/// - Target rate: ~3.33 seconds per share (`optimal = dsps * 3.33`)
+/// - Evaluation window: 72 shares OR 240 seconds, whichever comes first
+/// - Acceptable ratio range: 0.15 to 0.4 (raises if too fast, lowers if too slow)
+///
+/// With our 10/sec cap vs ckpool's ~0.3/sec target:
+/// - We're ~33x faster than target, well outside the 0.15-0.4 acceptable range
+/// - ckpool will aggressively raise difficulty each evaluation period
+/// - After a few adjustment cycles, difficulty will be high enough that natural
+///   share rate falls below 10/sec and the cap becomes inactive
+pub const FLOOD_PREVENTION_CAP: ShareRate = ShareRate::from_interval(Duration::from_millis(100));

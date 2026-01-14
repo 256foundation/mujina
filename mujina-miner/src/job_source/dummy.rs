@@ -13,7 +13,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::types::{difficulty_for_share_interval, HashRate};
+use crate::types::{target_for_share_rate, HashRate, ShareRate};
 
 use super::test_blocks::block_881423;
 use super::{
@@ -87,11 +87,10 @@ impl DummySource {
             bits: *block_881423::BITS,
 
             // Share difficulty: ~1 share per 10 seconds at 1 TH/s
-            share_target: difficulty_for_share_interval(
-                Duration::from_secs(10),
+            share_target: target_for_share_rate(
+                ShareRate::per_minute(6.0),
                 HashRate::from_terahashes(1.0),
-            )
-            .to_target(),
+            ),
 
             time: block_881423::TIME,
 

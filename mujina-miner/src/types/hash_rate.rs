@@ -1,5 +1,7 @@
 //! Hashrate measurement type.
 
+use std::time::Duration;
+
 /// Hashrate measurement.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HashRate(pub u64); // hashes per second
@@ -40,6 +42,11 @@ impl HashRate {
         self.0 == 0
     }
 
+    /// Expected number of hashes in the given duration.
+    pub fn hashes_in(&self, duration: Duration) -> u128 {
+        self.0 as u128 * duration.as_nanos() / 1_000_000_000
+    }
+
     /// Format as human-readable string with appropriate units
     pub fn to_human_readable(&self) -> String {
         if self.0 >= 1_000_000_000_000 {
@@ -57,6 +64,12 @@ impl HashRate {
 impl From<HashRate> for f64 {
     fn from(rate: HashRate) -> Self {
         rate.0 as f64
+    }
+}
+
+impl std::fmt::Display for HashRate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_human_readable())
     }
 }
 

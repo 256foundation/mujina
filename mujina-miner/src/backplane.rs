@@ -7,10 +7,13 @@
 
 use crate::{
     asic::hash_thread::HashThread,
-    board::{Board, BoardDescriptor},
+    board::{Board, BoardDescriptor, VirtualBoardRegistry},
     error::Result,
     tracing::prelude::*,
-    transport::{usb::TransportEvent as UsbTransportEvent, TransportEvent, UsbDeviceInfo},
+    transport::{
+        cpu::TransportEvent as CpuTransportEvent, usb::TransportEvent as UsbTransportEvent,
+        TransportEvent, UsbDeviceInfo,
+    },
 };
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -40,6 +43,7 @@ impl BoardRegistry {
 /// manages their lifecycle.
 pub struct Backplane {
     registry: BoardRegistry,
+    virtual_registry: VirtualBoardRegistry,
     /// Active boards managed by the backplane
     boards: HashMap<String, Box<dyn Board + Send>>,
     event_rx: mpsc::Receiver<TransportEvent>,
@@ -55,6 +59,7 @@ impl Backplane {
     ) -> Self {
         Self {
             registry: BoardRegistry,
+            virtual_registry: VirtualBoardRegistry,
             boards: HashMap::new(),
             event_rx,
             scheduler_tx,
@@ -67,6 +72,9 @@ impl Backplane {
             match event {
                 TransportEvent::Usb(usb_event) => {
                     self.handle_usb_event(usb_event).await?;
+                }
+                TransportEvent::Cpu(cpu_event) => {
+                    self.handle_cpu_event(cpu_event).await?;
                 }
             }
         }
@@ -198,6 +206,99 @@ impl Backplane {
                         }
                         // Don't re-insert - board is removed
                         break; // For now, assume one board per device
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle CPU miner transport events.
+    async fn handle_cpu_event(&mut self, event: CpuTransportEvent) -> Result<()> {
+        match event {
+            CpuTransportEvent::CpuDeviceConnected(device_info) => {
+                // Find the virtual board descriptor for cpu_miner
+                let Some(descriptor) = self.virtual_registry.find("cpu_miner") else {
+                    error!("No virtual board descriptor found for cpu_miner");
+                    return Ok(());
+                };
+
+                info!(
+                    board = descriptor.name,
+                    threads = device_info.thread_count,
+                    duty = device_info.duty_percent,
+                    "CPU miner board connected."
+                );
+
+                // Create the board using the descriptor's factory function
+                let mut board = match (descriptor.create_fn)().await {
+                    Ok(board) => board,
+                    Err(e) => {
+                        error!(
+                            board = descriptor.name,
+                            error = %e,
+                            "Failed to create CPU miner board"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let board_info = board.board_info();
+                let board_id = device_info.device_id.clone();
+
+                // Create hash threads from the board
+                match board.create_hash_threads().await {
+                    Ok(threads) => {
+                        let thread_count = threads.len();
+
+                        // Store board for lifecycle management
+                        self.boards.insert(board_id.clone(), board);
+
+                        // Send threads to scheduler individually
+                        for thread in threads {
+                            if let Err(e) = self.scheduler_tx.send(thread).await {
+                                tracing::error!(
+                                    board = %board_info.model,
+                                    error = %e,
+                                    "Failed to send thread to scheduler"
+                                );
+                                break;
+                            }
+                        }
+
+                        info!(
+                            board = %board_info.model,
+                            threads = thread_count,
+                            "CPU miner started."
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            board = %board_info.model,
+                            error = %e,
+                            "CPU miner failed to start."
+                        );
+                    }
+                }
+            }
+            CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
+                if let Some(mut board) = self.boards.remove(&device_id) {
+                    let model = board.board_info().model;
+                    debug!(board = %model, id = %device_id, "Shutting down CPU miner");
+
+                    match board.shutdown().await {
+                        Ok(()) => {
+                            info!(board = %model, id = %device_id, "CPU miner disconnected");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                board = %model,
+                                id = %device_id,
+                                error = %e,
+                                "Failed to shutdown CPU miner"
+                            );
+                        }
                     }
                 }
             }

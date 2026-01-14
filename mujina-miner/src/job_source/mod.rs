@@ -41,19 +41,19 @@
 //!
 //! ## Share Difficulty
 //!
-//! Sources receive share difficulty from their upstream (pool, node, etc.).
-//! We avoid suggesting difficulty because some pools (notably Ocean)
-//! disconnect clients that suggest inappropriately low values.
+//! Sources receive share difficulty from their upstream (pool, node, etc.)
+//! and report it directly in [`JobTemplate::share_target`]. We avoid
+//! suggesting difficulty to pools because some (notably Ocean) disconnect
+//! clients that suggest inappropriately low values.
 //!
-//! Instead, sources apply an **internal minimum difficulty** to prevent share
-//! flooding when upstream difficulty is lower than appropriate for our hashrate.
-//! The scheduler informs sources of expected hashrate via [`SourceCommand::UpdateHashRate`],
-//! and sources use `max(upstream_difficulty, min_difficulty)` where
-//! `min_difficulty` targets roughly one share per 10 seconds.
+//! Rate limiting to prevent share flooding is the scheduler's responsibility.
+//! Sources declare their maximum share rate at registration time, and the
+//! scheduler enforces it.
 
 // Submodules
 pub mod dummy;
 mod extranonce2;
+pub mod forced_rate;
 pub(crate) mod job;
 mod merkle;
 mod messages;

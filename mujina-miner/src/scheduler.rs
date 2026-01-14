@@ -43,7 +43,10 @@ use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
 };
 use crate::tracing::prelude::*;
-use crate::types::{expected_time_to_share_from_target, HashRate};
+use crate::types::{
+    expected_time_to_share_from_target, target_for_share_rate, Difficulty, HashRate, ShareRate,
+    Target,
+};
 use crate::u256::U256;
 
 /// Unique identifier for a job source, assigned by the scheduler.
@@ -93,6 +96,9 @@ pub struct SourceRegistration {
 
     /// Command sender for this source (SubmitShare, etc.)
     pub command_tx: mpsc::Sender<SourceCommand>,
+
+    /// Maximum average share submission rate for this source.
+    pub max_share_rate: Option<ShareRate>,
 }
 
 /// Internal scheduler tracking for a registered source.
@@ -106,6 +112,9 @@ struct SourceEntry {
 
     /// Last job received from this source (for assigning to newly-arriving threads)
     last_job: Option<Arc<JobTemplate>>,
+
+    /// Maximum average share submission rate for this source.
+    max_share_rate: Option<ShareRate>,
 }
 
 /// Whether to update alongside existing work or replace it.
@@ -154,14 +163,55 @@ impl Scheduler {
         }
     }
 
-    /// Calculates aggregate hashrate from all registered threads.
-    fn total_hashrate(&self) -> HashRate {
+    /// Calculates aggregate hashrate estimate from all registered threads.
+    ///
+    /// Uses static estimates from capabilities. Useful for initial hashrate
+    /// before measurements are available.
+    fn estimated_hashrate(&self) -> HashRate {
         let total: u64 = self
             .threads
             .values()
             .map(|t| t.capabilities().hashrate_estimate.0)
             .sum();
         HashRate(total)
+    }
+
+    /// Calculates aggregate measured hashrate from all registered threads.
+    ///
+    /// Falls back to estimated hashrate if no measurements available yet.
+    fn measured_hashrate(&self) -> HashRate {
+        let total: u64 = self.threads.values().map(|t| t.status().hashrate.0).sum();
+        let measured = HashRate(total);
+
+        // Fall back to estimate if no measurements yet
+        if measured.is_zero() {
+            self.estimated_hashrate()
+        } else {
+            measured
+        }
+    }
+
+    /// Compute the share_target for a HashTask.
+    ///
+    /// Applies the source's rate limit (if any) to avoid flooding. Returns
+    /// the harder of the source's target or the rate-limited target.
+    fn compute_share_target(
+        max_share_rate: Option<ShareRate>,
+        hashrate: HashRate,
+        source_target: Target,
+    ) -> Target {
+        let Some(max_rate) = max_share_rate else {
+            return source_target;
+        };
+
+        if hashrate.is_zero() {
+            return source_target;
+        }
+
+        let rate_limit_target = target_for_share_rate(max_rate, hashrate);
+
+        // Return the harder target (smaller value = higher difficulty)
+        std::cmp::min(source_target, rate_limit_target)
     }
 
     /// Collects hashrate command senders from all sources.
@@ -204,12 +254,13 @@ impl Scheduler {
             name: registration.name.clone(),
             command_tx: registration.command_tx,
             last_job: None,
+            max_share_rate: registration.max_share_rate,
         });
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");
 
         // Send current hashrate estimate to the new source
-        let hashrate = self.total_hashrate();
+        let hashrate = self.measured_hashrate();
         let _ = self.sources[source_id]
             .command_tx
             .send(SourceCommand::UpdateHashRate(hashrate))
@@ -254,7 +305,7 @@ impl Scheduler {
 
         // Check if difficulty is reasonable for our hashrate (once per source)
         if !self.difficulty_warned_sources.contains(&source_id) {
-            let hashrate = self.total_hashrate();
+            let hashrate = self.measured_hashrate();
             if warn_if_difficulty_too_high(&template, hashrate, &source_name) {
                 self.difficulty_warned_sources.insert(source_id);
             }
@@ -270,6 +321,12 @@ impl Scheduler {
             .split(self.threads.len())
             .expect("Failed to split EN2 range among threads");
 
+        // Compute share_target with rate limiting applied
+        let max_share_rate = self.sources.get(source_id).and_then(|s| s.max_share_rate);
+        let hashrate = self.measured_hashrate();
+        let share_target =
+            Self::compute_share_target(max_share_rate, hashrate, template.share_target);
+
         // Assign work to all threads
         for ((thread_id, thread), en2_range) in self.threads.iter_mut().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
@@ -281,7 +338,7 @@ impl Scheduler {
                 template: template.clone(),
                 en2_range: Some(en2_range),
                 en2: starting_en2,
-                share_target: template.share_target,
+                share_target,
                 ntime: template.time,
                 share_tx,
             };
@@ -332,22 +389,27 @@ impl Scheduler {
             return;
         };
 
+        // Extract fields for logging (share may be consumed on submission)
+        let nonce = share.nonce;
+        let hash = share.hash;
+        let share_difficulty = Difficulty::from_hash(&hash);
+        let threshold = Difficulty::from_target(task_entry.template.share_target);
+
         debug!(
-            task_id = ?task_id,
+            source = %self.sources.get(task_entry.source_id).map(|s| s.name.as_str()).unwrap_or("unknown"),
             job_id = %task_entry.template.id,
-            nonce = format!("{:#x}", share.nonce),
-            hash = %share.hash,
+            nonce = format!("{:#x}", nonce),
+            hash = %hash,
+            share_difficulty = %share_difficulty,
+            threshold = %threshold,
             "Share found"
         );
 
         // Track hashes for hashrate measurement (see MiningStats doc)
         self.stats.total_hashes += share.expected_hashes;
 
-        // Extract nonce for potential trace logging (share consumed if submitted)
-        let nonce = share.nonce;
-
         // Check if share meets source threshold
-        if task_entry.template.share_target.is_met_by(share.hash) {
+        if task_entry.template.share_target.is_met_by(hash) {
             self.stats.shares_submitted += 1;
 
             // Submit share to originating source
@@ -372,8 +434,11 @@ impl Scheduler {
             }
         } else {
             trace!(
-                task_id = ?task_id,
+                source = %self.sources.get(task_entry.source_id).map(|s| s.name.as_str()).unwrap_or("unknown"),
+                job_id = %task_entry.template.id,
                 nonce = format!("{:#x}", nonce),
+                share_difficulty = %share_difficulty,
+                threshold = %threshold,
                 "Share below source threshold (not submitted)"
             );
         }
@@ -428,7 +493,7 @@ impl Scheduler {
         debug!(thread = %thread_name, "Thread registered");
 
         // Broadcast updated hashrate to all sources
-        let hashrate = self.total_hashrate();
+        let hashrate = self.measured_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 
@@ -436,6 +501,9 @@ impl Scheduler {
         self.difficulty_warned_sources.clear();
 
         self.last_thread_count = thread_events.len();
+
+        // Compute hashrate once for all sources
+        let hashrate = self.measured_hashrate();
 
         // Assign cached jobs from all sources to the new thread
         for (source_id, source) in self.sources.iter() {
@@ -449,12 +517,16 @@ impl Scheduler {
                 MerkleRootKind::Fixed(_) => continue,
             };
 
+            // Compute share_target with rate limiting applied
+            let share_target =
+                Self::compute_share_target(source.max_share_rate, hashrate, template.share_target);
+
             let (share_tx, share_rx) = mpsc::channel(32);
             let hash_task = HashTask {
                 template: template.clone(),
                 en2_range: Some(full_en2_range.clone()),
                 en2: full_en2_range.iter().next(),
-                share_target: template.share_target,
+                share_target,
                 ntime: template.time,
                 share_tx,
             };
@@ -511,7 +583,7 @@ impl Scheduler {
         self.last_thread_count = current_count;
 
         // Broadcast updated hashrate to all sources
-        let hashrate = self.total_hashrate();
+        let hashrate = self.measured_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 
@@ -534,7 +606,12 @@ impl Scheduler {
         // Create interval for periodic status logging
         let mut status_interval = tokio::time::interval(Duration::from_secs(30));
         status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut first_tick = true;
+        let mut first_status_tick = true;
+
+        // Create interval for periodic hashrate broadcasts to sources
+        let mut hashrate_interval = tokio::time::interval(Duration::from_secs(10));
+        hashrate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut first_hashrate_tick = true;
 
         while !running.is_cancelled() {
             tokio::select! {
@@ -599,12 +676,23 @@ impl Scheduler {
                     self.handle_new_thread(thread, &mut thread_events, &mut share_channels).await;
                 }
 
-                // Periodic status check
+                // Periodic status logging
                 _ = status_interval.tick() => {
-                    if first_tick {
-                        first_tick = false;
+                    if first_status_tick {
+                        first_status_tick = false;
                     } else {
                         self.stats.log_summary();
+                    }
+                }
+
+                // Periodic hashrate broadcast to sources
+                _ = hashrate_interval.tick() => {
+                    if first_hashrate_tick {
+                        first_hashrate_tick = false;
+                    } else {
+                        let hashrate = self.measured_hashrate();
+                        let senders = self.hashrate_senders();
+                        broadcast_hashrate(senders, hashrate).await;
                     }
                 }
 

@@ -4,6 +4,7 @@ pub mod asic;
 pub mod backplane;
 pub mod board;
 pub mod config;
+pub mod cpu_miner;
 pub mod daemon;
 pub mod error;
 pub mod hw_trait;

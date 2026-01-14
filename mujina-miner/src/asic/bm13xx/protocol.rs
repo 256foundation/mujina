@@ -2400,14 +2400,14 @@ mod response_tests {
         let difficulty = Difficulty::from_hash(&hash);
 
         // Allow +/-1 tolerance for integer division rounding
-        let expected = Difficulty::new(esp_miner_job::EXPECTED_HASH_DIFFICULTY as u64);
+        let expected = Difficulty::from(esp_miner_job::EXPECTED_HASH_DIFFICULTY as u64);
         assert!(
-            difficulty >= Difficulty::new(u64::from(expected) - 1)
-                && difficulty <= Difficulty::new(u64::from(expected) + 1),
+            difficulty >= Difficulty::from(expected.as_u64() - 1)
+                && difficulty <= Difficulty::from(expected.as_u64() + 1),
             "Hash difficulty should match esp-miner result"
         );
         assert!(
-            difficulty >= Difficulty::new(esp_miner_job::POOL_SHARE_DIFFICULTY_INT),
+            difficulty >= Difficulty::from(esp_miner_job::POOL_SHARE_DIFFICULTY_INT),
             "Hash should meet pool difficulty"
         );
     }

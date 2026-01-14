@@ -8,7 +8,7 @@ use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Pool connection configuration.
 #[derive(Debug, Clone)]
@@ -613,7 +613,7 @@ impl StratumV1Client {
 
         let state = self.state.as_ref().unwrap();
         debug!(
-            extranonce1 = hex::encode(&state.extranonce1),
+            extranonce1 = %format_args!("0x{}", state.extranonce1),
             extranonce2_size = %state.extranonce2_size,
             "Subscribed"
         );

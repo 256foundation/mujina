@@ -683,10 +683,10 @@ pub mod esp_miner_job {
 
             // Verify difficulty matches expected value from esp-miner logs
             // Allow +/-1 tolerance for integer division rounding
-            let expected = Difficulty::new(EXPECTED_HASH_DIFFICULTY as u64);
+            let expected = Difficulty::from(EXPECTED_HASH_DIFFICULTY as u64);
             assert!(
-                difficulty >= Difficulty::new(u64::from(expected) - 1)
-                    && difficulty <= Difficulty::new(u64::from(expected) + 1),
+                difficulty >= Difficulty::from(expected.as_u64() - 1)
+                    && difficulty <= Difficulty::from(expected.as_u64() + 1),
                 "Hash difficulty mismatch: computed={}, expected={}",
                 difficulty,
                 expected
@@ -694,7 +694,7 @@ pub mod esp_miner_job {
 
             // Verify this would be a valid pool share
             assert!(
-                difficulty >= Difficulty::new(POOL_SHARE_DIFFICULTY_INT),
+                difficulty >= Difficulty::from(POOL_SHARE_DIFFICULTY_INT),
                 "Hash difficulty {} should exceed pool difficulty {}",
                 difficulty,
                 POOL_SHARE_DIFFICULTY_INT

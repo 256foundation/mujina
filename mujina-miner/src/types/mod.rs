@@ -7,14 +7,18 @@
 mod bitcoin_impls;
 mod difficulty;
 mod hash_rate;
+mod share_rate;
 
 use std::time::Duration;
+
+use crate::u256::U256;
 
 // Re-export frequently used bitcoin types for convenience
 pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 pub use difficulty::Difficulty;
 pub use hash_rate::HashRate;
+pub use share_rate::ShareRate;
 
 /// Calculate expected shares per second at given difficulty and hashrate.
 ///
@@ -23,7 +27,7 @@ pub use hash_rate::HashRate;
 /// This represents the statistical average; actual share arrival follows
 /// a Poisson distribution.
 pub fn expected_shares_per_second(difficulty: Difficulty, hashrate: HashRate) -> f64 {
-    let hashes_per_share = u64::from(difficulty) as f64 * (u32::MAX as f64 + 1.0);
+    let hashes_per_share = difficulty.as_f64() * (u32::MAX as f64 + 1.0);
     f64::from(hashrate) / hashes_per_share
 }
 
@@ -56,16 +60,17 @@ pub fn expected_time_to_share_from_target(target: Target, hashrate: HashRate) ->
     Duration::from_secs_f64(1.0 / shares_per_sec)
 }
 
-/// Calculate difficulty to achieve approximately one share per `interval`.
+/// Calculate target to achieve the given share rate at the given hashrate.
 ///
-/// This is the inverse of `expected_time_to_share`. Useful for setting pool
-/// difficulty based on hashrate and desired share frequency.
-///
-/// Formula: difficulty = hashrate * interval / 2^32
-pub fn difficulty_for_share_interval(interval: Duration, hashrate: HashRate) -> Difficulty {
-    let hashes_in_interval = f64::from(hashrate) * interval.as_secs_f64();
-    let difficulty = hashes_in_interval / (u32::MAX as f64 + 1.0);
-    Difficulty::new(difficulty.max(1.0) as u64)
+/// A hash is valid if hash < target. With hashes uniform over [0, 2^256),
+/// expected hashes per share = 2^256 / target, so target = 2^256 / hashes_per_share.
+pub fn target_for_share_rate(rate: ShareRate, hashrate: HashRate) -> Target {
+    let hashes_per_share = hashrate.hashes_in(rate.as_interval());
+    if hashes_per_share <= 1 {
+        return Target::MAX;
+    }
+
+    Target::from(U256::MAX / hashes_per_share)
 }
 
 #[cfg(test)]
@@ -75,7 +80,7 @@ mod tests {
     #[test]
     fn test_expected_shares_per_second() {
         // At 1 GH/s with difficulty 1024, expect roughly one share every ~4398 seconds
-        let diff = Difficulty::new(1024);
+        let diff = Difficulty::from(1024);
         let hashrate = HashRate::from_gigahashes(1.0);
 
         let shares_per_sec = expected_shares_per_second(diff, hashrate);
@@ -87,7 +92,7 @@ mod tests {
     #[test]
     fn test_expected_time_to_share() {
         // At 1 GH/s with difficulty 1024
-        let diff = Difficulty::new(1024);
+        let diff = Difficulty::from(1024);
         let hashrate = HashRate::from_gigahashes(1.0);
 
         let time_to_share = expected_time_to_share(diff, hashrate);
@@ -98,14 +103,14 @@ mod tests {
     #[test]
     fn test_share_calculations_extreme_hashrates() {
         // Very low hashrate (CPU miner: 1 MH/s)
-        let diff = Difficulty::new(256);
+        let diff = Difficulty::from(256);
         let hashrate = HashRate::from_megahashes(1.0);
         let time_to_share = expected_time_to_share(diff, hashrate);
         // Should be over 1 million seconds
         assert!(time_to_share.as_secs() > 1_000_000);
 
         // Very high hashrate (datacenter: 100 TH/s)
-        let diff = Difficulty::new(100_000);
+        let diff = Difficulty::from(100_000);
         let hashrate = HashRate::from_terahashes(100.0);
         let shares_per_sec = expected_shares_per_second(diff, hashrate);
         // Should be roughly 0.23 shares per second
@@ -113,26 +118,30 @@ mod tests {
     }
 
     #[test]
-    fn test_difficulty_for_share_interval() {
-        // 1 TH/s with 10 second target = ~2328 difficulty
+    fn test_target_for_share_rate() {
+        // 1 TH/s with 6 shares/min (10 second interval) = ~2328 difficulty
         let hashrate = HashRate::from_terahashes(1.0);
-        let interval = Duration::from_secs(10);
-        let diff = difficulty_for_share_interval(interval, hashrate);
-        // 1e12 * 10 / 2^32 ≈ 2328
-        assert!((u64::from(diff) as i64 - 2328).abs() < 10);
+        let rate = ShareRate::per_minute(6.0);
+        let target = target_for_share_rate(rate, hashrate);
+        // 1e12 * 10 / 2^32 ≈ 2328 difficulty
+        let diff = Difficulty::from_target(target);
+        assert!((diff.as_u64() as i64 - 2328).abs() < 10);
 
-        // Round-trip: difficulty -> interval -> difficulty should be close
-        let original = Difficulty::new(1024);
+        // Round-trip: target -> rate -> target should be close
+        let original = Difficulty::from(1024).to_target();
         let hashrate = HashRate::from_gigahashes(1.0);
-        let interval = expected_time_to_share(original, hashrate);
-        let recovered = difficulty_for_share_interval(interval, hashrate);
-        assert!((u64::from(recovered) as i64 - 1024).abs() < 2);
+        let interval = expected_time_to_share_from_target(original, hashrate);
+        let rate = ShareRate::from_interval(interval);
+        let recovered = target_for_share_rate(rate, hashrate);
+        // Compare via difficulty since target comparison is awkward
+        let recovered_diff = Difficulty::from_target(recovered);
+        assert!((recovered_diff.as_u64() as i64 - 1024).abs() < 2);
     }
 
     #[test]
     fn test_expected_time_to_share_from_target() {
         // Should match expected_time_to_share when using equivalent difficulty
-        let difficulty = Difficulty::new(1024);
+        let difficulty = Difficulty::from(1024);
         let target = difficulty.to_target();
         let hashrate = HashRate::from_terahashes(1.0);
 

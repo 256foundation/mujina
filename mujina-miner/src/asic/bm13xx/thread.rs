@@ -1013,7 +1013,7 @@ mod tests {
             )
             .expect("Valid version template"),
             bits: *esp_miner_job::wire_tx::NBITS,
-            share_target: crate::types::Difficulty::new(100).to_target(),
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
             time: *esp_miner_job::wire_tx::NTIME,
             merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
         });
@@ -1028,7 +1028,7 @@ mod tests {
             template,
             en2_range: None,
             en2: Some(dummy_en2),
-            share_target: crate::types::Difficulty::new(100).to_target(),
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
             ntime: *esp_miner_job::wire_tx::NTIME,
             share_tx,
         };

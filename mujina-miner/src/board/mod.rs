@@ -1,4 +1,5 @@
 pub(crate) mod bitaxe;
+pub mod cpu;
 pub(crate) mod emberone;
 pub mod pattern;
 
@@ -106,3 +107,39 @@ pub struct BoardDescriptor {
 
 // This creates the inventory collection for board descriptors
 inventory::collect!(BoardDescriptor);
+
+// ---------------------------------------------------------------------------
+// Virtual board support (CPU miner, test boards, etc.)
+// ---------------------------------------------------------------------------
+
+/// Type alias for virtual board factory function.
+///
+/// Unlike USB boards, virtual boards don't receive device info---they're
+/// configured via environment variables or other means.
+pub type VirtualBoardFactoryFn =
+    fn() -> BoxFuture<'static, crate::error::Result<Box<dyn Board + Send>>>;
+
+/// Descriptor for virtual boards (CPU miner, test boards, etc.).
+///
+/// Virtual boards are registered via `inventory::submit!` like USB boards,
+/// but match on a device type string rather than USB patterns.
+pub struct VirtualBoardDescriptor {
+    /// Device type identifier (e.g., "cpu_miner")
+    pub device_type: &'static str,
+    /// Human-readable board name (e.g., "CPU Miner")
+    pub name: &'static str,
+    /// Factory function to create the board
+    pub create_fn: VirtualBoardFactoryFn,
+}
+
+inventory::collect!(VirtualBoardDescriptor);
+
+/// Registry for virtual board descriptors.
+pub struct VirtualBoardRegistry;
+
+impl VirtualBoardRegistry {
+    /// Find a virtual board descriptor by device type.
+    pub fn find(&self, device_type: &str) -> Option<&'static VirtualBoardDescriptor> {
+        inventory::iter::<VirtualBoardDescriptor>().find(|desc| desc.device_type == device_type)
+    }
+}
