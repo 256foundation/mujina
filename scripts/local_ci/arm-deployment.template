@@ -1,0 +1,23 @@
+# Local ARM deployment environment template (local-only)
+
+# ARM host IP or hostname
+ARM_HOST=192.168.1.100
+
+# SSH username for the ARM host
+ARM_USER=pi
+
+# Optional: SSH private key path
+# SSH_KEY=/path/to/your/private/key
+
+# Optional: SSH passphrase automation (choose one method)
+# Method 1: Use ssh-agent (recommended)
+# ssh-add /path/to/your/private/key
+# Method 2: Use SSH_ASKPASS program
+# SSH_ASKPASS=/path/to/askpass/program
+
+# Optional: SSH port
+# SSH_PORT=22
+
+# Optional: Custom SSH options
+# SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
