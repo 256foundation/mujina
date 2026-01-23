@@ -83,7 +83,8 @@ struct ProtocolState {
     extranonce2_size: usize,
 
     /// Current difficulty (if set)
-    difficulty: Option<u64>,
+    /// Stratum v1 difficulty can be a float (e.g., 0.001 for low-difficulty shares)
+    difficulty: Option<f64>,
 
     /// Current version mask (if set)
     version_mask: Option<u32>,
@@ -144,7 +145,7 @@ impl StratumV1Client {
         method: &str,
         params: serde_json::Value,
     ) -> StratumResult<JsonRpcMessage> {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         let id = self.next_id();
 
@@ -535,8 +536,11 @@ impl StratumV1Client {
             ));
         }
 
+        // Stratum v1 difficulty can be integer or float (e.g., 0.001 for low-diff shares)
+        // Try as_f64 first (handles both int and float), fall back to as_u64 for compat
         let difficulty = arr[0]
-            .as_u64()
+            .as_f64()
+            .or_else(|| arr[0].as_u64().map(|v| v as f64))
             .ok_or_else(|| StratumError::InvalidMessage("difficulty not a number".to_string()))?;
 
         if let Some(state) = &mut self.state {
@@ -724,7 +728,7 @@ mod tests {
     use super::*;
     use crate::job_source::Extranonce2;
     use bitcoin::hashes::Hash;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     /// Integration test: Connect to public-pool.io and validate protocol.
     ///
@@ -845,7 +849,7 @@ mod tests {
     /// check remains valuable for catching delayed disconnects from pools that
     /// reject our configuration after the initial handshake.
     async fn test_pool_integration(pool_url: &str, username: &str) {
-        use tracing_subscriber::{fmt, EnvFilter};
+        use tracing_subscriber::{EnvFilter, fmt};
 
         // Initialize logging for the test
         let _ = fmt()
@@ -925,7 +929,7 @@ mod tests {
                 ClientEvent::DifficultyChanged(diff) => {
                     println!("\n[Difficulty Changed]");
                     println!("  Difficulty: {}", diff);
-                    assert!(*diff > 0, "difficulty should be positive");
+                    assert!(*diff > 0.0, "difficulty should be positive");
                     *received_difficulty = true;
                 }
                 ClientEvent::VersionMaskSet(mask) => {
@@ -1049,7 +1053,7 @@ mod tests {
             .expect("Expected DifficultyChanged event");
         match event {
             ClientEvent::DifficultyChanged(diff) => {
-                assert_eq!(diff, 2048);
+                assert_eq!(diff, 2048.0);
             }
             _ => panic!("Expected DifficultyChanged event, got {:?}", event),
         }
@@ -1075,6 +1079,30 @@ mod tests {
         let params = json!(["not a number"]);
         let result = client.handle_set_difficulty(&params).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_difficulty_float() {
+        use serde_json::json;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Float difficulty (common for low-difficulty vardiff)
+        let params = json!([0.001]);
+        let result = client.handle_set_difficulty(&params).await;
+
+        assert!(result.is_ok());
+
+        // Verify event was emitted with float value
+        let event = event_rx
+            .try_recv()
+            .expect("Expected DifficultyChanged event");
+        match event {
+            ClientEvent::DifficultyChanged(diff) => {
+                assert!((diff - 0.001).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected DifficultyChanged event, got {:?}", event),
+        }
     }
 
     #[tokio::test]
