@@ -200,7 +200,7 @@ impl StratumV1Source {
             }
 
             ClientEvent::DifficultyChanged(diff) => {
-                let difficulty = Difficulty::from(diff);
+                let difficulty = Difficulty::from_f64(diff);
                 debug!(difficulty = %difficulty, "Pool difficulty changed");
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
