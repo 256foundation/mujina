@@ -1,0 +1,96 @@
+.PHONY: help build test fmt clippy ci-local hybrid-ci hybrid-ci-arm hybrid-ci-containers clean
+
+help: ## Show this help message
+	@echo "Available commands:"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+build: ## Build the project
+	cargo build
+
+test: ## Run tests
+	cargo test
+
+fmt: ## Check formatting
+	cargo fmt --all -- --check
+
+fmt-fix: ## Fix formatting
+	cargo fmt --all
+
+clippy: ## Run clippy
+	cargo clippy --all-targets --all-features -- -D warnings
+
+# Individual CI steps using the shared script
+ci-fmt: ## Run formatting check in container
+	chmod +x .github/ci-runner.sh && ./.github/ci-runner.sh fmt
+
+ci-clippy: ## Run clippy in container
+	chmod +x .github/ci-runner.sh && ./.github/ci-runner.sh clippy
+
+ci-build: ## Build in container
+	chmod +x .github/ci-runner.sh && ./.github/ci-runner.sh build
+
+ci-test: ## Run tests in container
+	chmod +x .github/ci-runner.sh && ./.github/ci-runner.sh test
+
+## Cross-compile for ARM64 in container
+ci-build-arm64:
+	chmod +x .github/ci-runner.sh && TARGET_ARCH=aarch64-unknown-linux-gnu ./.github/ci-runner.sh build-release
+    # Copy binary from Podman volume to local filesystem
+	@mkdir -p target/aarch64-unknown-linux-gnu/release
+	@podman run --rm \
+		-v cargo-target:/workspace/target:Z \
+		--entrypoint="" \
+		quay.io/jbride2000/rust:1.90.0-trixie-tools \
+		cp /workspace/target/aarch64-unknown-linux-gnu/release/mujina-minerd /tmp/mujina-minerd
+	@podman run --rm \
+		-v cargo-target:/workspace/target:Z \
+		-v "$(PWD)":/host:Z \
+		--entrypoint="" \
+		quay.io/jbride2000/rust:1.90.0-trixie-tools \
+		cp /workspace/target/aarch64-unknown-linux-gnu/release/mujina-minerd /host/target/aarch64-unknown-linux-gnu/release/mujina-minerd
+
+# ARM deployment commands
+deploy-arm: ci-build-arm64
+	@# Check if arm-deployment.env exists, if not check for env vars
+	@if [ ! -f "scripts/local_ci/arm-deployment.env" ] && ([ -z "$(ARM_HOST)" ] || [ -z "$(ARM_USER)" ]); then \
+		echo "Error: Either create scripts/local_ci/arm-deployment.env or set ARM_HOST and ARM_USER environment variables"; \
+		echo "Usage: make deploy-arm [ARM_HOST=<ip>] [ARM_USER=<user>]"; \
+		echo "Or create scripts/local_ci/arm-deployment.env with ARM_HOST and ARM_USER values"; \
+		exit 1; \
+	fi
+	@# Use environment variables if provided, otherwise let the script load from arm-deployment.env
+	@if [ -n "$(ARM_HOST)" ] && [ -n "$(ARM_USER)" ]; then \
+		chmod +x scripts/local_ci/deploy-to-arm.sh && ./scripts/local_ci/deploy-to-arm.sh --host $(ARM_HOST) --user $(ARM_USER) --binary target/aarch64-unknown-linux-gnu/release/mujina-minerd --test-mode; \
+	else \
+		chmod +x scripts/local_ci/deploy-to-arm.sh && ./scripts/local_ci/deploy-to-arm.sh --binary target/aarch64-unknown-linux-gnu/release/mujina-minerd --test-mode; \
+	fi
+
+#########################################################
+####### Linux Container (podman) targets  ###############
+#########################################################
+
+## Run CI checks locally with Podman
+ci-containers:
+	chmod +x .github/ci-runner.sh && ./.github/ci-runner.sh all
+
+## Run CI and ARM64 cross-compilation with podman (skip ARM deployment)
+ci-containers-arm64-cross-compilation:
+	chmod +x scripts/local_ci/hybrid-ci-local.sh && ./scripts/local_ci/hybrid-ci-local.sh --skip-arm
+
+## Run hybrid CI (containers + ARM SSH) locally
+ci-containers-arm64-deploy:
+	chmod +x scripts/local_ci/hybrid-ci-local.sh && ./scripts/local_ci/hybrid-ci-local.sh
+
+## Run hybrid CI with ARM deployment (requires ARM_HOST and ARM_USER env vars)
+ci-containers-arm64-deploy-env-vars:
+	@if [ -z "$(ARM_HOST)" ] || [ -z "$(ARM_USER)" ]; then \
+		echo "Error: ARM_HOST and ARM_USER environment variables must be set"; \
+		echo "Usage: make hybrid-ci-arm ARM_HOST=<ip> ARM_USER=<user>"; \
+		exit 1; \
+	fi
+	chmod +x scripts/local_ci/hybrid-ci-local.sh && ./scripts/local_ci/hybrid-ci-local.sh --arm-host $(ARM_HOST) --arm-user $(ARM_USER)
+
+
+clean: ## Clean build artifacts
+	cargo clean
+	podman rmi mujina-ci:latest mujina-dev:latest 2>/dev/null || true
