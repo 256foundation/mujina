@@ -21,6 +21,7 @@ inventory::submit! {
         pattern: BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("256F")),
             product: Match::Specific(StringMatch::Exact("EmberOne00")),
             serial_pattern: Match::Any,
