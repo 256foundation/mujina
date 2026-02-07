@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 struct DeviceProperties {
     vid: u16,
     pid: u16,
+    bcd_device: Option<u16>,
     serial_number: Option<String>,
     manufacturer: Option<String>,
     product: Option<String>,
@@ -113,10 +114,10 @@ impl LinuxUdevDiscovery {
         Ok(Self {})
     }
 
-    /// Extract VID, PID, serial, manufacturer, and product from a udev device.
+    /// Extract VID, PID, bcdDevice, serial, manufacturer, and product from a udev device.
     ///
     /// VID and PID are found in device attributes as hexadecimal strings and are required.
-    /// Serial number, manufacturer, and product strings are optional.
+    /// bcdDevice, serial number, manufacturer, and product strings are optional.
     fn extract_device_properties(&self, device: &udev::Device) -> Result<DeviceProperties> {
         // Extract VID (vendor ID) - typically 4 hex digits like "0403"
         let vid_str = device
@@ -135,6 +136,12 @@ impl LinuxUdevDiscovery {
 
         let pid = u16::from_str_radix(pid_str, 16)
             .with_context(|| format!("invalid PID '{}'", pid_str))?;
+
+        // Extract bcdDevice (device release number, optional) - 4 hex digits like "0500"
+        let bcd_device = device
+            .attribute_value("bcdDevice")
+            .and_then(|v| v.to_str())
+            .and_then(|s| u16::from_str_radix(s, 16).ok());
 
         // Extract serial number (optional)
         let serial_number = device
@@ -157,6 +164,7 @@ impl LinuxUdevDiscovery {
         Ok(DeviceProperties {
             vid,
             pid,
+            bcd_device,
             serial_number,
             manufacturer,
             product,
@@ -182,6 +190,7 @@ impl LinuxUdevDiscovery {
         Ok(UsbDeviceInfo {
             vid: props.vid,
             pid: props.pid,
+            bcd_device: props.bcd_device,
             serial_number: props.serial_number,
             manufacturer: props.manufacturer,
             product: props.product,

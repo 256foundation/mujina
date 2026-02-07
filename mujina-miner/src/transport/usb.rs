@@ -23,6 +23,9 @@ pub struct UsbDeviceInfo {
     pub vid: u16,
     /// USB product ID
     pub pid: u16,
+    /// USB device release number (bcdDevice), if available.
+    /// This is a BCD-encoded version number (e.g., 0x0500 = version 5.00).
+    pub bcd_device: Option<u16>,
     /// Device serial number (if available)
     pub serial_number: Option<String>,
     /// Manufacturer string (if available)
@@ -71,6 +74,7 @@ impl Default for UsbDeviceInfo {
         Self {
             vid: 0,
             pid: 0,
+            bcd_device: None,
             serial_number: None,
             manufacturer: None,
             product: None,
