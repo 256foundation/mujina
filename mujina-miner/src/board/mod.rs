@@ -1,3 +1,4 @@
+pub(crate) mod birds;
 pub(crate) mod bitaxe;
 pub mod cpu;
 pub(crate) mod emberone;
