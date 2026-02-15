@@ -6,6 +6,7 @@
 //! events when devices are connected or disconnected.
 
 pub mod cpu;
+pub mod nine_bit;
 pub mod serial;
 pub mod usb;
 
