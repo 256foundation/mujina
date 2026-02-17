@@ -24,7 +24,7 @@ use super::protocol;
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
-        HashThreadEvent, HashThreadStatus, ThreadRemovalSignal,
+        HashThreadEvent, HashThreadStatus, Share, ThreadRemovalSignal,
     },
     job_source::{GeneralPurposeBits, MerkleRootKind},
     tracing::prelude::*,
@@ -414,6 +414,13 @@ struct TaskJobPayload {
     timestamp: u32,
 }
 
+#[derive(Clone)]
+struct AssignedTask {
+    task: HashTask,
+    merkle_root: TxMerkleNode,
+    version_counter: u16,
+}
+
 fn expand_counter_into_mask(mask: u16, mut counter: u16) -> u16 {
     let mut rolled = 0u16;
     for bit in 0..16 {
@@ -478,24 +485,27 @@ fn compute_midstate_le(header_prefix_64: &[u8; 64]) -> [u8; 32] {
     midstate
 }
 
-fn task_to_bzm2_payload(
-    task: &HashTask,
-    version_counter: u16,
-) -> Result<TaskJobPayload, HashThreadError> {
+fn task_version_for_counter(task: &HashTask, version_counter: u16) -> BlockVersion {
     let template = task.template.as_ref();
-    let merkle_root = compute_task_merkle_root(task)?;
     let base_version = template.version.base();
     let version_mask = u16::from_be_bytes(*template.version.gp_bits_mask().as_bytes());
+    let rolled_bits_u16 = expand_counter_into_mask(version_mask, version_counter);
+    let rolled_bits = GeneralPurposeBits::new(rolled_bits_u16.to_be_bytes());
+    rolled_bits.apply_to_version(base_version)
+}
 
+fn task_to_bzm2_payload(
+    task: &HashTask,
+    merkle_root: TxMerkleNode,
+    version_counter: u16,
+) -> Result<TaskJobPayload, HashThreadError> {
     let mut midstates = [[0u8; 32]; MIDSTATE_COUNT];
     let mut merkle_residue = 0u32;
     let mut timestamp = 0u32;
 
     for (idx, midstate) in midstates.iter_mut().enumerate() {
-        let rolled_bits_u16 =
-            expand_counter_into_mask(version_mask, version_counter.wrapping_add(idx as u16));
-        let rolled_bits = GeneralPurposeBits::new(rolled_bits_u16.to_be_bytes());
-        let rolled_version = rolled_bits.apply_to_version(base_version);
+        let rolled_version =
+            task_version_for_counter(task, version_counter.wrapping_add(idx as u16));
 
         let header = build_header_bytes(task, rolled_version, merkle_root)?;
         let header_prefix: [u8; 64] = header[..64]
@@ -528,6 +538,7 @@ fn task_to_bzm2_payload(
 async fn send_task_to_all_engines<W>(
     chip_commands: &mut W,
     task: &HashTask,
+    merkle_root: TxMerkleNode,
     version_counter: u16,
     sequence_id: u8,
 ) -> Result<(), HashThreadError>
@@ -535,7 +546,7 @@ where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
-    let payload = task_to_bzm2_payload(task, version_counter)?;
+    let payload = task_to_bzm2_payload(task, merkle_root, version_counter)?;
 
     for col in 0..ENGINE_COLS {
         for row in 0..ENGINE_ROWS {
@@ -1093,6 +1104,7 @@ async fn bzm2_thread_actor<R, W>(
 
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
+    let mut assigned_tasks: [Option<AssignedTask>; 2] = [None, None];
     let mut next_sequence_id: u8 = 0;
     let mut next_version_counter: u16 = 0;
     let mut status_ticker = time::interval(Duration::from_secs(5));
@@ -1131,9 +1143,19 @@ async fn bzm2_thread_actor<R, W>(
                             }
                         }
 
+                        let merkle_root = match compute_task_merkle_root(&new_task) {
+                            Ok(root) => root,
+                            Err(e) => {
+                                error!(error = %e, "Failed to derive merkle root for update_task");
+                                let _ = response_tx.send(Err(e));
+                                continue;
+                            }
+                        };
+
                         if let Err(e) = send_task_to_all_engines(
                             &mut chip_commands,
                             &new_task,
+                            merkle_root,
                             next_version_counter,
                             next_sequence_id,
                         )
@@ -1143,6 +1165,13 @@ async fn bzm2_thread_actor<R, W>(
                             let _ = response_tx.send(Err(e));
                             continue;
                         }
+
+                        let slot = (next_sequence_id as usize) & 0x01;
+                        assigned_tasks[slot] = Some(AssignedTask {
+                            task: new_task.clone(),
+                            merkle_root,
+                            version_counter: next_version_counter,
+                        });
 
                         debug!(
                             job_id = %new_task.template.id,
@@ -1179,9 +1208,19 @@ async fn bzm2_thread_actor<R, W>(
                             }
                         }
 
+                        let merkle_root = match compute_task_merkle_root(&new_task) {
+                            Ok(root) => root,
+                            Err(e) => {
+                                error!(error = %e, "Failed to derive merkle root for replace_task");
+                                let _ = response_tx.send(Err(e));
+                                continue;
+                            }
+                        };
+
                         if let Err(e) = send_task_to_all_engines(
                             &mut chip_commands,
                             &new_task,
+                            merkle_root,
                             next_version_counter,
                             next_sequence_id,
                         )
@@ -1191,6 +1230,13 @@ async fn bzm2_thread_actor<R, W>(
                             let _ = response_tx.send(Err(e));
                             continue;
                         }
+
+                        let slot = (next_sequence_id as usize) & 0x01;
+                        assigned_tasks[slot] = Some(AssignedTask {
+                            task: new_task.clone(),
+                            merkle_root,
+                            version_counter: next_version_counter,
+                        });
 
                         debug!(
                             job_id = %new_task.template.id,
@@ -1211,6 +1257,7 @@ async fn bzm2_thread_actor<R, W>(
                     }
                     ThreadCommand::GoIdle { response_tx } => {
                         let old_task = current_task.take();
+                        assigned_tasks = [None, None];
                         {
                             let mut s = status.write().expect("status lock poisoned");
                             s.is_active = false;
@@ -1230,6 +1277,90 @@ async fn bzm2_thread_actor<R, W>(
                     }
                     Ok(protocol::Response::ReadReg { asic_hw_id, data }) => {
                         trace!(asic_hw_id, data = ?data, "BZM2 READREG response");
+                    }
+                    Ok(protocol::Response::ReadResult {
+                        asic_hw_id,
+                        engine_id,
+                        status: result_status,
+                        nonce,
+                        sequence,
+                        timecode,
+                    }) => {
+                        // status bit3 indicates a valid nonce candidate.
+                        if (result_status & 0x8) == 0 {
+                            trace!(
+                                asic_hw_id,
+                                engine_id,
+                                result_status,
+                                nonce,
+                                sequence,
+                                timecode,
+                                "Ignoring BZM2 READRESULT without valid-nonce flag"
+                            );
+                            continue;
+                        }
+
+                        let slot = (sequence as usize) / MIDSTATE_COUNT;
+                        if slot >= assigned_tasks.len() {
+                            trace!(
+                                asic_hw_id,
+                                engine_id,
+                                sequence,
+                                "Ignoring BZM2 READRESULT with unsupported sequence slot"
+                            );
+                            continue;
+                        }
+
+                        let Some(assigned) = assigned_tasks[slot].as_ref() else {
+                            trace!(
+                                asic_hw_id,
+                                engine_id,
+                                sequence,
+                                "Ignoring BZM2 READRESULT with no assigned task for slot"
+                            );
+                            continue;
+                        };
+
+                        let micro_job = (sequence % (MIDSTATE_COUNT as u8)) as u16;
+                        let share_version =
+                            task_version_for_counter(&assigned.task, assigned.version_counter.wrapping_add(micro_job));
+                        // BZM2 result timecode identifies which rolled ntime found the nonce.
+                        let share_ntime = assigned.task.ntime.wrapping_add(timecode as u32);
+
+                        let header = BlockHeader {
+                            version: share_version,
+                            prev_blockhash: assigned.task.template.prev_blockhash,
+                            merkle_root: assigned.merkle_root,
+                            time: share_ntime,
+                            bits: assigned.task.template.bits,
+                            nonce,
+                        };
+                        let hash = header.block_hash();
+
+                        if assigned.task.share_target.is_met_by(hash) {
+                            let share = Share {
+                                nonce,
+                                hash,
+                                version: share_version,
+                                ntime: share_ntime,
+                                extranonce2: assigned.task.en2,
+                                expected_work: assigned.task.share_target.to_work(),
+                            };
+
+                            if assigned.task.share_tx.send(share).await.is_ok() {
+                                let mut s = status.write().expect("status lock poisoned");
+                                s.chip_shares_found = s.chip_shares_found.saturating_add(1);
+                            }
+                        } else {
+                            trace!(
+                                asic_hw_id,
+                                engine_id,
+                                nonce,
+                                sequence,
+                                timecode,
+                                "BZM2 nonce filtered by share target"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "Error reading BZM2 response stream");
