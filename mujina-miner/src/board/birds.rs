@@ -3,22 +3,28 @@
 //! The BIRDS board is a mining board with 4 BZM2 ASIC chips, communicating via
 //! USB using two serial ports: a control UART for GPIO/I2C and a data UART for
 //! ASIC communication with 8-bit to 9-bit serial translation.
-//!
-//! This is currently a stub implementation pending full BZM2 ASIC support.
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio::time::{Duration, sleep};
 use tokio_serial::SerialPortBuilderExt;
+use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{
     Board, BoardDescriptor, BoardError, BoardInfo,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    asic::{bzm2::smoke, hash_thread::HashThread},
+    asic::{
+        bzm2::{FrameCodec, smoke, thread::Bzm2Thread},
+        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
+    },
     error::Error,
-    transport::UsbDeviceInfo,
+    transport::{
+        UsbDeviceInfo,
+        serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
+    },
 };
 
 /// Number of BZM2 ASICs on a BIRDS board.
@@ -42,12 +48,24 @@ const CTRL_PAGE_GPIO: u8 = 0x06;
 /// BIRDS mining board.
 pub struct BirdsBoard {
     device_info: UsbDeviceInfo,
+    control_port: Option<String>,
+    data_reader: Option<FramedRead<SerialReader, FrameCodec>>,
+    data_writer: Option<FramedWrite<SerialWriter, FrameCodec>>,
+    data_control: Option<SerialControl>,
+    thread_shutdown: Option<watch::Sender<ThreadRemovalSignal>>,
 }
 
 impl BirdsBoard {
     /// Create a new BIRDS board instance.
     pub fn new(device_info: UsbDeviceInfo) -> Result<Self, BoardError> {
-        Ok(Self { device_info })
+        Ok(Self {
+            device_info,
+            control_port: None,
+            data_reader: None,
+            data_writer: None,
+            data_control: None,
+            thread_shutdown: None,
+        })
     }
 
     /// Early bring-up init path.
@@ -85,6 +103,7 @@ impl BirdsBoard {
         // 2) Pulse ASIC reset low/high
         // 3) Wait for UART startup
         self.bringup_power_and_reset(&control_port).await?;
+        self.control_port = Some(control_port);
 
         let result = smoke::run_smoke(&data_port, 0).await.map_err(|e| {
             BoardError::InitializationFailed(format!("BIRDS ASIC smoke test failed: {:#}", e))
@@ -96,6 +115,14 @@ impl BirdsBoard {
             asic_id = format_args!("0x{:08x}", result.asic_id),
             "BIRDS ASIC smoke test succeeded"
         );
+
+        let data_stream = SerialStream::new(&data_port, DATA_UART_BAUD).map_err(|e| {
+            BoardError::InitializationFailed(format!("Failed to open BIRDS data port: {}", e))
+        })?;
+        let (data_reader, data_writer, data_control) = data_stream.split();
+        self.data_reader = Some(FramedRead::new(data_reader, FrameCodec::default()));
+        self.data_writer = Some(FramedWrite::new(data_writer, FrameCodec::default()));
+        self.data_control = Some(data_control);
 
         Ok(())
     }
@@ -162,6 +189,48 @@ impl BirdsBoard {
 
         Ok(())
     }
+
+    async fn hold_in_reset(&self) -> Result<(), BoardError> {
+        let control_port = self.control_port.as_ref().ok_or_else(|| {
+            BoardError::InitializationFailed("BIRDS control port not initialized".into())
+        })?;
+
+        let mut control_stream = tokio_serial::new(control_port, CONTROL_UART_BAUD)
+            .open_native_async()
+            .map_err(|e| {
+                BoardError::InitializationFailed(format!(
+                    "Failed to open BIRDS control port {}: {}",
+                    control_port, e
+                ))
+            })?;
+
+        Self::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, false).await
+    }
+}
+
+struct BirdsAsicEnable {
+    control_port: String,
+}
+
+#[async_trait]
+impl AsicEnable for BirdsAsicEnable {
+    async fn enable(&mut self) -> anyhow::Result<()> {
+        let mut control_stream = tokio_serial::new(&self.control_port, CONTROL_UART_BAUD)
+            .open_native_async()
+            .map_err(|e| anyhow::anyhow!("failed to open control port: {}", e))?;
+        BirdsBoard::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, true)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to release BZM2 reset: {}", e))
+    }
+
+    async fn disable(&mut self) -> anyhow::Result<()> {
+        let mut control_stream = tokio_serial::new(&self.control_port, CONTROL_UART_BAUD)
+            .open_native_async()
+            .map_err(|e| anyhow::anyhow!("failed to open control port: {}", e))?;
+        BirdsBoard::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, false)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to assert BZM2 reset: {}", e))
+    }
 }
 
 #[async_trait]
@@ -175,14 +244,58 @@ impl Board for BirdsBoard {
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
-        tracing::info!("BIRDS stub shutdown (no-op)");
+        if let Some(ref tx) = self.thread_shutdown {
+            if let Err(e) = tx.send(ThreadRemovalSignal::Shutdown) {
+                tracing::warn!("Failed to send shutdown signal to BIRDS thread: {}", e);
+            }
+        }
+
+        self.hold_in_reset().await?;
         Ok(())
     }
 
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
-        Err(BoardError::InitializationFailed(
-            "BIRDS not yet implemented".into(),
-        ))
+        let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+        self.thread_shutdown = Some(removal_tx);
+
+        let data_reader = self
+            .data_reader
+            .take()
+            .ok_or(BoardError::InitializationFailed(
+                "No BIRDS data reader available".into(),
+            ))?;
+        let data_writer = self
+            .data_writer
+            .take()
+            .ok_or(BoardError::InitializationFailed(
+                "No BIRDS data writer available".into(),
+            ))?;
+
+        let control_port = self
+            .control_port
+            .clone()
+            .ok_or(BoardError::InitializationFailed(
+                "No BIRDS control port available".into(),
+            ))?;
+        let asic_enable = BirdsAsicEnable { control_port };
+        let peripherals = BoardPeripherals {
+            asic_enable: Some(Box::new(asic_enable)),
+            voltage_regulator: None,
+        };
+
+        let thread_name = match &self.device_info.serial_number {
+            Some(serial) => format!("BIRDS-{}", &serial[..8.min(serial.len())]),
+            None => "BIRDS".to_string(),
+        };
+
+        let thread = Bzm2Thread::new(
+            thread_name,
+            data_reader,
+            data_writer,
+            peripherals,
+            removal_rx,
+        );
+        Ok(vec![Box::new(thread)])
     }
 }
 
