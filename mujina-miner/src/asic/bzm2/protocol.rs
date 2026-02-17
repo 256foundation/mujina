@@ -29,6 +29,13 @@ pub const BROADCAST_ENGINE: u16 = 0x00ff;
 pub const TERM_BYTE: u8 = 0xa5;
 pub const TAR_BYTE: u8 = 0x08;
 
+fn format_hex(data: &[u8]) -> String {
+    data.iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub mod engine_reg {
     pub const STATUS: u16 = 0x00;
     pub const CONFIG: u16 = 0x01;
@@ -193,7 +200,7 @@ pub fn hw_to_logical_asic_id(hw_asic_id: u8) -> Option<u8> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Send short NOOP command.
+    /// Send NOOP command.
     Noop { asic_hw_id: u8 },
 
     /// Read register value (1/2/4 bytes).
@@ -208,6 +215,14 @@ pub enum Command {
     WriteReg {
         asic_hw_id: u8,
         engine: u16,
+        offset: u16,
+        value: Bytes,
+    },
+
+    /// Write one or more bytes using opcode 0x4 (row/group write).
+    MulticastWrite {
+        asic_hw_id: u8,
+        group: u16,
         offset: u16,
         value: Bytes,
     },
@@ -238,6 +253,15 @@ impl Command {
             engine,
             offset,
             value: Bytes::copy_from_slice(&value.to_le_bytes()),
+        }
+    }
+
+    pub fn multicast_write_u8(asic_hw_id: u8, group: u16, offset: u16, value: u8) -> Self {
+        Self::MulticastWrite {
+            asic_hw_id,
+            group,
+            offset,
+            value: Bytes::copy_from_slice(&[value]),
         }
     }
 
@@ -293,6 +317,29 @@ impl Command {
                     *asic_hw_id,
                     Opcode::WriteReg,
                     *engine,
+                    *offset,
+                ));
+                raw.put_u8((value.len() as u8).saturating_sub(1));
+                raw.extend_from_slice(value);
+            }
+            Self::MulticastWrite {
+                asic_hw_id,
+                group,
+                offset,
+                value,
+            } => {
+                if value.is_empty() {
+                    return Err(ProtocolError::EmptyWritePayload);
+                }
+                if value.len() > usize::from(u8::MAX) {
+                    return Err(ProtocolError::WritePayloadTooLarge(value.len()));
+                }
+
+                raw.reserve(5 + value.len());
+                raw.put_u32(build_full_header(
+                    *asic_hw_id,
+                    Opcode::MulticastWrite,
+                    *group,
                     *offset,
                 ));
                 raw.put_u8((value.len() as u8).saturating_sub(1));
@@ -358,6 +405,11 @@ impl Encoder<Command> for FrameCodec {
     fn encode(&mut self, item: Command, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let raw = item.encode_raw().map_err(Self::io_error)?;
         let encoded = nine_bit_encode_frame(&raw);
+        tracing::debug!(
+            raw = %format_hex(&raw),
+            encoded = %format_hex(&encoded),
+            "BZM2 tx frame"
+        );
         dst.extend_from_slice(&encoded);
         Ok(())
     }
@@ -378,6 +430,11 @@ impl Decoder for FrameCodec {
                 Some(op) => op,
                 None => {
                     // Byte-level resync when stream is misaligned.
+                    tracing::debug!(
+                        dropped = format_args!("0x{:02X}", src[0]),
+                        next = format_args!("0x{:02X}", src[1]),
+                        "BZM2 rx resync: dropping byte"
+                    );
                     src.advance(1);
                     continue;
                 }
@@ -388,6 +445,7 @@ impl Decoder for FrameCodec {
                     if src.len() < 5 {
                         return Ok(None);
                     }
+                    tracing::debug!(rx = %format_hex(&src[..5]), "BZM2 rx NOOP frame");
 
                     let mut frame = src.split_to(5);
                     let asic_hw_id = frame.get_u8();
@@ -411,6 +469,10 @@ impl Decoder for FrameCodec {
                     if src.len() < frame_len {
                         return Ok(None);
                     }
+                    tracing::debug!(
+                        rx = %format_hex(&src[..frame_len]),
+                        "BZM2 rx READREG frame"
+                    );
 
                     let mut frame = src.split_to(frame_len);
                     let asic_hw_id = frame.get_u8();
@@ -435,13 +497,24 @@ impl Decoder for FrameCodec {
                     if src.len() < TDM_FIXED_LEN {
                         return Ok(None);
                     }
+                    tracing::trace!(
+                        opcode = opcode as u8,
+                        rx = %format_hex(&src[..TDM_FIXED_LEN]),
+                        "BZM2 rx skipping telemetry frame"
+                    );
                     src.advance(TDM_FIXED_LEN);
                     continue;
                 }
                 other => {
-                    return Err(Self::io_error(ProtocolError::UnsupportedResponseOpcode(
-                        other as u8,
-                    )));
+                    let preview_len = src.len().min(32);
+                    tracing::debug!(
+                        opcode = format_args!("0x{:02X}", other as u8),
+                        buffer_len = src.len(),
+                        buffer_preview = %format_hex(&src[..preview_len]),
+                        "BZM2 rx unsupported opcode, resync by dropping one byte"
+                    );
+                    src.advance(1);
+                    continue;
                 }
             }
         }
@@ -504,6 +577,13 @@ mod tests {
             raw.as_ref(),
             &[0x0a, 0x2f, 0xff, 0x0a, 0x03, 0x78, 0x56, 0x34, 0x12,]
         );
+    }
+
+    #[test]
+    fn test_encode_multicast_write_u8_frame() {
+        let cmd = Command::multicast_write_u8(0x0a, 0x0012, engine_reg::CONFIG, 0x04);
+        let raw = cmd.encode_raw().expect("encode should succeed");
+        assert_eq!(raw.as_ref(), &[0x0a, 0x40, 0x12, 0x01, 0x00, 0x04]);
     }
 
     #[test]

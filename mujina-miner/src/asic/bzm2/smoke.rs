@@ -20,6 +20,13 @@ pub const DEFAULT_BZM2_DATA_BAUD: u32 = 5_000_000;
 /// Default timeout for each request/response step.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn format_hex(data: &[u8]) -> String {
+    data.iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Output from the smoke test.
 #[derive(Debug, Clone, Copy)]
 pub struct SmokeResult {
@@ -71,6 +78,11 @@ pub async fn run_smoke_with_options(
         .await
         .context("timeout waiting for NOOP response")?
         .context("read error while waiting for NOOP response")?;
+    tracing::debug!(
+        asic_hw_id = format_args!("0x{:02X}", asic_hw_id),
+        rx = %format_hex(&noop_raw),
+        "BZM2 smoke NOOP rx"
+    );
 
     let mut signature = [0u8; 3];
     signature.copy_from_slice(&noop_raw[2..5]);
@@ -96,6 +108,11 @@ pub async fn run_smoke_with_options(
         .await
         .context("timeout waiting for READREG response")?
         .context("read error while waiting for READREG response")?;
+    tracing::debug!(
+        asic_hw_id = format_args!("0x{:02X}", asic_hw_id),
+        rx = %format_hex(&readreg_raw),
+        "BZM2 smoke READREG rx"
+    );
 
     let asic_id = u32::from_le_bytes(
         readreg_raw[2..6]
@@ -115,7 +132,14 @@ async fn drain_input_noise(reader: &mut crate::transport::serial::SerialReader) 
     loop {
         match time::timeout(Duration::from_millis(20), reader.read(&mut scratch)).await {
             Ok(Ok(0)) => break,
-            Ok(Ok(_n)) => continue,
+            Ok(Ok(n)) => {
+                tracing::debug!(
+                    bytes = n,
+                    rx = %format_hex(&scratch[..n]),
+                    "BZM2 smoke drained residual input"
+                );
+                continue;
+            }
             Ok(Err(_)) => break,
             Err(_elapsed) => break,
         }

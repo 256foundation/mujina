@@ -38,12 +38,23 @@ const CONTROL_UART_BAUD: u32 = 115_200;
 
 /// BIRDS control GPIO: 5V power enable.
 const GPIO_5V_EN: u8 = 1;
+/// BIRDS control GPIO: VR power enable.
+const GPIO_VR_EN: u8 = 0;
 /// BIRDS control GPIO: ASIC reset (active-low).
 const GPIO_ASIC_RST: u8 = 2;
 /// BIRDS control board ID for 5V/ASIC reset GPIO operations.
 const CTRL_ID_POWER_RESET: u8 = 0xAB;
+/// BIRDS control board ID for VR GPIO operations.
+const CTRL_ID_VR: u8 = 0xAA;
 /// Control protocol page for GPIO.
 const CTRL_PAGE_GPIO: u8 = 0x06;
+
+fn format_hex(data: &[u8]) -> String {
+    data.iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// BIRDS mining board.
 pub struct BirdsBoard {
@@ -98,10 +109,12 @@ impl BirdsBoard {
             "Running BIRDS ASIC smoke test during initialization"
         );
 
-        // Match known-good bring-up sequence from reference scripts:
-        // 1) Enable 5V rail
-        // 2) Pulse ASIC reset low/high
-        // 3) Wait for UART startup
+        // Match known-good bring-up sequence from birds_asyncio.py:
+        // 1) VR off and settle
+        // 2) Enable 5V rail
+        // 3) Enable VR
+        // 4) Pulse ASIC reset low/high
+        // 5) Wait for UART startup
         self.bringup_power_and_reset(&control_port).await?;
         self.control_port = Some(control_port);
 
@@ -137,13 +150,32 @@ impl BirdsBoard {
                 ))
             })?;
 
-        Self::control_gpio_write(&mut control_stream, GPIO_5V_EN, true).await?;
+        Self::control_gpio_write(&mut control_stream, CTRL_ID_VR, GPIO_VR_EN, false).await?;
+        sleep(Duration::from_millis(2000)).await;
+
+        Self::control_gpio_write(&mut control_stream, CTRL_ID_POWER_RESET, GPIO_5V_EN, true)
+            .await?;
         sleep(Duration::from_millis(100)).await;
 
-        Self::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, false).await?;
+        Self::control_gpio_write(&mut control_stream, CTRL_ID_VR, GPIO_VR_EN, true).await?;
         sleep(Duration::from_millis(100)).await;
 
-        Self::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, true).await?;
+        Self::control_gpio_write(
+            &mut control_stream,
+            CTRL_ID_POWER_RESET,
+            GPIO_ASIC_RST,
+            false,
+        )
+        .await?;
+        sleep(Duration::from_millis(100)).await;
+
+        Self::control_gpio_write(
+            &mut control_stream,
+            CTRL_ID_POWER_RESET,
+            GPIO_ASIC_RST,
+            true,
+        )
+        .await?;
         sleep(Duration::from_millis(1000)).await;
 
         Ok(())
@@ -151,20 +183,27 @@ impl BirdsBoard {
 
     async fn control_gpio_write(
         stream: &mut tokio_serial::SerialStream,
+        dev_id: u8,
         pin: u8,
         value_high: bool,
     ) -> Result<(), BoardError> {
-        // Packet format: [len:u16_le][id][bus][page][cmd=pin][value]
-        // For BIRDS, id is the board target (0xAB for 5V/RST).
+        // Packet format: [len:u16_le][id][bus][page][cmd=pin][value].
         let packet: [u8; 7] = [
             0x07,
             0x00,
-            CTRL_ID_POWER_RESET,
+            dev_id,
             0x00,
             CTRL_PAGE_GPIO,
             pin,
             if value_high { 0x01 } else { 0x00 },
         ];
+        tracing::debug!(
+            dev_id = format_args!("0x{:02X}", dev_id),
+            pin,
+            value = if value_high { 1 } else { 0 },
+            tx = %format_hex(&packet),
+            "BIRDS ctrl gpio tx"
+        );
         stream.write_all(&packet).await.map_err(|e| {
             BoardError::HardwareControl(format!(
                 "Failed to write GPIO control packet (pin {}): {}",
@@ -180,10 +219,16 @@ impl BirdsBoard {
                 pin, e
             ))
         })?;
-        if ack[2] != CTRL_ID_POWER_RESET {
+        tracing::debug!(
+            dev_id = format_args!("0x{:02X}", dev_id),
+            pin,
+            rx = %format_hex(&ack),
+            "BIRDS ctrl gpio rx"
+        );
+        if ack[2] != dev_id {
             return Err(BoardError::HardwareControl(format!(
                 "GPIO ack ID mismatch for pin {}: expected 0x{:02x}, got 0x{:02x}",
-                pin, CTRL_ID_POWER_RESET, ack[2]
+                pin, dev_id, ack[2]
             )));
         }
 
@@ -204,7 +249,13 @@ impl BirdsBoard {
                 ))
             })?;
 
-        Self::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, false).await
+        Self::control_gpio_write(
+            &mut control_stream,
+            CTRL_ID_POWER_RESET,
+            GPIO_ASIC_RST,
+            false,
+        )
+        .await
     }
 }
 
@@ -218,18 +269,28 @@ impl AsicEnable for BirdsAsicEnable {
         let mut control_stream = tokio_serial::new(&self.control_port, CONTROL_UART_BAUD)
             .open_native_async()
             .map_err(|e| anyhow::anyhow!("failed to open control port: {}", e))?;
-        BirdsBoard::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, true)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to release BZM2 reset: {}", e))
+        BirdsBoard::control_gpio_write(
+            &mut control_stream,
+            CTRL_ID_POWER_RESET,
+            GPIO_ASIC_RST,
+            true,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to release BZM2 reset: {}", e))
     }
 
     async fn disable(&mut self) -> anyhow::Result<()> {
         let mut control_stream = tokio_serial::new(&self.control_port, CONTROL_UART_BAUD)
             .open_native_async()
             .map_err(|e| anyhow::anyhow!("failed to open control port: {}", e))?;
-        BirdsBoard::control_gpio_write(&mut control_stream, GPIO_ASIC_RST, false)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to assert BZM2 reset: {}", e))
+        BirdsBoard::control_gpio_write(
+            &mut control_stream,
+            CTRL_ID_POWER_RESET,
+            GPIO_ASIC_RST,
+            false,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to assert BZM2 reset: {}", e))
     }
 }
 
@@ -294,6 +355,7 @@ impl Board for BirdsBoard {
             data_writer,
             peripherals,
             removal_rx,
+            ASICS_PER_BOARD as u8,
         );
         Ok(vec![Box::new(thread)])
     }
