@@ -28,6 +28,7 @@ pub const BROADCAST_ENGINE: u16 = 0x00ff;
 
 pub const TERM_BYTE: u8 = 0xa5;
 pub const TAR_BYTE: u8 = 0x08;
+pub const WRITEJOB_OFFSET: u16 = 41;
 
 fn format_hex(data: &[u8]) -> String {
     data.iter()
@@ -260,6 +261,66 @@ impl Command {
         }
     }
 
+    /// Build the 4-command enhanced-mode WRITEJOB burst.
+    ///
+    /// Sequence mapping follows bzmd:
+    /// `seq_start = (sequence_id % 2) * 4`, then `seq_start + [0,1,2,3]`.
+    /// The first three commands carry `job_ctl=0`; the final command carries
+    /// the requested `job_ctl` (must be 1 or 3).
+    pub fn write_job_enhanced(
+        asic_hw_id: u8,
+        engine: u16,
+        midstates: [[u8; 32]; 4],
+        merkle_residue: u32,
+        timestamp: u32,
+        sequence_id: u8,
+        job_ctl: u8,
+    ) -> Result<[Self; 4], ProtocolError> {
+        if !matches!(job_ctl, 1 | 3) {
+            return Err(ProtocolError::InvalidJobControl(job_ctl));
+        }
+
+        let seq_start = (sequence_id % 2) * 4;
+        Ok([
+            Self::write_job(
+                asic_hw_id,
+                engine,
+                midstates[0],
+                merkle_residue,
+                timestamp,
+                seq_start,
+                0,
+            ),
+            Self::write_job(
+                asic_hw_id,
+                engine,
+                midstates[1],
+                merkle_residue,
+                timestamp,
+                seq_start + 1,
+                0,
+            ),
+            Self::write_job(
+                asic_hw_id,
+                engine,
+                midstates[2],
+                merkle_residue,
+                timestamp,
+                seq_start + 2,
+                0,
+            ),
+            Self::write_job(
+                asic_hw_id,
+                engine,
+                midstates[3],
+                merkle_residue,
+                timestamp,
+                seq_start + 3,
+                job_ctl,
+            ),
+        ])
+    }
+
     pub fn read_reg_u32(asic_hw_id: u8, engine: u16, offset: u16) -> Self {
         Self::ReadReg {
             asic_hw_id,
@@ -313,7 +374,12 @@ impl Command {
                 // [header:u32_be][midstate:32][merkle_residue:u32_le]
                 // [timestamp:u32_le][sequence:u8][job_ctl:u8]
                 raw.reserve(46);
-                raw.put_u32(build_full_header(*asic_hw_id, Opcode::WriteJob, *engine, 0));
+                raw.put_u32(build_full_header(
+                    *asic_hw_id,
+                    Opcode::WriteJob,
+                    *engine,
+                    WRITEJOB_OFFSET,
+                ));
                 raw.extend_from_slice(midstate);
                 raw.put_u32_le(*merkle_residue);
                 raw.put_u32_le(*timestamp);
@@ -647,12 +713,51 @@ mod tests {
         let cmd = Command::write_job(0x0a, 0x0123, midstate, 0x1122_3344, 0x5566_7788, 0xfe, 0x03);
 
         let raw = cmd.encode_raw().expect("encode should succeed");
-        assert_eq!(&raw[..4], [0x0a, 0x01, 0x23, 0x00]);
+        assert_eq!(&raw[..4], [0x0a, 0x01, 0x23, 0x29]);
         assert_eq!(&raw[4..36], midstate);
         assert_eq!(&raw[36..40], 0x1122_3344u32.to_le_bytes());
         assert_eq!(&raw[40..44], 0x5566_7788u32.to_le_bytes());
         assert_eq!(raw[44], 0xfe);
         assert_eq!(raw[45], 0x03);
+    }
+
+    #[test]
+    fn test_writejob_enhanced_builds_four_commands() {
+        let mut midstates = [[0u8; 32]; 4];
+        midstates[0][0] = 0x10;
+        midstates[1][0] = 0x20;
+        midstates[2][0] = 0x30;
+        midstates[3][0] = 0x40;
+
+        let cmds =
+            Command::write_job_enhanced(0x0a, 0x0123, midstates, 0x1122_3344, 0x5566_7788, 0xff, 3)
+                .expect("enhanced writejob should build");
+
+        let raw0 = cmds[0].clone().encode_raw().expect("encode should succeed");
+        let raw1 = cmds[1].clone().encode_raw().expect("encode should succeed");
+        let raw2 = cmds[2].clone().encode_raw().expect("encode should succeed");
+        let raw3 = cmds[3].clone().encode_raw().expect("encode should succeed");
+
+        assert_eq!(raw0[44], 4);
+        assert_eq!(raw1[44], 5);
+        assert_eq!(raw2[44], 6);
+        assert_eq!(raw3[44], 7);
+        assert_eq!(raw0[45], 0);
+        assert_eq!(raw1[45], 0);
+        assert_eq!(raw2[45], 0);
+        assert_eq!(raw3[45], 3);
+        assert_eq!(raw0[4], 0x10);
+        assert_eq!(raw1[4], 0x20);
+        assert_eq!(raw2[4], 0x30);
+        assert_eq!(raw3[4], 0x40);
+    }
+
+    #[test]
+    fn test_writejob_enhanced_rejects_invalid_job_ctl() {
+        let midstates = [[0u8; 32]; 4];
+        let err = Command::write_job_enhanced(0x0a, 0x0123, midstates, 0, 0, 0, 0x02)
+            .expect_err("invalid job_ctl should fail");
+        assert!(matches!(err, ProtocolError::InvalidJobControl(0x02)));
     }
 
     #[test]
