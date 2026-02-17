@@ -476,8 +476,22 @@ pub enum ReadRegData {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    Noop { asic_hw_id: u8, signature: [u8; 3] },
-    ReadReg { asic_hw_id: u8, data: ReadRegData },
+    Noop {
+        asic_hw_id: u8,
+        signature: [u8; 3],
+    },
+    ReadReg {
+        asic_hw_id: u8,
+        data: ReadRegData,
+    },
+    ReadResult {
+        asic_hw_id: u8,
+        engine_id: u16,
+        status: u8,
+        nonce: u32,
+        sequence: u8,
+        timecode: u8,
+    },
 }
 
 /// BZM2 frame codec.
@@ -606,10 +620,36 @@ impl Decoder for FrameCodec {
 
                     return Ok(Some(Response::ReadReg { asic_hw_id, data }));
                 }
+                Opcode::ReadResult => {
+                    const FRAME_LEN: usize = 10; // [asic:u8][opcode:u8][engine+status:2][nonce:4][sequence:1][time:1]
+                    if src.len() < FRAME_LEN {
+                        return Ok(None);
+                    }
+                    tracing::trace!(rx = %format_hex(&src[..FRAME_LEN]), "BZM2 rx READRESULT frame");
+
+                    let mut frame = src.split_to(FRAME_LEN);
+                    let asic_hw_id = frame.get_u8();
+                    let _opcode = frame.get_u8();
+                    let engine_status = frame.get_u16();
+                    let engine_id = (engine_status >> 4) & 0x0fff;
+                    let status = (engine_status & 0x000f) as u8;
+                    let nonce = frame.get_u32_le();
+                    let sequence = frame.get_u8();
+                    let timecode = frame.get_u8();
+
+                    return Ok(Some(Response::ReadResult {
+                        asic_hw_id,
+                        engine_id,
+                        status,
+                        nonce,
+                        sequence,
+                        timecode,
+                    }));
+                }
                 // Pass-1 decoder only surfaces NOOP and READREG. Drop other
                 // fixed-length TDM messages so callers can keep waiting for
                 // the response type they care about.
-                Opcode::ReadResult | Opcode::DtsVs => {
+                Opcode::DtsVs => {
                     const TDM_FIXED_LEN: usize = 10; // [asic:u8][opcode:u8][payload:8]
                     if src.len() < TDM_FIXED_LEN {
                         return Ok(None);
@@ -803,6 +843,39 @@ mod tests {
             Some(Response::ReadReg {
                 asic_hw_id: 0x0a,
                 data: ReadRegData::U8(0xab),
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_readresult_response() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(
+            &[
+                0x0a,
+                Opcode::ReadResult as u8,
+                0x12,
+                0x34, // engine_status: engine_id=0x123, status=0x4
+                0x78,
+                0x56,
+                0x34,
+                0x12, // nonce LE
+                0x07, // sequence
+                0x2a, // timecode
+            ][..],
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::ReadResult {
+                asic_hw_id: 0x0a,
+                engine_id: 0x123,
+                status: 0x4,
+                nonce: 0x1234_5678,
+                sequence: 0x07,
+                timecode: 0x2a,
             })
         );
         assert!(src.is_empty());
