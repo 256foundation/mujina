@@ -200,6 +200,17 @@ pub fn hw_to_logical_asic_id(hw_asic_id: u8) -> Option<u8> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Push a job payload to one engine.
+    WriteJob {
+        asic_hw_id: u8,
+        engine: u16,
+        midstate: [u8; 32],
+        merkle_residue: u32,
+        timestamp: u32,
+        sequence: u8,
+        job_ctl: u8,
+    },
+
     /// Send NOOP command.
     Noop { asic_hw_id: u8 },
 
@@ -229,6 +240,26 @@ pub enum Command {
 }
 
 impl Command {
+    pub fn write_job(
+        asic_hw_id: u8,
+        engine: u16,
+        midstate: [u8; 32],
+        merkle_residue: u32,
+        timestamp: u32,
+        sequence: u8,
+        job_ctl: u8,
+    ) -> Self {
+        Self::WriteJob {
+            asic_hw_id,
+            engine,
+            midstate,
+            merkle_residue,
+            timestamp,
+            sequence,
+            job_ctl,
+        }
+    }
+
     pub fn read_reg_u32(asic_hw_id: u8, engine: u16, offset: u16) -> Self {
         Self::ReadReg {
             asic_hw_id,
@@ -269,6 +300,26 @@ impl Command {
         let mut raw = BytesMut::new();
 
         match self {
+            Self::WriteJob {
+                asic_hw_id,
+                engine,
+                midstate,
+                merkle_residue,
+                timestamp,
+                sequence,
+                job_ctl,
+            } => {
+                // WRITEJOB command:
+                // [header:u32_be][midstate:32][merkle_residue:u32_le]
+                // [timestamp:u32_le][sequence:u8][job_ctl:u8]
+                raw.reserve(46);
+                raw.put_u32(build_full_header(*asic_hw_id, Opcode::WriteJob, *engine, 0));
+                raw.extend_from_slice(midstate);
+                raw.put_u32_le(*merkle_residue);
+                raw.put_u32_le(*timestamp);
+                raw.put_u8(*sequence);
+                raw.put_u8(*job_ctl);
+            }
             Self::Noop { asic_hw_id } => {
                 // NOOP command:
                 // [asic_hw_id][opcode<<4]
@@ -584,6 +635,24 @@ mod tests {
         let cmd = Command::multicast_write_u8(0x0a, 0x0012, engine_reg::CONFIG, 0x04);
         let raw = cmd.encode_raw().expect("encode should succeed");
         assert_eq!(raw.as_ref(), &[0x0a, 0x40, 0x12, 0x01, 0x00, 0x04]);
+    }
+
+    #[test]
+    fn test_encode_writejob_frame() {
+        let mut midstate = [0u8; 32];
+        for (i, byte) in midstate.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+
+        let cmd = Command::write_job(0x0a, 0x0123, midstate, 0x1122_3344, 0x5566_7788, 0xfe, 0x03);
+
+        let raw = cmd.encode_raw().expect("encode should succeed");
+        assert_eq!(&raw[..4], [0x0a, 0x01, 0x23, 0x00]);
+        assert_eq!(&raw[4..36], midstate);
+        assert_eq!(&raw[36..40], 0x1122_3344u32.to_le_bytes());
+        assert_eq!(&raw[40..44], 0x5566_7788u32.to_le_bytes());
+        assert_eq!(raw[44], 0xfe);
+        assert_eq!(raw[45], 0x03);
     }
 
     #[test]
