@@ -13,6 +13,9 @@ pub enum ProtocolError {
     #[error("invalid read register byte count: {0} (expected 1, 2, or 4)")]
     InvalidReadRegCount(u8),
 
+    #[error("invalid job control value: {0} (expected 1 or 3)")]
+    InvalidJobControl(u8),
+
     #[error("unsupported read register response size: {0} (expected 1 or 4)")]
     UnsupportedReadRegResponseSize(usize),
 
