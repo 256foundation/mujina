@@ -81,7 +81,8 @@ struct ProtocolState {
     extranonce2_size: usize,
 
     /// Current difficulty (if set)
-    difficulty: Option<u64>,
+    /// Stratum v1 difficulty can be a float (e.g., 0.001 for low-difficulty shares)
+    difficulty: Option<f64>,
 
     /// Current version mask (if set)
     version_mask: Option<u32>,
@@ -579,9 +580,17 @@ impl StratumV1Client {
             ));
         }
 
+        // Stratum v1 difficulty can be integer or float (e.g., 0.001 for low-diff vardiff)
         let difficulty = arr[0]
-            .as_u64()
+            .as_f64()
             .ok_or_else(|| StratumError::InvalidMessage("difficulty not a number".to_string()))?;
+
+        if !difficulty.is_finite() || difficulty <= 0.0 {
+            return Err(StratumError::InvalidMessage(format!(
+                "difficulty must be positive, got {}",
+                difficulty
+            )));
+        }
 
         if let Some(state) = &mut self.state {
             state.difficulty = Some(difficulty);
@@ -994,7 +1003,7 @@ mod tests {
                 ClientEvent::DifficultyChanged(diff) => {
                     println!("\n[Difficulty Changed]");
                     println!("  Difficulty: {}", diff);
-                    assert!(*diff > 0, "difficulty should be positive");
+                    assert!(*diff > 0.0, "difficulty should be positive");
                     *received_difficulty = true;
                 }
                 ClientEvent::VersionMaskSet(mask) => {
@@ -1117,7 +1126,7 @@ mod tests {
             .expect("Expected DifficultyChanged event");
         match event {
             ClientEvent::DifficultyChanged(diff) => {
-                assert_eq!(diff, 2048);
+                assert_eq!(diff, 2048.0);
             }
             _ => panic!("Expected DifficultyChanged event, got {:?}", event),
         }
@@ -1143,6 +1152,40 @@ mod tests {
         let params = json!(["not a number"]);
         let result = client.handle_set_difficulty(&params).await;
         assert!(result.is_err());
+
+        // Zero difficulty
+        let params = json!([0.0]);
+        let result = client.handle_set_difficulty(&params).await;
+        assert!(result.is_err());
+
+        // Negative difficulty
+        let params = json!([-5.0]);
+        let result = client.handle_set_difficulty(&params).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_set_difficulty_float() {
+        use serde_json::json;
+
+        let (mut client, mut event_rx) = test_client();
+
+        // Float difficulty (common for low-difficulty vardiff)
+        let params = json!([0.001]);
+        let result = client.handle_set_difficulty(&params).await;
+
+        assert!(result.is_ok());
+
+        // Verify event was emitted with float value
+        let event = event_rx
+            .try_recv()
+            .expect("Expected DifficultyChanged event");
+        match event {
+            ClientEvent::DifficultyChanged(diff) => {
+                assert_eq!(diff, 0.001);
+            }
+            _ => panic!("Expected DifficultyChanged event, got {:?}", event),
+        }
     }
 
     #[tokio::test]

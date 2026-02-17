@@ -38,7 +38,10 @@ pub enum ClientEvent {
     NewJob(JobNotification),
 
     /// Difficulty changed
-    DifficultyChanged(u64),
+    ///
+    /// Stratum v1 difficulty can be a float (e.g., 0.001 for low-difficulty shares).
+    /// Pools may send integer or floating-point values.
+    DifficultyChanged(f64),
 
     /// Version mask set (for version rolling)
     VersionMaskSet(u32),
