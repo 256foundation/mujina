@@ -9,6 +9,12 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bitcoin::{
+    TxMerkleNode,
+    block::{Header as BlockHeader, Version as BlockVersion},
+    consensus,
+    hashes::{HashEngine as _, sha256},
+};
 use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
@@ -20,6 +26,7 @@ use crate::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
         HashThreadEvent, HashThreadStatus, ThreadRemovalSignal,
     },
+    job_source::{GeneralPurposeBits, MerkleRootKind},
     tracing::prelude::*,
     types::HashRate,
 };
@@ -47,6 +54,8 @@ const INIT_READREG_TIMEOUT: Duration = Duration::from_millis(500);
 const PLL_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const PLL_POLL_DELAY: Duration = Duration::from_millis(100);
 const SOFT_RESET_DELAY: Duration = Duration::from_millis(1);
+const MIDSTATE_COUNT: usize = 4;
+const WRITEJOB_CTL_REPLACE: u8 = 3;
 
 #[derive(Debug)]
 enum ThreadCommand {
@@ -397,6 +406,166 @@ fn calc_pll_dividers(freq_mhz: f32, post1_divider: u8) -> (u32, u32) {
 
 fn engine_id(row: u16, col: u16) -> u16 {
     ((col & 0x3f) << 6) | (row & 0x3f)
+}
+
+struct TaskJobPayload {
+    midstates: [[u8; 32]; MIDSTATE_COUNT],
+    merkle_residue: u32,
+    timestamp: u32,
+}
+
+fn expand_counter_into_mask(mask: u16, mut counter: u16) -> u16 {
+    let mut rolled = 0u16;
+    for bit in 0..16 {
+        let bit_mask = 1u16 << bit;
+        if (mask & bit_mask) != 0 {
+            if (counter & 1) != 0 {
+                rolled |= bit_mask;
+            }
+            counter >>= 1;
+        }
+    }
+    rolled
+}
+
+fn compute_task_merkle_root(task: &HashTask) -> Result<TxMerkleNode, HashThreadError> {
+    let template = task.template.as_ref();
+    match &template.merkle_root {
+        MerkleRootKind::Computed(_) => {
+            let en2 = task.en2.as_ref().ok_or_else(|| {
+                HashThreadError::WorkAssignmentFailed(
+                    "EN2 is required for computed merkle roots".into(),
+                )
+            })?;
+            template.compute_merkle_root(en2).map_err(|e| {
+                HashThreadError::WorkAssignmentFailed(format!("failed to compute merkle root: {e}"))
+            })
+        }
+        MerkleRootKind::Fixed(merkle_root) => Ok(*merkle_root),
+    }
+}
+
+fn build_header_bytes(
+    task: &HashTask,
+    version: BlockVersion,
+    merkle_root: TxMerkleNode,
+) -> Result<[u8; 80], HashThreadError> {
+    let template = task.template.as_ref();
+    let header = BlockHeader {
+        version,
+        prev_blockhash: template.prev_blockhash,
+        merkle_root,
+        time: task.ntime,
+        bits: template.bits,
+        nonce: 0,
+    };
+
+    let bytes = consensus::serialize(&header);
+    let len = bytes.len();
+    bytes.try_into().map_err(|_| {
+        HashThreadError::WorkAssignmentFailed(format!("unexpected serialized header size: {}", len))
+    })
+}
+
+fn compute_midstate_le(header_prefix_64: &[u8; 64]) -> [u8; 32] {
+    let mut engine = sha256::HashEngine::default();
+    engine.input(header_prefix_64);
+    let mut midstate = engine.midstate().to_byte_array();
+    for word in midstate.chunks_exact_mut(4) {
+        // Firmware expects each state word little-endian on the wire.
+        word.reverse();
+    }
+    midstate
+}
+
+fn task_to_bzm2_payload(
+    task: &HashTask,
+    version_counter: u16,
+) -> Result<TaskJobPayload, HashThreadError> {
+    let template = task.template.as_ref();
+    let merkle_root = compute_task_merkle_root(task)?;
+    let base_version = template.version.base();
+    let version_mask = u16::from_be_bytes(*template.version.gp_bits_mask().as_bytes());
+
+    let mut midstates = [[0u8; 32]; MIDSTATE_COUNT];
+    let mut merkle_residue = 0u32;
+    let mut timestamp = 0u32;
+
+    for (idx, midstate) in midstates.iter_mut().enumerate() {
+        let rolled_bits_u16 =
+            expand_counter_into_mask(version_mask, version_counter.wrapping_add(idx as u16));
+        let rolled_bits = GeneralPurposeBits::new(rolled_bits_u16.to_be_bytes());
+        let rolled_version = rolled_bits.apply_to_version(base_version);
+
+        let header = build_header_bytes(task, rolled_version, merkle_root)?;
+        let header_prefix: [u8; 64] = header[..64]
+            .try_into()
+            .expect("header prefix length is fixed");
+
+        *midstate = compute_midstate_le(&header_prefix);
+
+        if idx == 0 {
+            merkle_residue = u32::from_le_bytes(
+                header[64..68]
+                    .try_into()
+                    .expect("slice length is exactly 4 bytes"),
+            );
+            timestamp = u32::from_le_bytes(
+                header[68..72]
+                    .try_into()
+                    .expect("slice length is exactly 4 bytes"),
+            );
+        }
+    }
+
+    Ok(TaskJobPayload {
+        midstates,
+        merkle_residue,
+        timestamp,
+    })
+}
+
+async fn send_task_to_all_engines<W>(
+    chip_commands: &mut W,
+    task: &HashTask,
+    version_counter: u16,
+    sequence_id: u8,
+) -> Result<(), HashThreadError>
+where
+    W: Sink<protocol::Command> + Unpin,
+    W::Error: std::fmt::Debug,
+{
+    let payload = task_to_bzm2_payload(task, version_counter)?;
+
+    for col in 0..ENGINE_COLS {
+        for row in 0..ENGINE_ROWS {
+            let engine = engine_id(row, col);
+            let commands = protocol::Command::write_job_enhanced(
+                protocol::BROADCAST_ASIC,
+                engine,
+                payload.midstates,
+                payload.merkle_residue,
+                payload.timestamp,
+                sequence_id,
+                WRITEJOB_CTL_REPLACE,
+            )
+            .map_err(|e| {
+                HashThreadError::WorkAssignmentFailed(format!(
+                    "failed to build WRITEJOB payload for engine 0x{engine:03x}: {e}"
+                ))
+            })?;
+
+            for command in commands {
+                chip_commands.send(command).await.map_err(|e| {
+                    HashThreadError::WorkAssignmentFailed(format!(
+                        "failed to send WRITEJOB to engine 0x{engine:03x}: {e:?}"
+                    ))
+                })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn configure_sensors<R, W>(
@@ -924,6 +1093,8 @@ async fn bzm2_thread_actor<R, W>(
 
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
+    let mut next_sequence_id: u8 = 0;
+    let mut next_version_counter: u16 = 0;
     let mut status_ticker = time::interval(Duration::from_secs(5));
     status_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -960,6 +1131,29 @@ async fn bzm2_thread_actor<R, W>(
                             }
                         }
 
+                        if let Err(e) = send_task_to_all_engines(
+                            &mut chip_commands,
+                            &new_task,
+                            next_version_counter,
+                            next_sequence_id,
+                        )
+                        .await
+                        {
+                            error!(error = %e, "Failed to send BZM2 work during update_task");
+                            let _ = response_tx.send(Err(e));
+                            continue;
+                        }
+
+                        debug!(
+                            job_id = %new_task.template.id,
+                            sequence_id = next_sequence_id,
+                            version_counter = next_version_counter,
+                            "Sent BZM2 WRITEJOB payloads for update_task"
+                        );
+                        next_sequence_id = next_sequence_id.wrapping_add(1);
+                        next_version_counter =
+                            next_version_counter.wrapping_add(MIDSTATE_COUNT as u16);
+
                         let old_task = current_task.replace(new_task);
                         {
                             let mut s = status.write().expect("status lock poisoned");
@@ -984,6 +1178,29 @@ async fn bzm2_thread_actor<R, W>(
                                 }
                             }
                         }
+
+                        if let Err(e) = send_task_to_all_engines(
+                            &mut chip_commands,
+                            &new_task,
+                            next_version_counter,
+                            next_sequence_id,
+                        )
+                        .await
+                        {
+                            error!(error = %e, "Failed to send BZM2 work during replace_task");
+                            let _ = response_tx.send(Err(e));
+                            continue;
+                        }
+
+                        debug!(
+                            job_id = %new_task.template.id,
+                            sequence_id = next_sequence_id,
+                            version_counter = next_version_counter,
+                            "Sent BZM2 WRITEJOB payloads for replace_task"
+                        );
+                        next_sequence_id = next_sequence_id.wrapping_add(1);
+                        next_version_counter =
+                            next_version_counter.wrapping_add(MIDSTATE_COUNT as u16);
 
                         let old_task = current_task.replace(new_task);
                         {
@@ -1025,5 +1242,26 @@ async fn bzm2_thread_actor<R, W>(
                 let _ = evt_tx.send(HashThreadEvent::StatusUpdate(snapshot)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_counter_into_mask;
+
+    #[test]
+    fn test_expand_counter_into_contiguous_mask() {
+        assert_eq!(expand_counter_into_mask(0b0011, 0), 0b0000);
+        assert_eq!(expand_counter_into_mask(0b0011, 1), 0b0001);
+        assert_eq!(expand_counter_into_mask(0b0011, 2), 0b0010);
+        assert_eq!(expand_counter_into_mask(0b0011, 3), 0b0011);
+    }
+
+    #[test]
+    fn test_expand_counter_into_sparse_mask() {
+        assert_eq!(expand_counter_into_mask(0b1010, 0), 0b0000);
+        assert_eq!(expand_counter_into_mask(0b1010, 1), 0b0010);
+        assert_eq!(expand_counter_into_mask(0b1010, 2), 0b1000);
+        assert_eq!(expand_counter_into_mask(0b1010, 3), 0b1010);
     }
 }
