@@ -2,6 +2,8 @@
 
 pub mod error;
 pub mod protocol;
+pub mod smoke;
+pub mod thread;
 
 pub use error::ProtocolError;
 pub use protocol::{Command, FrameCodec, Opcode, ReadRegData, Response};
