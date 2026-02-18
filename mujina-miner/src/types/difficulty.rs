@@ -37,30 +37,21 @@ impl Difficulty {
     /// Maximum difficulty (target of zero---no hash can satisfy it).
     pub const MAX: Self = Self(Target::ZERO);
 
-    /// Create from f64 for sub-1.0 difficulties (testing only).
+    /// Create from an f64 difficulty value.
     ///
-    /// Most code should use `Difficulty::from(u64)` instead. This exists
-    /// for forced-rate testing where fractional difficulties are needed.
-    /// The conversion is necessarily lossy.
+    /// Preserves all 53 bits of f64 mantissa precision via
+    /// [`U256`]'s `Div<f64>` implementation. Integer difficulties
+    /// up to 2^53 (~9.0P) are exact; beyond that, f64 can't
+    /// represent consecutive integers and the target will be
+    /// approximate. Current network difficulty (~100T) is about
+    /// two orders of magnitude below this ceiling, and Stratum v2
+    /// will avoid the issue entirely by communicating targets
+    /// directly.
     pub fn from_f64(value: f64) -> Self {
         if value <= 0.0 || !value.is_finite() {
             return Self(Target::MAX);
         }
-
-        let max_target = U256::from(Target::MAX);
-
-        if value >= 1.0 {
-            // target = MAX_TARGET / difficulty
-            // Use integer division (lossy for non-integer difficulties)
-            let target = max_target / (value as u64).max(1);
-            Self(Target::from(target))
-        } else {
-            // Sub-1.0 difficulty: target > MAX_TARGET
-            // target = MAX_TARGET / difficulty = MAX_TARGET * (1/difficulty)
-            let multiplier = (1.0 / value) as u64;
-            let target = max_target * multiplier;
-            Self(Target::from(target))
-        }
+        Self(Target::from(U256::from(Target::MAX) / value))
     }
 
     /// Get difficulty as f64 (lossy for very large values).
@@ -353,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic] // known bug: from_f64 truncates to integer arithmetic
     fn test_f64_roundtrip() {
         for &input in &[0.003, 0.007, 0.5, 0.001, 2048.5, 100.1, 1.0, 2048.0] {
             let diff = Difficulty::from_f64(input);
@@ -364,5 +354,35 @@ mod tests {
                 "from_f64({input}) round-tripped as {output} (relative error {error:.2e})"
             );
         }
+    }
+
+    #[test]
+    fn test_from_f64_matches_from_u64_for_integers() {
+        for &val in &[1_u64, 2, 100, 1024, 2048, 1_000_000] {
+            assert_eq!(
+                Difficulty::from(val),
+                Difficulty::from_f64(val as f64),
+                "from({val}) and from_f64({val}.0) diverge"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_f64_extreme_values() {
+        // Enormous values must not panic (divisor overflow guard)
+        assert_eq!(Difficulty::from_f64(f64::MAX), Difficulty::MAX);
+        assert_eq!(Difficulty::from_f64(1e100), Difficulty::MAX);
+
+        // Subnormal and tiny values must not panic
+        let tiny = Difficulty::from_f64(f64::MIN_POSITIVE);
+        assert!(tiny.as_f64() < 1.0);
+        let subnormal = Difficulty::from_f64(5e-324);
+        assert!(subnormal.as_f64() < 1.0);
+
+        // Non-finite and invalid inputs return Target::MAX (easiest)
+        assert_eq!(Difficulty::from_f64(f64::INFINITY).to_target(), Target::MAX);
+        assert_eq!(Difficulty::from_f64(f64::NAN).to_target(), Target::MAX);
+        assert_eq!(Difficulty::from_f64(-1.0).to_target(), Target::MAX);
+        assert_eq!(Difficulty::from_f64(0.0).to_target(), Target::MAX);
     }
 }
