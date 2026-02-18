@@ -351,4 +351,18 @@ mod tests {
             assert_eq!(diff, recovered, "Round-trip failed for {}", diff_val);
         }
     }
+
+    #[test]
+    #[should_panic] // known bug: from_f64 truncates to integer arithmetic
+    fn test_f64_roundtrip() {
+        for &input in &[0.003, 0.007, 0.5, 0.001, 2048.5, 100.1, 1.0, 2048.0] {
+            let diff = Difficulty::from_f64(input);
+            let output = diff.as_f64();
+            let error = (output - input).abs() / input;
+            assert!(
+                error < 1e-6,
+                "from_f64({input}) round-tripped as {output} (relative error {error:.2e})"
+            );
+        }
+    }
 }
