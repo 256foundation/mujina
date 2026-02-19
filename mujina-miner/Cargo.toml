@@ -51,6 +51,11 @@ ruint = "1.17.0"
 tokio-udev = { workspace = true }
 udev = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
+io-kit-sys = { workspace = true }
+mach2 = { workspace = true }
+
 [[bin]]
 name = "mujina-minerd"
 path = "src/bin/minerd.rs"

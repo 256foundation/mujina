@@ -52,7 +52,11 @@ impl UsbDeviceInfo {
                 {
                     linux::find_serial_ports_for_device(&self.device_path)
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
+                {
+                    macos::find_serial_ports_for_device(&self.device_path)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 {
                     Ok(vec![])
                 }

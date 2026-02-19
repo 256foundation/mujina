@@ -45,6 +45,9 @@ rustix = { version = "0.38", features = ["fs", "termios"] }
 slotmap = "1.0"
 tokio-udev = "0.10"
 udev = "0.9"
+core-foundation = "0.10"
+io-kit-sys = "0.4"
+mach2 = "0.4"
 utoipa = "5.4"
 utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }

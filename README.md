@@ -85,7 +85,8 @@ sudo apt-get install libudev-dev libssl-dev
 
 ### macOS
 
-macOS support is planned, but USB discovery using IOKit is not yet implemented.
+macOS is supported. USB discovery uses IOKit, which is part of the system
+frameworks and requires no additional dependencies.
 
 ## Building
 
