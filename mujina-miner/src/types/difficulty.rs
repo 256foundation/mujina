@@ -54,11 +54,26 @@ impl Difficulty {
         Self(Target::from(U256::from(Target::MAX) / value))
     }
 
-    /// Get difficulty as f64 (lossy for very large values).
+    /// Get difficulty as f64.
     ///
-    /// Uses rust-bitcoin's `difficulty_float()` for the conversion.
+    /// Exact to 12 significant digits for any difficulty a
+    /// source would reasonably assign. Only difficulties above
+    /// 2^53 (~9.0P) lose precision, since f64 can't exactly
+    /// represent integers that large, well beyond current
+    /// network difficulty.
+    ///
+    /// Recovering difficulty from the internal 256-bit target
+    /// can introduce tiny arithmetic residuals. The result is
+    /// rounded to [`Self::PRECISION_DIGITS`] significant
+    /// digits to clean these up. Even very small values like
+    /// 0.000_000_42 are unaffected; the rounding only discards
+    /// noise past the last significant digit.
     pub fn as_f64(self) -> f64 {
-        self.0.difficulty_float()
+        let raw = self.0.difficulty_float();
+        if !raw.is_finite() {
+            return f64::MAX;
+        }
+        Self::round_significant(raw, Self::PRECISION_DIGITS)
     }
 
     /// Convert to u64, saturating at u64::MAX.
@@ -99,6 +114,34 @@ impl Difficulty {
         }
         // The hash IS the target that was met
         Self(Target::from(hash_u256))
+    }
+
+    /// Significant digits preserved by [`Self::as_f64()`] (and
+    /// transitively by [`Self::as_u64()`]).
+    ///
+    /// The target-to-difficulty conversion involves two f64
+    /// rounding steps: a U256-to-f64 conversion (~1 ULP) and a
+    /// division (~0.5 ULP). Together that is at most 1.5 ULP of
+    /// relative error (~1.7e-16), placing the noise floor around
+    /// the 16th significant decimal digit.
+    ///
+    /// Twelve digits provides ~4 orders of magnitude of margin
+    /// over that bound.
+    const PRECISION_DIGITS: u32 = 12;
+
+    /// Round an f64 to `digits` significant decimal digits.
+    fn round_significant(value: f64, digits: u32) -> f64 {
+        if value == 0.0 || !value.is_finite() {
+            return value;
+        }
+        // Scale so `digits` significant digits sit in the integer
+        // part, round, then scale back.
+        let magnitude = value.abs().log10().floor() as i32;
+        let scale = 10_f64.powi(digits as i32 - 1 - magnitude);
+        if !scale.is_finite() {
+            return value;
+        }
+        (value * scale).round() / scale
     }
 }
 
@@ -142,7 +185,12 @@ impl fmt::Display for Difficulty {
 
         // Handle sub-1.0 difficulties with adaptive precision
         if value < 1.0 {
-            let s = format!("{:.6}", value);
+            if value <= 0.0 {
+                return write!(f, "0");
+            }
+            let magnitude = value.log10().floor() as i32;
+            let decimals = (Self::PRECISION_DIGITS as i32 - 1 - magnitude) as usize;
+            let s = format!("{:.prec$}", value, prec = decimals);
             let trimmed = s.trim_end_matches('0').trim_end_matches('.');
             return write!(f, "{}", trimmed);
         }
@@ -277,6 +325,10 @@ mod tests {
         let diff = Difficulty::from_f64(0.000048);
         assert_eq!(diff.to_string(), "0.000048");
 
+        // Very small sub-1.0 values are not truncated
+        let diff = Difficulty::from_f64(0.000_000_42);
+        assert_eq!(diff.to_string(), "0.00000042");
+
         // Whole f64 values display without decimals
         let diff = Difficulty::from_f64(42.0);
         assert_eq!(diff.to_string(), "42");
@@ -365,6 +417,65 @@ mod tests {
                 "from({val}) and from_f64({val}.0) diverge"
             );
         }
+    }
+
+    #[test]
+    fn test_as_f64_integer_round_trip_exact() {
+        // Integer difficulties must round-trip to exact f64 integers.
+        // Without rounding, the 256-bit target conversion can produce
+        // residuals like 500000.00000006.
+        for &val in &[1.0, 2.0, 100.0, 500.0, 2048.0, 500_000.0, 1_000_000.0] {
+            let result = Difficulty::from_f64(val).as_f64();
+            assert_eq!(
+                result, val,
+                "from_f64({val}).as_f64() = {result}, expected {val}"
+            );
+        }
+
+        // Same via the from(u64) path
+        for &val in &[1_u64, 2, 100, 500, 2048, 500_000, 1_000_000] {
+            let result = Difficulty::from(val).as_f64();
+            assert_eq!(
+                result, val as f64,
+                "from({val}).as_f64() = {result}, expected {val}.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_as_f64_fractional_round_trip() {
+        // Fractional difficulties must survive the round-trip within
+        // the 12-digit precision window.
+        for &val in &[0.5, 0.001, 0.000048, 2048.5, 100.1] {
+            let result = Difficulty::from_f64(val).as_f64();
+            let error = (result - val).abs() / val;
+            assert!(
+                error < 1e-9,
+                "from_f64({val}).as_f64() = {result} (relative error {error:.2e})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_as_f64_large_values() {
+        // Large difficulties (terahash range and above)
+        for &val in &[1e12, 100e12, 1.5e15] {
+            let result = Difficulty::from_f64(val).as_f64();
+            let error = (result - val).abs() / val;
+            assert!(
+                error < 1e-9,
+                "from_f64({val}).as_f64() = {result} (relative error {error:.2e})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_as_f64_edge_cases() {
+        // Difficulty::MAX (target = 0) saturates to f64::MAX
+        assert_eq!(Difficulty::MAX.as_f64(), f64::MAX);
+
+        // Difficulty 0 → Target::MAX → difficulty 1
+        assert_eq!(Difficulty::from(0_u64).as_f64(), 1.0);
     }
 
     #[test]
