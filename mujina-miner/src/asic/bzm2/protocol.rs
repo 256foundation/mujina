@@ -2,7 +2,7 @@
 //!
 //! This module implements pass-1 support for bring-up:
 //! - Command encoding for `NOOP`, `READREG`, `WRITEREG`
-//! - Response decoding for `NOOP` and `READREG`
+//! - Response decoding for `NOOP`, `READREG`, `READRESULT`, and `DTS/VS`
 //! - 9-bit TX framing via the BIRDS USB bridge format
 
 use std::io;
@@ -241,7 +241,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn write_job(
+    pub fn write_job_single_midstate(
         asic_hw_id: u8,
         engine: u16,
         midstate: [u8; 32],
@@ -261,13 +261,13 @@ impl Command {
         }
     }
 
-    /// Build the 4-command enhanced-mode WRITEJOB burst.
+    /// Build the 4-command WRITEJOB burst.
     ///
-    /// Sequence mapping follows bzmd:
+    /// Sequence mapping:
     /// `seq_start = (sequence_id % 2) * 4`, then `seq_start + [0,1,2,3]`.
     /// The first three commands carry `job_ctl=0`; the final command carries
     /// the requested `job_ctl` (must be 1 or 3).
-    pub fn write_job_enhanced(
+    pub fn write_job(
         asic_hw_id: u8,
         engine: u16,
         midstates: [[u8; 32]; 4],
@@ -282,7 +282,7 @@ impl Command {
 
         let seq_start = (sequence_id % 2) * 4;
         Ok([
-            Self::write_job(
+            Self::write_job_single_midstate(
                 asic_hw_id,
                 engine,
                 midstates[0],
@@ -291,7 +291,7 @@ impl Command {
                 seq_start,
                 0,
             ),
-            Self::write_job(
+            Self::write_job_single_midstate(
                 asic_hw_id,
                 engine,
                 midstates[1],
@@ -300,7 +300,7 @@ impl Command {
                 seq_start + 1,
                 0,
             ),
-            Self::write_job(
+            Self::write_job_single_midstate(
                 asic_hw_id,
                 engine,
                 midstates[2],
@@ -309,7 +309,7 @@ impl Command {
                 seq_start + 2,
                 0,
             ),
-            Self::write_job(
+            Self::write_job_single_midstate(
                 asic_hw_id,
                 engine,
                 midstates[3],
@@ -471,6 +471,7 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadRegData {
     U8(u8),
+    U16(u16),
     U32(u32),
 }
 
@@ -492,6 +493,18 @@ pub enum Response {
         sequence: u8,
         timecode: u8,
     },
+    DtsVs {
+        asic_hw_id: u8,
+        data: DtsVsData,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DtsVsData {
+    /// Generation-1 payload (`uart_dts_vs_msg`) represented as a big-endian `u32`.
+    Gen1(u32),
+    /// Generation-2 payload (`uart_gen2_dts_vs_msg`) represented as a big-endian `u64`.
+    Gen2(u64),
 }
 
 /// BZM2 frame codec.
@@ -501,12 +514,13 @@ pub enum Response {
 #[derive(Debug, Clone)]
 pub struct FrameCodec {
     readreg_response_size: usize,
+    dts_vs_payload_size: Option<usize>,
 }
 
 impl FrameCodec {
-    /// Create codec with explicit READREG response payload size (1 or 4 bytes).
+    /// Create codec with explicit READREG response payload size (1, 2, or 4 bytes).
     pub fn new(readreg_response_size: usize) -> Result<Self, ProtocolError> {
-        if !matches!(readreg_response_size, 1 | 4) {
+        if !matches!(readreg_response_size, 1 | 2 | 4) {
             return Err(ProtocolError::UnsupportedReadRegResponseSize(
                 readreg_response_size,
             ));
@@ -514,6 +528,7 @@ impl FrameCodec {
 
         Ok(Self {
             readreg_response_size,
+            dts_vs_payload_size: None,
         })
     }
 
@@ -526,7 +541,36 @@ impl Default for FrameCodec {
     fn default() -> Self {
         Self {
             readreg_response_size: 4,
+            dts_vs_payload_size: None,
         }
+    }
+}
+
+impl FrameCodec {
+    const DTS_VS_GEN1_PAYLOAD_LEN: usize = 4;
+    const DTS_VS_GEN2_PAYLOAD_LEN: usize = 8;
+
+    fn is_plausible_asic_hw_id(asic_hw_id: u8) -> bool {
+        asic_hw_id == BROADCAST_ASIC
+            || asic_hw_id == DEFAULT_ASIC_ID
+            || hw_to_logical_asic_id(asic_hw_id).is_some()
+    }
+
+    fn response_opcode(opcode: u8) -> Option<Opcode> {
+        match opcode {
+            0x01 => Some(Opcode::ReadResult),
+            0x03 => Some(Opcode::ReadReg),
+            0x0d => Some(Opcode::DtsVs),
+            0x0f => Some(Opcode::Noop),
+            _ => None,
+        }
+    }
+
+    fn is_plausible_response_header(buf: &[u8]) -> bool {
+        if buf.len() < 2 {
+            return false;
+        }
+        Self::is_plausible_asic_hw_id(buf[0]) && Self::response_opcode(buf[1]).is_some()
     }
 }
 
@@ -557,19 +601,28 @@ impl Decoder for FrameCodec {
                 return Ok(None);
             }
 
-            let opcode = match Opcode::from_repr(src[1]) {
+            let opcode = match Self::response_opcode(src[1]) {
                 Some(op) => op,
                 None => {
                     // Byte-level resync when stream is misaligned.
-                    tracing::debug!(
-                        dropped = format_args!("0x{:02X}", src[0]),
-                        next = format_args!("0x{:02X}", src[1]),
-                        "BZM2 rx resync: dropping byte"
-                    );
+                    // tracing::debug!(
+                    //     dropped = format_args!("0x{:02X}", src[0]),
+                    //     next = format_args!("0x{:02X}", src[1]),
+                    //     "BZM2 rx resync: dropping byte"
+                    // );
                     src.advance(1);
                     continue;
                 }
             };
+            if !Self::is_plausible_asic_hw_id(src[0]) {
+                // tracing::debug!(
+                //     dropped = format_args!("0x{:02X}", src[0]),
+                //     next = format_args!("0x{:02X}", src[1]),
+                //     "BZM2 rx resync: dropping byte"
+                // );
+                src.advance(1);
+                continue;
+            }
 
             match opcode {
                 Opcode::Noop => {
@@ -578,18 +631,20 @@ impl Decoder for FrameCodec {
                     }
                     tracing::debug!(rx = %format_hex(&src[..5]), "BZM2 rx NOOP frame");
 
-                    let mut frame = src.split_to(5);
-                    let asic_hw_id = frame.get_u8();
-                    let _opcode = frame.get_u8();
-                    let mut signature = [0u8; 3];
-                    frame.copy_to_slice(&mut signature);
-
+                    let asic_hw_id = src[0];
+                    let signature = [src[2], src[3], src[4]];
                     if signature != *NOOP_STRING {
-                        return Err(Self::io_error(ProtocolError::InvalidNoopSignature(
-                            signature,
-                        )));
+                        // tracing::debug!(
+                        //     asic_hw_id,
+                        //     signature = %format_hex(&signature),
+                        //     buffer_len = src.len(),
+                        //     "BZM2 rx NOOP signature mismatch, resync by dropping one byte"
+                        // );
+                        src.advance(1);
+                        continue;
                     }
 
+                    src.advance(5);
                     return Ok(Some(Response::Noop {
                         asic_hw_id,
                         signature,
@@ -610,6 +665,7 @@ impl Decoder for FrameCodec {
                     let _opcode = frame.get_u8();
                     let data = match self.readreg_response_size {
                         1 => ReadRegData::U8(frame.get_u8()),
+                        2 => ReadRegData::U16(frame.get_u16_le()),
                         4 => ReadRegData::U32(frame.get_u32_le()),
                         n => {
                             return Err(Self::io_error(
@@ -625,17 +681,18 @@ impl Decoder for FrameCodec {
                     if src.len() < FRAME_LEN {
                         return Ok(None);
                     }
+
+                    let engine_status = u16::from_be_bytes([src[2], src[3]]);
+                    // BIRDS/bzm2 layout packs [status:4 | engine_id:12] in network byte order.
+                    let engine_id = engine_status & 0x0fff;
+                    let status = ((engine_status >> 12) & 0x000f) as u8;
                     tracing::trace!(rx = %format_hex(&src[..FRAME_LEN]), "BZM2 rx READRESULT frame");
 
-                    let mut frame = src.split_to(FRAME_LEN);
-                    let asic_hw_id = frame.get_u8();
-                    let _opcode = frame.get_u8();
-                    let engine_status = frame.get_u16();
-                    let engine_id = (engine_status >> 4) & 0x0fff;
-                    let status = (engine_status & 0x000f) as u8;
-                    let nonce = frame.get_u32_le();
-                    let sequence = frame.get_u8();
-                    let timecode = frame.get_u8();
+                    let asic_hw_id = src[0];
+                    let nonce = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
+                    let sequence = src[8];
+                    let timecode = src[9];
+                    src.advance(FRAME_LEN);
 
                     return Ok(Some(Response::ReadResult {
                         asic_hw_id,
@@ -646,30 +703,68 @@ impl Decoder for FrameCodec {
                         timecode,
                     }));
                 }
-                // Pass-1 decoder only surfaces NOOP and READREG. Drop other
-                // fixed-length TDM messages so callers can keep waiting for
-                // the response type they care about.
                 Opcode::DtsVs => {
-                    const TDM_FIXED_LEN: usize = 10; // [asic:u8][opcode:u8][payload:8]
-                    if src.len() < TDM_FIXED_LEN {
+                    let gen1_frame_len = 2 + Self::DTS_VS_GEN1_PAYLOAD_LEN;
+                    let gen2_frame_len = 2 + Self::DTS_VS_GEN2_PAYLOAD_LEN;
+                    if src.len() < gen1_frame_len {
                         return Ok(None);
                     }
-                    tracing::trace!(
-                        opcode = opcode as u8,
-                        rx = %format_hex(&src[..TDM_FIXED_LEN]),
-                        "BZM2 rx skipping telemetry frame"
-                    );
-                    src.advance(TDM_FIXED_LEN);
-                    continue;
+
+                    let payload_len = if let Some(payload_len) = self.dts_vs_payload_size {
+                        payload_len
+                    } else {
+                        // Don't lock to gen1 on a fragmented gen2 frame.
+                        // Wait until we have enough bytes to disambiguate.
+                        if src.len() < gen2_frame_len {
+                            return Ok(None);
+                        }
+
+                        let gen1_boundary_ok =
+                            Self::is_plausible_response_header(&src[gen1_frame_len..]);
+                        let gen2_boundary_ok =
+                            Self::is_plausible_response_header(&src[gen2_frame_len..]);
+
+                        let chosen = match (gen1_boundary_ok, gen2_boundary_ok) {
+                            (true, false) => Self::DTS_VS_GEN1_PAYLOAD_LEN,
+                            (false, true) => Self::DTS_VS_GEN2_PAYLOAD_LEN,
+                            // Prefer gen2 in ambiguous cases: this aligns with existing boards.
+                            _ => Self::DTS_VS_GEN2_PAYLOAD_LEN,
+                        };
+                        self.dts_vs_payload_size = Some(chosen);
+                        chosen
+                    };
+
+                    let frame_len = 2 + payload_len;
+                    if src.len() < frame_len {
+                        return Ok(None);
+                    }
+                    // tracing::trace!(
+                    //     payload_len,
+                    //     rx = %format_hex(&src[..frame_len]),
+                    //     "BZM2 rx DTS/VS frame"
+                    // );
+
+                    let mut frame = src.split_to(frame_len);
+                    let asic_hw_id = frame.get_u8();
+                    let _opcode = frame.get_u8();
+                    let data = match payload_len {
+                        Self::DTS_VS_GEN1_PAYLOAD_LEN => DtsVsData::Gen1(frame.get_u32()),
+                        Self::DTS_VS_GEN2_PAYLOAD_LEN => DtsVsData::Gen2(frame.get_u64()),
+                        n => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("unsupported DTS/VS payload size: {n}"),
+                            ));
+                        }
+                    };
+
+                    return Ok(Some(Response::DtsVs { asic_hw_id, data }));
                 }
-                other => {
-                    let preview_len = src.len().min(32);
-                    tracing::debug!(
-                        opcode = format_args!("0x{:02X}", other as u8),
-                        buffer_len = src.len(),
-                        buffer_preview = %format_hex(&src[..preview_len]),
-                        "BZM2 rx unsupported opcode, resync by dropping one byte"
-                    );
+                _other => {
+                    // tracing::debug!(
+                    //     opcode = format_args!("0x{:02X}", _other as u8),
+                    //     "BZM2 rx non-response opcode after header check, resync by dropping one byte"
+                    // );
                     src.advance(1);
                     continue;
                 }
@@ -698,6 +793,18 @@ mod tests {
         assert_eq!(hw_to_logical_asic_id(20), Some(1));
         assert_eq!(hw_to_logical_asic_id(9), None);
         assert_eq!(hw_to_logical_asic_id(11), None);
+    }
+
+    #[test]
+    fn test_response_header_rejects_command_opcode() {
+        assert!(!FrameCodec::is_plausible_response_header(&[
+            0x0a,
+            Opcode::WriteReg as u8
+        ]));
+        assert!(FrameCodec::is_plausible_response_header(&[
+            0x0a,
+            Opcode::ReadReg as u8
+        ]));
     }
 
     #[test]
@@ -744,13 +851,21 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_writejob_frame() {
+    fn test_encode_writejob_single_midstate_frame() {
         let mut midstate = [0u8; 32];
         for (i, byte) in midstate.iter_mut().enumerate() {
             *byte = i as u8;
         }
 
-        let cmd = Command::write_job(0x0a, 0x0123, midstate, 0x1122_3344, 0x5566_7788, 0xfe, 0x03);
+        let cmd = Command::write_job_single_midstate(
+            0x0a,
+            0x0123,
+            midstate,
+            0x1122_3344,
+            0x5566_7788,
+            0xfe,
+            0x03,
+        );
 
         let raw = cmd.encode_raw().expect("encode should succeed");
         assert_eq!(&raw[..4], [0x0a, 0x01, 0x23, 0x29]);
@@ -762,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn test_writejob_enhanced_builds_four_commands() {
+    fn test_writejob_builds_four_commands() {
         let mut midstates = [[0u8; 32]; 4];
         midstates[0][0] = 0x10;
         midstates[1][0] = 0x20;
@@ -770,8 +885,8 @@ mod tests {
         midstates[3][0] = 0x40;
 
         let cmds =
-            Command::write_job_enhanced(0x0a, 0x0123, midstates, 0x1122_3344, 0x5566_7788, 0xff, 3)
-                .expect("enhanced writejob should build");
+            Command::write_job(0x0a, 0x0123, midstates, 0x1122_3344, 0x5566_7788, 0xff, 3)
+                .expect("writejob should build");
 
         let raw0 = cmds[0].clone().encode_raw().expect("encode should succeed");
         let raw1 = cmds[1].clone().encode_raw().expect("encode should succeed");
@@ -793,9 +908,9 @@ mod tests {
     }
 
     #[test]
-    fn test_writejob_enhanced_rejects_invalid_job_ctl() {
+    fn test_writejob_rejects_invalid_job_ctl() {
         let midstates = [[0u8; 32]; 4];
-        let err = Command::write_job_enhanced(0x0a, 0x0123, midstates, 0, 0, 0, 0x02)
+        let err = Command::write_job(0x0a, 0x0123, midstates, 0, 0, 0, 0x02)
             .expect_err("invalid job_ctl should fail");
         assert!(matches!(err, ProtocolError::InvalidJobControl(0x02)));
     }
@@ -849,14 +964,30 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_readreg_u16_response() {
+        let mut codec = FrameCodec::new(2).expect("codec should construct");
+        let mut src = BytesMut::from(&[0x0a, Opcode::ReadReg as u8, 0x34, 0x12][..]);
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::ReadReg {
+                asic_hw_id: 0x0a,
+                data: ReadRegData::U16(0x1234),
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
     fn test_decode_readresult_response() {
         let mut codec = FrameCodec::default();
         let mut src = BytesMut::from(
             &[
                 0x0a,
                 Opcode::ReadResult as u8,
-                0x12,
-                0x34, // engine_status: engine_id=0x123, status=0x4
+                0x40,
+                0xe3, // engine_status: status=0x4, engine_id=0x0e3
                 0x78,
                 0x56,
                 0x34,
@@ -871,7 +1002,7 @@ mod tests {
             response,
             Some(Response::ReadResult {
                 asic_hw_id: 0x0a,
-                engine_id: 0x123,
+                engine_id: 0x0e3,
                 status: 0x4,
                 nonce: 0x1234_5678,
                 sequence: 0x07,
@@ -898,20 +1029,49 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_skips_tdm_telemetry_before_noop() {
+    fn test_decode_resyncs_from_invalid_noop_signature() {
         let mut codec = FrameCodec::default();
         let mut src = BytesMut::from(
             &[
                 0x0a,
-                Opcode::DtsVs as u8,
+                Opcode::Noop as u8,
+                0xfd,
+                0x7f,
+                0x0a, // bogus NOOP-like frame
+                0x0a,
+                Opcode::Noop as u8,
+                b'2',
+                b'Z',
+                b'B', // valid NOOP frame
+            ][..],
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::Noop {
+                asic_hw_id: 0x0a,
+                signature: *NOOP_STRING,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_resyncs_from_implausible_asic_id() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(
+            &[
+                0x6b,
+                Opcode::ReadResult as u8,
+                0x8f,
+                0xff,
                 0x00,
-                0x01,
-                0x02,
-                0x03,
-                0x04,
-                0x05,
-                0x06,
-                0x07,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00, // bogus frame with impossible ASIC ID
                 0x0a,
                 Opcode::Noop as u8,
                 b'2',
@@ -926,6 +1086,193 @@ mod tests {
             Some(Response::Noop {
                 asic_hw_id: 0x0a,
                 signature: *NOOP_STRING,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_accepts_high_readresult_engine_id() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(
+            &[
+                0x0a,
+                Opcode::ReadResult as u8,
+                0x8f,
+                0xff, // engine_id=0x0fff
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x01,
+                0x00,
+                0x0a,
+                Opcode::ReadResult as u8,
+                0x80,
+                0xe3, // engine_id=0x0e3, status=0x8
+                0x78,
+                0x56,
+                0x34,
+                0x12,
+                0x07,
+                0x2a,
+            ][..],
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::ReadResult {
+                asic_hw_id: 0x0a,
+                engine_id: 0x0fff,
+                status: 0x8,
+                nonce: 0x0000_0000,
+                sequence: 0x01,
+                timecode: 0x00,
+            })
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::ReadResult {
+                asic_hw_id: 0x0a,
+                engine_id: 0x0e3,
+                status: 0x8,
+                nonce: 0x1234_5678,
+                sequence: 0x07,
+                timecode: 0x2a,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_drops_echoed_tx_pairs_before_noop() {
+        let mut codec = FrameCodec::default();
+
+        let echoed_raw = [0x0a, 0x2f, 0xff, 0x00, 0x00, 0xaa, 0xbb, 0xcc];
+        let mut src = nine_bit_encode_frame(&echoed_raw);
+        src.extend_from_slice(&[0x0a, Opcode::Noop as u8, b'2', b'Z', b'B']);
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::Noop {
+                asic_hw_id: 0x0a,
+                signature: *NOOP_STRING,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_realigns_and_drops_echoed_tx_pairs() {
+        let mut codec = FrameCodec::default();
+
+        let echoed_raw = [0xff, 0x40, 0x12, 0x01, 0x00, 0x04, 0x08];
+        let mut src = BytesMut::from(&[0x99][..]); // misalignment byte
+        src.extend_from_slice(&nine_bit_encode_frame(&echoed_raw));
+        src.extend_from_slice(&[0x0a, Opcode::Noop as u8, b'2', b'Z', b'B']);
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::Noop {
+                asic_hw_id: 0x0a,
+                signature: *NOOP_STRING,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_dts_vs_gen1_before_noop() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(
+            &[
+                0x0a,
+                Opcode::DtsVs as u8,
+                0x12,
+                0x34,
+                0x56,
+                0x78,
+                0x0a,
+                Opcode::Noop as u8,
+                b'2',
+                b'Z',
+                b'B',
+            ][..],
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::DtsVs {
+                asic_hw_id: 0x0a,
+                data: DtsVsData::Gen1(0x1234_5678),
+            })
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::Noop {
+                asic_hw_id: 0x0a,
+                signature: *NOOP_STRING,
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_dts_vs_gen2_response() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(
+            &[
+                0x0a,
+                Opcode::DtsVs as u8,
+                0x01,
+                0x02,
+                0x03,
+                0x04,
+                0x05,
+                0x06,
+                0x07,
+                0x08,
+            ][..],
+        );
+
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::DtsVs {
+                asic_hw_id: 0x0a,
+                data: DtsVsData::Gen2(0x0102_0304_0506_0708),
+            })
+        );
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn test_decode_dts_vs_gen2_fragmented_does_not_lock_gen1() {
+        let mut codec = FrameCodec::default();
+        let mut src = BytesMut::from(&[0x0a, Opcode::DtsVs as u8, 0x01, 0x02, 0x03, 0x04][..]);
+
+        assert!(
+            codec
+                .decode(&mut src)
+                .expect("decode should succeed")
+                .is_none()
+        );
+
+        src.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
+        let response = codec.decode(&mut src).expect("decode should succeed");
+        assert_eq!(
+            response,
+            Some(Response::DtsVs {
+                asic_hw_id: 0x0a,
+                data: DtsVsData::Gen2(0x0102_0304_0506_0708),
             })
         );
         assert!(src.is_empty());
