@@ -100,6 +100,7 @@ impl Daemon {
         // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
         // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
         // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        // - MUJINA_SUGGEST_DIFF: Suggested share difficulty (optional, u64)
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
@@ -108,13 +109,40 @@ impl Daemon {
             let pool_user =
                 env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
             let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
+            let suggested_difficulty = match env::var("MUJINA_SUGGEST_DIFF") {
+                Ok(raw) => match raw.trim().parse::<u64>() {
+                    Ok(value) if value > 0 => {
+                        info!(
+                            suggested_difficulty = value,
+                            "Using suggested pool difficulty"
+                        );
+                        Some(value)
+                    }
+                    Ok(_) => {
+                        warn!(
+                            value = %raw,
+                            "Ignoring MUJINA_SUGGEST_DIFF because it must be > 0"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            value = %raw,
+                            error = %e,
+                            "Ignoring invalid MUJINA_SUGGEST_DIFF"
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
 
             let stratum_config = StratumPoolConfig {
                 url: pool_url,
                 username: pool_user,
                 password: pool_pass,
                 user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-                suggested_difficulty: None,
+                suggested_difficulty,
             };
 
             // Optionally wrap with ForcedRateSource for testing
