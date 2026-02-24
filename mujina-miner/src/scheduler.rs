@@ -31,6 +31,7 @@
 
 use slotmap::SlotMap;
 use std::collections::HashSet;
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -40,7 +41,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
-    JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
+    Extranonce2, Extranonce2Range, JobTemplate, MerkleRootKind, Share as SourceShare,
+    SourceCommand, SourceEvent,
 };
 use crate::tracing::prelude::*;
 use crate::types::{
@@ -48,6 +50,8 @@ use crate::types::{
     target_for_share_rate,
 };
 use crate::u256::U256;
+
+const EN2_SEQUENCE_ENV: &str = "MUJINA_EN2_SEQUENCE";
 
 /// Unique identifier for a job source, assigned by the scheduler.
 type SourceId = slotmap::DefaultKey;
@@ -149,10 +153,17 @@ struct Scheduler {
 
     /// Track thread count for disconnect detection
     last_thread_count: usize,
+
+    /// Optional fixed EN2 sequence override for deterministic work replay.
+    fixed_en2_sequence: Option<Vec<Extranonce2>>,
+
+    /// Cursor into `fixed_en2_sequence`.
+    fixed_en2_next: usize,
 }
 
 impl Scheduler {
     fn new() -> Self {
+        let fixed_en2_sequence = parse_fixed_en2_sequence_from_env();
         Self {
             sources: SlotMap::new(),
             threads: SlotMap::new(),
@@ -160,6 +171,8 @@ impl Scheduler {
             stats: MiningStats::default(),
             difficulty_warned_sources: HashSet::new(),
             last_thread_count: 0,
+            fixed_en2_sequence,
+            fixed_en2_next: 0,
         }
     }
 
@@ -321,6 +334,19 @@ impl Scheduler {
             .split(self.threads.len())
             .expect("Failed to split EN2 range among threads");
 
+        let mut fixed_en2_next = self.fixed_en2_next;
+        let starting_en2s: Vec<Option<Extranonce2>> = en2_slices
+            .iter()
+            .map(|range| {
+                select_starting_en2(
+                    range,
+                    self.fixed_en2_sequence.as_deref(),
+                    &mut fixed_en2_next,
+                )
+            })
+            .collect();
+        self.fixed_en2_next = fixed_en2_next;
+
         // Compute share_target with rate limiting applied
         let max_share_rate = self.sources.get(source_id).and_then(|s| s.max_share_rate);
         let hashrate = self.measured_hashrate();
@@ -328,9 +354,9 @@ impl Scheduler {
             Self::compute_share_target(max_share_rate, hashrate, template.share_target);
 
         // Assign work to all threads
-        for ((thread_id, thread), en2_range) in self.threads.iter_mut().zip(en2_slices) {
-            let starting_en2 = en2_range.iter().next();
-
+        for (((thread_id, thread), en2_range), starting_en2) in
+            self.threads.iter_mut().zip(en2_slices).zip(starting_en2s)
+        {
             // Create share channel for this task
             let (share_tx, share_rx) = mpsc::channel(32);
 
@@ -522,10 +548,16 @@ impl Scheduler {
                 Self::compute_share_target(source.max_share_rate, hashrate, template.share_target);
 
             let (share_tx, share_rx) = mpsc::channel(32);
+            let starting_en2 = select_starting_en2(
+                &full_en2_range,
+                self.fixed_en2_sequence.as_deref(),
+                &mut self.fixed_en2_next,
+            );
+
             let hash_task = HashTask {
                 template: template.clone(),
                 en2_range: Some(full_en2_range.clone()),
-                en2: full_en2_range.iter().next(),
+                en2: starting_en2,
                 share_target,
                 ntime: template.time,
                 share_tx,
@@ -712,6 +744,155 @@ impl Scheduler {
         self.stats.log_summary();
 
         debug!("Scheduler shutdown complete");
+    }
+}
+
+fn format_en2_hex(value: u64, size: u8) -> String {
+    format!("{value:0width$x}", width = size as usize * 2)
+}
+
+fn parse_fixed_en2_sequence_from_env() -> Option<Vec<Extranonce2>> {
+    let raw = match env::var(EN2_SEQUENCE_ENV) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    let mut parsed = Vec::new();
+    for (idx, token) in raw.split(',').enumerate() {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        let hex = token
+            .trim_start_matches("0x")
+            .trim_start_matches("0X")
+            .to_string();
+        if hex.is_empty() {
+            warn!(
+                index = idx,
+                value = %token,
+                "Ignoring MUJINA_EN2_SEQUENCE: empty EN2 token"
+            );
+            return None;
+        }
+
+        let normalized = if (hex.len() % 2) != 0 {
+            format!("0{hex}")
+        } else {
+            hex
+        };
+        if normalized.len() > 16 {
+            warn!(
+                index = idx,
+                value = %token,
+                "Ignoring MUJINA_EN2_SEQUENCE: EN2 token exceeds 8 bytes"
+            );
+            return None;
+        }
+
+        let size = (normalized.len() / 2) as u8;
+        let mut le_bytes = [0u8; 8];
+        for (byte_index, pair) in normalized.as_bytes().chunks_exact(2).enumerate() {
+            let Ok(pair_str) = std::str::from_utf8(pair) else {
+                warn!(
+                    index = idx,
+                    value = %token,
+                    "Ignoring MUJINA_EN2_SEQUENCE: invalid UTF-8 in EN2 token"
+                );
+                return None;
+            };
+            let Ok(byte) = u8::from_str_radix(pair_str, 16) else {
+                warn!(
+                    index = idx,
+                    value = %token,
+                    "Ignoring MUJINA_EN2_SEQUENCE: invalid hex in EN2 token"
+                );
+                return None;
+            };
+            le_bytes[byte_index] = byte;
+        }
+
+        let value = u64::from_le_bytes(le_bytes);
+        let Ok(en2) = Extranonce2::new(value, size) else {
+            warn!(
+                index = idx,
+                value = %token,
+                "Ignoring MUJINA_EN2_SEQUENCE: EN2 token doesn't fit declared size"
+            );
+            return None;
+        };
+
+        parsed.push(en2);
+    }
+
+    if parsed.is_empty() {
+        warn!(
+            value = %raw,
+            "Ignoring MUJINA_EN2_SEQUENCE: no valid EN2 tokens found"
+        );
+        return None;
+    }
+
+    let rendered = parsed
+        .iter()
+        .map(|en2| format_en2_hex(en2.value(), en2.size()))
+        .collect::<Vec<_>>()
+        .join(",");
+    info!(
+        env = EN2_SEQUENCE_ENV,
+        count = parsed.len(),
+        sequence = %rendered,
+        "Using fixed EN2 assignment sequence"
+    );
+
+    Some(parsed)
+}
+
+fn default_starting_en2(en2_range: &Extranonce2Range) -> Option<Extranonce2> {
+    en2_range.iter().next()
+}
+
+fn select_starting_en2(
+    en2_range: &Extranonce2Range,
+    fixed_sequence: Option<&[Extranonce2]>,
+    fixed_next: &mut usize,
+) -> Option<Extranonce2> {
+    let fallback = default_starting_en2(en2_range);
+    let Some(sequence) = fixed_sequence else {
+        return fallback;
+    };
+    if sequence.is_empty() {
+        return fallback;
+    }
+
+    let index = *fixed_next % sequence.len();
+    *fixed_next = fixed_next.saturating_add(1);
+    let chosen = sequence[index];
+
+    if chosen.size() == en2_range.size {
+        return Some(chosen);
+    }
+
+    match Extranonce2::new(chosen.value(), en2_range.size) {
+        Ok(expanded) => {
+            debug!(
+                configured_en2 = %format_en2_hex(chosen.value(), chosen.size()),
+                expanded_en2 = %format_en2_hex(expanded.value(), expanded.size()),
+                required_size = en2_range.size,
+                "Expanded fixed EN2 to match pool extranonce2 size"
+            );
+            Some(expanded)
+        }
+        Err(e) => {
+            warn!(
+                configured_en2 = %format_en2_hex(chosen.value(), chosen.size()),
+                required_size = en2_range.size,
+                error = %e,
+                "Fixed EN2 can't be represented at pool extranonce2 size; falling back"
+            );
+            fallback
+        }
     }
 }
 
