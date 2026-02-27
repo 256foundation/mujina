@@ -25,4 +25,13 @@ pub enum BoardCommand {
         percent: Option<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
+
+    /// Set the output voltage of a named power domain.
+    SetVoltage {
+        /// Power domain name (e.g. "core").
+        domain: String,
+        /// Target voltage in volts.
+        voltage_v: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }

@@ -95,7 +95,7 @@ async fn create_from_usb(
         telemetry_tx,
     };
 
-    let registration = super::BoardRegistration { telemetry_rx };
+    let registration = super::BoardRegistration { telemetry_rx, cmd_tx: None };
     Ok((Box::new(board), registration))
 }
 

@@ -88,6 +88,25 @@ pub struct SetFanTargetRequest {
     pub target_percent: Option<u8>,
 }
 
+/// A single power-domain patch entry for `PATCH /api/v0/boards/{name}`.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PowerPatch {
+    /// Power domain name (e.g. "core").
+    pub name: String,
+    /// Desired output voltage in volts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voltage_v: Option<f32>,
+}
+
+/// Writable fields for `PATCH /api/v0/boards/{name}`.
+///
+/// All fields are optional; only those present in the request body are applied.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardPatchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub powers: Option<Vec<PowerPatch>>,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {

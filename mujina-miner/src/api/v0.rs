@@ -13,10 +13,10 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::commands::SchedulerCommand;
+use super::commands::{BoardCommand, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardPatchRequest, BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -25,7 +25,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(health))
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
-        .routes(routes!(get_board))
+        .routes(routes!(get_board, patch_board))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -128,6 +128,77 @@ async fn get_board(
     State(state): State<SharedState>,
     Path(name): Path<String>,
 ) -> Result<Json<BoardTelemetry>, StatusCode> {
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .find(|b| b.name == name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Apply partial updates to a board's configuration.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = BoardPatchRequest,
+    responses(
+        (status = OK, description = "Updated board telemetry", body = BoardTelemetry),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = UNPROCESSABLE_ENTITY, description = "Unknown power domain or voltage out of range"),
+        (status = INTERNAL_SERVER_ERROR, description = "Command channel error or hardware fault"),
+    ),
+)]
+async fn patch_board(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<BoardPatchRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    if let Some(powers) = req.powers {
+        // Resolve the board's command sender while holding the lock as briefly as possible.
+        let (board_exists, cmd_tx) = {
+            let registry = state
+                .board_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (registry.contains(&name), registry.find_cmd_tx(&name))
+        };
+
+        if !board_exists {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let cmd_tx = cmd_tx.ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+
+        for patch in powers {
+            let Some(voltage_v) = patch.voltage_v else {
+                continue;
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(BoardCommand::SetVoltage {
+                    domain: patch.name,
+                    voltage_v,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            let result = tokio::time::timeout(Duration::from_secs(5), reply_rx).await;
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(_))) => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+                _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+            }
+        }
+    }
+
+    // Return the current board snapshot.
     state
         .board_registry
         .lock()
