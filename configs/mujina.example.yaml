@@ -1,0 +1,110 @@
+# Mujina Miner — example configuration
+#
+# Copy this file to /etc/mujina/mujina.yaml and edit as needed.
+# All keys are optional; values shown here are the hard-coded defaults.
+#
+# Full documentation: docs/configuration.md
+
+# ------------------------------------------------------------
+# daemon — process and logging
+# ------------------------------------------------------------
+daemon:
+  # Minimum log level emitted to stdout or journald.
+  # Values: error | warn | info | debug | trace
+  log_level: "info"
+
+  # PID file written on startup, removed on clean exit.
+  # Null disables PID file creation.
+  pid_file: ~
+
+  # Emit systemd sd_notify readiness notifications.
+  # Enable when running under a systemd Type=notify service unit.
+  systemd: false
+
+
+# ------------------------------------------------------------
+# api — HTTP REST API server
+# ------------------------------------------------------------
+api:
+  # TCP address and port for the API server.
+  # Use 127.0.0.1 (loopback) to restrict access to localhost.
+  # Use 0.0.0.0 to expose on all interfaces (see security note below).
+  listen: "127.0.0.1:7785"
+
+  # WARNING: The API has no authentication. Binding to a non-loopback
+  # address exposes full miner control to the network. Only do this
+  # behind a firewall or reverse proxy that provides authentication.
+
+
+# ------------------------------------------------------------
+# pool — primary mining pool
+# ------------------------------------------------------------
+pool:
+  # Stratum v1 pool URL.
+  # Format: stratum+tcp://<host>:<port>
+  # Required for actual mining. When absent, the daemon starts with
+  # a dummy job source (useful for hardware testing).
+  url: ~
+
+  # Worker name, typically wallet_address.worker_name
+  user: "mujina-testing"
+
+  # Worker password. Most pools accept "x".
+  password: "x"
+
+
+# ------------------------------------------------------------
+# backplane — board discovery and lifecycle management
+# ------------------------------------------------------------
+backplane:
+  # Enable USB device discovery and hotplug monitoring.
+  # Disable for environments without USB mining hardware
+  # (e.g., CPU-only testing).
+  usb_enabled: true
+
+
+# ------------------------------------------------------------
+# boards — per-board-type hardware configuration
+# ------------------------------------------------------------
+boards:
+
+  # -- Bitaxe family (BM1370-based boards) --
+  bitaxe:
+    # Emergency shutdown temperature in Celsius.
+    # The board halts hashing if any sensor reads above this value.
+    temp_limit_c: 85.0
+
+    # Fan speed bounds as a percentage of full speed.
+    # The thermal controller adjusts within this range.
+    fan_min_pct: 20
+    fan_max_pct: 100
+
+    # Maximum board power consumption in watts.
+    # Null disables the power cap (hardware default applies).
+    power_limit_w: ~
+
+  # -- CPU miner (software SHA256d, for testing and development) --
+  cpu_miner:
+    # Enable the software CPU miner.
+    # When false, no CPU mining threads are started.
+    enabled: false
+
+    # Number of OS threads to dedicate to hashing.
+    threads: 1
+
+    # Target CPU utilisation per thread as a percentage (1–100).
+    # At 80%, each thread hashes for 800 ms then sleeps for 200 ms.
+    # Useful on cloud instances that alert on sustained 100% CPU usage.
+    duty_percent: 50
+
+
+# ------------------------------------------------------------
+# hash_thread — ASIC hash thread tuning
+# ------------------------------------------------------------
+hash_thread:
+  # Difficulty target configured on-chip for share reporting.
+  # Lower values produce more frequent shares (useful for health
+  # monitoring); higher values reduce message volume on large
+  # installations. The scheduler still applies pool difficulty
+  # filtering before forwarding shares to the pool.
+  chip_target_difficulty: 256

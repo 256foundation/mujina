@@ -10,6 +10,8 @@ repository = "https://github.com/256-Foundation/Mujina-Mining-Firmware"
 
 [workspace.dependencies]
 anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+config = { version = "0.14", features = ["yaml"] }
 async-trait = "0.1"
 axum = "0.8"
 bitcoin = "0.32"
