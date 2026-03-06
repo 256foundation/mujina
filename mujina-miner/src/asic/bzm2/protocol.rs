@@ -1,9 +1,14 @@
 //! BZM2 wire protocol and frame codec.
 //!
-//! This module implements pass-1 support for bring-up:
-//! - Command encoding for `NOOP`, `READREG`, `WRITEREG`
+//! This module defines the wire-format types used by the BIRDS BZM2 transport:
+//! - Command encoding for `NOOP`, `READREG`, `WRITEREG`, multicast writes, and
+//!   `WRITEJOB`
 //! - Response decoding for `NOOP`, `READREG`, `READRESULT`, and `DTS/VS`
-//! - 9-bit TX framing via the BIRDS USB bridge format
+//! - 9-bit transmit framing via the BIRDS USB bridge format
+//!
+//! The API surface is intentionally narrow: higher-level chip initialization and
+//! mining logic live in [`super::thread`], while this module stays responsible
+//! for translating typed commands and responses to bytes.
 
 use std::io;
 
@@ -11,32 +16,38 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use strum::FromRepr;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::error::ProtocolError;
+use super::{HexBytes, error::ProtocolError};
 use crate::transport::nine_bit::nine_bit_encode_frame;
 
+/// ASCII marker returned by the ASIC in identification contexts.
 pub const ASIC_STRING: &[u8; 3] = b"BZ2";
+/// Signature returned by a successful `NOOP` response.
 pub const NOOP_STRING: &[u8; 3] = b"2ZB";
+/// Default hardware ASIC ID before per-chip addressing is assigned.
 pub const DEFAULT_ASIC_ID: u8 = 0xfa;
 
+/// Distance between logical ASIC indices and hardware UART IDs.
 pub const ASIC_HW_ID_STRIDE: u8 = 10;
+/// Total engine count exposed by one BZM2 ASIC package.
 pub const ENGINES_PER_ASIC: usize = 240;
 
+/// Engine selector used for local-register accesses.
 pub const NOTCH_REG: u16 = 0x0fff;
+/// Engine selector used for BIST register accesses.
 pub const BIST_REG: u16 = 0x0fc0;
+/// Broadcast ASIC target used by commands that address every device.
 pub const BROADCAST_ASIC: u8 = 0xff;
+/// Broadcast engine/group target used for wide writes.
 pub const BROADCAST_ENGINE: u16 = 0x00ff;
 
+/// Terminator byte appended to transmit frames by the bridge format.
 pub const TERM_BYTE: u8 = 0xa5;
+/// Target selector used by `READREG` requests.
 pub const TAR_BYTE: u8 = 0x08;
+/// Register offset encoded in `WRITEJOB` headers.
 pub const WRITEJOB_OFFSET: u16 = 41;
 
-fn format_hex(data: &[u8]) -> String {
-    data.iter()
-        .map(|byte| format!("{:02X}", byte))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
+/// Engine-local register offsets used by job dispatch and result handling.
 pub mod engine_reg {
     pub const STATUS: u16 = 0x00;
     pub const CONFIG: u16 = 0x01;
@@ -58,6 +69,7 @@ pub mod engine_reg {
     pub const RESULT_POP: u16 = 0x77;
 }
 
+/// Local control and sensor register offsets for one ASIC.
 pub mod local_reg {
     pub const RESULT_STS_CTL: u16 = 0x00;
     pub const ERROR_LOG0: u16 = 0x01;
@@ -124,6 +136,7 @@ pub mod local_reg {
     pub const CKDLLR_1_1: u16 = 0x63;
 }
 
+/// BIST register offsets used during engine self-test programming.
 pub mod bist_reg {
     pub const RESULT_FSM_CTL: u16 = 0x00;
     pub const ERROR_LOG0: u16 = 0x01;
@@ -170,16 +183,25 @@ pub mod bist_reg {
     }
 }
 
+/// Supported BZM2 opcodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromRepr)]
 #[repr(u8)]
 pub enum Opcode {
+    /// Push one micro-job into an engine.
     WriteJob = 0x0,
+    /// Read a completed result from an engine.
     ReadResult = 0x1,
+    /// Write one or more bytes to a register region.
     WriteReg = 0x2,
+    /// Read one, two, or four bytes from a register region.
     ReadReg = 0x3,
+    /// Write one or more bytes to a register group or broadcast target.
     MulticastWrite = 0x4,
+    /// Read temperature/voltage sensor telemetry.
     DtsVs = 0x0d,
+    /// Loopback command used by bring-up and diagnostics.
     Loopback = 0x0e,
+    /// Lightweight connectivity check that returns `NOOP_STRING`.
     Noop = 0x0f,
 }
 
@@ -192,13 +214,14 @@ pub fn logical_to_hw_asic_id(logical_asic: u8) -> u8 {
 
 /// Translate hardware ASIC ID from UART into logical ASIC index.
 pub fn hw_to_logical_asic_id(hw_asic_id: u8) -> Option<u8> {
-    if hw_asic_id < ASIC_HW_ID_STRIDE || hw_asic_id % ASIC_HW_ID_STRIDE != 0 {
+    if hw_asic_id < ASIC_HW_ID_STRIDE || !hw_asic_id.is_multiple_of(ASIC_HW_ID_STRIDE) {
         return None;
     }
 
     Some((hw_asic_id / ASIC_HW_ID_STRIDE) - 1)
 }
 
+/// Commands that can be sent to one or more BZM2 ASICs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Push a job payload to one engine.
@@ -241,6 +264,7 @@ pub enum Command {
 }
 
 impl Command {
+    /// Build a single `WRITEJOB` command containing one midstate variant.
     pub fn write_job_single_midstate(
         asic_hw_id: u8,
         engine: u16,
@@ -321,6 +345,7 @@ impl Command {
         ])
     }
 
+    /// Build a `READREG` command for a four-byte little-endian register.
     pub fn read_reg_u32(asic_hw_id: u8, engine: u16, offset: u16) -> Self {
         Self::ReadReg {
             asic_hw_id,
@@ -330,6 +355,7 @@ impl Command {
         }
     }
 
+    /// Build a single-byte `WRITEREG` command.
     pub fn write_reg_u8(asic_hw_id: u8, engine: u16, offset: u16, value: u8) -> Self {
         Self::WriteReg {
             asic_hw_id,
@@ -339,6 +365,7 @@ impl Command {
         }
     }
 
+    /// Build a four-byte little-endian `WRITEREG` command.
     pub fn write_reg_u32_le(asic_hw_id: u8, engine: u16, offset: u16, value: u32) -> Self {
         Self::WriteReg {
             asic_hw_id,
@@ -348,6 +375,7 @@ impl Command {
         }
     }
 
+    /// Build a single-byte multicast register write.
     pub fn multicast_write_u8(asic_hw_id: u8, group: u16, offset: u16, value: u8) -> Self {
         Self::MulticastWrite {
             asic_hw_id,
@@ -468,23 +496,25 @@ impl Command {
     }
 }
 
+/// Typed payload returned by a `READREG` response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadRegData {
+    /// One-byte register payload.
     U8(u8),
+    /// Two-byte little-endian register payload.
     U16(u16),
+    /// Four-byte little-endian register payload.
     U32(u32),
 }
 
+/// Responses decoded from the BZM2 UART receive stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
-    Noop {
-        asic_hw_id: u8,
-        signature: [u8; 3],
-    },
-    ReadReg {
-        asic_hw_id: u8,
-        data: ReadRegData,
-    },
+    /// Response to a `NOOP` request.
+    Noop { asic_hw_id: u8, signature: [u8; 3] },
+    /// Response to a `READREG` request.
+    ReadReg { asic_hw_id: u8, data: ReadRegData },
+    /// Completed result from one engine.
     ReadResult {
         asic_hw_id: u8,
         engine_id: u16,
@@ -493,12 +523,11 @@ pub enum Response {
         sequence: u8,
         timecode: u8,
     },
-    DtsVs {
-        asic_hw_id: u8,
-        data: DtsVsData,
-    },
+    /// Temperature and voltage sensor telemetry.
+    DtsVs { asic_hw_id: u8, data: DtsVsData },
 }
 
+/// Decoded payload for the `DTS/VS` response family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DtsVsData {
     /// Generation-1 payload (`uart_dts_vs_msg`) represented as a big-endian `u32`.
@@ -572,6 +601,24 @@ impl FrameCodec {
         }
         Self::is_plausible_asic_hw_id(buf[0]) && Self::response_opcode(buf[1]).is_some()
     }
+
+    fn echoed_tx_prefix_len(buf: &[u8]) -> Option<usize> {
+        if buf.len() < 6 || buf[1] != 0x01 {
+            return None;
+        }
+
+        for offset in (4..=buf.len().saturating_sub(2)).step_by(2) {
+            if buf[offset - 1] != 0x00 {
+                return None;
+            }
+
+            if Self::is_plausible_response_header(&buf[offset..]) {
+                return Some(offset);
+            }
+        }
+
+        None
+    }
 }
 
 impl Encoder<Command> for FrameCodec {
@@ -581,8 +628,8 @@ impl Encoder<Command> for FrameCodec {
         let raw = item.encode_raw().map_err(Self::io_error)?;
         let encoded = nine_bit_encode_frame(&raw);
         tracing::debug!(
-            raw = %format_hex(&raw),
-            encoded = %format_hex(&encoded),
+            raw = %HexBytes(&raw),
+            encoded = %HexBytes(&encoded),
             "BZM2 tx frame"
         );
         dst.extend_from_slice(&encoded);
@@ -599,6 +646,11 @@ impl Decoder for FrameCodec {
             // Minimum frame is [asic_hw_id, opcode]
             if src.len() < 2 {
                 return Ok(None);
+            }
+
+            if let Some(prefix_len) = Self::echoed_tx_prefix_len(src) {
+                src.advance(prefix_len);
+                continue;
             }
 
             let opcode = match Self::response_opcode(src[1]) {
@@ -629,7 +681,7 @@ impl Decoder for FrameCodec {
                     if src.len() < 5 {
                         return Ok(None);
                     }
-                    tracing::debug!(rx = %format_hex(&src[..5]), "BZM2 rx NOOP frame");
+                    tracing::debug!(rx = %HexBytes(&src[..5]), "BZM2 rx NOOP frame");
 
                     let asic_hw_id = src[0];
                     let signature = [src[2], src[3], src[4]];
@@ -656,7 +708,7 @@ impl Decoder for FrameCodec {
                         return Ok(None);
                     }
                     tracing::debug!(
-                        rx = %format_hex(&src[..frame_len]),
+                        rx = %HexBytes(&src[..frame_len]),
                         "BZM2 rx READREG frame"
                     );
 
@@ -686,7 +738,7 @@ impl Decoder for FrameCodec {
                     // BIRDS/bzm2 layout packs [status:4 | engine_id:12] in network byte order.
                     let engine_id = engine_status & 0x0fff;
                     let status = ((engine_status >> 12) & 0x000f) as u8;
-                    tracing::trace!(rx = %format_hex(&src[..FRAME_LEN]), "BZM2 rx READRESULT frame");
+                    tracing::trace!(rx = %HexBytes(&src[..FRAME_LEN]), "BZM2 rx READRESULT frame");
 
                     let asic_hw_id = src[0];
                     let nonce = u32::from_le_bytes([src[4], src[5], src[6], src[7]]);
@@ -779,6 +831,77 @@ fn build_short_header(asic_hw_id: u8, opcode: Opcode) -> u16 {
 
 fn build_full_header(asic_hw_id: u8, opcode: Opcode, engine: u16, offset: u16) -> u32 {
     ((asic_hw_id as u32) << 24) | ((opcode as u32) << 20) | ((engine as u32) << 8) | (offset as u32)
+}
+
+/// Stateless command factory for BZM2 protocol operations.
+///
+/// Callers that want a protocol-centric entry point can build common commands
+/// through this type instead of constructing enum variants directly.
+pub struct Bzm2Protocol;
+
+impl Default for Bzm2Protocol {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Bzm2Protocol {
+    /// Create a new protocol helper.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Create a `NOOP` command for one ASIC.
+    pub fn noop(&self, asic_hw_id: u8) -> Command {
+        Command::Noop { asic_hw_id }
+    }
+
+    /// Create a `READREG` command.
+    pub fn read_register(&self, asic_hw_id: u8, engine: u16, offset: u16, count: u8) -> Command {
+        Command::ReadReg {
+            asic_hw_id,
+            engine,
+            offset,
+            count,
+        }
+    }
+
+    /// Create a four-byte `READREG` command for the `ASIC_ID` local register.
+    pub fn read_asic_id(&self, asic_hw_id: u8) -> Command {
+        self.read_register(asic_hw_id, NOTCH_REG, local_reg::ASIC_ID, 4)
+    }
+
+    /// Create a `WRITEREG` command.
+    pub fn write_register(
+        &self,
+        asic_hw_id: u8,
+        engine: u16,
+        offset: u16,
+        value: Bytes,
+    ) -> Command {
+        Command::WriteReg {
+            asic_hw_id,
+            engine,
+            offset,
+            value,
+        }
+    }
+
+    /// Create a multicast write command.
+    pub fn multicast_write(
+        &self,
+        asic_hw_id: u8,
+        group: u16,
+        offset: u16,
+        value: Bytes,
+    ) -> Command {
+        Command::MulticastWrite {
+            asic_hw_id,
+            group,
+            offset,
+            value,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -884,9 +1007,8 @@ mod tests {
         midstates[2][0] = 0x30;
         midstates[3][0] = 0x40;
 
-        let cmds =
-            Command::write_job(0x0a, 0x0123, midstates, 0x1122_3344, 0x5566_7788, 0xff, 3)
-                .expect("writejob should build");
+        let cmds = Command::write_job(0x0a, 0x0123, midstates, 0x1122_3344, 0x5566_7788, 0xff, 3)
+            .expect("writejob should build");
 
         let raw0 = cmds[0].clone().encode_raw().expect("encode should succeed");
         let raw1 = cmds[1].clone().encode_raw().expect("encode should succeed");
