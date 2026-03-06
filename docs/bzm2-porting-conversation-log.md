@@ -259,6 +259,65 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - `c5bb770a4a24faec6d76d54684075179ad1f6385`
   - `Add UART-based BZM2 PLL diagnostic flow`
 
+## 33. Reference-Implementation Gap Review And Roadmap
+
+### User
+> Reviewing the documentation you've drafted and the software you have implemented. Can you see any gaps in what exists in the ASIC from a comprehensive reference implementation standpoint, and what we have?
+
+### Assistant
+- Reviewed the implemented Rust path against the documented ASIC capabilities.
+- Identified the main remaining gaps as:
+  - applied per-domain voltage control
+  - hardware discovery and `ASIC_ID` assignment
+  - topology and defect discovery
+  - closed-loop retune
+  - broader diagnostics/API parity
+- Explicitly dropped Gen1 telemetry completion from near-term scope.
+
+### User
+> Yes, let's build a concrete roadmap as suggested, and then begin tackling that. First, log this update into our conversation log file please. And then the roadmap.
+
+### Assistant
+- Added `docs/blockscale-reference-roadmap.md`.
+- Started roadmap execution with chain-enumeration support as Phase 1.
+
+## 34. Roadmap Phase 1 Through Phase 3
+
+### User
+> between each step of each phase, can you add a full regression test pass, and if that pases, then commit the work to git with a verbose git commit message, and move on to the next step?
+
+### Assistant
+- Adopted the requested gated workflow:
+  - implement one step
+  - run the full `cargo test -p mujina-miner` regression pass
+  - commit only if green
+  - then move to the next step
+
+### Assistant
+- Completed and committed:
+  - `6db1004` `Add BZM2 startup auto-enumeration`
+  - `1cd9d55` `Wire BZM2 bring-up sequencing into board lifecycle`
+  - `45a492b` `Expose BZM2 rail telemetry through board state`
+
+### User
+> Let's do it! Apply planner-generated domain voltages onto the configured rail control path instead of treating them as advisory only.
+
+### Assistant
+- Implemented planner-driven per-domain rail application in `Bzm2Board`.
+- Added explicit domain-to-rail mapping support with one-to-one default mapping
+  and optional override through `MUJINA_BZM2_DOMAIN_RAIL_INDICES`.
+- Applied persisted per-domain voltages during saved operating-point replay.
+- Added conflict detection so multiple domains cannot silently program different
+  voltages onto one shared rail.
+- Extended calibration persistence to store `per_domain_voltage_mv`.
+- Added regression coverage proving:
+  - live calibration writes rail setpoints that match the persisted profile
+  - replay writes saved per-domain voltages without rewriting the stored profile
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner bzm2`
+  - full regression gate before commit
+
 ### User
 > now, let's add the DLL-side clock diagnostics alongside the PLL flow and wire this into a small Mujina CLI or board hook so you can invoke PLL debug against a live serial device. A full featured UART interface with good comments and explained comprehensive functionality is good, especially one that supports broadcast, multicast, and unicast examples for developers to follow/choose to implement.
 
@@ -627,6 +686,13 @@ This document captures the working session that produced the BZM2 Mujina port. I
 - Hardened an existing BZM2 fanout test so it reads the full PTY stream instead
   of assuming one read call returns the entire dispatch burst under parallel
   test load
+- Extended the same board-control path with optional file-backed rail telemetry
+  so `BoardState` can now publish:
+  - `railN-input`
+  - `railN-output`
+  - `railN-regulator`
+- Added a board-state regression test that verifies configured rail telemetry is
+  visible immediately after `create_hash_threads()`
 
 ## Current State At End Of This Log
 
