@@ -19,10 +19,10 @@ use crate::transport::serial::{SerialControl, SerialReader, SerialWriter};
 use crate::types::{Difficulty, HashRate};
 
 use super::protocol::{
-    self, BROADCAST_ASIC, DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT, ENGINE_REG_TARGET,
-    ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND, TdmResultParser,
-    default_engine_coordinates, encode_write_job, encode_write_register, leading_zero_threshold,
-    logical_engine_address,
+    self, BROADCAST_ASIC, DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT, DtsVsGeneration,
+    ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND, TdmDtsVsFrame,
+    TdmFrame, TdmFrameParser, default_engine_coordinates, encode_write_job, encode_write_register,
+    leading_zero_threshold, logical_engine_address,
 };
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,7 @@ pub struct Bzm2ThreadConfig {
     pub nonce_gap: u32,
     pub dispatch_interval: Duration,
     pub nominal_hashrate_ths: f64,
+    pub dts_vs_generation: DtsVsGeneration,
 }
 
 impl Bzm2ThreadConfig {
@@ -44,6 +45,7 @@ impl Bzm2ThreadConfig {
             nonce_gap: DEFAULT_NONCE_GAP,
             dispatch_interval: Duration::from_millis(500),
             nominal_hashrate_ths: 40.0,
+            dts_vs_generation: DtsVsGeneration::Gen2,
         }
     }
 }
@@ -106,8 +108,16 @@ impl Bzm2Thread {
         let nominal_hashrate_ths = config.nominal_hashrate_ths;
 
         tokio::spawn(async move {
-            bzm2_thread_actor(command_rx, event_tx, status_clone, reader, writer, control, config)
-                .await;
+            bzm2_thread_actor(
+                command_rx,
+                event_tx,
+                status_clone,
+                reader,
+                writer,
+                control,
+                config,
+            )
+            .await;
         });
 
         Self {
@@ -210,7 +220,7 @@ async fn bzm2_thread_actor(
         .await;
 
     let engine_coords = default_engine_coordinates();
-    let mut parser = TdmResultParser::default();
+    let mut parser = TdmFrameParser::new(config.dts_vs_generation);
     let mut current_task: Option<HashTask> = None;
     let mut engine_dispatches: HashMap<u16, EngineDispatch> = HashMap::new();
     let mut base_sequence: u8 = 0;
@@ -241,7 +251,7 @@ async fn bzm2_thread_actor(
                                 continue;
                             }
                             base_sequence = base_sequence.wrapping_add(1);
-                            set_active(&status, true);
+                            set_active(&status, true, config.nominal_hashrate_ths);
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -262,7 +272,7 @@ async fn bzm2_thread_actor(
                                 continue;
                             }
                             base_sequence = base_sequence.wrapping_add(1);
-                            set_active(&status, true);
+                            set_active(&status, true, config.nominal_hashrate_ths);
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -270,7 +280,7 @@ async fn bzm2_thread_actor(
                     ThreadCommand::GoIdle { response_tx } => {
                         engine_dispatches.clear();
                         let old = current_task.take();
-                        set_active(&status, false);
+                        set_active(&status, false, config.nominal_hashrate_ths);
                         let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         let _ = response_tx.send(Ok(old));
                     }
@@ -281,19 +291,35 @@ async fn bzm2_thread_actor(
                 match read_result {
                     Ok(0) => break,
                     Ok(n) => {
+                        let mut should_shutdown = false;
                         for frame in parser.push(&read_buf[..n]) {
-                            handle_result_frame(
-                                &frame,
-                                &engine_dispatches,
-                                &config,
-                                &status,
-                                &event_tx,
-                            )
-                            .await;
+                            match frame {
+                                TdmFrame::Result(frame) => {
+                                    handle_result_frame(
+                                        &frame,
+                                        &engine_dispatches,
+                                        &config,
+                                        &status,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                }
+                                TdmFrame::DtsVs(frame) => {
+                                    should_shutdown = handle_dts_vs_frame(&frame, &config, &status).await;
+                                    if should_shutdown {
+                                        break;
+                                    }
+                                }
+                                TdmFrame::Register(_) | TdmFrame::Noop(_) => {}
+                            }
+                        }
+                        if should_shutdown {
+                            break;
                         }
                     }
                     Err(err) => {
                         error!(path = %config.serial_path, error = %err, "BZM2 serial read failed");
+                        record_hardware_error(&status);
                         break;
                     }
                 }
@@ -313,6 +339,7 @@ async fn bzm2_thread_actor(
                         }
                         Err(err) => {
                             error!(path = %config.serial_path, error = %err, "BZM2 dispatch failed");
+                            record_hardware_error(&status);
                         }
                     }
                 }
@@ -325,6 +352,63 @@ async fn bzm2_thread_actor(
             _ = status_tick.tick() => {
                 let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
             }
+        }
+    }
+
+    set_active(&status, false, config.nominal_hashrate_ths);
+    let _ = event_tx
+        .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
+        .await;
+}
+
+async fn handle_dts_vs_frame(
+    frame: &TdmDtsVsFrame,
+    config: &Bzm2ThreadConfig,
+    status: &Arc<RwLock<HashThreadStatus>>,
+) -> bool {
+    match frame {
+        TdmDtsVsFrame::Gen1(frame) => {
+            trace!(
+                path = %config.serial_path,
+                asic = frame.asic,
+                voltage = frame.voltage,
+                voltage_enabled = frame.voltage_enabled,
+                thermal_tune_code = frame.thermal_tune_code,
+                thermal_validity = frame.thermal_validity,
+                thermal_enabled = frame.thermal_enabled,
+                "BZM2 DTS/VS telemetry frame"
+            );
+            false
+        }
+        TdmDtsVsFrame::Gen2(frame) => {
+            trace!(
+                path = %config.serial_path,
+                asic = frame.asic,
+                thermal_trip = frame.thermal_trip_status,
+                thermal_fault = frame.thermal_fault,
+                voltage_fault = frame.voltage_fault,
+                voltage_shutdown = frame.voltage_shutdown_status,
+                "BZM2 DTS/VS gen2 telemetry frame"
+            );
+
+            if frame.thermal_trip_status
+                || frame.thermal_fault
+                || frame.voltage_fault
+                || frame.voltage_shutdown_status
+            {
+                warn!(
+                    path = %config.serial_path,
+                    asic = frame.asic,
+                    thermal_trip = frame.thermal_trip_status,
+                    thermal_fault = frame.thermal_fault,
+                    voltage_fault = frame.voltage_fault,
+                    voltage_shutdown = frame.voltage_shutdown_status,
+                    "BZM2 hardware fault reported by DTS/VS frame"
+                );
+                record_hardware_error(status);
+                return true;
+            }
+            false
         }
     }
 }
@@ -572,9 +656,19 @@ fn snapshot_status(status: &Arc<RwLock<HashThreadStatus>>) -> HashThreadStatus {
     status.read().unwrap().clone()
 }
 
-fn set_active(status: &Arc<RwLock<HashThreadStatus>>, is_active: bool) {
+fn set_active(status: &Arc<RwLock<HashThreadStatus>>, is_active: bool, nominal_hashrate_ths: f64) {
     let mut lock = status.write().unwrap();
     lock.is_active = is_active;
+    lock.hashrate = if is_active {
+        HashRate::from_terahashes(nominal_hashrate_ths)
+    } else {
+        HashRate::default()
+    };
+}
+
+fn record_hardware_error(status: &Arc<RwLock<HashThreadStatus>>) {
+    let mut lock = status.write().unwrap();
+    lock.hardware_errors = lock.hardware_errors.saturating_add(1);
 }
 
 #[cfg(test)]
@@ -591,9 +685,9 @@ mod tests {
 
     fn test_task() -> HashTask {
         let share_target = Target::from_be_bytes([
-            0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
         ]);
         let template = Arc::new(JobTemplate {
             id: "bzm2-test".into(),
@@ -632,8 +726,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_writes_expected_packet_fanout() {
         let pty = openpty(None, None).unwrap();
-        let writer_side = SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
-        let reader_side = SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let writer_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let reader_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
         let (_reader_a, mut writer, _control_a) = writer_side.split();
         let (mut reader, _writer_b, _control_b) = reader_side.split();
 
@@ -674,6 +770,144 @@ mod tests {
         );
         assert_eq!(bytes[last_packet_start + 46], 7);
         assert_eq!(bytes[last_packet_start + 47], 3);
+    }
+
+    #[tokio::test]
+    async fn parsed_uart_frame_emits_share_and_status_event() {
+        let mut task = test_task();
+        let merkle_root = bitcoin::TxMerkleNode::all_zeros();
+        let versions = compute_micro_versions(&task);
+        let (row, col) = default_engine_coordinates()[0];
+        let engine_id = protocol::logical_engine_id(row, col).unwrap();
+        let nonce = 0;
+        let expected_hash = bitcoin::block::Header {
+            version: versions[0],
+            prev_blockhash: task.template.prev_blockhash,
+            merkle_root,
+            time: task.ntime,
+            bits: task.template.bits,
+            nonce,
+        }
+        .block_hash();
+        task.share_target = Difficulty::from_hash(&expected_hash).to_target();
+
+        let mut engine_dispatches = StdHashMap::new();
+        engine_dispatches.insert(
+            engine_id,
+            EngineDispatch {
+                task: task.clone(),
+                merkle_root,
+                versions,
+                base_sequence: 0,
+            },
+        );
+
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
+        let status = Arc::new(RwLock::new(HashThreadStatus {
+            hashrate: HashRate::from_terahashes(40.0),
+            is_active: true,
+            ..Default::default()
+        }));
+        let (event_tx, mut event_rx) = tokio_mpsc::channel(4);
+        let (share_tx, mut share_rx) = tokio_mpsc::channel(4);
+        engine_dispatches.get_mut(&engine_id).unwrap().task.share_tx = share_tx;
+
+        let engine_address = protocol::logical_engine_address(row, col);
+        let header = ((0x8u16) << 12) | engine_address;
+        let mut raw = Vec::with_capacity(10);
+        raw.push(0);
+        raw.push(protocol::OPCODE_UART_READRESULT);
+        raw.extend_from_slice(&header.to_be_bytes());
+        raw.extend_from_slice(&(nonce + DEFAULT_NONCE_GAP).to_le_bytes());
+        raw.push(0);
+        raw.push(DEFAULT_TIMESTAMP_COUNT);
+
+        let mut parser = protocol::TdmResultParser::default();
+        let frames = parser.push(&raw);
+        assert_eq!(frames.len(), 1);
+        assert!(reconstruct_share_from_result(&frames[0], &engine_dispatches, &config).is_some());
+
+        handle_result_frame(&frames[0], &engine_dispatches, &config, &status, &event_tx).await;
+
+        let share = tokio::time::timeout(Duration::from_millis(250), share_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(share.nonce, nonce);
+        assert_eq!(share.ntime, task.ntime);
+        assert_eq!(share.version, versions[0]);
+        assert_eq!(share.hash, expected_hash);
+
+        let status_update = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match status_update {
+            HashThreadEvent::StatusUpdate(snapshot) => {
+                assert!(snapshot.is_active);
+                assert_eq!(snapshot.chip_shares_found, 1);
+                assert_eq!(snapshot.hashrate, HashRate::from_terahashes(40.0));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+    #[tokio::test]
+    async fn gen2_dts_vs_fault_shuts_down_live_thread() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (_host_reader, mut host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
+        config.dts_vs_generation = protocol::DtsVsGeneration::Gen2;
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let mut event_rx = thread.take_event_receiver().unwrap();
+
+        let initial = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(initial, HashThreadEvent::StatusUpdate(_)));
+
+        host_writer
+            .write_all(&[
+                0x00,
+                protocol::OPCODE_UART_DTS_VS,
+                0xD5,
+                0xAB,
+                0x34,
+                0x12,
+                0x45,
+                0x96,
+                0xA9,
+                0xF7,
+            ])
+            .await
+            .unwrap();
+
+        let mut saw_fault_status = false;
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(event) = event_rx.recv().await {
+                if let HashThreadEvent::StatusUpdate(status) = event {
+                    if !status.is_active && status.hardware_errors >= 1 {
+                        saw_fault_status = true;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            closed.is_ok(),
+            "thread should exit after DTS/VS hardware fault"
+        );
+        assert!(
+            saw_fault_status,
+            "thread should publish a final faulted status"
+        );
     }
 
     #[test]
@@ -738,15 +972,3 @@ mod tests {
         assert_eq!(target_diff, Difficulty::from_target(task.share_target));
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
