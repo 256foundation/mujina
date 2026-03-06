@@ -386,7 +386,9 @@ impl Backplane {
                     debug!(board = %model, id = %device_id, "Shutting down virtual board");
 
                     match board.shutdown().await {
-                        Ok(()) => info!(board = %model, id = %device_id, "Virtual board disconnected"),
+                        Ok(()) => {
+                            info!(board = %model, id = %device_id, "Virtual board disconnected")
+                        }
                         Err(e) => error!(
                             board = %model,
                             id = %device_id,

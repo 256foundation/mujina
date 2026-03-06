@@ -88,12 +88,12 @@ impl Daemon {
                 baud = config.baud_rate,
                 "BZM2 virtual board enabled"
             );
-            let event = TransportEvent::Virtual(virtual_device::TransportEvent::VirtualDeviceConnected(
-                VirtualDeviceInfo {
+            let event = TransportEvent::Virtual(
+                virtual_device::TransportEvent::VirtualDeviceConnected(VirtualDeviceInfo {
                     device_type: "bzm2".into(),
                     device_id: config.device_id(),
-                },
-            ));
+                }),
+            );
             if let Err(e) = transport_tx.send(event).await {
                 error!("Failed to send BZM2 virtual board event: {}", e);
             }

@@ -306,6 +306,36 @@ impl Bzm2ClockController {
         Ok(config)
     }
 
+    pub async fn broadcast_pll_frequency(
+        &mut self,
+        pll: Bzm2Pll,
+        frequency_mhz: f32,
+        post1_divider: u8,
+    ) -> Result<Bzm2PllConfig, Bzm2ClockError> {
+        let config = Bzm2PllConfig::from_target_frequency(frequency_mhz, post1_divider)?;
+        let (postdiv_reg, fbdiv_reg, _, _) = pll.register_block();
+        self.uart
+            .broadcast_local_reg_u32(fbdiv_reg, config.feedback_divider as u32)
+            .await?;
+        self.uart
+            .broadcast_local_reg_u32(postdiv_reg, config.packed_post_divider)
+            .await?;
+        sleep(Duration::from_millis(1)).await;
+        Ok(config)
+    }
+
+    pub async fn broadcast_enable_pll(&mut self, pll: Bzm2Pll) -> Result<(), Bzm2ClockError> {
+        let (_, _, enable_reg, _) = pll.register_block();
+        self.uart.broadcast_local_reg_u32(enable_reg, 1).await?;
+        Ok(())
+    }
+
+    pub async fn broadcast_disable_pll(&mut self, pll: Bzm2Pll) -> Result<(), Bzm2ClockError> {
+        let (_, _, enable_reg, _) = pll.register_block();
+        self.uart.broadcast_local_reg_u32(enable_reg, 0).await?;
+        Ok(())
+    }
+
     pub async fn wait_for_pll_lock(
         &mut self,
         asic: u8,
