@@ -1,16 +1,16 @@
 pub(crate) mod bitaxe;
 pub(crate) mod bzm2;
 pub mod cpu;
-pub(crate) mod emberone00;
+pub(crate) mod emberone;
 pub mod pattern;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::{future::Future, pin::Pin};
-use tokio::sync::watch;
+use std::{error::Error, fmt, future::Future, pin::Pin};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -57,8 +57,21 @@ pub struct BoardInfo {
 /// with a board. The backplane forwards this to the API server after
 /// creating a board.
 pub struct BoardRegistration {
-    /// Watch receiver for the board's telemetry.
-    pub telemetry_rx: watch::Receiver<BoardTelemetry>,
+    /// Watch receiver for the board's current state.
+    pub state_rx: watch::Receiver<BoardState>,
+
+    /// Optional command sender for board-specific control and queries.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
+}
+
+/// Board-specific control and query commands exposed to higher layers.
+pub enum BoardCommand {
+    /// Query one BZM2 ASIC's internal DTS/VS telemetry through a live hash thread.
+    QueryBzm2DtsVs {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
 }
 
 /// Helper type for async board factory functions
@@ -69,7 +82,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The factory is responsible for:
 ///
 /// 1. Opening hardware resources (serial ports, etc.)
-/// 2. Creating a `watch::channel<BoardTelemetry>` seeded with the board's
+/// 2. Creating a `watch::channel<BoardState>` seeded with the board's
 ///    identity (model, serial) and storing the sender in the board
 /// 3. Initializing the board hardware
 /// 4. Returning the board and a [`BoardRegistration`] containing the

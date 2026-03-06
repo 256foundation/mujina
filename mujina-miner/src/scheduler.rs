@@ -559,6 +559,10 @@ impl Scheduler {
                     "Thread status"
                 );
             }
+
+            HashThreadEvent::TelemetryUpdate(_) => {
+                trace!(thread = %thread_name, "Thread telemetry update");
+            }
         }
     }
 

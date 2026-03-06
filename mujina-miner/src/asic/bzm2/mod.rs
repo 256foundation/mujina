@@ -16,4 +16,7 @@ pub use pnp::{
     Bzm2PerformanceMode, Bzm2SavedOperatingPoint, Bzm2VoltageDomain,
 };
 pub use thread::{Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle};
-pub use uart::{BROADCAST_GROUP_ASIC, Bzm2UartController, Bzm2UartError, NOTCH_REG};
+pub use uart::{
+    BROADCAST_GROUP_ASIC, Bzm2DtsVsConfig, Bzm2UartController, Bzm2UartError,
+    DEFAULT_DTS_VS_QUERY_TIMEOUT, NOTCH_REG,
+};

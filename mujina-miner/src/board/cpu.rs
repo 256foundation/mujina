@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use super::{Board, BoardInfo, VirtualBoardDescriptor};
 use crate::{
-    api_client::types::BoardTelemetry,
+    api_client::types::BoardState,
     asic::hash_thread::HashThread,
     cpu_miner::{CpuHashThread, CpuMinerConfig},
 };
@@ -26,18 +26,18 @@ pub struct CpuBoard {
     /// Threads created by this board (kept for shutdown).
     threads: Vec<CpuHashThread>,
 
-    /// Channel for publishing board telemetry to the API server.
+    /// Channel for publishing board state to the API server.
     #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
-    telemetry_tx: watch::Sender<BoardTelemetry>,
+    state_tx: watch::Sender<BoardState>,
 }
 
 impl CpuBoard {
     /// Create a new CPU mining board from environment configuration.
-    pub fn new(config: CpuMinerConfig, telemetry_tx: watch::Sender<BoardTelemetry>) -> Self {
+    pub fn new(config: CpuMinerConfig, state_tx: watch::Sender<BoardState>) -> Self {
         Self {
             config,
             threads: Vec::new(),
-            telemetry_tx,
+            state_tx,
         }
     }
 }
@@ -86,16 +86,19 @@ async fn create_cpu_board() -> Result<(Box<dyn Board + Send>, super::BoardRegist
         .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
 
     let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
-    let initial_state = BoardTelemetry {
+    let initial_state = BoardState {
         name: serial.clone(),
         model: "CPU Miner".into(),
         serial: Some(serial),
         ..Default::default()
     };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+    let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let board = CpuBoard::new(config, telemetry_tx);
-    let registration = super::BoardRegistration { telemetry_rx };
+    let board = CpuBoard::new(config, state_tx);
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: None,
+    };
     Ok((Box::new(board), registration))
 }
 
