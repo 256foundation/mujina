@@ -53,6 +53,22 @@ Planned support:
 - [Architecture Overview](docs/architecture.md) - System design and component
   interaction
 - [REST API](docs/api.md) - API contract, conventions, and endpoints
+- [BZM2 Port Note](docs/bzm2-port.md) - Architecture, implemented behavior,
+  telemetry, and current scope boundaries for the BZM2 port
+- [BZM2 UART Debug Guide](docs/bzm2-uart-debug.md) - CLI usage for UART,
+  telemetry queries, TDM observation, clock diagnostics, and validation flows
+- [BZM2 Tuning Planner](docs/bzm2-pnp.md) - Tuning-planner behavior and current
+  calibration scope
+- [BZM2 Opcode Grounding](docs/bzm2-opcode-grounding.md) - Source-grounded UART
+  opcode behavior and the current JTAG evidence boundary
+- [Blockscale ASIC Integration Guide](docs/blockscale-asic-integration-guide.md) -
+  Generic hardware design guidance for building a custom solution around the
+  Blockscale / BZM2 ASIC
+- [Blockscale UART And TDM Reference](docs/blockscale-uart-protocol-reference.md) -
+  ASIC-facing UART, TDM, opcode, and job-programming reference
+- [Blockscale Reference Roadmap](docs/blockscale-reference-roadmap.md) -
+  Ordered implementation plan for closing the remaining bring-up, tuning, and
+  diagnostics gaps
 - [CPU Mining](docs/cpu-mining.md) - Run without hardware for development and
   testing
 - [Container Image](docs/container.md) - Build and run as a container

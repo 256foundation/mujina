@@ -13,7 +13,9 @@ use super::protocol::{
 pub const NOTCH_REG: u16 = 0x0fff;
 pub const BROADCAST_GROUP_ASIC: u8 = BROADCAST_ASIC;
 pub const DEFAULT_DTS_VS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_ASIC_ID: u8 = 0xfa;
 
+const LOCAL_REG_ASIC_ID: u8 = 0x0b;
 const LOCAL_REG_SLOW_CLK_DIV: u8 = 0x08;
 const LOCAL_REG_UART_TX: u8 = 0x0a;
 const LOCAL_REG_SENS_TDM_GAP_CNT: u8 = 0x2d;
@@ -69,6 +71,9 @@ pub enum Bzm2UartError {
         actual_asic: u8,
         actual_opcode: u8,
     },
+
+    #[error("unexpected NOOP payload from ASIC {asic:#x}: {data:02x?}")]
+    UnexpectedNoopPayload { asic: u8, data: [u8; 3] },
 
     #[error("timed out waiting for DTS/VS frame from ASIC {asic:#x}")]
     DtsVsTimeout { asic: u8 },
@@ -182,6 +187,12 @@ impl Bzm2UartController {
             .await
     }
 
+    /// Program the next ASIC still responding on the default chain id.
+    pub async fn assign_default_asic_id(&mut self, new_id: u8) -> Result<(), Bzm2UartError> {
+        self.write_local_reg_u32(DEFAULT_ASIC_ID, LOCAL_REG_ASIC_ID, new_id as u32)
+            .await
+    }
+
     pub async fn multicast_write_register(
         &mut self,
         asic: u8,
@@ -261,6 +272,35 @@ impl Bzm2UartController {
         self.reader.read_exact(&mut response).await?;
         validate_response_header(asic, OPCODE_UART_NOOP, &response)?;
         Ok(response[2..5].try_into().unwrap())
+    }
+
+    pub async fn verify_noop_bz2(&mut self, asic: u8) -> Result<(), Bzm2UartError> {
+        let data = self.noop(asic).await?;
+        if data == *b"BZ2" {
+            Ok(())
+        } else {
+            Err(Bzm2UartError::UnexpectedNoopPayload { asic, data })
+        }
+    }
+
+    /// Enumerate a fresh chain by assigning ids to devices that still answer on
+    /// the documented default ASIC id `0xFA`.
+    pub async fn enumerate_chain(
+        &mut self,
+        max_asics: u8,
+        start_id: u8,
+    ) -> Result<Vec<u8>, Bzm2UartError> {
+        let mut assigned = Vec::new();
+        for offset in 0..max_asics {
+            let next_id = start_id.saturating_add(offset);
+            if self.verify_noop_bz2(DEFAULT_ASIC_ID).await.is_err() {
+                break;
+            }
+            self.assign_default_asic_id(next_id).await?;
+            self.verify_noop_bz2(next_id).await?;
+            assigned.push(next_id);
+        }
+        Ok(assigned)
     }
 
     pub async fn loopback(&mut self, asic: u8, payload: &[u8]) -> Result<Vec<u8>, Bzm2UartError> {
@@ -570,5 +610,10 @@ mod tests {
     #[test]
     fn legacy_voltage_query_threshold_matches_legacy_formula_family() {
         assert_eq!(legacy_voltage_mv_to_tune_code(500), 7561);
+    }
+
+    #[test]
+    fn default_asic_id_matches_legacy_value() {
+        assert_eq!(DEFAULT_ASIC_ID, 0xfa);
     }
 }

@@ -11,7 +11,7 @@ use mujina_miner::asic::bzm2::protocol::{
 };
 use mujina_miner::asic::bzm2::{
     BROADCAST_GROUP_ASIC, Bzm2ClockController, Bzm2Dll, Bzm2DtsVsConfig, Bzm2Pll,
-    Bzm2UartController, DEFAULT_DTS_VS_QUERY_TIMEOUT, NOTCH_REG,
+    Bzm2UartController, DEFAULT_ASIC_ID, DEFAULT_DTS_VS_QUERY_TIMEOUT, NOTCH_REG,
 };
 use mujina_miner::transport::{SerialReader, SerialStream, SerialWriter};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         "uart-read-result" => cmd_uart_read_result(&args[2..]).await,
         "dts-vs-query" => cmd_dts_vs_query(&args[2..]).await,
         "dts-vs-scan" => cmd_dts_vs_scan(&args[2..]).await,
+        "enumerate-chain" => cmd_enumerate_chain(&args[2..]).await,
         "noop-scan" => cmd_noop_scan(&args[2..]).await,
         "loopback-scan" => cmd_loopback_scan(&args[2..]).await,
         "tdm-enable" => cmd_tdm_enable(&args[2..]).await,
@@ -76,6 +77,7 @@ fn print_usage() {
     eprintln!("  uart-read-result <serial> <asic> <dts-gen> [baud]");
     eprintln!("  dts-vs-query <serial> <asic> <dts-gen> [timeout-ms] [baud]");
     eprintln!("  dts-vs-scan <serial> <asic-start> <asic-end> <dts-gen> [timeout-ms] [baud]");
+    eprintln!("  enumerate-chain <serial> <max-asics> [start-id] [baud]");
     eprintln!("  noop-scan <serial> <asic-start> <asic-end> [baud]");
     eprintln!("  loopback-scan <serial> <asic-start> <asic-end> <payload-len> [baud]");
     eprintln!();
@@ -114,6 +116,7 @@ fn print_usage() {
     eprintln!("  unicast   : uart-write /dev/ttyUSB0 2 notch 0x12 01000000");
     eprintln!("  broadcast : uart-write /dev/ttyUSB0 broadcast notch 0x12 01000000");
     eprintln!("  multicast : uart-multicast-write /dev/ttyUSB0 2 7 0x49 3c");
+    eprintln!("  enumerate : enumerate-chain /dev/ttyUSB0 32 0");
     eprintln!("  scan      : noop-scan /dev/ttyUSB0 0 15");
     eprintln!("  TDM watch : tdm-watch /dev/ttyUSB0 gen2 5");
     eprintln!("  grid job  : job-grid-watch /dev/ttyUSB0 2 0 1700000000 60 5 gen2");
@@ -397,6 +400,39 @@ async fn cmd_dts_vs_scan(args: &[String]) -> Result<()> {
             .query_dts_vs(asic, generation, Bzm2DtsVsConfig::default(), timeout)
             .await?;
         print_dts_vs_query_frame(&frame);
+    }
+
+    Ok(())
+}
+
+async fn cmd_enumerate_chain(args: &[String]) -> Result<()> {
+    if args.len() < 2 || args.len() > 4 {
+        bail!("usage: enumerate-chain <serial> <max-asics> [start-id] [baud]");
+    }
+
+    let max_asics = parse_u8(&args[1])?;
+    if max_asics == 0 {
+        bail!("max-asics must be greater than zero");
+    }
+
+    let (start_id, baud_arg) = match args.len() {
+        2 => (0, None),
+        3 => (parse_u8(&args[2])?, None),
+        4 => (parse_u8(&args[2])?, args.get(3)),
+        _ => unreachable!(),
+    };
+    let mut uart = open_uart(&args[0], parse_baud(baud_arg)?)?;
+
+    let assigned = uart.enumerate_chain(max_asics, start_id).await?;
+    println!(
+        "enumerated {} ASIC(s) from default id 0x{DEFAULT_ASIC_ID:02x}",
+        assigned.len()
+    );
+    for asic in &assigned {
+        println!("  assigned asic id {}", asic);
+    }
+    if assigned.is_empty() {
+        println!("  no ASIC responded on the default id");
     }
 
     Ok(())
