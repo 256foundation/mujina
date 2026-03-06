@@ -18,7 +18,7 @@ use crate::{
             Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
             Bzm2ClockController, Bzm2DomainMeasurement, Bzm2OperatingClass, Bzm2PerformanceMode,
             Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle,
-            Bzm2VoltageDomain,
+            Bzm2UartController, Bzm2VoltageDomain,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -44,6 +44,7 @@ const DEFAULT_CALIBRATION_SITE_TEMP_C: f32 = 20.0;
 const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
 const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
+const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Bzm2VirtualDeviceConfig {
@@ -56,6 +57,7 @@ pub struct Bzm2VirtualDeviceConfig {
     pub dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration,
     pub telemetry: Bzm2TelemetryConfig,
     pub calibration: Bzm2CalibrationConfig,
+    pub enumeration: Bzm2EnumerationConfig,
 }
 
 impl Bzm2VirtualDeviceConfig {
@@ -101,6 +103,7 @@ impl Bzm2VirtualDeviceConfig {
             .as_deref()
             .and_then(crate::asic::bzm2::protocol::DtsVsGeneration::from_env_value)
             .unwrap_or(crate::asic::bzm2::protocol::DtsVsGeneration::Gen2);
+        let calibration = Bzm2CalibrationConfig::from_env(serial_paths.len());
 
         Some(Self {
             serial_paths: serial_paths.clone(),
@@ -111,7 +114,8 @@ impl Bzm2VirtualDeviceConfig {
             nominal_hashrate_ths,
             dts_vs_generation,
             telemetry: Bzm2TelemetryConfig::from_env(),
-            calibration: Bzm2CalibrationConfig::from_env(serial_paths.len()),
+            enumeration: Bzm2EnumerationConfig::from_env(serial_paths.len(), &calibration),
+            calibration,
         })
     }
 
@@ -131,6 +135,50 @@ impl Bzm2VirtualDeviceConfig {
             .collect::<Vec<_>>()
             .join("-");
         format!("bzm2-{}", suffix)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2EnumerationConfig {
+    pub enabled: bool,
+    pub start_id: u8,
+    pub max_asics_per_bus: Vec<u16>,
+}
+
+impl Default for Bzm2EnumerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_id: 0,
+            max_asics_per_bus: vec![DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS],
+        }
+    }
+}
+
+impl Bzm2EnumerationConfig {
+    fn from_env(serial_count: usize, calibration: &Bzm2CalibrationConfig) -> Self {
+        let mut max_asics_per_bus = parse_csv_numbers::<u16>("MUJINA_BZM2_ENUM_MAX_ASICS_PER_BUS")
+            .unwrap_or_else(|| {
+                if calibration.asics_per_bus.iter().any(|count| *count > 1) {
+                    calibration.asics_per_bus.clone()
+                } else if serial_count == 0 {
+                    Vec::new()
+                } else {
+                    vec![DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS; serial_count]
+                }
+            });
+        if max_asics_per_bus.is_empty() && serial_count > 0 {
+            max_asics_per_bus = vec![DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS; serial_count];
+        }
+
+        Self {
+            enabled: env_flag_any(&["MUJINA_BZM2_ENUMERATE_CHAIN", "MUJINA_BZM2_AUTO_ENUMERATE"]),
+            start_id: env::var("MUJINA_BZM2_ENUM_START_ID")
+                .ok()
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0),
+            max_asics_per_bus,
+        }
     }
 }
 
@@ -679,13 +727,81 @@ impl Bzm2Board {
         }));
     }
 
-    async fn execute_live_calibration(&self) -> Result<(), BoardError> {
+    async fn resolve_bus_layouts(&self) -> Result<Vec<Bzm2BusLayout>, BoardError> {
+        let configured = build_bus_layouts(
+            &self.config.serial_paths,
+            &self.config.calibration.asics_per_bus,
+        );
+        if !self.config.enumeration.enabled {
+            return Ok(configured);
+        }
+
+        let discovered = self.enumerate_bus_layouts().await?;
+        if should_fallback_to_configured_bus_layouts(&discovered, &configured) {
+            warn!(
+                board = %self.config.device_id(),
+                "BZM2 startup enumeration found no ASICs on the default id; falling back to configured bus topology"
+            );
+            return Ok(configured);
+        }
+
+        Ok(discovered)
+    }
+
+    async fn enumerate_bus_layouts(&self) -> Result<Vec<Bzm2BusLayout>, BoardError> {
+        let mut counts = Vec::with_capacity(self.config.serial_paths.len());
+
+        for (index, serial_path) in self.config.serial_paths.iter().enumerate() {
+            let max_asics = *self
+                .config
+                .enumeration
+                .max_asics_per_bus
+                .get(index)
+                .or_else(|| self.config.enumeration.max_asics_per_bus.last())
+                .unwrap_or(&DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS);
+            let max_asics = max_asics.min(u8::MAX as u16) as u8;
+
+            let stream = SerialStream::new(serial_path, self.config.baud_rate).map_err(|err| {
+                BoardError::InitializationFailed(format!(
+                    "Failed to open BZM2 enumeration transport {}: {}",
+                    serial_path, err
+                ))
+            })?;
+            let (reader, writer, _control) = stream.split();
+            let mut uart = Bzm2UartController::new(reader, writer);
+            let assigned = uart
+                .enumerate_chain(max_asics, self.config.enumeration.start_id)
+                .await
+                .map_err(|err| {
+                    BoardError::InitializationFailed(format!(
+                        "BZM2 startup enumeration failed on {}: {}",
+                        serial_path, err
+                    ))
+                })?;
+            counts.push(assigned.len() as u16);
+            info!(
+                board = %self.config.device_id(),
+                serial_path,
+                asic_count = assigned.len(),
+                "BZM2 startup enumeration completed"
+            );
+        }
+
+        Ok(build_discovered_bus_layouts(
+            &self.config.serial_paths,
+            &counts,
+        ))
+    }
+
+    async fn execute_live_calibration(
+        &self,
+        bus_layouts: &[Bzm2BusLayout],
+    ) -> Result<(), BoardError> {
         let calibration = &self.config.calibration;
         if !calibration.enabled {
             return Ok(());
         }
 
-        let bus_layouts = build_bus_layouts(&self.config.serial_paths, &calibration.asics_per_bus);
         let total_asics = bus_layouts
             .iter()
             .map(|layout| layout.asic_count as usize)
@@ -834,6 +950,9 @@ impl Bzm2Board {
         profile: &Bzm2PersistedCalibrationProfile,
     ) -> Result<(), BoardError> {
         for bus in bus_layouts {
+            if bus.asic_count == 0 {
+                continue;
+            }
             let initial_frequencies = [0usize, 1usize].map(|pll_index| {
                 average_f32(
                     (bus.asic_start..bus.asic_start + bus.asic_count)
@@ -871,6 +990,9 @@ impl Bzm2Board {
         initial_frequencies_mhz: [f32; 2],
         per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
     ) -> Result<(), BoardError> {
+        if bus.asic_count == 0 {
+            return Ok(());
+        }
         let stream = SerialStream::new(&bus.serial_path, self.config.baud_rate).map_err(|err| {
             BoardError::InitializationFailed(format!(
                 "Failed to open BZM2 calibration transport {}: {}",
@@ -999,6 +1121,7 @@ impl Board for Bzm2Board {
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
+        let bus_layouts = self.resolve_bus_layouts().await?;
         let initial_snapshot = self.config.telemetry.snapshot();
         let _ = self.state_tx.send_modify(|state| {
             state.fans = initial_snapshot.fans.clone();
@@ -1006,7 +1129,7 @@ impl Board for Bzm2Board {
             merge_power_readings(&mut state.powers, &initial_snapshot.powers);
         });
 
-        self.execute_live_calibration().await?;
+        self.execute_live_calibration(&bus_layouts).await?;
 
         for (index, serial_path) in self.config.serial_paths.iter().enumerate() {
             let stream = SerialStream::new(serial_path, self.config.baud_rate).map_err(|err| {
@@ -1212,6 +1335,21 @@ fn merge_power_readings(existing: &mut Vec<PowerMeasurement>, updates: &[PowerMe
 }
 
 fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2BusLayout> {
+    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 1)
+}
+
+fn build_discovered_bus_layouts(
+    serial_paths: &[String],
+    asics_per_bus: &[u16],
+) -> Vec<Bzm2BusLayout> {
+    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 0)
+}
+
+fn build_bus_layouts_with_minimum(
+    serial_paths: &[String],
+    asics_per_bus: &[u16],
+    minimum_asic_count: u16,
+) -> Vec<Bzm2BusLayout> {
     let mut next_asic = 0u16;
     serial_paths
         .iter()
@@ -1221,7 +1359,7 @@ fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2
                 .get(index)
                 .or_else(|| asics_per_bus.last())
                 .unwrap_or(&1)
-                .max(&1);
+                .max(&minimum_asic_count);
             let layout = Bzm2BusLayout {
                 serial_path: path.clone(),
                 asic_start: next_asic,
@@ -1231,6 +1369,21 @@ fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2
             layout
         })
         .collect()
+}
+
+fn should_fallback_to_configured_bus_layouts(
+    discovered: &[Bzm2BusLayout],
+    configured: &[Bzm2BusLayout],
+) -> bool {
+    let discovered_total = discovered
+        .iter()
+        .map(|layout| layout.asic_count as usize)
+        .sum::<usize>();
+    let configured_total = configured
+        .iter()
+        .map(|layout| layout.asic_count as usize)
+        .sum::<usize>();
+    discovered_total == 0 && configured_total > 0
 }
 
 fn build_voltage_domains(
@@ -1580,10 +1733,60 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::bzm2::protocol::{OPCODE_UART_NOOP, encode_noop, encode_write_register};
     use nix::pty::openpty;
     use std::fs;
+    use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn spawn_chain_emulator(
+        master: std::os::fd::OwnedFd,
+        chain_len: u8,
+        start_id: u8,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut file = fs::File::from(master);
+            for offset in 0..chain_len {
+                let mut noop_request =
+                    vec![0u8; encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID).len()];
+                file.read_exact(&mut noop_request).unwrap();
+                assert_eq!(
+                    noop_request,
+                    encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID)
+                );
+                file.write_all(&[
+                    crate::asic::bzm2::DEFAULT_ASIC_ID,
+                    OPCODE_UART_NOOP,
+                    b'B',
+                    b'Z',
+                    b'2',
+                ])
+                .unwrap();
+
+                let assigned = start_id.saturating_add(offset);
+                let expected_write = encode_write_register(
+                    crate::asic::bzm2::DEFAULT_ASIC_ID,
+                    crate::asic::bzm2::NOTCH_REG,
+                    0x0b,
+                    &(assigned as u32).to_le_bytes(),
+                );
+                let mut write_request = vec![0u8; expected_write.len()];
+                file.read_exact(&mut write_request).unwrap();
+                assert_eq!(write_request, expected_write);
+
+                let mut assigned_noop = vec![0u8; encode_noop(assigned).len()];
+                file.read_exact(&mut assigned_noop).unwrap();
+                assert_eq!(assigned_noop, encode_noop(assigned));
+                file.write_all(&[assigned, OPCODE_UART_NOOP, b'B', b'Z', b'2'])
+                    .unwrap();
+            }
+
+            let mut final_probe = vec![0u8; encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID).len()];
+            file.read_exact(&mut final_probe).unwrap();
+            assert_eq!(final_probe, encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID));
+        })
+    }
 
     #[tokio::test]
     async fn live_calibration_persists_profile() {
@@ -1610,6 +1813,7 @@ mod tests {
             nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 asics_per_bus: vec![2],
@@ -1626,8 +1830,9 @@ mod tests {
             ..Default::default()
         });
         let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+        let bus_layouts = board.resolve_bus_layouts().await.unwrap();
 
-        board.execute_live_calibration().await.unwrap();
+        board.execute_live_calibration(&bus_layouts).await.unwrap();
 
         let profile = load_saved_operating_point_profile(Some(&profile_path))
             .unwrap()
@@ -1681,6 +1886,7 @@ mod tests {
             nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 apply_saved_operating_point: true,
@@ -1697,8 +1903,9 @@ mod tests {
             ..Default::default()
         });
         let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+        let bus_layouts = board.resolve_bus_layouts().await.unwrap();
 
-        board.execute_live_calibration().await.unwrap();
+        board.execute_live_calibration(&bus_layouts).await.unwrap();
 
         assert_eq!(fs::read_to_string(&profile_path).unwrap(), original);
 
@@ -1713,6 +1920,106 @@ mod tests {
         assert_eq!(layouts[0].asic_count, 4);
         assert_eq!(layouts[1].asic_start, 4);
         assert_eq!(layouts[1].asic_count, 6);
+    }
+
+    #[tokio::test]
+    async fn resolve_bus_layouts_uses_startup_enumeration_counts() {
+        let pty = openpty(None, None).unwrap();
+        let master = pty.master;
+        let slave = pty.slave;
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let emulator = spawn_chain_emulator(master, 2, 0);
+
+        let config = Bzm2VirtualDeviceConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig {
+                enabled: true,
+                start_id: 0,
+                max_asics_per_bus: vec![4],
+            },
+            calibration: Bzm2CalibrationConfig::default(),
+        };
+        let (state_tx, _state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+
+        let layouts = board.resolve_bus_layouts().await.unwrap();
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].asic_count, 2);
+
+        emulator.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_bus_layouts_falls_back_to_configured_counts_when_default_id_is_silent() {
+        let pty = openpty(None, None).unwrap();
+        let master = pty.master;
+        let slave = pty.slave;
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let emulator = std::thread::spawn(move || {
+            let mut file = fs::File::from(master);
+            let mut probe = vec![0u8; encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID).len()];
+            file.read_exact(&mut probe).unwrap();
+            assert_eq!(probe, encode_noop(crate::asic::bzm2::DEFAULT_ASIC_ID));
+            file.write_all(&[
+                crate::asic::bzm2::DEFAULT_ASIC_ID,
+                OPCODE_UART_NOOP,
+                b'N',
+                b'O',
+                b'P',
+            ])
+            .unwrap();
+        });
+
+        let config = Bzm2VirtualDeviceConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig {
+                enabled: true,
+                start_id: 0,
+                max_asics_per_bus: vec![4],
+            },
+            calibration: Bzm2CalibrationConfig {
+                asics_per_bus: vec![3],
+                ..Default::default()
+            },
+        };
+        let (state_tx, _state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+
+        let layouts = board.resolve_bus_layouts().await.unwrap();
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].asic_count, 3);
+
+        emulator.join().unwrap();
     }
 
     #[tokio::test]
@@ -1750,6 +2057,7 @@ mod tests {
                 max_asic_temp_c: Some(80.0),
                 ..Default::default()
             },
+            enumeration: Bzm2EnumerationConfig::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (state_tx, mut state_rx) = watch::channel(BoardState {

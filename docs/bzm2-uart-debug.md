@@ -84,6 +84,16 @@ cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
 This is the first generic bring-up step for a fresh chain where every ASIC is
 still on the default id.
 
+The chain walk now uses a bounded `NOOP` probe internally, so the command stops
+cleanly when no additional default-id ASIC is present instead of hanging at the
+end of the bus.
+
+The same discovery flow can be enabled during Mujina board startup with:
+
+- `MUJINA_BZM2_ENUMERATE_CHAIN=true`
+- optional `MUJINA_BZM2_ENUM_START_ID`
+- optional `MUJINA_BZM2_ENUM_MAX_ASICS_PER_BUS`
+
 Run deterministic loopback validation across an ASIC range:
 
 ```text
