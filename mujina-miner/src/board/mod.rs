@@ -102,6 +102,14 @@ pub enum BoardCommand {
         asic: u8,
         reply: oneshot::Sender<Result<(), BoardError>>,
     },
+    DiscoverBzm2Engines {
+        thread_index: usize,
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout_ms: Option<u32>,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
 }
 
 /// Helper type for async board factory functions

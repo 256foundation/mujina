@@ -808,6 +808,7 @@ impl BitaxeBoard {
                         },
                     ],
                     threads: Vec::new(),
+                    asics: Vec::new(),
                 });
 
                 // -- Log summary (throttled) --

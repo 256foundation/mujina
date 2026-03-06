@@ -145,6 +145,9 @@ pub enum HashThreadError {
     #[error("Telemetry query failed: {0}")]
     TelemetryQueryFailed(String),
 
+    #[error("Diagnostics failed: {0}")]
+    DiagnosticsFailed(String),
+
     #[error("Shutdown timeout")]
     ShutdownTimeout,
 

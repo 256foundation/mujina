@@ -318,6 +318,47 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - focused `cargo test -p mujina-miner bzm2`
   - full regression gate before commit
 
+## 35. Roadmap Phase 4 Step 1: Engine Probe Helpers
+
+### User
+> OK, push this, and let's get on with Phase 4!
+
+### Assistant
+- Pushed the completed Phase 3 commit.
+- Started Phase 4 with the lowest-risk dependency step:
+  source-grounded engine/topology probing over the existing UART/TDM path.
+
+### Assistant
+- Reviewed the static engine-map path and the historical C helper
+  `asic_detect_engine`.
+- Chose to port the probe rule exactly as evidenced:
+  - perform a TDM-sync read of `ENGINE_REG_END_NONCE`
+  - treat `0xfffffffe` as an existing engine
+
+### Assistant
+- Added:
+  - `read_register_tdm_sync` in the Rust UART layer
+  - `detect_engine`
+  - `discover_engine_map`
+  - CLI commands:
+    - `engine-probe`
+    - `discover-engine-map`
+- Kept this step observational only:
+  - no dispatch-path changes yet
+  - no runtime topology replacement yet
+
+### Assistant
+- Added regression coverage for:
+  - one TDM-sync engine-register read
+  - one full physical `20 x 12` engine scan against a synthetic emulator
+
+### Assistant
+- Ran:
+  - `cargo fmt --all`
+  - `cargo test -p mujina-miner bzm2 --message-format=human`
+  - `cargo test -p mujina-miner --bin mujina-bzm2-debug --message-format=human`
+  - full regression gate before commit
+
 ### User
 > now, let's add the DLL-side clock diagnostics alongside the PLL flow and wire this into a small Mujina CLI or board hook so you can invoke PLL debug against a live serial device. A full featured UART interface with good comments and explained comprehensive functionality is good, especially one that supports broadcast, multicast, and unicast examples for developers to follow/choose to implement.
 
@@ -734,3 +775,61 @@ This document captures the working session that produced the BZM2 Mujina port. I
 - `6473845` `Document BZM2 ASIC telemetry in API and debug docs`
 - `bc7c6a6` `Add on-demand BZM2 DTS/VS query tooling`
 - `1fc40b1` `Refactor BZM2 tuning names to reduce legacy copy signaling`
+
+## 36. Roadmap Phase 4 Step 2: Runtime Engine Map Publication
+
+### User
+> let's do it!
+
+### Assistant
+- Continued Phase 4 by moving engine discovery out of diagnostics-only status
+  and into the live board/runtime surface.
+- Kept the serial-ownership rule intact by routing discovery through the live
+  BZM2 thread actor rather than opening a second UART handle behind the board.
+
+### Assistant
+- Added a new thread command for engine discovery that:
+  - requires the BZM2 thread to be idle
+  - runs the TDM enable -> scan -> TDM disable sequence in-thread
+  - returns a structured discovered engine map
+- Added new board command handling so `Bzm2Board` can:
+  - invoke that thread-side discovery
+  - associate the result with the correct UART thread and serial path
+  - publish the result into `BoardState.asics`
+
+### Assistant
+- Extended the API types with:
+  - `AsicState`
+  - `EngineCoordinate`
+  - `Bzm2EngineDiscoveryRequest`
+- Added `POST /api/v0/boards/{name}/bzm2/discover-engines`
+- Kept the response model simple:
+  - run the command
+  - update board state
+  - return the refreshed `BoardState`
+
+### Assistant
+- Updated the existing `discover_engine_map` UART helper so it owns the TDM
+  enable/disable sequence internally.
+- Adjusted the PTY-backed UART regression fixture to match the new ownership
+  boundary.
+- Fixed one unrelated compile fallout where an older `Bitaxe` board-state
+  initializer needed the new `asics` field.
+
+### Assistant
+- Added regression coverage for:
+  - board-state publication of discovered engine maps
+  - the new HTTP endpoint returning refreshed `BoardState`
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner bzm2 --message-format=human`
+  - focused `cargo test -p mujina-miner api::server --message-format=human`
+  - full regression gate before commit
+
+### Assistant
+- Result:
+  - discovered engine topology is now part of normal runtime/API state
+  - the next remaining Phase 4 step is to feed that discovered engine map into:
+    - work dispatch
+    - validation helpers
+    - tuning calculations

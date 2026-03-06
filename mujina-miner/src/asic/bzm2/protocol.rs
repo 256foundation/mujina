@@ -15,6 +15,7 @@ pub const TARGET_BYTE: u8 = 0x08;
 pub const ENGINE_REG_TARGET: u8 = 0x44;
 pub const ENGINE_REG_TIMESTAMP_COUNT: u8 = 0x48;
 pub const ENGINE_REG_ZEROS_TO_FIND: u8 = 0x49;
+pub const ENGINE_REG_END_NONCE: u8 = 0x40;
 
 pub const DEFAULT_TIMESTAMP_COUNT: u8 = 60;
 pub const DEFAULT_NONCE_GAP: u32 = 0x28;
@@ -384,6 +385,16 @@ pub fn logical_engine_id(row: u8, col: u8) -> Option<u16> {
 
 pub fn default_excluded_engines() -> HashSet<(u8, u8)> {
     HashSet::from([(0, 4), (0, 5), (19, 5), (19, 11)])
+}
+
+pub fn physical_engine_coordinates() -> Vec<(u8, u8)> {
+    let mut coords = Vec::new();
+    for col in 0..LOGICAL_ENGINE_COLS {
+        for row in 0..LOGICAL_ENGINE_ROWS {
+            coords.push((row, col));
+        }
+    }
+    coords
 }
 
 pub fn default_engine_coordinates() -> Vec<(u8, u8)> {

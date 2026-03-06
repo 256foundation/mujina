@@ -16,7 +16,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardState, Bzm2DtsVsQueryRequest, MinerPatchRequest, MinerState, SourceState,
+    BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, MinerPatchRequest, MinerState,
+    SourceState,
 };
 use crate::board::BoardCommand;
 
@@ -28,6 +29,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(query_bzm2_dts_vs))
+        .routes(routes!(discover_bzm2_engines))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -181,6 +183,66 @@ async fn query_bzm2_dts_vs(
         .send(BoardCommand::QueryBzm2DtsVs {
             thread_index: req.thread_index,
             asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Trigger an explicit BZM2 engine-discovery scan and return the refreshed board state.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/discover-engines",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2EngineDiscoveryRequest,
+    responses(
+        (status = OK, description = "Refreshed board details", body = BoardState),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 engine discovery"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn discover_bzm2_engines(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2EngineDiscoveryRequest>,
+) -> Result<Json<BoardState>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::DiscoverBzm2Engines {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            tdm_prediv_raw: req.tdm_prediv_raw,
+            tdm_counter: req.tdm_counter,
+            timeout_ms: req.timeout_ms,
             reply: tx,
         })
         .await

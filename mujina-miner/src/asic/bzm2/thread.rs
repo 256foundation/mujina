@@ -26,7 +26,10 @@ use super::protocol::{
     TdmFrame, TdmFrameParser, default_engine_coordinates, encode_write_job, encode_write_register,
     leading_zero_threshold, logical_engine_address,
 };
-use super::uart::{Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT, configure_dts_vs_stream};
+use super::uart::{
+    Bzm2DiscoveredEngineMap, Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT,
+    configure_dts_vs_stream, discover_engine_map_stream,
+};
 
 #[derive(Debug, Clone)]
 pub struct Bzm2ThreadConfig {
@@ -76,6 +79,29 @@ impl Bzm2ThreadHandle {
             .await
             .map_err(|_| HashThreadError::TelemetryQueryFailed("thread dropped response".into()))?
     }
+
+    pub async fn discover_engine_map(
+        &self,
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout: Duration,
+    ) -> Result<Bzm2DiscoveredEngineMap, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::DiscoverEngineMap {
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +120,13 @@ enum ThreadCommand {
     QueryDtsVs {
         asic: u8,
         response_tx: oneshot::Sender<Result<HashThreadTelemetryUpdate, HashThreadError>>,
+    },
+    DiscoverEngineMap {
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout: Duration,
+        response_tx: oneshot::Sender<Result<Bzm2DiscoveredEngineMap, HashThreadError>>,
     },
     Shutdown,
 }
@@ -318,6 +351,31 @@ async fn bzm2_thread_actor(
                             &event_tx,
                             &mut dts_vs_configured,
                         ).await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::DiscoverEngineMap {
+                        asic,
+                        tdm_prediv_raw,
+                        tdm_counter,
+                        timeout,
+                        response_tx,
+                    } => {
+                        if current_task.is_some() {
+                            let _ = response_tx.send(Err(HashThreadError::DiagnosticsFailed(
+                                "BZM2 engine discovery requires the thread to be idle".into(),
+                            )));
+                            continue;
+                        }
+                        let result = discover_engine_map_stream(
+                            &mut reader,
+                            &mut writer,
+                            asic,
+                            tdm_prediv_raw,
+                            tdm_counter,
+                            timeout,
+                        )
+                        .await
+                        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()));
                         let _ = response_tx.send(result);
                     }
                     ThreadCommand::Shutdown => break,

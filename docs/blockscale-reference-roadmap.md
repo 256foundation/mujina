@@ -159,6 +159,21 @@ Exit criteria:
 - systems with missing or disabled engines do not need a code rebuild or static
   exclusion map edit
 
+Status:
+
+- completed: TDM-sync engine probe helpers now detect physical engine presence
+  by reading `ENGINE_REG_END_NONCE`, matching the historical C detection path
+- completed: the debug CLI now supports:
+  - `engine-probe`
+  - `discover-engine-map`
+- completed: discovered per-ASIC engine maps can now be pushed into live
+  `BoardState.asics` through:
+  - `Bzm2Board` command handling
+  - the live BZM2 thread actor
+  - `POST /api/v0/boards/{name}/bzm2/discover-engines`
+- next: feed the discovered engine map into work dispatch, validation helpers,
+  and tuning calculations
+
 ## Phase 5: Closed-Loop Calibration And Retune
 
 Objective:
