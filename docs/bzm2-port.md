@@ -93,10 +93,33 @@ Supported environment variables:
 - `MUJINA_BZM2_RAIL_WRITE_SCALES`: optional comma-separated scale factors used
   when converting volts into the raw file value, for example `1000` for mV or
   `1000000` for uV
+- `MUJINA_BZM2_DOMAIN_RAIL_INDICES`: optional comma-separated mapping from
+  planner domain id to configured rail index; defaults to one-to-one
+  `domain_id -> rail_index` when omitted
 - `MUJINA_BZM2_RAIL_ENABLE_PATHS`: optional comma-separated enable/control file
   paths paired with the rail list
 - `MUJINA_BZM2_RAIL_ENABLE_VALUES`: optional comma-separated values written to
   the rail enable paths during rail initialization
+- `MUJINA_BZM2_RAIL_VIN_PATHS`: optional comma-separated rail input-voltage
+  sensor files
+- `MUJINA_BZM2_RAIL_VIN_SCALES`: optional scale factors for the rail input
+  voltage files
+- `MUJINA_BZM2_RAIL_VOUT_PATHS`: optional comma-separated rail output-voltage
+  sensor files
+- `MUJINA_BZM2_RAIL_VOUT_SCALES`: optional scale factors for the rail output
+  voltage files
+- `MUJINA_BZM2_RAIL_CURRENT_PATHS`: optional comma-separated rail current sensor
+  files
+- `MUJINA_BZM2_RAIL_CURRENT_SCALES`: optional scale factors for the rail current
+  files
+- `MUJINA_BZM2_RAIL_POWER_PATHS`: optional comma-separated rail power sensor
+  files
+- `MUJINA_BZM2_RAIL_POWER_SCALES`: optional scale factors for the rail power
+  files
+- `MUJINA_BZM2_RAIL_TEMP_PATHS`: optional comma-separated rail regulator
+  temperature sensor files
+- `MUJINA_BZM2_RAIL_TEMP_SCALES`: optional scale factors for the rail
+  regulator temperature files
 - `MUJINA_BZM2_RESET_PATH`: optional reset-control file path
 - `MUJINA_BZM2_RESET_ACTIVE_LOW`: whether the reset path is active-low, default
   `true`
@@ -122,11 +145,26 @@ Bring-up notes:
 
 - if bring-up is enabled, `Bzm2Board` applies the configured rail/reset
   sequence before chain discovery, calibration, and hash-thread creation
+- when the tuning planner produces per-domain voltage targets, `Bzm2Board`
+  now applies them onto the configured rail-control path before the PLL ramp
+  rather than treating them as advisory only
+- saved operating-point replay now reapplies persisted per-domain voltages
+  before clock replay when the profile contains them
+- if multiple domains are mapped onto one rail, the runtime requires them to
+  agree on the same target voltage; conflicting targets fail loudly instead of
+  applying an ambiguous setpoint
 - on board shutdown, the same plan is used in reverse order to assert reset and
   drive the configured rails back to `0`
-- the current implementation is intentionally coarse-grained: it provides real
-  board lifecycle sequencing now, while richer rail telemetry and domain-aware
-  voltage application remain the next steps
+- the current implementation is still coarse-grained at the regulator layer:
+  it applies domain targets onto configured rails, but it does not yet perform
+  closed-loop voltage verification against live rail telemetry or runtime retune
+
+If the optional rail telemetry files are configured, the board monitor also
+publishes them into normal board state using stable names:
+
+- `rail0-input`, `rail1-input`, ... for input-side voltage snapshots
+- `rail0-output`, `rail1-output`, ... for output-side voltage/current/power
+- `rail0-regulator`, `rail1-regulator`, ... for regulator temperatures
 
 ## API Telemetry
 

@@ -19,7 +19,7 @@ use crate::{
             Bzm2ClockController, Bzm2DomainMeasurement, Bzm2OperatingClass, Bzm2PerformanceMode,
             Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle,
             Bzm2UartController, Bzm2VoltageDomain, FileGpioPin, FilePowerRail, GpioResetLine,
-            VoltageStackStep,
+            VoltageStackStep, control::Bzm2PowerRail,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -194,8 +194,14 @@ pub struct Bzm2BringupConfig {
     pub enabled: bool,
     pub rail_set_paths: Vec<String>,
     pub rail_write_scales: Vec<f32>,
+    pub domain_rail_indices: Vec<usize>,
     pub rail_enable_paths: Vec<String>,
     pub rail_enable_values: Vec<String>,
+    pub rail_vin: Vec<SensorSpec>,
+    pub rail_vout: Vec<SensorSpec>,
+    pub rail_current: Vec<SensorSpec>,
+    pub rail_power: Vec<SensorSpec>,
+    pub rail_temperature: Vec<SensorSpec>,
     pub reset_path: Option<String>,
     pub reset_active_low: bool,
     pub plan: Bzm2BringupPlan,
@@ -207,8 +213,14 @@ impl Default for Bzm2BringupConfig {
             enabled: false,
             rail_set_paths: Vec::new(),
             rail_write_scales: Vec::new(),
+            domain_rail_indices: Vec::new(),
             rail_enable_paths: Vec::new(),
             rail_enable_values: Vec::new(),
+            rail_vin: Vec::new(),
+            rail_vout: Vec::new(),
+            rail_current: Vec::new(),
+            rail_power: Vec::new(),
+            rail_temperature: Vec::new(),
             reset_path: None,
             reset_active_low: true,
             plan: Bzm2BringupPlan {
@@ -223,51 +235,52 @@ impl Default for Bzm2BringupConfig {
 
 impl Bzm2BringupConfig {
     fn from_env() -> Self {
-        let rail_set_paths = env_var_any(&[
+        let rail_set_paths = env_csv_strings_any(&[
             "MUJINA_BZM2_RAIL_SET_PATHS",
             "MUJINA_BZM2_BRINGUP_RAIL_SET_PATHS",
-        ])
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        ]);
         let rail_target_volts = parse_csv_numbers::<f32>("MUJINA_BZM2_RAIL_TARGET_VOLTS")
             .or_else(|| parse_csv_numbers::<f32>("MUJINA_BZM2_BRINGUP_RAIL_TARGET_VOLTS"))
             .unwrap_or_default();
         let rail_write_scales = parse_csv_numbers::<f32>("MUJINA_BZM2_RAIL_WRITE_SCALES")
             .or_else(|| parse_csv_numbers::<f32>("MUJINA_BZM2_BRINGUP_RAIL_WRITE_SCALES"))
             .unwrap_or_default();
-        let rail_enable_paths = env_var_any(&[
+        let domain_rail_indices =
+            parse_csv_numbers_any::<usize>(&["MUJINA_BZM2_DOMAIN_RAIL_INDICES"])
+                .unwrap_or_default();
+        let rail_enable_paths = env_csv_strings_any(&[
             "MUJINA_BZM2_RAIL_ENABLE_PATHS",
             "MUJINA_BZM2_BRINGUP_RAIL_ENABLE_PATHS",
-        ])
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-        let rail_enable_values = env_var_any(&[
+        ]);
+        let rail_enable_values = env_csv_strings_any(&[
             "MUJINA_BZM2_RAIL_ENABLE_VALUES",
             "MUJINA_BZM2_BRINGUP_RAIL_ENABLE_VALUES",
-        ])
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        ]);
+        let rail_vin = sensor_specs_from_env(
+            &["MUJINA_BZM2_RAIL_VIN_PATHS"],
+            &["MUJINA_BZM2_RAIL_VIN_SCALES"],
+            DEFAULT_VOLTAGE_SCALE,
+        );
+        let rail_vout = sensor_specs_from_env(
+            &["MUJINA_BZM2_RAIL_VOUT_PATHS"],
+            &["MUJINA_BZM2_RAIL_VOUT_SCALES"],
+            DEFAULT_VOLTAGE_SCALE,
+        );
+        let rail_current = sensor_specs_from_env(
+            &["MUJINA_BZM2_RAIL_CURRENT_PATHS"],
+            &["MUJINA_BZM2_RAIL_CURRENT_SCALES"],
+            DEFAULT_CURRENT_SCALE,
+        );
+        let rail_power = sensor_specs_from_env(
+            &["MUJINA_BZM2_RAIL_POWER_PATHS"],
+            &["MUJINA_BZM2_RAIL_POWER_SCALES"],
+            DEFAULT_POWER_SCALE,
+        );
+        let rail_temperature = sensor_specs_from_env(
+            &["MUJINA_BZM2_RAIL_TEMP_PATHS"],
+            &["MUJINA_BZM2_RAIL_TEMP_SCALES"],
+            DEFAULT_BOARD_TEMP_SCALE,
+        );
         let reset_path = env_var_any(&["MUJINA_BZM2_RESET_PATH", "MUJINA_BZM2_BRINGUP_RESET_PATH"]);
         let enabled = env_flag_any(&["MUJINA_BZM2_ENABLE_BRINGUP", "MUJINA_BZM2_BRINGUP_ENABLE"])
             || !rail_set_paths.is_empty()
@@ -318,8 +331,14 @@ impl Bzm2BringupConfig {
             enabled,
             rail_set_paths,
             rail_write_scales,
+            domain_rail_indices,
             rail_enable_paths,
             rail_enable_values,
+            rail_vin,
+            rail_vout,
+            rail_current,
+            rail_power,
+            rail_temperature,
             reset_path,
             reset_active_low: env_flag_default_any(&["MUJINA_BZM2_RESET_ACTIVE_LOW"], true),
             plan,
@@ -362,6 +381,85 @@ impl Bzm2BringupConfig {
                 self.reset_active_low,
             )
         })
+    }
+
+    fn rail_index_for_domain(&self, domain_id: u16) -> Option<usize> {
+        self.domain_rail_indices
+            .get(domain_id as usize)
+            .copied()
+            .or_else(|| {
+                let fallback = domain_id as usize;
+                (fallback < self.rail_set_paths.len()).then_some(fallback)
+            })
+    }
+
+    fn has_telemetry(&self) -> bool {
+        !self.rail_vin.is_empty()
+            || !self.rail_vout.is_empty()
+            || !self.rail_current.is_empty()
+            || !self.rail_power.is_empty()
+            || !self.rail_temperature.is_empty()
+    }
+
+    fn snapshot_telemetry(&self) -> Bzm2TelemetrySnapshot {
+        let rail_count = [
+            self.rail_set_paths.len(),
+            self.rail_vin.len(),
+            self.rail_vout.len(),
+            self.rail_current.len(),
+            self.rail_power.len(),
+            self.rail_temperature.len(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+
+        let mut temperatures = Vec::new();
+        let mut powers = Vec::new();
+        for index in 0..rail_count {
+            let vin = self.rail_vin.get(index).and_then(SensorSpec::read);
+            let vout = self.rail_vout.get(index).and_then(SensorSpec::read);
+            let current = self.rail_current.get(index).and_then(SensorSpec::read);
+            let power = self
+                .rail_power
+                .get(index)
+                .and_then(SensorSpec::read)
+                .or_else(|| match (vout, current) {
+                    (Some(voltage_v), Some(current_a)) => Some(voltage_v * current_a),
+                    _ => None,
+                });
+            let temperature_c = self.rail_temperature.get(index).and_then(SensorSpec::read);
+
+            if let Some(temperature_c) = temperature_c {
+                temperatures.push(TemperatureSensor {
+                    name: format!("rail{}-regulator", index),
+                    temperature_c: Some(temperature_c),
+                });
+            }
+            if vin.is_some() {
+                powers.push(PowerMeasurement {
+                    name: format!("rail{}-input", index),
+                    voltage_v: vin,
+                    current_a: None,
+                    power_w: None,
+                });
+            }
+            if vout.is_some() || current.is_some() || power.is_some() {
+                powers.push(PowerMeasurement {
+                    name: format!("rail{}-output", index),
+                    voltage_v: vout,
+                    current_a: current,
+                    power_w: power,
+                });
+            }
+        }
+
+        Bzm2TelemetrySnapshot {
+            fans: Vec::new(),
+            temperatures,
+            powers,
+            trip_reason: None,
+        }
     }
 }
 
@@ -846,11 +944,14 @@ impl Bzm2Board {
     }
 
     fn spawn_monitor(&mut self) {
-        if !self.config.telemetry.is_enabled() || self.monitor_task.is_some() {
+        if (!self.config.telemetry.is_enabled() && !self.config.bringup.has_telemetry())
+            || self.monitor_task.is_some()
+        {
             return;
         }
 
         let telemetry = self.config.telemetry.clone();
+        let rail_telemetry = self.config.bringup.clone();
         let state_tx = self.state_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
         let serial_controls = self.serial_controls.clone();
@@ -865,6 +966,7 @@ impl Bzm2Board {
                 tokio::select! {
                     _ = interval.tick() => {
                         let snapshot = telemetry.snapshot();
+                        let rail_snapshot = rail_telemetry.snapshot_telemetry();
                         let total_stats = serial_controls.iter().fold((0u64, 0u64), |acc, control| {
                             let stats = control.stats();
                             (acc.0 + stats.bytes_read, acc.1 + stats.bytes_written)
@@ -873,6 +975,8 @@ impl Bzm2Board {
                             state.fans = snapshot.fans.clone();
                             merge_temperature_readings(&mut state.temperatures, &snapshot.temperatures);
                             merge_power_readings(&mut state.powers, &snapshot.powers);
+                            merge_temperature_readings(&mut state.temperatures, &rail_snapshot.temperatures);
+                            merge_power_readings(&mut state.powers, &rail_snapshot.powers);
                         });
                         trace!(board = %board_name, bytes_read = total_stats.0, bytes_written = total_stats.1, "BZM2 board telemetry updated");
                         if let Some(reason) = snapshot.trip_reason.clone() {
@@ -1115,16 +1219,13 @@ impl Bzm2Board {
             constraints: Bzm2CalibrationConstraints::default(),
             force_retune: calibration.force_retune,
         });
-        let mut domain_voltages = plan
+        let per_domain_voltage_mv = plan
             .domain_plans
             .iter()
-            .map(|domain| domain.voltage_mv)
-            .collect::<Vec<_>>();
-        domain_voltages.sort_unstable();
-        domain_voltages.dedup();
-        if domain_voltages.len() > 1 {
-            warn!(board = %self.config.device_id(), ?domain_voltages, "planner requested multiple domain voltages; board runtime currently applies clock phases only");
-        }
+            .map(|domain| (domain.domain_id, domain.voltage_mv))
+            .collect::<BTreeMap<_, _>>();
+        self.apply_domain_voltage_map(&per_domain_voltage_mv)
+            .await?;
 
         let per_asic_pll_mhz = plan
             .asic_plans
@@ -1149,6 +1250,7 @@ impl Bzm2Board {
                     self.config.nominal_hashrate_ths as f32,
                     self.config.serial_paths.len(),
                 ),
+                per_domain_voltage_mv,
                 per_asic_pll_mhz,
             };
             let profile = Bzm2PersistedCalibrationProfile {
@@ -1172,6 +1274,8 @@ impl Bzm2Board {
         bus_layouts: &[Bzm2BusLayout],
         profile: &Bzm2PersistedCalibrationProfile,
     ) -> Result<(), BoardError> {
+        self.apply_domain_voltage_map(&profile.saved_state.per_domain_voltage_mv)
+            .await?;
         for bus in bus_layouts {
             if bus.asic_count == 0 {
                 continue;
@@ -1190,6 +1294,74 @@ impl Bzm2Board {
                 &profile.saved_state.per_asic_pll_mhz,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_domain_voltage_map(
+        &self,
+        per_domain_voltage_mv: &BTreeMap<u16, u32>,
+    ) -> Result<(), BoardError> {
+        if per_domain_voltage_mv.is_empty() {
+            return Ok(());
+        }
+        if self.config.bringup.rail_set_paths.is_empty() {
+            warn!(
+                board = %self.config.device_id(),
+                ?per_domain_voltage_mv,
+                "planner produced per-domain voltages, but no BZM2 rail control path is configured"
+            );
+            return Ok(());
+        }
+
+        let mut rail_targets_mv = BTreeMap::<usize, u32>::new();
+        for (&domain_id, &voltage_mv) in per_domain_voltage_mv {
+            let rail_index = self
+                .config
+                .bringup
+                .rail_index_for_domain(domain_id)
+                .ok_or_else(|| {
+                    BoardError::HardwareControl(format!(
+                        "BZM2 domain {domain_id} has no mapped rail index"
+                    ))
+                })?;
+            if rail_index >= self.config.bringup.rail_set_paths.len() {
+                return Err(BoardError::HardwareControl(format!(
+                    "BZM2 domain {domain_id} mapped to rail {rail_index}, but only {} rail set paths are configured",
+                    self.config.bringup.rail_set_paths.len()
+                )));
+            }
+            match rail_targets_mv.entry(rail_index) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(voltage_mv);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if *entry.get() != voltage_mv =>
+                {
+                    return Err(BoardError::HardwareControl(format!(
+                        "BZM2 rail {rail_index} received conflicting domain voltages: {}mV vs {}mV",
+                        entry.get(),
+                        voltage_mv
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+
+        let mut rails = self.config.bringup.build_rails();
+        for (rail_index, voltage_mv) in rail_targets_mv {
+            let rail = rails.get_mut(rail_index).ok_or_else(|| {
+                BoardError::HardwareControl(format!(
+                    "BZM2 rail {rail_index} is missing from configured rail controls"
+                ))
+            })?;
+            rail.set_voltage(voltage_mv as f32 / 1000.0)
+                .await
+                .map_err(|err| {
+                    BoardError::HardwareControl(format!(
+                        "Failed to apply BZM2 domain voltage {voltage_mv}mV on rail {rail_index}: {err}"
+                    ))
+                })?;
         }
         Ok(())
     }
@@ -1348,13 +1520,27 @@ impl Board for Bzm2Board {
         self.apply_bringup_sequence().await?;
         let bus_layouts = self.resolve_bus_layouts().await?;
         let initial_snapshot = self.config.telemetry.snapshot();
+        let initial_rail_snapshot = self.config.bringup.snapshot_telemetry();
         let _ = self.state_tx.send_modify(|state| {
             state.fans = initial_snapshot.fans.clone();
             merge_temperature_readings(&mut state.temperatures, &initial_snapshot.temperatures);
             merge_power_readings(&mut state.powers, &initial_snapshot.powers);
+            merge_temperature_readings(
+                &mut state.temperatures,
+                &initial_rail_snapshot.temperatures,
+            );
+            merge_power_readings(&mut state.powers, &initial_rail_snapshot.powers);
         });
 
         self.execute_live_calibration(&bus_layouts).await?;
+        let post_calibration_rail_snapshot = self.config.bringup.snapshot_telemetry();
+        let _ = self.state_tx.send_modify(|state| {
+            merge_temperature_readings(
+                &mut state.temperatures,
+                &post_calibration_rail_snapshot.temperatures,
+            );
+            merge_power_readings(&mut state.powers, &post_calibration_rail_snapshot.powers);
+        });
 
         for (index, serial_path) in self.config.serial_paths.iter().enumerate() {
             let stream = SerialStream::new(serial_path, self.config.baud_rate).map_err(|err| {
@@ -1779,6 +1965,19 @@ fn env_var_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok())
 }
 
+fn env_csv_strings_any(keys: &[&str]) -> Vec<String> {
+    env_var_any(keys)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 fn env_flag(key: &str) -> bool {
     env_var_any(&[key]).as_deref().is_some_and(|value| {
         matches!(
@@ -1837,6 +2036,33 @@ where
         .map(|value| value.parse().ok())
         .collect::<Option<Vec<_>>>()?;
     Some(parsed)
+}
+
+fn parse_csv_numbers_any<T>(keys: &[&str]) -> Option<Vec<T>>
+where
+    T: std::str::FromStr,
+{
+    keys.iter().find_map(|key| parse_csv_numbers::<T>(key))
+}
+
+fn sensor_specs_from_env(
+    paths_keys: &[&str],
+    scales_keys: &[&str],
+    default_scale: f32,
+) -> Vec<SensorSpec> {
+    let paths = env_csv_strings_any(paths_keys);
+    let scales = parse_csv_numbers_any::<f32>(scales_keys).unwrap_or_default();
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| SensorSpec {
+            path,
+            scale: *scales
+                .get(index)
+                .or_else(|| scales.last())
+                .unwrap_or(&default_scale),
+        })
+        .collect()
 }
 
 fn parse_operating_class(value: &str) -> Option<Bzm2OperatingClass> {
@@ -2020,14 +2246,17 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let profile_path = std::env::temp_dir().join(format!(
             "bzm2-profile-{}-{}.json",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique
         ));
+        let rail0_path = std::env::temp_dir().join(format!("bzm2-domain-rail0-{unique}.txt"));
+        let rail1_path = std::env::temp_dir().join(format!("bzm2-domain-rail1-{unique}.txt"));
 
         let config = Bzm2VirtualDeviceConfig {
             serial_paths: vec![serial_path],
@@ -2039,11 +2268,19 @@ mod tests {
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
-            bringup: Bzm2BringupConfig::default(),
+            bringup: Bzm2BringupConfig {
+                rail_set_paths: vec![
+                    rail0_path.to_string_lossy().into_owned(),
+                    rail1_path.to_string_lossy().into_owned(),
+                ],
+                rail_write_scales: vec![1000.0, 1000.0],
+                ..Default::default()
+            },
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 asics_per_bus: vec![2],
                 asics_per_domain: vec![1],
+                domain_voltage_offsets_mv: vec![0, 100],
                 profile_path: Some(profile_path.clone()),
                 skip_lock_check: true,
                 ..Default::default()
@@ -2064,9 +2301,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(profile.saved_state.per_asic_pll_mhz.len(), 2);
+        assert_eq!(profile.saved_state.per_domain_voltage_mv.len(), 2);
+        assert_eq!(
+            fs::read_to_string(&rail0_path).unwrap().trim(),
+            profile
+                .saved_state
+                .per_domain_voltage_mv
+                .get(&0)
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(&rail1_path).unwrap().trim(),
+            profile
+                .saved_state
+                .per_domain_voltage_mv
+                .get(&1)
+                .unwrap()
+                .to_string()
+        );
         assert!(profile.persisted.is_some());
 
         let _ = fs::remove_file(profile_path);
+        let _ = fs::remove_file(rail0_path);
+        let _ = fs::remove_file(rail1_path);
         drop(pty);
     }
 
@@ -2077,14 +2335,17 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let profile_path = std::env::temp_dir().join(format!(
             "bzm2-replay-{}-{}.json",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            unique
         ));
+        let rail0_path = std::env::temp_dir().join(format!("bzm2-replay-rail0-{unique}.txt"));
+        let rail1_path = std::env::temp_dir().join(format!("bzm2-replay-rail1-{unique}.txt"));
         let persisted = Bzm2PersistedCalibrationProfile {
             schema_version: Bzm2PersistedCalibrationProfile::SCHEMA_VERSION,
             operating_class: operating_class_name(Bzm2OperatingClass::Generic).into(),
@@ -2094,6 +2355,7 @@ mod tests {
             saved_state: Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 80.0,
+                per_domain_voltage_mv: BTreeMap::from([(0, 17_450), (1, 17_600)]),
                 per_asic_pll_mhz: BTreeMap::from([
                     (0, [1_100.0, 1_125.0]),
                     (1, [1_150.0, 1_175.0]),
@@ -2113,7 +2375,14 @@ mod tests {
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
-            bringup: Bzm2BringupConfig::default(),
+            bringup: Bzm2BringupConfig {
+                rail_set_paths: vec![
+                    rail0_path.to_string_lossy().into_owned(),
+                    rail1_path.to_string_lossy().into_owned(),
+                ],
+                rail_write_scales: vec![1000.0, 1000.0],
+                ..Default::default()
+            },
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 apply_saved_operating_point: true,
@@ -2135,8 +2404,12 @@ mod tests {
         board.execute_live_calibration(&bus_layouts).await.unwrap();
 
         assert_eq!(fs::read_to_string(&profile_path).unwrap(), original);
+        assert_eq!(fs::read_to_string(&rail0_path).unwrap().trim(), "17450");
+        assert_eq!(fs::read_to_string(&rail1_path).unwrap().trim(), "17600");
 
         let _ = fs::remove_file(profile_path);
+        let _ = fs::remove_file(rail0_path);
+        let _ = fs::remove_file(rail1_path);
         drop(pty);
     }
 
@@ -2285,11 +2558,17 @@ mod tests {
                     rail1_path.to_string_lossy().into_owned(),
                 ],
                 rail_write_scales: vec![1000.0, 1000.0],
+                domain_rail_indices: Vec::new(),
                 rail_enable_paths: vec![
                     enable0_path.to_string_lossy().into_owned(),
                     enable1_path.to_string_lossy().into_owned(),
                 ],
                 rail_enable_values: vec!["EN".into(), "ON".into()],
+                rail_vin: Vec::new(),
+                rail_vout: Vec::new(),
+                rail_current: Vec::new(),
+                rail_power: Vec::new(),
+                rail_temperature: Vec::new(),
                 reset_path: Some(reset_path.to_string_lossy().into_owned()),
                 reset_active_low: true,
                 plan: Bzm2BringupPlan {
@@ -2340,6 +2619,108 @@ mod tests {
         let _ = fs::remove_file(enable0_path);
         let _ = fs::remove_file(enable1_path);
         let _ = fs::remove_file(reset_path);
+        drop(pty);
+    }
+
+    #[tokio::test]
+    async fn create_hash_threads_publishes_rail_telemetry() {
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let vin_path = std::env::temp_dir().join(format!("bzm2-vin-{unique}.txt"));
+        let vout_path = std::env::temp_dir().join(format!("bzm2-vout-{unique}.txt"));
+        let current_path = std::env::temp_dir().join(format!("bzm2-current-{unique}.txt"));
+        let power_path = std::env::temp_dir().join(format!("bzm2-power-{unique}.txt"));
+        let temp_path = std::env::temp_dir().join(format!("bzm2-temp-{unique}.txt"));
+        fs::write(&vin_path, "12000\n").unwrap();
+        fs::write(&vout_path, "850\n").unwrap();
+        fs::write(&current_path, "1500\n").unwrap();
+        fs::write(&power_path, "1275\n").unwrap();
+        fs::write(&temp_path, "47000\n").unwrap();
+
+        let config = Bzm2VirtualDeviceConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig {
+                rail_vin: vec![SensorSpec {
+                    path: vin_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_vout: vec![SensorSpec {
+                    path: vout_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_current: vec![SensorSpec {
+                    path: current_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_power: vec![SensorSpec {
+                    path: power_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_temperature: vec![SensorSpec {
+                    path: temp_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                ..Default::default()
+            },
+            calibration: Bzm2CalibrationConfig::default(),
+        };
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+
+        let _threads = board.create_hash_threads().await.unwrap();
+        let state = state_rx.borrow().clone();
+        assert!(state.temperatures.iter().any(|sensor| {
+            sensor.name == "rail0-regulator"
+                && sensor
+                    .temperature_c
+                    .is_some_and(|value| (value - 47.0).abs() < 0.001)
+        }));
+        assert!(state.powers.iter().any(|power| {
+            power.name == "rail0-input"
+                && power
+                    .voltage_v
+                    .is_some_and(|value| (value - 12.0).abs() < 0.001)
+        }));
+        assert!(state.powers.iter().any(|power| {
+            power.name == "rail0-output"
+                && power
+                    .voltage_v
+                    .is_some_and(|value| (value - 0.85).abs() < 0.001)
+                && power
+                    .current_a
+                    .is_some_and(|value| (value - 1.5).abs() < 0.001)
+                && power
+                    .power_w
+                    .is_some_and(|value| (value - 1.275).abs() < 0.001)
+        }));
+
+        board.shutdown().await.unwrap();
+
+        let _ = fs::remove_file(vin_path);
+        let _ = fs::remove_file(vout_path);
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(power_path);
+        let _ = fs::remove_file(temp_path);
         drop(pty);
     }
 

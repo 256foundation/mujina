@@ -109,6 +109,8 @@ pub struct Bzm2CalibrationSweepRequest {
 pub struct Bzm2SavedOperatingPoint {
     pub board_voltage_mv: u32,
     pub board_throughput_ths: f32,
+    #[serde(default)]
+    pub per_domain_voltage_mv: BTreeMap<u16, u32>,
     pub per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
 }
 
@@ -707,6 +709,7 @@ mod tests {
             saved_operating_point: Some(Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 42.0,
+                per_domain_voltage_mv: BTreeMap::new(),
                 per_asic_pll_mhz: stored,
             }),
             domain_measurements: vec![Bzm2DomainMeasurement {
@@ -756,6 +759,7 @@ mod tests {
             saved_operating_point: Some(Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 50.0,
+                per_domain_voltage_mv: BTreeMap::new(),
                 per_asic_pll_mhz: stored,
             }),
             domain_measurements: vec![],
