@@ -12,7 +12,7 @@
 
 use std::{
     collections::VecDeque,
-    env, io,
+    io,
     sync::{Arc, RwLock},
 };
 
@@ -28,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
 use tokio_stream::StreamExt;
 
-use super::{HexBytes, protocol};
+use super::protocol;
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
@@ -91,8 +91,6 @@ const READRESULT_SEQUENCE_SPACE: usize = 64; // sequence byte carries 4 micro-jo
 const READRESULT_SLOT_HISTORY: usize = 16;
 const READRESULT_ASSIGNMENT_HISTORY_LIMIT: usize =
     READRESULT_SEQUENCE_SPACE * READRESULT_SLOT_HISTORY;
-const SANITY_DIAGNOSTIC_LIMIT: u64 = 24;
-const SEQUENCE_LOOKUP_DIAGNOSTIC_LIMIT: u64 = 24;
 const ZERO_LZ_DIAGNOSTIC_LIMIT: u64 = 24;
 const SHA256_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -640,27 +638,6 @@ struct AssignedTask {
     nonce_minus_value: u32,
 }
 
-#[derive(Clone, Debug)]
-struct ReplayCheckConfig {
-    job_id: Option<String>,
-    en2_value: u64,
-    en2_size: u8,
-    ntime: u32,
-    nonce: u32,
-    version_bits: u32,
-}
-
-#[derive(Clone, Debug)]
-struct FocusedReadResultConfig {
-    adjusted_nonce: Option<u32>,
-    raw_nonce: Option<u32>,
-    break_on_match: bool,
-}
-
-fn format_replay_en2_hex(value: u64, size: u8) -> String {
-    format!("{:0width$x}", value, width = size as usize * 2)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bzm2CheckResult {
     Correct,
@@ -671,22 +648,14 @@ enum Bzm2CheckResult {
 struct SelectedReadResultCandidate {
     assigned: AssignedTask,
     share_version: BlockVersion,
-    selected_midstate: [u8; 32],
     ntime_offset: u32,
     share_ntime: u32,
     nonce_adjusted: u32,
     nonce_submit: u32,
-    header: BlockHeader,
-    tail16: [u8; 16],
     hash_bytes: [u8; 32],
     hash: bitcoin::BlockHash,
-    target_bytes: [u8; 32],
     check_result: Bzm2CheckResult,
     observed_leading_zeros: u16,
-    achieved_difficulty: Difficulty,
-    target_difficulty: Difficulty,
-    achieved_difficulty_f64: f64,
-    target_difficulty_f64: f64,
 }
 
 // Compute the four version-mask deltas used across the 4-midstate micro-jobs.
@@ -886,407 +855,6 @@ fn hash_bytes_bzm2_order(hash: &bitcoin::BlockHash) -> [u8; 32] {
     *hash.as_byte_array()
 }
 
-fn validation_probe_summary(
-    assigned: &AssignedTask,
-    version: BlockVersion,
-    ntime: u32,
-    nonce: u32,
-) -> String {
-    let header = BlockHeader {
-        version,
-        prev_blockhash: assigned.task.template.prev_blockhash,
-        merkle_root: assigned.merkle_root,
-        time: ntime,
-        bits: assigned.task.template.bits,
-        nonce,
-    };
-    let header_bytes = consensus::serialize(&header);
-    let header_prefix: [u8; 64] = header_bytes[..64]
-        .try_into()
-        .expect("header prefix length is fixed");
-    let midstate = compute_midstate_le(&header_prefix);
-    let tail16 = bzm2_tail16_bytes(assigned, ntime, nonce);
-    let hash_bytes = bzm2_double_sha_from_midstate_and_tail(&midstate, &tail16);
-    let target_bytes = assigned.task.share_target.to_le_bytes();
-    let check = check_result(&hash_bytes, &target_bytes, assigned.leading_zeros);
-    let lz_bits = leading_zero_bits(&hash_bytes);
-    format!(
-        "v={:#010x},t={:#010x},n={:#010x},chk={:?},lz={},msb={:#04x}",
-        version.to_consensus() as u32,
-        ntime,
-        nonce,
-        check,
-        lz_bits,
-        hash_bytes[31]
-    )
-}
-
-fn evaluate_check_with_hash_orders(
-    assigned: &AssignedTask,
-    version: BlockVersion,
-    ntime: u32,
-    nonce_submit: u32,
-) -> (Bzm2CheckResult, u8, Bzm2CheckResult, u8) {
-    let evaluate = |candidate_nonce: u32| {
-        let header = BlockHeader {
-            version,
-            prev_blockhash: assigned.task.template.prev_blockhash,
-            merkle_root: assigned.merkle_root,
-            time: ntime,
-            bits: assigned.task.template.bits,
-            nonce: candidate_nonce,
-        };
-        let header_bytes = consensus::serialize(&header);
-        let header_prefix: [u8; 64] = header_bytes[..64]
-            .try_into()
-            .expect("header prefix length is fixed");
-        let midstate = compute_midstate_le(&header_prefix);
-        let tail16 = bzm2_tail16_bytes(assigned, ntime, candidate_nonce);
-        let hash_bytes = bzm2_double_sha_from_midstate_and_tail(&midstate, &tail16);
-        let target_bytes = assigned.task.share_target.to_le_bytes();
-        let check = check_result(&hash_bytes, &target_bytes, assigned.leading_zeros);
-        (check, hash_bytes[31])
-    };
-
-    // Keep the legacy "le/be" labels in focused diagnostics, but compare
-    // submit-order nonce vs swapped-order nonce to surface byte-order mistakes.
-    let (submit_check, submit_msb) = evaluate(nonce_submit);
-    let (swapped_check, swapped_msb) = evaluate(nonce_submit.swap_bytes());
-    (submit_check, submit_msb, swapped_check, swapped_msb)
-}
-
-fn focused_validation_entry(
-    label: &str,
-    assigned: &AssignedTask,
-    sequence: u8,
-    timecode: u8,
-    nonce: u32,
-) -> String {
-    let sequence_id = sequence / (MIDSTATE_COUNT as u8);
-    let micro_job_id = (sequence % (MIDSTATE_COUNT as u8)) as usize;
-    let version = assigned.microjob_versions[micro_job_id];
-    let ntime_rev = assigned
-        .task
-        .ntime
-        .wrapping_add(u32::from(assigned.timestamp_count.wrapping_sub(timecode)));
-    let ntime_plus = assigned.task.ntime.wrapping_add(u32::from(timecode));
-    let (rev_le, rev_le_msb, rev_be, rev_be_msb) =
-        evaluate_check_with_hash_orders(assigned, version, ntime_rev, nonce);
-    let (plus_le, plus_le_msb, plus_be, plus_be_msb) =
-        evaluate_check_with_hash_orders(assigned, version, ntime_plus, nonce);
-
-    format!(
-        "{label}(seq={:#04x}/sid={}/mj={},time={:#04x},n={:#010x},rev(le={:?}/{:#04x},be={:?}/{:#04x}),plus(le={:?}/{:#04x},be={:?}/{:#04x}))",
-        sequence,
-        sequence_id,
-        micro_job_id,
-        timecode,
-        nonce,
-        rev_le,
-        rev_le_msb,
-        rev_be,
-        rev_be_msb,
-        plus_le,
-        plus_le_msb,
-        plus_be,
-        plus_be_msb
-    )
-}
-
-fn focused_readresult_diagnostic(
-    assigned: &AssignedTask,
-    sequence_raw: u8,
-    timecode_raw: u8,
-    nonce_raw: u32,
-) -> String {
-    let sequence_masked = sequence_raw & 0x7f;
-    let timecode_masked = timecode_raw & 0x7f;
-    let nonce_adjusted = nonce_raw.wrapping_sub(assigned.nonce_minus_value);
-    let entries = [
-        focused_validation_entry(
-            "raw_adj",
-            assigned,
-            sequence_raw,
-            timecode_raw,
-            nonce_adjusted,
-        ),
-        focused_validation_entry("raw_raw", assigned, sequence_raw, timecode_raw, nonce_raw),
-        focused_validation_entry(
-            "m7_adj",
-            assigned,
-            sequence_masked,
-            timecode_masked,
-            nonce_adjusted,
-        ),
-        focused_validation_entry(
-            "m7_raw",
-            assigned,
-            sequence_masked,
-            timecode_masked,
-            nonce_raw,
-        ),
-    ];
-    entries.join(" | ")
-}
-
-fn parse_hex_u32(input: &str) -> Option<u32> {
-    let trimmed = input
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X");
-    u32::from_str_radix(trimmed, 16).ok()
-}
-
-fn parse_u32_env(input: &str) -> Option<u32> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        return parse_hex_u32(trimmed);
-    }
-    trimmed
-        .parse::<u32>()
-        .ok()
-        .or_else(|| parse_hex_u32(trimmed))
-}
-
-fn parse_bool_env_flag(name: &str) -> bool {
-    let Ok(raw) = env::var(name) else {
-        return false;
-    };
-    let v = raw.trim();
-    v == "1"
-        || v.eq_ignore_ascii_case("true")
-        || v.eq_ignore_ascii_case("yes")
-        || v.eq_ignore_ascii_case("on")
-}
-
-fn parse_focused_readresult_config_from_env() -> Option<FocusedReadResultConfig> {
-    let adjusted_nonce = match env::var("MUJINA_BZM2_TRACE_NONCE") {
-        Ok(v) => {
-            let Some(parsed) = parse_u32_env(&v) else {
-                warn!(value = %v, "Invalid MUJINA_BZM2_TRACE_NONCE (expected hex or decimal u32)");
-                return None;
-            };
-            Some(parsed)
-        }
-        Err(_) => None,
-    };
-    let raw_nonce = match env::var("MUJINA_BZM2_TRACE_RAW_NONCE") {
-        Ok(v) => {
-            let Some(parsed) = parse_u32_env(&v) else {
-                warn!(value = %v, "Invalid MUJINA_BZM2_TRACE_RAW_NONCE (expected hex or decimal u32)");
-                return None;
-            };
-            Some(parsed)
-        }
-        Err(_) => None,
-    };
-    if adjusted_nonce.is_none() && raw_nonce.is_none() {
-        return None;
-    }
-    let break_on_match = parse_bool_env_flag("MUJINA_BZM2_TRACE_BREAK_ON_NONCE");
-    Some(FocusedReadResultConfig {
-        adjusted_nonce,
-        raw_nonce,
-        break_on_match,
-    })
-}
-
-fn parse_replay_check_config_from_env() -> Option<ReplayCheckConfig> {
-    let en2_hex = match env::var("MUJINA_BZM2_REPLAY_EN2") {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let ntime_s = match env::var("MUJINA_BZM2_REPLAY_NTIME") {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("MUJINA_BZM2_REPLAY_EN2 is set but MUJINA_BZM2_REPLAY_NTIME is missing");
-            return None;
-        }
-    };
-    let nonce_s = match env::var("MUJINA_BZM2_REPLAY_NONCE") {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("MUJINA_BZM2_REPLAY_EN2 is set but MUJINA_BZM2_REPLAY_NONCE is missing");
-            return None;
-        }
-    };
-    let version_bits_s = match env::var("MUJINA_BZM2_REPLAY_VERSION_BITS") {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("MUJINA_BZM2_REPLAY_EN2 is set but MUJINA_BZM2_REPLAY_VERSION_BITS is missing");
-            return None;
-        }
-    };
-
-    let en2_trim = en2_hex
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X");
-    if en2_trim.is_empty() || (en2_trim.len() % 2) != 0 || en2_trim.len() > 16 {
-        warn!(
-            en2 = %en2_hex,
-            "Invalid MUJINA_BZM2_REPLAY_EN2 (must be 1-8 bytes of hex)"
-        );
-        return None;
-    }
-
-    let en2_size = (en2_trim.len() / 2) as u8;
-    let mut en2_bytes = [0u8; 8];
-    for (idx, pair) in en2_trim.as_bytes().chunks_exact(2).enumerate() {
-        let Ok(byte_str) = std::str::from_utf8(pair) else {
-            warn!(en2 = %en2_hex, "Invalid UTF-8 in MUJINA_BZM2_REPLAY_EN2");
-            return None;
-        };
-        let Ok(byte) = u8::from_str_radix(byte_str, 16) else {
-            warn!(en2 = %en2_hex, "Invalid MUJINA_BZM2_REPLAY_EN2 hex");
-            return None;
-        };
-        en2_bytes[idx] = byte;
-    }
-    // Stratum submit extranonce2 is sent as raw bytes hex. Extranonce2 stores value as little-endian.
-    let en2_value = u64::from_le_bytes(en2_bytes);
-
-    let Some(ntime) = parse_hex_u32(&ntime_s) else {
-        warn!(ntime = %ntime_s, "Invalid MUJINA_BZM2_REPLAY_NTIME hex");
-        return None;
-    };
-    let Some(nonce) = parse_hex_u32(&nonce_s) else {
-        warn!(nonce = %nonce_s, "Invalid MUJINA_BZM2_REPLAY_NONCE hex");
-        return None;
-    };
-    let Some(version_bits) = parse_hex_u32(&version_bits_s) else {
-        warn!(
-            version_bits = %version_bits_s,
-            "Invalid MUJINA_BZM2_REPLAY_VERSION_BITS hex"
-        );
-        return None;
-    };
-    let job_id = env::var("MUJINA_BZM2_REPLAY_JOB_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-
-    Some(ReplayCheckConfig {
-        job_id,
-        en2_value,
-        en2_size,
-        ntime,
-        nonce,
-        version_bits,
-    })
-}
-
-fn log_replay_check_for_task(config: &ReplayCheckConfig, assigned: &AssignedTask) -> bool {
-    if let Some(job_id) = &config.job_id
-        && assigned.task.template.id.as_str() != job_id
-    {
-        debug!(
-            configured_job_id = %job_id,
-            assigned_job_id = %assigned.task.template.id,
-            "BZM2 replay check skipped (job_id mismatch)"
-        );
-        return false;
-    }
-
-    let Ok(config_en2) = Extranonce2::new(config.en2_value, config.en2_size) else {
-        debug!(
-            job_id = %assigned.task.template.id,
-            configured_en2 = %format_replay_en2_hex(config.en2_value, config.en2_size),
-            "BZM2 replay check skipped (configured extranonce2 invalid for configured size)"
-        );
-        return false;
-    };
-
-    let matched_engine = assigned
-        .engine_assignments
-        .iter()
-        .position(|engine| engine.extranonce2 == Some(config_en2));
-    let (task_en2, replay_merkle_root) = if let Some(logical_engine_id) = matched_engine {
-        (
-            config_en2,
-            assigned.engine_assignments[logical_engine_id].merkle_root,
-        )
-    } else {
-        let Some(task_en2) = assigned.task.en2 else {
-            debug!(
-                job_id = %assigned.task.template.id,
-                configured_en2 = %format_replay_en2_hex(config.en2_value, config.en2_size),
-                "BZM2 replay check skipped (assigned task has no extranonce2)"
-            );
-            return false;
-        };
-        if task_en2 != config_en2 {
-            debug!(
-                job_id = %assigned.task.template.id,
-                configured_en2 = %format_replay_en2_hex(config.en2_value, config.en2_size),
-                assigned_en2 = %task_en2,
-                "BZM2 replay check skipped (extranonce2 mismatch)"
-            );
-            return false;
-        }
-        (task_en2, assigned.merkle_root)
-    };
-
-    let base_version = assigned.task.template.version.base().to_consensus() as u32;
-    let replay_version_u32 = base_version | config.version_bits;
-    let replay_version = BlockVersion::from_consensus(replay_version_u32 as i32);
-    let matched_microjob = assigned
-        .microjob_versions
-        .iter()
-        .position(|v| v.to_consensus() as u32 == replay_version_u32);
-
-    let header = BlockHeader {
-        version: replay_version,
-        prev_blockhash: assigned.task.template.prev_blockhash,
-        merkle_root: replay_merkle_root,
-        time: config.ntime,
-        bits: assigned.task.template.bits,
-        nonce: config.nonce,
-    };
-    let header_bytes = consensus::serialize(&header);
-    let replay_midstate = matched_microjob
-        .and_then(|idx| {
-            matched_engine.map(|logical_engine_id| {
-                assigned.engine_assignments[logical_engine_id].midstates[idx]
-            })
-        })
-        .unwrap_or_else(|| {
-            let header_prefix: [u8; 64] = header_bytes[..64]
-                .try_into()
-                .expect("header prefix length is fixed");
-            compute_midstate_le(&header_prefix)
-        });
-    let replay_tail16 = bzm2_tail16_bytes(assigned, config.ntime, config.nonce);
-    let hash_bzm2 = bzm2_double_sha_from_midstate_and_tail(&replay_midstate, &replay_tail16);
-    let hash = bitcoin::BlockHash::from_byte_array(hash_bzm2);
-    let target_bytes = assigned.task.share_target.to_le_bytes();
-    let check_result = check_result(&hash_bzm2, &target_bytes, assigned.leading_zeros);
-    let achieved_difficulty = Difficulty::from_hash(&hash);
-    let target_difficulty = Difficulty::from_target(assigned.task.share_target);
-
-    debug!(
-        job_id = %assigned.task.template.id,
-        assigned_sequence_id = assigned.sequence_id,
-        assigned_en2 = %task_en2,
-        replay_en2 = format_args!("{:0width$x}", config.en2_value, width = config.en2_size as usize * 2),
-        replay_ntime = format_args!("{:#010x}", config.ntime),
-        replay_nonce = format_args!("{:#010x}", config.nonce),
-        replay_version_bits = format_args!("{:#010x}", config.version_bits),
-        replay_version = format_args!("{:#010x}", replay_version_u32),
-        matched_logical_engine = ?matched_engine,
-        matched_microjob = ?matched_microjob,
-        check_result = ?check_result,
-        achieved_difficulty = %achieved_difficulty,
-        target_difficulty = %target_difficulty,
-        hash_bzm2 = %HexBytes(&hash_bzm2),
-        header = %HexBytes(&header_bytes),
-        "BZM2 replay check"
-    );
-    true
-}
-
 fn compute_task_merkle_root(task: &HashTask) -> Result<TxMerkleNode, HashThreadError> {
     let template = task.template.as_ref();
     match &template.merkle_root {
@@ -1429,61 +997,6 @@ fn task_to_bzm2_payload(
     })
 }
 
-fn log_bzm2_job_fingerprint(
-    task: &HashTask,
-    merkle_root: TxMerkleNode,
-    versions: [BlockVersion; MIDSTATE_COUNT],
-    payload: &TaskJobPayload,
-    sequence_id: u8,
-    zeros_to_find: u8,
-    timestamp_count: u8,
-) -> Result<(), HashThreadError> {
-    let target_swapped = task.template.bits.to_consensus().swap_bytes();
-    let target_reg_bytes = target_swapped.to_le_bytes();
-    let merkle_root_bytes = consensus::serialize(&merkle_root);
-    let en2_dbg = task
-        .en2
-        .as_ref()
-        .map(|v| format!("{v:?}"))
-        .unwrap_or_else(|| "None".to_owned());
-
-    let mut version_map = Vec::with_capacity(MIDSTATE_COUNT);
-    let mut header_tails = Vec::with_capacity(MIDSTATE_COUNT);
-    let mut header_full = Vec::with_capacity(MIDSTATE_COUNT);
-    let mut midstates_hex = Vec::with_capacity(MIDSTATE_COUNT);
-
-    for (idx, version) in versions.iter().copied().enumerate() {
-        let header = build_header_bytes(task, version, merkle_root)?;
-        version_map.push(format!("mj{idx}={:#010x}", version.to_consensus() as u32));
-        header_tails.push(format!("mj{idx}={}", HexBytes(&header[64..80])));
-        header_full.push(format!("mj{idx}={}", HexBytes(&header)));
-        midstates_hex.push(format!("mj{idx}={}", HexBytes(&payload.midstates[idx])));
-    }
-
-    debug!(
-        job_id = %task.template.id,
-        sequence_id,
-        ntime = format_args!("{:#x}", task.ntime),
-        template_time = format_args!("{:#x}", task.template.time),
-        bits = format_args!("{:#x}", task.template.bits.to_consensus()),
-        share_target = %task.share_target,
-        en2 = %en2_dbg,
-        zeros_to_find,
-        timestamp_count,
-        target_reg = %HexBytes(&target_reg_bytes),
-        merkle_root = %HexBytes(&merkle_root_bytes),
-        payload_merkle_residue = format_args!("{:#010x}", payload.merkle_residue),
-        payload_timestamp = format_args!("{:#010x}", payload.timestamp),
-        versions = %version_map.join(" "),
-        header_tail = %header_tails.join(" | "),
-        midstates = %midstates_hex.join(" | "),
-        headers = %header_full.join(" | "),
-        "BZM2 job fingerprint"
-    );
-
-    Ok(())
-}
-
 async fn send_task_to_all_engines<W>(
     chip_commands: &mut W,
     task: &HashTask,
@@ -1501,7 +1014,6 @@ where
     let target = task.template.bits.to_consensus().swap_bytes();
     let timestamp_reg_value = ((AUTO_CLOCK_UNGATE & 0x1) << 7) | (timestamp_count & 0x7f);
     let mut engine_assignments = Vec::with_capacity(WORK_ENGINE_COUNT);
-    let mut fingerprint_logged = false;
 
     for row in 0..ENGINE_ROWS {
         for col in 0..ENGINE_COLS {
@@ -1525,32 +1037,6 @@ where
                     "failed to derive per-engine payload for logical engine {logical_engine_id} (row {row} col {col}): {e}"
                 ))
             })?;
-            if !fingerprint_logged {
-                fingerprint_logged = true;
-                if let Err(e) = log_bzm2_job_fingerprint(
-                    &engine_task,
-                    merkle_root,
-                    versions,
-                    &payload,
-                    sequence_id,
-                    zeros_to_find,
-                    timestamp_count,
-                ) {
-                    warn!(error = %e, "Failed to emit BZM2 job fingerprint");
-                }
-            }
-            debug!(
-                logical_engine_id,
-                engine_hw_id = format_args!("{:#05x}", engine),
-                row,
-                column = col,
-                sequence_id,
-                extranonce2 = ?engine_task.en2,
-                data0 = format_args!("{:#010x}", payload.merkle_residue),
-                data1 = format_args!("{:#010x}", payload.timestamp),
-                data2 = format_args!("{:#010x}", target),
-                "BZM2 dispatch map"
-            );
 
             write_reg_u8(
                 chip_commands,
@@ -2210,33 +1696,7 @@ where
     let mut assigned_tasks: VecDeque<AssignedTask> =
         VecDeque::with_capacity(READRESULT_ASSIGNMENT_HISTORY_LIMIT);
     let mut next_sequence_id: u8 = 0;
-    let mut sanity_candidates_total: u64 = 0;
-    let mut sanity_candidates_meet_task: u64 = 0;
-    let mut sanity_best_difficulty: Option<Difficulty> = None;
-    let mut sanity_diagnostic_samples: u64 = 0;
-    let mut sequence_lookup_diagnostic_samples: u64 = 0;
     let mut zero_lz_diagnostic_samples: u64 = 0;
-    let replay_check_config = parse_replay_check_config_from_env();
-    let focused_readresult_config = parse_focused_readresult_config_from_env();
-    if let Some(cfg) = replay_check_config.as_ref() {
-        info!(
-            replay_job_id = ?cfg.job_id,
-            replay_en2 = %format_replay_en2_hex(cfg.en2_value, cfg.en2_size),
-            replay_ntime = format_args!("{:#010x}", cfg.ntime),
-            replay_nonce = format_args!("{:#010x}", cfg.nonce),
-            replay_version_bits = format_args!("{:#010x}", cfg.version_bits),
-            "BZM2 replay check configured"
-        );
-    }
-    if let Some(cfg) = focused_readresult_config.as_ref() {
-        info!(
-            trace_nonce = ?cfg.adjusted_nonce.map(|n| format!("{:#010x}", n)),
-            trace_raw_nonce = ?cfg.raw_nonce.map(|n| format!("{:#010x}", n)),
-            break_on_match = cfg.break_on_match,
-            "BZM2 focused READRESULT tracing configured"
-        );
-    }
-    let mut replay_check_hits: u64 = 0;
     let mut status_ticker = time::interval(Duration::from_secs(5));
     status_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -2256,6 +1716,16 @@ where
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     ThreadCommand::UpdateTask { new_task, response_tx } => {
+                        if let Some(ref old) = current_task {
+                            debug!(
+                                old_job = %old.template.id,
+                                new_job = %new_task.template.id,
+                                "Updating work"
+                            );
+                        } else {
+                            debug!(new_job = %new_task.template.id, "Updating work from idle");
+                        }
+
                         if !chip_initialized {
                             match initialize_chip(&mut chip_responses, &mut chip_commands, &mut peripherals, asic_count).await {
                                 Ok(ids) => {
@@ -2314,19 +1784,11 @@ where
                             nonce_minus_value: BZM2_NONCE_MINUS,
                         };
                         retain_assigned_task(&mut assigned_tasks, new_assigned_task);
-                        if let Some(cfg) = replay_check_config.as_ref()
-                            && let Some(assigned) = assigned_tasks.back()
-                            && log_replay_check_for_task(cfg, assigned)
-                        {
-                            replay_check_hits = replay_check_hits.saturating_add(1);
-                            trace!(replay_check_hits, "BZM2 replay check matched on update_task");
-                        }
 
                         debug!(
                             job_id = %new_task.template.id,
-                            sequence_id = next_sequence_id,
                             write_sequence_id,
-                            "Sent BZM2 WRITEJOB payloads for update_task"
+                            "Sent BZM2 work to chip"
                         );
                         next_sequence_id = next_sequence_id.wrapping_add(1);
 
@@ -2338,6 +1800,16 @@ where
                         let _ = response_tx.send(Ok(old_task));
                     }
                     ThreadCommand::ReplaceTask { new_task, response_tx } => {
+                        if let Some(ref old) = current_task {
+                            debug!(
+                                old_job = %old.template.id,
+                                new_job = %new_task.template.id,
+                                "Replacing work"
+                            );
+                        } else {
+                            debug!(new_job = %new_task.template.id, "Replacing work from idle");
+                        }
+
                         if !chip_initialized {
                             match initialize_chip(&mut chip_responses, &mut chip_commands, &mut peripherals, asic_count).await {
                                 Ok(ids) => {
@@ -2396,22 +1868,11 @@ where
                             nonce_minus_value: BZM2_NONCE_MINUS,
                         };
                         retain_assigned_task(&mut assigned_tasks, new_assigned_task);
-                        if let Some(cfg) = replay_check_config.as_ref()
-                            && let Some(assigned) = assigned_tasks.back()
-                            && log_replay_check_for_task(cfg, assigned)
-                        {
-                            replay_check_hits = replay_check_hits.saturating_add(1);
-                            trace!(
-                                replay_check_hits,
-                                "BZM2 replay check matched on replace_task"
-                            );
-                        }
 
                         debug!(
                             job_id = %new_task.template.id,
-                            sequence_id = next_sequence_id,
                             write_sequence_id,
-                            "Sent BZM2 WRITEJOB payloads for replace_task"
+                            "Sent BZM2 work to chip (old work invalidated)"
                         );
                         next_sequence_id = next_sequence_id.wrapping_add(1);
 
@@ -2423,6 +1884,8 @@ where
                         let _ = response_tx.send(Ok(old_task));
                     }
                     ThreadCommand::GoIdle { response_tx } => {
+                        debug!("Going idle");
+
                         let old_task = current_task.take();
                         assigned_tasks.clear();
                         {
@@ -2432,6 +1895,7 @@ where
                         let _ = response_tx.send(Ok(old_task));
                     }
                     ThreadCommand::Shutdown => {
+                        info!("Shutdown command received");
                         break;
                     }
                 }
@@ -2439,12 +1903,8 @@ where
 
             Some(result) = chip_responses.next() => {
                 match result {
-                    Ok(protocol::Response::Noop { asic_hw_id, signature }) => {
-                        trace!(asic_hw_id, signature = ?signature, "BZM2 NOOP response");
-                    }
-                    Ok(protocol::Response::ReadReg { asic_hw_id, data }) => {
-                        trace!(asic_hw_id, data = ?data, "BZM2 READREG response");
-                    }
+                    Ok(protocol::Response::Noop { .. }) => {}
+                    Ok(protocol::Response::ReadReg { .. }) => {}
                     Ok(protocol::Response::DtsVs { asic_hw_id, data }) => {
                         // Temporarily suppress noisy DTS/VS logging while debugging share flow.
                         let _ = (asic_hw_id, data);
@@ -2459,59 +1919,21 @@ where
                     }) => {
                         // status bit3 indicates a valid nonce candidate.
                         if (result_status & 0x8) == 0 {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                result_status,
-                                nonce,
-                                sequence,
-                                timecode,
-                                "Ignoring BZM2 READRESULT without valid-nonce flag"
-                            );
                             continue;
                         }
 
                         let row = engine_id & 0x3f;
                         let column = engine_id >> 6;
                         if row >= ENGINE_ROWS || column >= ENGINE_COLS {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                row,
-                                column,
-                                sequence,
-                                "Ignoring BZM2 READRESULT with unmapped engine coordinates"
-                            );
                             continue;
                         }
                         if is_invalid_engine(row, column) {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                row,
-                                column,
-                                sequence,
-                                "Ignoring BZM2 READRESULT from invalid engine coordinate"
-                            );
                             continue;
                         }
                         let Some(logical_engine_id) = logical_engine_index(row, column) else {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                row,
-                                column,
-                                sequence,
-                                "Ignoring BZM2 READRESULT with unmapped logical engine index"
-                            );
                             continue;
                         };
 
-                        let sequence_id_raw = sequence / (MIDSTATE_COUNT as u8);
-                        let sequence_masked = sequence & 0x7f;
-                        let sequence_id_masked = sequence_masked / (MIDSTATE_COUNT as u8);
-                        let micro_job_id_masked = sequence_masked % (MIDSTATE_COUNT as u8);
-                        let timecode_masked = timecode & 0x7f;
                         let Some(resolved_fields) =
                             resolve_readresult_fields(sequence, timecode, |slot| {
                                 assigned_tasks.iter().rev().any(|task| {
@@ -2519,59 +1941,10 @@ where
                                 })
                             })
                         else {
-                            if sequence_lookup_diagnostic_samples < SEQUENCE_LOOKUP_DIAGNOSTIC_LIMIT {
-                                sequence_lookup_diagnostic_samples =
-                                    sequence_lookup_diagnostic_samples.saturating_add(1);
-                                let masked_match = assigned_tasks
-                                    .iter()
-                                    .rev()
-                                    .find(|task| {
-                                        readresult_sequence_slot(task.sequence_id)
-                                            == sequence_id_masked
-                                    })
-                                    .map(|task| task.sequence_id);
-                                let recent_slots: Vec<u8> = assigned_tasks
-                                    .iter()
-                                    .rev()
-                                    .take(6)
-                                    .map(|task| readresult_sequence_slot(task.sequence_id))
-                                    .collect();
-                                let recent_sequence_ids: Vec<u8> = assigned_tasks
-                                    .iter()
-                                    .rev()
-                                    .take(6)
-                                    .map(|task| task.sequence_id)
-                                    .collect();
-                                debug!(
-                                    asic_hw_id,
-                                    engine_id,
-                                    sequence_raw = format_args!("{:#04x}", sequence),
-                                    sequence_id_raw,
-                                    sequence_masked = format_args!("{:#04x}", sequence_masked),
-                                    sequence_id_masked,
-                                    micro_job_id_masked,
-                                    timecode_raw = format_args!("{:#04x}", timecode),
-                                    timecode_masked = format_args!("{:#04x}", timecode_masked),
-                                    masked_lookup_hit = masked_match.is_some(),
-                                    masked_lookup_sequence_id = ?masked_match,
-                                    recent_slots = ?recent_slots,
-                                    recent_sequence_ids = ?recent_sequence_ids,
-                                    "BZM2 READRESULT lookup diagnostic"
-                                );
-                            }
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                sequence_id_raw,
-                                sequence,
-                                timecode,
-                                "Ignoring BZM2 READRESULT with no assigned task"
-                            );
                             continue;
                         };
                         let sequence_id = resolved_fields.sequence_id;
                         let micro_job_id = resolved_fields.micro_job_id;
-                        let sequence_effective = resolved_fields.sequence;
                         let timecode_effective = resolved_fields.timecode;
                         let sequence_slot = readresult_sequence_slot(sequence_id);
                         let slot_candidates: Vec<AssignedTask> = assigned_tasks
@@ -2582,14 +1955,6 @@ where
                             .collect();
                         let slot_candidate_count = slot_candidates.len();
                         if slot_candidate_count == 0 {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                sequence_id,
-                                sequence_raw = sequence,
-                                sequence_effective,
-                                "Ignoring BZM2 READRESULT with no assigned task after field resolution"
-                            );
                             continue;
                         }
 
@@ -2618,15 +1983,6 @@ where
                             let nonce_adjusted = nonce_raw.wrapping_sub(candidate.nonce_minus_value);
                             let nonce_submit = nonce_adjusted.swap_bytes();
 
-                            // Build a canonical header for logging/replay diagnostics.
-                            let header = BlockHeader {
-                                version: share_version,
-                                prev_blockhash: candidate.task.template.prev_blockhash,
-                                merkle_root: candidate.merkle_root,
-                                time: share_ntime,
-                                bits: candidate.task.template.bits,
-                                nonce: nonce_submit,
-                            };
                             let tail16 = bzm2_tail16_bytes(&candidate, share_ntime, nonce_submit);
                             let hash_bytes =
                                 bzm2_double_sha_from_midstate_and_tail(&selected_midstate, &tail16);
@@ -2637,13 +1993,7 @@ where
                                 &target_bytes,
                                 candidate.leading_zeros,
                             );
-                            let observed_leading_zeros =
-                                leading_zero_bits(&hash_bytes);
-                            let achieved_difficulty = Difficulty::from_hash(&hash);
-                            let target_difficulty =
-                                Difficulty::from_target(candidate.task.share_target);
-                            let achieved_difficulty_f64 = achieved_difficulty.as_f64();
-                            let target_difficulty_f64 = target_difficulty.as_f64();
+                            let observed_leading_zeros = leading_zero_bits(&hash_bytes);
                             let rank = match check_result {
                                 Bzm2CheckResult::Correct => 3,
                                 Bzm2CheckResult::NotMeetTarget => 2,
@@ -2655,22 +2005,14 @@ where
                                 selected_candidate = Some(SelectedReadResultCandidate {
                                     assigned: candidate,
                                     share_version,
-                                    selected_midstate,
                                     ntime_offset,
                                     share_ntime,
                                     nonce_adjusted,
                                     nonce_submit,
-                                    header,
-                                    tail16,
                                     hash_bytes,
                                     hash,
-                                    target_bytes,
                                     check_result,
                                     observed_leading_zeros,
-                                    achieved_difficulty,
-                                    target_difficulty,
-                                    achieved_difficulty_f64,
-                                    target_difficulty_f64,
                                 });
                                 if rank == 3 {
                                     break;
@@ -2681,123 +2023,18 @@ where
                         let Some(SelectedReadResultCandidate {
                             assigned,
                             share_version,
-                            selected_midstate,
                             ntime_offset,
                             share_ntime,
                             nonce_adjusted,
                             nonce_submit,
-                            header,
-                            tail16,
                             hash_bytes,
                             hash,
-                            target_bytes,
                             check_result,
                             observed_leading_zeros,
-                            achieved_difficulty,
-                            target_difficulty,
-                            achieved_difficulty_f64,
-                            target_difficulty_f64,
                         }) = selected_candidate
                         else {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                logical_engine_id,
-                                sequence_id,
-                                slot_candidate_count,
-                                "Ignoring BZM2 READRESULT without a usable retained assignment"
-                            );
                             continue;
                         };
-
-                        if slot_candidate_count > 1 {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                logical_engine_id,
-                                sequence_id,
-                                matched_sequence_id = assigned.sequence_id,
-                                slot_candidate_count,
-                                "BZM2 READRESULT evaluated retained slot history"
-                            );
-                        }
-
-                        if resolved_fields.used_masked_fields {
-                            trace!(
-                                asic_hw_id,
-                                engine_id,
-                                sequence_raw = format_args!("{:#04x}", sequence),
-                                sequence_effective = format_args!("{:#04x}", sequence_effective),
-                                timecode_raw = format_args!("{:#04x}", timecode),
-                                timecode_effective = format_args!("{:#04x}", timecode_effective),
-                                "BZM2 READRESULT using masked sequence/timecode fields"
-                            );
-                        }
-
-                        sanity_candidates_total = sanity_candidates_total.saturating_add(1);
-                        if sanity_best_difficulty
-                            .is_none_or(|best| achieved_difficulty > best)
-                        {
-                            sanity_best_difficulty = Some(achieved_difficulty);
-                        }
-
-                        if let Some(cfg) = focused_readresult_config.as_ref() {
-                            let adjusted_match =
-                                cfg.adjusted_nonce.is_none_or(|n| n == nonce_adjusted);
-                            let raw_match = cfg.raw_nonce.is_none_or(|n| n == nonce_raw);
-                            if adjusted_match && raw_match {
-                                let header_bytes = consensus::serialize(&header);
-                                let merkle_root_bytes = consensus::serialize(&assigned.merkle_root);
-                                let header_prefix: [u8; 64] = header_bytes[..64]
-                                    .try_into()
-                                    .expect("header prefix length is fixed");
-                                let derived_midstate = compute_midstate_le(&header_prefix);
-                                let mut hash_rev = hash_bytes;
-                                hash_rev.reverse();
-                                debug!(
-                                    asic_hw_id,
-                                    engine_hw_id = engine_id,
-                                    logical_engine_id,
-                                    sequence_raw = format_args!("{:#04x}", sequence),
-                                    sequence_effective = format_args!("{:#04x}", sequence_effective),
-                                    sequence_id,
-                                    micro_job_id,
-                                    timecode_raw = format_args!("{:#04x}", timecode),
-                                    timecode_effective = format_args!("{:#04x}", timecode_effective),
-                                    nonce_raw = format_args!("{:#010x}", nonce_raw),
-                                    nonce_adjusted = format_args!("{:#010x}", nonce_adjusted),
-                                    nonce_submit = format_args!("{:#010x}", nonce_submit),
-                                    nonce_minus_value = format_args!("{:#x}", assigned.nonce_minus_value),
-                                    ntime_offset,
-                                    ntime = format_args!("{:#010x}", share_ntime),
-                                    version = format_args!("{:#010x}", share_version.to_consensus() as u32),
-                                    bits = format_args!("{:#010x}", assigned.task.template.bits.to_consensus()),
-                                    extranonce2 = ?assigned.task.en2,
-                                    merkle_root = %HexBytes(&merkle_root_bytes),
-                                    midstate = %HexBytes(&selected_midstate),
-                                    derived_midstate = %HexBytes(&derived_midstate),
-                                    header = %HexBytes(&header_bytes),
-                                    tail16 = %HexBytes(&tail16),
-                                    hash_bzm2_order = %HexBytes(&hash_bytes),
-                                    hash_reversed = %HexBytes(&hash_rev),
-                                    hash_msb_bzm2 = format_args!("{:#04x}", hash_bytes[31]),
-                                    target = %HexBytes(&target_bytes),
-                                    check_result = ?check_result,
-                                    observed_leading_zeros_bits = observed_leading_zeros,
-                                    achieved_difficulty = %achieved_difficulty,
-                                    achieved_difficulty_f64 = format_args!("{:.3e}", achieved_difficulty_f64),
-                                    target_difficulty = %target_difficulty,
-                                    target_difficulty_f64 = format_args!("{:.3e}", target_difficulty_f64),
-                                    "BZM2 focused READRESULT trace"
-                                );
-                                if cfg.break_on_match {
-                                    panic!(
-                                        "BZM2 focused READRESULT breakpoint hit: engine_hw_id={:#x} logical_engine_id={} sequence={:#x} timecode={:#x} raw_nonce={:#010x} adjusted_nonce={:#010x}",
-                                        engine_id, logical_engine_id, sequence, timecode, nonce_raw, nonce_adjusted
-                                    );
-                                }
-                            }
-                        }
 
                         if check_result == Bzm2CheckResult::Error
                             && observed_leading_zeros == 0
@@ -2809,12 +2046,9 @@ where
                                 asic_hw_id,
                                 engine_hw_id = engine_id,
                                 logical_engine_id,
-                                sequence_raw = format_args!("{:#04x}", sequence),
-                                sequence_effective = format_args!("{:#04x}", sequence_effective),
                                 sequence_id,
                                 matched_sequence_id = assigned.sequence_id,
                                 micro_job_id,
-                                timecode_raw = format_args!("{:#04x}", timecode),
                                 timecode_effective = format_args!("{:#04x}", timecode_effective),
                                 slot_candidate_count,
                                 nonce_raw = format_args!("{:#010x}", nonce_raw),
@@ -2832,8 +2066,6 @@ where
                         }
 
                         if check_result == Bzm2CheckResult::Correct {
-                            sanity_candidates_meet_task =
-                                sanity_candidates_meet_task.saturating_add(1);
                             let share = Share {
                                 nonce: nonce_submit,
                                 hash,
@@ -2843,188 +2075,12 @@ where
                                 expected_work: assigned.task.share_target.to_work(),
                             };
 
-                            if assigned.task.share_tx.send(share).await.is_ok() {
+                            if assigned.task.share_tx.send(share).await.is_err() {
+                                debug!("Share channel closed (task replaced)");
+                            } else {
                                 let mut s = status.write().expect("status lock poisoned");
                                 s.chip_shares_found = s.chip_shares_found.saturating_add(1);
                             }
-
-                            trace!(
-                                asic_hw_id,
-                                engine_hw_id = engine_id,
-                                logical_engine_id,
-                                sequence_id,
-                                micro_job_id,
-                                nonce = format_args!("{:#010x}", nonce_submit),
-                                nonce_adjusted = format_args!("{:#010x}", nonce_adjusted),
-                                sequence,
-                                timecode,
-                                ntime_offset,
-                                expected_sequence_id = assigned.sequence_id,
-                                nonce_minus_value = format_args!("{:#x}", assigned.nonce_minus_value),
-                                observed_leading_zeros_bits = observed_leading_zeros,
-                                achieved_difficulty = %achieved_difficulty,
-                                achieved_difficulty_f64 = format_args!("{:.3e}", achieved_difficulty_f64),
-                                target_difficulty = %target_difficulty,
-                                target_difficulty_f64 = format_args!("{:.3e}", target_difficulty_f64),
-                                "BZM2 candidate met task share target"
-                            );
-                        } else if check_result == Bzm2CheckResult::NotMeetTarget {
-                            trace!(
-                                asic_hw_id,
-                                engine_hw_id = engine_id,
-                                logical_engine_id,
-                                sequence_id,
-                                micro_job_id,
-                                nonce = format_args!("{:#010x}", nonce_submit),
-                                nonce_adjusted = format_args!("{:#010x}", nonce_adjusted),
-                                sequence,
-                                timecode,
-                                ntime_offset,
-                                expected_sequence_id = assigned.sequence_id,
-                                nonce_minus_value = format_args!("{:#x}", assigned.nonce_minus_value),
-                                observed_leading_zeros_bits = observed_leading_zeros,
-                                achieved_difficulty = %achieved_difficulty,
-                                achieved_difficulty_f64 = format_args!("{:.3e}", achieved_difficulty_f64),
-                                target_difficulty = %target_difficulty,
-                                target_difficulty_f64 = format_args!("{:.3e}", target_difficulty_f64),
-                                "BZM2 nonce filtered by share target"
-                            );
-                        } else {
-                            if sanity_diagnostic_samples < SANITY_DIAGNOSTIC_LIMIT {
-                                sanity_diagnostic_samples = sanity_diagnostic_samples.saturating_add(1);
-
-                                let header_bytes = consensus::serialize(&header);
-                                let base_ntime = assigned.task.ntime;
-                                let mut probes = Vec::new();
-                                let focused = focused_readresult_diagnostic(
-                                    &assigned,
-                                    sequence,
-                                    timecode,
-                                    nonce_raw,
-                                );
-
-                                probes.push(format!(
-                                    "current({})",
-                                    validation_probe_summary(
-                                        &assigned,
-                                        share_version,
-                                        share_ntime,
-                                        nonce_submit,
-                                    )
-                                ));
-                                probes.push(format!(
-                                    "raw_nonce({})",
-                                    validation_probe_summary(&assigned, share_version, share_ntime, nonce_raw)
-                                ));
-                                for gap in [0x14u32, 0x28, 0x4c, 0x98] {
-                                    probes.push(format!(
-                                        "gap_{gap:#x}({})",
-                                        validation_probe_summary(
-                                            &assigned,
-                                            share_version,
-                                            share_ntime,
-                                            nonce_raw.wrapping_sub(gap).swap_bytes(),
-                                        )
-                                    ));
-                                }
-                                probes.push(format!(
-                                    "time_base({})",
-                                    validation_probe_summary(
-                                        &assigned,
-                                        share_version,
-                                        base_ntime,
-                                        nonce_submit,
-                                    )
-                                ));
-                                probes.push(format!(
-                                    "time_plus_tc({})",
-                                    validation_probe_summary(
-                                        &assigned,
-                                        share_version,
-                                        base_ntime.wrapping_add(u32::from(timecode)),
-                                        nonce_submit,
-                                    )
-                                ));
-                                probes.push(format!(
-                                    "time_minus_tc({})",
-                                    validation_probe_summary(
-                                        &assigned,
-                                        share_version,
-                                        base_ntime.wrapping_sub(u32::from(timecode)),
-                                        nonce_submit,
-                                    )
-                                ));
-                                for (alt_idx, alt_version) in
-                                    assigned.microjob_versions.iter().copied().enumerate()
-                                {
-                                    probes.push(format!(
-                                        "ver_mj{alt_idx}({})",
-                                        validation_probe_summary(
-                                            &assigned,
-                                            alt_version,
-                                            share_ntime,
-                                            nonce_submit,
-                                        )
-                                    ));
-                                }
-
-                                debug!(
-                                    asic_hw_id,
-                                    engine_id,
-                                    sequence_id,
-                                    micro_job_id,
-                                    sequence,
-                                    timecode,
-                                    result_status,
-                                    nonce_raw,
-                                    nonce_adjusted = format_args!("{:#010x}", nonce_adjusted),
-                                    nonce_submit = format_args!("{:#010x}", nonce_submit),
-                                    assigned_sequence_id = assigned.sequence_id,
-                                    assigned_timestamp_count = assigned.timestamp_count,
-                                    assigned_nonce_minus = format_args!("{:#x}", assigned.nonce_minus_value),
-                                    base_ntime = format_args!("{:#x}", base_ntime),
-                                    selected_ntime = format_args!("{:#x}", share_ntime),
-                                    selected_version = format_args!("{:#x}", share_version.to_consensus() as u32),
-                                    bits = format_args!("{:#x}", assigned.task.template.bits.to_consensus()),
-                                    header = %HexBytes(&header_bytes),
-                                    focused = %focused,
-                                    probes = %probes.join(" | "),
-                                    "BZM2 READRESULT sanity diagnostic"
-                                );
-                            }
-
-                            trace!(
-                                asic_hw_id,
-                                engine_hw_id = engine_id,
-                                logical_engine_id,
-                                sequence_id,
-                                micro_job_id,
-                                nonce = format_args!("{:#010x}", nonce_submit),
-                                nonce_adjusted = format_args!("{:#010x}", nonce_adjusted),
-                                sequence,
-                                timecode,
-                                ntime_offset,
-                                expected_sequence_id = assigned.sequence_id,
-                                nonce_minus_value = format_args!("{:#x}", assigned.nonce_minus_value),
-                                observed_leading_zeros_bits = observed_leading_zeros,
-                                hash_msb = format_args!("{:#04x}", hash_bytes[31]),
-                                "BZM2 nonce rejected by leading-zeros sanity check"
-                            );
-                        }
-
-                        if sanity_candidates_total.is_multiple_of(500) {
-                            debug!(
-                                total_candidates = sanity_candidates_total,
-                                candidates_meeting_task_target = sanity_candidates_meet_task,
-                                best_achieved_difficulty = %sanity_best_difficulty
-                                    .expect("sanity_best_difficulty is set when total_candidates > 0"),
-                                best_achieved_difficulty_f64 = format_args!("{:.3e}", sanity_best_difficulty
-                                    .expect("sanity_best_difficulty is set when total_candidates > 0")
-                                    .as_f64()),
-                                current_target_difficulty = %target_difficulty,
-                                current_target_difficulty_f64 = format_args!("{:.3e}", target_difficulty_f64),
-                                "BZM2 candidate sanity summary"
-                            );
                         }
                     }
                     Err(e) => {
@@ -3039,6 +2095,8 @@ where
             }
         }
     }
+
+    debug!("BZM2 thread actor exiting");
 }
 
 #[cfg(test)]
