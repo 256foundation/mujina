@@ -16,6 +16,7 @@ use crate::{
     transport::{
         TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
         usb::TransportEvent as UsbTransportEvent,
+        virtual_device::TransportEvent as VirtualTransportEvent,
     },
 };
 
@@ -80,6 +81,9 @@ impl Backplane {
                 }
                 TransportEvent::Cpu(cpu_event) => {
                     self.handle_cpu_event(cpu_event).await?;
+                }
+                TransportEvent::Virtual(virtual_event) => {
+                    self.handle_virtual_event(virtual_event).await?;
                 }
             }
         }
@@ -322,6 +326,102 @@ impl Backplane {
                                 "Failed to shutdown CPU miner"
                             );
                         }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle generic virtual device transport events.
+    async fn handle_virtual_event(&mut self, event: VirtualTransportEvent) -> Result<()> {
+        match event {
+            VirtualTransportEvent::VirtualDeviceConnected(device_info) => {
+                let Some(descriptor) = self.virtual_registry.find(&device_info.device_type) else {
+                    error!(
+                        device_type = %device_info.device_type,
+                        "No virtual board descriptor found"
+                    );
+                    return Ok(());
+                };
+
+                info!(
+                    board = descriptor.name,
+                    device_type = %device_info.device_type,
+                    device_id = %device_info.device_id,
+                    "Virtual board connected."
+                );
+
+                let (mut board, registration) = match (descriptor.create_fn)().await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        error!(
+                            board = descriptor.name,
+                            error = %e,
+                            "Failed to create virtual board"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let board_info = board.board_info();
+                let board_id = device_info.device_id.clone();
+
+                if let Err(e) = self.board_reg_tx.send(registration).await {
+                    error!(
+                        board = %board_info.model,
+                        error = %e,
+                        "Failed to register board with API server"
+                    );
+                }
+
+                match board.create_hash_threads().await {
+                    Ok(threads) => {
+                        let thread_count = threads.len();
+                        self.boards.insert(board_id.clone(), board);
+
+                        for thread in threads {
+                            if let Err(e) = self.scheduler_tx.send(thread).await {
+                                error!(
+                                    board = %board_info.model,
+                                    error = %e,
+                                    "Failed to send thread to scheduler"
+                                );
+                                break;
+                            }
+                        }
+
+                        info!(
+                            board = %board_info.model,
+                            device_id = %board_id,
+                            threads = thread_count,
+                            "Virtual board started."
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            board = %board_info.model,
+                            device_id = %board_id,
+                            error = %e,
+                            "Virtual board failed to start."
+                        );
+                    }
+                }
+            }
+            VirtualTransportEvent::VirtualDeviceDisconnected { device_id } => {
+                if let Some(mut board) = self.boards.remove(&device_id) {
+                    let model = board.board_info().model;
+                    debug!(board = %model, id = %device_id, "Shutting down virtual board");
+
+                    match board.shutdown().await {
+                        Ok(()) => info!(board = %model, id = %device_id, "Virtual board disconnected"),
+                        Err(e) => error!(
+                            board = %model,
+                            id = %device_id,
+                            error = %e,
+                            "Failed to shutdown virtual board"
+                        ),
                     }
                 }
             }
