@@ -6,6 +6,7 @@ This guide documents the direct BZM2 UART and silicon-validation interface added
 
 The current CLI folds in the portable parts of the legacy `silicon validation` BZM2 validation surface:
 
+- chain enumeration and `ASIC_ID` assignment from the default bus id
 - ASIC discovery and liveness scans
 - loopback data-path validation
 - explicit TDM enable and disable control
@@ -71,6 +72,17 @@ Run a NOOP sanity check across an ASIC range:
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   noop-scan /dev/ttyUSB0 0 15 5000000
 ```
+
+Enumerate a powered chain from the default `ASIC_ID` (`0xFA`) and assign
+incrementing ids starting at `0`:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  enumerate-chain /dev/ttyUSB0 32 0 5000000
+```
+
+This is the first generic bring-up step for a fresh chain where every ASIC is
+still on the default id.
 
 Run deterministic loopback validation across an ASIC range:
 
