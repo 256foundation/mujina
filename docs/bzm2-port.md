@@ -45,6 +45,8 @@ The BZM2 Mujina thread now reimplements the core legacy data path and the genera
 - reusable TPS546 PMBus rail control through `VoltageRegulator`
 - reusable multi-rail bring-up and shutdown sequencing for single-rail, small-stack, and larger multi-stack designs
 - UART-register-based PLL diagnostic/control flow for divider programming, enable/disable, lock polling, and readback
+- UART-register-based DLL diagnostic/control flow for duty-cycle programming, enable/disable, lock polling, and fincon validation
+- developer-facing UART debug CLI documented in [bzm2-uart-debug.md](C:/Users/prael/Documents/Codex/bzm2_mujina/docs/bzm2-uart-debug.md) with unicast, multicast, and broadcast examples
 
 ## Configuration
 

@@ -513,20 +513,39 @@ mod tests {
         match &parsed[0] {
             TdmFrame::DtsVs(TdmDtsVsFrame::Gen2(frame)) => {
                 assert_eq!(frame.asic, 0x02);
-                assert_eq!(frame.thermal_tune_code, 0x05AB);
+                assert_eq!(frame.thermal_tune_code, 0x07A9);
                 assert!(frame.thermal_trip_status);
-                assert!(!frame.thermal_fault);
+                assert!(frame.thermal_fault);
                 assert!(frame.thermal_validity);
                 assert!(frame.thermal_enabled);
-                assert_eq!(frame.ch0_voltage, 0x1234);
-                assert!(frame.voltage_shutdown_status);
-                assert!(!frame.voltage_enabled);
-                assert_eq!(frame.ch1_voltage, 0x1159);
-                assert_eq!(frame.ch2_voltage, 0x1E56);
+                assert_eq!(frame.ch0_voltage, 0x1645);
+                assert!(!frame.voltage_shutdown_status);
+                assert!(frame.voltage_enabled);
+                assert_eq!(frame.ch1_voltage, 0x04B4);
+                assert_eq!(frame.ch2_voltage, 0x16AC);
                 assert!(frame.voltage_fault);
-                assert!(frame.dll0_lock);
+                assert!(!frame.dll0_lock);
                 assert!(frame.dll1_lock);
                 assert!(frame.pll_lock);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_decodes_gen1_dts_vs() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen1);
+        let raw = [0x02, OPCODE_UART_DTS_VS, 0x91, 0xab, 0xcd, 0x45];
+        let parsed = parser.push(&raw);
+        assert_eq!(parsed.len(), 1);
+        match &parsed[0] {
+            TdmFrame::DtsVs(TdmDtsVsFrame::Gen1(frame)) => {
+                assert_eq!(frame.asic, 0x02);
+                assert_eq!(frame.voltage, 0x545);
+                assert!(frame.voltage_enabled);
+                assert_eq!(frame.thermal_tune_code, 0xab);
+                assert!(!frame.thermal_validity);
+                assert!(frame.thermal_enabled);
             }
             other => panic!("unexpected frame: {other:?}"),
         }
@@ -554,7 +573,27 @@ mod tests {
             TdmFrame::Register(frame) => assert_eq!(frame.data, vec![0x78, 0x56, 0x34, 0x12]),
             other => panic!("unexpected frame: {other:?}"),
         }
-        match parsed[1] {
+        match &parsed[1] {
+            TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_resyncs_after_unknown_prefix_and_partial_frames() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen2);
+        parser.expect_read_register_bytes(0x03, 4);
+
+        let first = parser.push(&[0xfe, 0xaa, 0x03, OPCODE_UART_READREG, 0x78, 0x56]);
+        assert!(first.is_empty());
+
+        let second = parser.push(&[0x34, 0x12, 0x01, OPCODE_UART_NOOP, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(second.len(), 2);
+        match &second[0] {
+            TdmFrame::Register(frame) => assert_eq!(frame.data, vec![0x78, 0x56, 0x34, 0x12]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        match &second[1] {
             TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
             other => panic!("unexpected frame: {other:?}"),
         }
