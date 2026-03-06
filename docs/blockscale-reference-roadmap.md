@@ -99,6 +99,13 @@ Deliverables:
 3. Apply safe startup and shutdown sequencing through the board runtime
 4. Expose rail telemetry into board state where available
 
+Status:
+
+- completed: `Bzm2BringupPlan` is now wired into `Bzm2Board` startup and
+  shutdown through generic file-backed rail and reset adapters
+- next: map planned domain voltages and richer rail telemetry onto those
+  startup/shutdown hooks
+
 Exit criteria:
 
 - board startup can perform reset and rail sequencing without external manual

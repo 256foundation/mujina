@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::fs;
 use tokio::time::sleep;
 
 use crate::{
@@ -110,6 +111,55 @@ impl<PIN> GpioResetLine<PIN> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FileGpioPin {
+    path: String,
+    high_value: String,
+    low_value: String,
+}
+
+impl FileGpioPin {
+    pub fn new(
+        path: impl Into<String>,
+        high_value: impl Into<String>,
+        low_value: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            high_value: high_value.into(),
+            low_value: low_value.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl GpioPin for FileGpioPin {
+    async fn set_mode(
+        &mut self,
+        _mode: crate::hw_trait::gpio::PinMode,
+    ) -> crate::hw_trait::Result<()> {
+        Ok(())
+    }
+
+    async fn write(&mut self, value: PinValue) -> crate::hw_trait::Result<()> {
+        let raw = match value {
+            PinValue::Low => &self.low_value,
+            PinValue::High => &self.high_value,
+        };
+        fs::write(&self.path, raw).await?;
+        Ok(())
+    }
+
+    async fn read(&mut self) -> crate::hw_trait::Result<PinValue> {
+        let raw = fs::read_to_string(&self.path).await?;
+        if raw.trim() == self.high_value.trim() {
+            Ok(PinValue::High)
+        } else {
+            Ok(PinValue::Low)
+        }
+    }
+}
+
 #[async_trait]
 impl<PIN: GpioPin> AsicEnable for GpioResetLine<PIN> {
     async fn enable(&mut self) -> Result<()> {
@@ -135,6 +185,68 @@ pub struct Bzm2BringupPlan {
     pub post_power_delay: Duration,
     pub release_reset_delay: Duration,
     pub steps: Vec<VoltageStackStep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilePowerRail {
+    set_path: String,
+    write_scale: f32,
+    enable_path: Option<String>,
+    enable_value: Option<String>,
+}
+
+impl FilePowerRail {
+    pub fn new(path: impl Into<String>, write_scale: f32) -> Self {
+        Self {
+            set_path: path.into(),
+            write_scale,
+            enable_path: None,
+            enable_value: None,
+        }
+    }
+
+    pub fn with_enable(
+        mut self,
+        enable_path: impl Into<String>,
+        enable_value: impl Into<String>,
+    ) -> Self {
+        self.enable_path = Some(enable_path.into());
+        self.enable_value = Some(enable_value.into());
+        self
+    }
+
+    fn encode_voltage(&self, volts: f32) -> String {
+        if (self.write_scale - 1.0).abs() < f32::EPSILON {
+            format!("{volts:.6}")
+        } else {
+            format!("{}", (volts * self.write_scale).round() as i64)
+        }
+    }
+}
+
+#[async_trait]
+impl Bzm2PowerRail for FilePowerRail {
+    async fn initialize(&mut self) -> Result<()> {
+        if let (Some(path), Some(value)) = (&self.enable_path, &self.enable_value) {
+            fs::write(path, value).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_voltage(&mut self, volts: f32) -> Result<()> {
+        fs::write(&self.set_path, self.encode_voltage(volts)).await?;
+        Ok(())
+    }
+
+    async fn telemetry(&mut self) -> Result<PowerRailTelemetry> {
+        Ok(PowerRailTelemetry {
+            vin_volts: 0.0,
+            vout_volts: 0.0,
+            current_amps: 0.0,
+            temperature_c: 0.0,
+            power_watts: 0.0,
+        })
+    }
 }
 
 impl Default for Bzm2BringupPlan {
