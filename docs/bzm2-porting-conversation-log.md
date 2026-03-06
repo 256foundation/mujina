@@ -606,6 +606,28 @@ This document captures the working session that produced the BZM2 Mujina port. I
     - successful startup enumeration
     - fallback to configured counts when default-id discovery is unavailable
 
+## 24. Phase 2 Board Bring-Up Wiring
+
+### Assistant
+- Began Phase 2 by wiring the existing generic bring-up and shutdown plan into
+  the live board lifecycle instead of leaving it as library-only code.
+- Added generic file-backed rail and reset adapters so `Bzm2Board` can apply:
+  - pre-power reset assertion
+  - rail initialization and setpoint writes
+  - reset release after rail sequencing
+  - reverse-order shutdown that reasserts reset and drives rails back to `0`
+- Kept the integration generic rather than binding it to one carrier board:
+  - rail-control paths are configured from environment variables
+  - optional enable/control files can be paired with each rail
+  - reset is expressed as an optional file-backed line
+- Added a board-lifecycle regression test that drives:
+  - `create_hash_threads()` through the new bring-up path
+  - `shutdown()` through the new power-down path
+  - and verifies the expected rail, enable, and reset file outputs
+- Hardened an existing BZM2 fanout test so it reads the full PTY stream instead
+  of assuming one read call returns the entire dispatch burst under parallel
+  test load
+
 ## Current State At End Of This Log
 
 - The BZM2 Mujina port exists as a native Rust implementation integrated into Mujina.
@@ -622,6 +644,7 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - silicon-validation helpers adapted from the legacy silicon validation stack
   - passive and on-demand ASIC DTS/VS telemetry through both board API and debug tooling
   - opt-in startup chain enumeration for `Bzm2Board`
+  - board-level bring-up and shutdown sequencing through generic file-backed rails and reset control
   - formal ASIC integration and UART/TDM reference documentation for generic hardware developers
 - The largest remaining work is now in generic bring-up, topology discovery, applied voltage-domain control, and closed-loop runtime tuning.
 - The naming refactor reduced direct legacy copy-signaling in the PnP/tuning layer while preserving compatibility.

@@ -14,11 +14,12 @@ use crate::{
     api_client::types::{BoardState, Fan, PowerMeasurement, TemperatureSensor, ThreadState},
     asic::{
         bzm2::{
-            Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput,
+            Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput, Bzm2BringupPlan,
             Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
             Bzm2ClockController, Bzm2DomainMeasurement, Bzm2OperatingClass, Bzm2PerformanceMode,
             Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle,
-            Bzm2UartController, Bzm2VoltageDomain,
+            Bzm2UartController, Bzm2VoltageDomain, FileGpioPin, FilePowerRail, GpioResetLine,
+            VoltageStackStep,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -45,6 +46,9 @@ const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
 const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
 const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
+const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
+const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
+const DEFAULT_BRINGUP_RELEASE_RESET_MS: u64 = 25;
 
 #[derive(Debug, Clone)]
 pub struct Bzm2VirtualDeviceConfig {
@@ -58,6 +62,7 @@ pub struct Bzm2VirtualDeviceConfig {
     pub telemetry: Bzm2TelemetryConfig,
     pub calibration: Bzm2CalibrationConfig,
     pub enumeration: Bzm2EnumerationConfig,
+    pub bringup: Bzm2BringupConfig,
 }
 
 impl Bzm2VirtualDeviceConfig {
@@ -104,6 +109,7 @@ impl Bzm2VirtualDeviceConfig {
             .and_then(crate::asic::bzm2::protocol::DtsVsGeneration::from_env_value)
             .unwrap_or(crate::asic::bzm2::protocol::DtsVsGeneration::Gen2);
         let calibration = Bzm2CalibrationConfig::from_env(serial_paths.len());
+        let bringup = Bzm2BringupConfig::from_env();
 
         Some(Self {
             serial_paths: serial_paths.clone(),
@@ -115,6 +121,7 @@ impl Bzm2VirtualDeviceConfig {
             dts_vs_generation,
             telemetry: Bzm2TelemetryConfig::from_env(),
             enumeration: Bzm2EnumerationConfig::from_env(serial_paths.len(), &calibration),
+            bringup,
             calibration,
         })
     }
@@ -179,6 +186,182 @@ impl Bzm2EnumerationConfig {
                 .unwrap_or(0),
             max_asics_per_bus,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2BringupConfig {
+    pub enabled: bool,
+    pub rail_set_paths: Vec<String>,
+    pub rail_write_scales: Vec<f32>,
+    pub rail_enable_paths: Vec<String>,
+    pub rail_enable_values: Vec<String>,
+    pub reset_path: Option<String>,
+    pub reset_active_low: bool,
+    pub plan: Bzm2BringupPlan,
+}
+
+impl Default for Bzm2BringupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rail_set_paths: Vec::new(),
+            rail_write_scales: Vec::new(),
+            rail_enable_paths: Vec::new(),
+            rail_enable_values: Vec::new(),
+            reset_path: None,
+            reset_active_low: true,
+            plan: Bzm2BringupPlan {
+                pre_power_delay: Duration::from_millis(DEFAULT_BRINGUP_PRE_POWER_MS),
+                post_power_delay: Duration::from_millis(DEFAULT_BRINGUP_POST_POWER_MS),
+                release_reset_delay: Duration::from_millis(DEFAULT_BRINGUP_RELEASE_RESET_MS),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl Bzm2BringupConfig {
+    fn from_env() -> Self {
+        let rail_set_paths = env_var_any(&[
+            "MUJINA_BZM2_RAIL_SET_PATHS",
+            "MUJINA_BZM2_BRINGUP_RAIL_SET_PATHS",
+        ])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        let rail_target_volts = parse_csv_numbers::<f32>("MUJINA_BZM2_RAIL_TARGET_VOLTS")
+            .or_else(|| parse_csv_numbers::<f32>("MUJINA_BZM2_BRINGUP_RAIL_TARGET_VOLTS"))
+            .unwrap_or_default();
+        let rail_write_scales = parse_csv_numbers::<f32>("MUJINA_BZM2_RAIL_WRITE_SCALES")
+            .or_else(|| parse_csv_numbers::<f32>("MUJINA_BZM2_BRINGUP_RAIL_WRITE_SCALES"))
+            .unwrap_or_default();
+        let rail_enable_paths = env_var_any(&[
+            "MUJINA_BZM2_RAIL_ENABLE_PATHS",
+            "MUJINA_BZM2_BRINGUP_RAIL_ENABLE_PATHS",
+        ])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        let rail_enable_values = env_var_any(&[
+            "MUJINA_BZM2_RAIL_ENABLE_VALUES",
+            "MUJINA_BZM2_BRINGUP_RAIL_ENABLE_VALUES",
+        ])
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        let reset_path = env_var_any(&["MUJINA_BZM2_RESET_PATH", "MUJINA_BZM2_BRINGUP_RESET_PATH"]);
+        let enabled = env_flag_any(&["MUJINA_BZM2_ENABLE_BRINGUP", "MUJINA_BZM2_BRINGUP_ENABLE"])
+            || !rail_set_paths.is_empty()
+            || reset_path.is_some();
+
+        let mut plan = Bzm2BringupPlan {
+            assert_reset_before_power: env_flag_default_any(
+                &["MUJINA_BZM2_ASSERT_RESET_BEFORE_POWER"],
+                true,
+            ),
+            pre_power_delay: Duration::from_millis(
+                env::var("MUJINA_BZM2_BRINGUP_PRE_POWER_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_BRINGUP_PRE_POWER_MS),
+            ),
+            post_power_delay: Duration::from_millis(
+                env::var("MUJINA_BZM2_BRINGUP_POST_POWER_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_BRINGUP_POST_POWER_MS),
+            ),
+            release_reset_delay: Duration::from_millis(
+                env::var("MUJINA_BZM2_BRINGUP_RELEASE_RESET_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_BRINGUP_RELEASE_RESET_MS),
+            ),
+            ..Default::default()
+        };
+        plan.steps = rail_set_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                rail_target_volts
+                    .get(index)
+                    .or_else(|| rail_target_volts.last())
+                    .copied()
+                    .map(|voltage| VoltageStackStep {
+                        rail_index: index,
+                        voltage,
+                        settle_for: Duration::ZERO,
+                    })
+            })
+            .collect();
+
+        Self {
+            enabled,
+            rail_set_paths,
+            rail_write_scales,
+            rail_enable_paths,
+            rail_enable_values,
+            reset_path,
+            reset_active_low: env_flag_default_any(&["MUJINA_BZM2_RESET_ACTIVE_LOW"], true),
+            plan,
+        }
+    }
+
+    fn build_rails(&self) -> Vec<FilePowerRail> {
+        self.rail_set_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let write_scale = *self
+                    .rail_write_scales
+                    .get(index)
+                    .or_else(|| self.rail_write_scales.last())
+                    .unwrap_or(&1.0);
+                let mut rail = FilePowerRail::new(path.clone(), write_scale);
+                if let Some(enable_path) = self
+                    .rail_enable_paths
+                    .get(index)
+                    .or_else(|| self.rail_enable_paths.last())
+                {
+                    let enable_value = self
+                        .rail_enable_values
+                        .get(index)
+                        .or_else(|| self.rail_enable_values.last())
+                        .cloned()
+                        .unwrap_or_else(|| "1".into());
+                    rail = rail.with_enable(enable_path.clone(), enable_value);
+                }
+                rail
+            })
+            .collect()
+    }
+
+    fn build_reset_line(&self) -> Option<GpioResetLine<FileGpioPin>> {
+        self.reset_path.as_ref().map(|path| {
+            GpioResetLine::new(
+                FileGpioPin::new(path.clone(), "1", "0"),
+                self.reset_active_low,
+            )
+        })
     }
 }
 
@@ -593,6 +776,7 @@ struct Bzm2LoadedCalibrationProfile {
 
 pub struct Bzm2Board {
     config: Bzm2VirtualDeviceConfig,
+    bringup_applied: bool,
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
     state_tx: watch::Sender<BoardState>,
@@ -611,6 +795,7 @@ impl Bzm2Board {
     ) -> Self {
         Self {
             config,
+            bringup_applied: false,
             shutdown_handles: Vec::new(),
             serial_controls: Vec::new(),
             state_tx,
@@ -620,6 +805,44 @@ impl Bzm2Board {
             command_shutdown: None,
             command_task: None,
         }
+    }
+
+    async fn apply_bringup_sequence(&mut self) -> Result<(), BoardError> {
+        if self.bringup_applied || !self.config.bringup.enabled {
+            return Ok(());
+        }
+
+        let mut rails = self.config.bringup.build_rails();
+        let mut reset_line = self.config.bringup.build_reset_line();
+        self.config
+            .bringup
+            .plan
+            .apply(&mut rails, reset_line.as_mut())
+            .await
+            .map_err(|err| {
+                BoardError::InitializationFailed(format!("BZM2 bring-up sequence failed: {err}"))
+            })?;
+        self.bringup_applied = true;
+        Ok(())
+    }
+
+    async fn apply_shutdown_sequence(&mut self) -> Result<(), BoardError> {
+        if !self.bringup_applied || !self.config.bringup.enabled {
+            return Ok(());
+        }
+
+        let mut rails = self.config.bringup.build_rails();
+        let mut reset_line = self.config.bringup.build_reset_line();
+        self.config
+            .bringup
+            .plan
+            .shutdown(&mut rails, reset_line.as_mut())
+            .await
+            .map_err(|err| {
+                BoardError::HardwareControl(format!("BZM2 shutdown sequence failed: {err}"))
+            })?;
+        self.bringup_applied = false;
+        Ok(())
     }
 
     fn spawn_monitor(&mut self) {
@@ -1115,12 +1338,14 @@ impl Board for Bzm2Board {
                 thread.hashrate = 0;
             }
         });
+        self.apply_shutdown_sequence().await?;
         Ok(())
     }
 
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
+        self.apply_bringup_sequence().await?;
         let bus_layouts = self.resolve_bus_layouts().await?;
         let initial_snapshot = self.config.telemetry.snapshot();
         let _ = self.state_tx.send_modify(|state| {
@@ -1814,6 +2039,7 @@ mod tests {
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig::default(),
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 asics_per_bus: vec![2],
@@ -1887,6 +2113,7 @@ mod tests {
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig::default(),
             calibration: Bzm2CalibrationConfig {
                 enabled: true,
                 apply_saved_operating_point: true,
@@ -1947,6 +2174,7 @@ mod tests {
                 start_id: 0,
                 max_asics_per_bus: vec![4],
             },
+            bringup: Bzm2BringupConfig::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (state_tx, _state_rx) = watch::channel(BoardState {
@@ -2002,6 +2230,7 @@ mod tests {
                 start_id: 0,
                 max_asics_per_bus: vec![4],
             },
+            bringup: Bzm2BringupConfig::default(),
             calibration: Bzm2CalibrationConfig {
                 asics_per_bus: vec![3],
                 ..Default::default()
@@ -2020,6 +2249,98 @@ mod tests {
         assert_eq!(layouts[0].asic_count, 3);
 
         emulator.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_hash_threads_applies_bringup_and_shutdown_sequences() {
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rail0_path = std::env::temp_dir().join(format!("bzm2-rail0-{unique}.txt"));
+        let rail1_path = std::env::temp_dir().join(format!("bzm2-rail1-{unique}.txt"));
+        let enable0_path = std::env::temp_dir().join(format!("bzm2-enable0-{unique}.txt"));
+        let enable1_path = std::env::temp_dir().join(format!("bzm2-enable1-{unique}.txt"));
+        let reset_path = std::env::temp_dir().join(format!("bzm2-reset-{unique}.txt"));
+
+        let config = Bzm2VirtualDeviceConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig {
+                enabled: true,
+                rail_set_paths: vec![
+                    rail0_path.to_string_lossy().into_owned(),
+                    rail1_path.to_string_lossy().into_owned(),
+                ],
+                rail_write_scales: vec![1000.0, 1000.0],
+                rail_enable_paths: vec![
+                    enable0_path.to_string_lossy().into_owned(),
+                    enable1_path.to_string_lossy().into_owned(),
+                ],
+                rail_enable_values: vec!["EN".into(), "ON".into()],
+                reset_path: Some(reset_path.to_string_lossy().into_owned()),
+                reset_active_low: true,
+                plan: Bzm2BringupPlan {
+                    pre_power_delay: Duration::ZERO,
+                    post_power_delay: Duration::ZERO,
+                    release_reset_delay: Duration::ZERO,
+                    steps: vec![
+                        VoltageStackStep {
+                            rail_index: 0,
+                            voltage: 1.1,
+                            settle_for: Duration::ZERO,
+                        },
+                        VoltageStackStep {
+                            rail_index: 1,
+                            voltage: 1.25,
+                            settle_for: Duration::ZERO,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            },
+            calibration: Bzm2CalibrationConfig::default(),
+        };
+        let (state_tx, _state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
+
+        let _threads = board.create_hash_threads().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&rail0_path).unwrap(), "1100");
+        assert_eq!(fs::read_to_string(&rail1_path).unwrap(), "1250");
+        assert_eq!(fs::read_to_string(&enable0_path).unwrap(), "EN");
+        assert_eq!(fs::read_to_string(&enable1_path).unwrap(), "ON");
+        assert_eq!(fs::read_to_string(&reset_path).unwrap(), "1");
+
+        board.shutdown().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&rail0_path).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&rail1_path).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&reset_path).unwrap(), "0");
+
+        let _ = fs::remove_file(rail0_path);
+        let _ = fs::remove_file(rail1_path);
+        let _ = fs::remove_file(enable0_path);
+        let _ = fs::remove_file(enable1_path);
+        let _ = fs::remove_file(reset_path);
+        drop(pty);
     }
 
     #[tokio::test]
@@ -2058,6 +2379,7 @@ mod tests {
                 ..Default::default()
             },
             enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (state_tx, mut state_rx) = watch::channel(BoardState {
