@@ -75,6 +75,29 @@ pub struct HashThreadStatus {
     pub is_active: bool,
 }
 
+/// Temperature reading reported by a hash thread.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashThreadTemperatureReading {
+    pub name: String,
+    pub temperature_c: Option<f32>,
+}
+
+/// Voltage/current/power reading reported by a hash thread.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashThreadPowerReading {
+    pub name: String,
+    pub voltage_v: Option<f32>,
+    pub current_a: Option<f32>,
+    pub power_w: Option<f32>,
+}
+
+/// Telemetry update reported by a hash thread.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HashThreadTelemetryUpdate {
+    pub temperatures: Vec<HashThreadTemperatureReading>,
+    pub powers: Vec<HashThreadPowerReading>,
+}
+
 /// Events emitted by HashThreads back to the scheduler.
 ///
 /// When a thread shuts down (USB unplug, fault, user request, etc.), it closes
@@ -100,8 +123,35 @@ pub enum HashThreadEvent {
 
     /// Periodic status update
     StatusUpdate(HashThreadStatus),
+
+    /// Additional telemetry update
+    TelemetryUpdate(HashThreadTelemetryUpdate),
 }
 
+/// Error types for HashThread operations.
+#[derive(Debug, thiserror::Error)]
+pub enum HashThreadError {
+    #[error("Thread has been shut down")]
+    ThreadOffline,
+
+    #[error("Channel closed: {0}")]
+    ChannelClosed(String),
+
+    #[error("Work assignment failed: {0}")]
+    WorkAssignmentFailed(String),
+
+    #[error("Preemption failed: {0}")]
+    PreemptionFailed(String),
+
+    #[error("Telemetry query failed: {0}")]
+    TelemetryQueryFailed(String),
+
+    #[error("Shutdown timeout")]
+    ShutdownTimeout,
+
+    #[error("Chip initialization failed: {0}")]
+    InitializationFailed(String),
+}
 // ---------------------------------------------------------------------------
 // Hardware abstraction traits for hash threads
 // ---------------------------------------------------------------------------

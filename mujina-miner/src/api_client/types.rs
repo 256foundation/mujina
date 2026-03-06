@@ -88,6 +88,15 @@ pub struct SetFanTargetRequest {
     pub target_percent: Option<u8>,
 }
 
+/// Request body for an explicit BZM2 ASIC DTS/VS query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DtsVsQueryRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
 /// Job source status.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceState {

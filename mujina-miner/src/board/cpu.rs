@@ -95,7 +95,10 @@ async fn create_cpu_board() -> Result<(Box<dyn Board + Send>, super::BoardRegist
     let (state_tx, state_rx) = watch::channel(initial_state);
 
     let board = CpuBoard::new(config, state_tx);
-    let registration = super::BoardRegistration { state_rx };
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: None,
+    };
     Ok((Box::new(board), registration))
 }
 
