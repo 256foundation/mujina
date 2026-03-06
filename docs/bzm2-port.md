@@ -63,6 +63,23 @@ Supported environment variables:
 - `MUJINA_BZM2_DISPATCH_MS`: redispatch interval in milliseconds, default `500`
 - `MUJINA_BZM2_HASHRATE_THS`: nominal per-thread hashrate estimate, default `40`
 - `MUJINA_BZM2_DTS_VS_GEN`: DTS/VS payload generation, `1` or `2`, default `2`
+- `MUJINA_BZM2_ENUMERATE_CHAIN`: enable startup chain enumeration from the
+  documented default `ASIC_ID`
+- `MUJINA_BZM2_AUTO_ENUMERATE`: alternate name for the same setting
+- `MUJINA_BZM2_ENUM_START_ID`: first assigned runtime `ASIC_ID`, default `0`
+- `MUJINA_BZM2_ENUM_MAX_ASICS_PER_BUS`: comma-separated per-bus enumeration
+  ceilings, default `100` per bus unless calibration topology already provides
+  a larger configured count
+
+Startup enumeration notes:
+
+- this mode is intended for fresh chains where ASICs still answer on the
+  default `ASIC_ID`
+- enumeration uses a bounded `NOOP` probe so the chain walk terminates cleanly
+  at the end of the bus
+- if no default-id ASIC responds on startup, Mujina falls back to the configured
+  `MUJINA_BZM2_ASICS_PER_BUS` topology so warm-restart cases do not collapse to
+  zero ASICs
 
 ## Design Boundary
 
