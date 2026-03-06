@@ -533,6 +533,25 @@ mod tests {
     }
 
     #[test]
+    fn parser_decodes_gen1_dts_vs() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen1);
+        let raw = [0x02, OPCODE_UART_DTS_VS, 0x91, 0xab, 0xcd, 0x45];
+        let parsed = parser.push(&raw);
+        assert_eq!(parsed.len(), 1);
+        match &parsed[0] {
+            TdmFrame::DtsVs(TdmDtsVsFrame::Gen1(frame)) => {
+                assert_eq!(frame.asic, 0x02);
+                assert_eq!(frame.voltage, 0x545);
+                assert!(frame.voltage_enabled);
+                assert_eq!(frame.thermal_tune_code, 0xab);
+                assert!(!frame.thermal_validity);
+                assert!(frame.thermal_enabled);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parser_decodes_readreg_and_noop() {
         let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen2);
         parser.expect_read_register_bytes(0x03, 4);
