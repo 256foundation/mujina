@@ -1,28 +1,13 @@
-#[cfg(test)]
-use bitcoin::hashes::Hash as _;
 use bitcoin::{
     TxMerkleNode,
     block::{Header as BlockHeader, Version as BlockVersion},
     consensus,
+    hashes::{Hash as _, HashEngine as _, sha256},
 };
 
 use crate::asic::hash_thread::{HashTask, HashThreadError};
 
 use super::{AssignedTask, MIDSTATE_COUNT};
-
-const SHA256_IV: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-];
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Bzm2CheckResult {
@@ -127,93 +112,44 @@ pub(super) fn leading_zero_bits(sha256_le: &[u8; 32]) -> u16 {
     bits
 }
 
-fn sha256_compress_state(initial_state: [u32; 8], block: &[u8; 64]) -> [u32; 8] {
-    let mut w = [0u32; 64];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes(chunk.try_into().expect("chunk size is 4"));
-    }
-    for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
+fn bzm2_midstate_to_sha256_midstate(midstate_le: &[u8; 32]) -> sha256::Midstate {
+    let mut midstate_be = [0u8; 32];
+    for (be_chunk, le_chunk) in midstate_be
+        .chunks_exact_mut(4)
+        .zip(midstate_le.chunks_exact(4))
+    {
+        let word = u32::from_le_bytes(le_chunk.try_into().expect("chunk size is 4"));
+        be_chunk.copy_from_slice(&word.to_be_bytes());
     }
 
-    let mut a = initial_state[0];
-    let mut b = initial_state[1];
-    let mut c = initial_state[2];
-    let mut d = initial_state[3];
-    let mut e = initial_state[4];
-    let mut f = initial_state[5];
-    let mut g = initial_state[6];
-    let mut h = initial_state[7];
-
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let t1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(SHA256_K[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let t2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(t1);
-        d = c;
-        c = b;
-        b = a;
-        a = t1.wrapping_add(t2);
-    }
-
-    [
-        initial_state[0].wrapping_add(a),
-        initial_state[1].wrapping_add(b),
-        initial_state[2].wrapping_add(c),
-        initial_state[3].wrapping_add(d),
-        initial_state[4].wrapping_add(e),
-        initial_state[5].wrapping_add(f),
-        initial_state[6].wrapping_add(g),
-        initial_state[7].wrapping_add(h),
-    ]
+    sha256::Midstate::from_byte_array(midstate_be)
 }
 
-fn sha256_state_to_be_bytes(state: [u32; 8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().copied().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+fn sha256_midstate_to_bzm2_le(midstate: sha256::Midstate) -> [u8; 32] {
+    let midstate_be = midstate.to_byte_array();
+    let mut midstate_le = [0u8; 32];
+    for (le_chunk, be_chunk) in midstate_le
+        .chunks_exact_mut(4)
+        .zip(midstate_be.chunks_exact(4))
+    {
+        let word = u32::from_be_bytes(be_chunk.try_into().expect("chunk size is 4"));
+        le_chunk.copy_from_slice(&word.to_le_bytes());
     }
-    out
+
+    midstate_le
 }
 
 pub(super) fn bzm2_double_sha_from_midstate_and_tail(
     midstate_le: &[u8; 32],
     tail16: &[u8; 16],
 ) -> [u8; 32] {
-    let mut resumed_state = [0u32; 8];
-    for (i, chunk) in midstate_le.chunks_exact(4).enumerate() {
-        resumed_state[i] = u32::from_le_bytes(chunk.try_into().expect("chunk size is 4"));
-    }
+    let mut engine =
+        sha256::HashEngine::from_midstate(bzm2_midstate_to_sha256_midstate(midstate_le), 64);
+    engine.input(tail16);
 
-    let mut first_block = [0u8; 64];
-    first_block[..16].copy_from_slice(tail16);
-    first_block[16] = 0x80;
-    first_block[56..64].copy_from_slice(&(80u64 * 8).to_be_bytes());
-    let first_state = sha256_compress_state(resumed_state, &first_block);
-    let first_digest = sha256_state_to_be_bytes(first_state);
-
-    let mut second_block = [0u8; 64];
-    second_block[..32].copy_from_slice(&first_digest);
-    second_block[32] = 0x80;
-    second_block[56..64].copy_from_slice(&(32u64 * 8).to_be_bytes());
-    let second_state = sha256_compress_state(SHA256_IV, &second_block);
-    sha256_state_to_be_bytes(second_state)
+    sha256::Hash::from_engine(engine)
+        .hash_again()
+        .to_byte_array()
 }
 
 pub(super) fn bzm2_tail16_bytes(
@@ -253,66 +189,9 @@ pub(super) fn build_header_bytes(
 }
 
 pub(super) fn compute_midstate_le(header_prefix_64: &[u8; 64]) -> [u8; 32] {
-    let mut w = [0u32; 64];
-    for (i, chunk) in header_prefix_64.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes(chunk.try_into().expect("chunk size is 4"));
-    }
-    for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
-    }
-
-    let mut a = SHA256_IV[0];
-    let mut b = SHA256_IV[1];
-    let mut c = SHA256_IV[2];
-    let mut d = SHA256_IV[3];
-    let mut e = SHA256_IV[4];
-    let mut f = SHA256_IV[5];
-    let mut g = SHA256_IV[6];
-    let mut h = SHA256_IV[7];
-
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let t1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(SHA256_K[i])
-            .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let t2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(t1);
-        d = c;
-        c = b;
-        b = a;
-        a = t1.wrapping_add(t2);
-    }
-
-    let state = [
-        SHA256_IV[0].wrapping_add(a),
-        SHA256_IV[1].wrapping_add(b),
-        SHA256_IV[2].wrapping_add(c),
-        SHA256_IV[3].wrapping_add(d),
-        SHA256_IV[4].wrapping_add(e),
-        SHA256_IV[5].wrapping_add(f),
-        SHA256_IV[6].wrapping_add(g),
-        SHA256_IV[7].wrapping_add(h),
-    ];
-
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().copied().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
-    }
-    out
+    let mut engine = sha256::HashEngine::default();
+    engine.input(header_prefix_64);
+    sha256_midstate_to_bzm2_le(engine.midstate())
 }
 
 #[cfg(test)]
@@ -322,11 +201,12 @@ pub(super) fn hash_bytes_bzm2_order(hash: &bitcoin::BlockHash) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::hashes::Hash as _;
+    use bitcoin::hashes::{Hash as _, HashEngine as _, sha256d};
 
     use super::{
-        Bzm2CheckResult, bzm2_double_sha_from_midstate_and_tail, check_result,
-        hash_bytes_bzm2_order, midstate_version_mask_variants,
+        Bzm2CheckResult, bzm2_double_sha_from_midstate_and_tail,
+        bzm2_midstate_to_sha256_midstate, check_result, compute_midstate_le,
+        hash_bytes_bzm2_order, midstate_version_mask_variants, sha256_midstate_to_bzm2_le,
     };
 
     #[test]
@@ -388,6 +268,50 @@ mod tests {
         let src = core::array::from_fn(|i| i as u8);
         let hash = bitcoin::BlockHash::from_byte_array(src);
         assert_eq!(hash_bytes_bzm2_order(&hash), src);
+    }
+
+    #[test]
+    fn test_midstate_conversion_round_trip_preserves_words() {
+        let sha256_midstate = bitcoin::hashes::sha256::Midstate::from_byte_array(
+            core::array::from_fn(|i| i as u8),
+        );
+        let bzm2_midstate = sha256_midstate_to_bzm2_le(sha256_midstate);
+
+        assert_eq!(
+            bzm2_midstate_to_sha256_midstate(&bzm2_midstate).to_byte_array(),
+            sha256_midstate.to_byte_array()
+        );
+    }
+
+    #[test]
+    fn test_compute_midstate_le_matches_bitcoin_sha256_engine() {
+        let header_prefix = core::array::from_fn(|i| i as u8);
+        let mut engine = bitcoin::hashes::sha256::HashEngine::default();
+        engine.input(&header_prefix);
+
+        assert_eq!(
+            compute_midstate_le(&header_prefix),
+            sha256_midstate_to_bzm2_le(engine.midstate())
+        );
+    }
+
+    #[test]
+    fn test_bzm2_double_sha_matches_bitcoin_double_sha_for_full_header() {
+        let header_bytes: [u8; 80] = core::array::from_fn(|i| i as u8);
+        let header_prefix: [u8; 64] = header_bytes[..64]
+            .try_into()
+            .expect("header prefix must be 64 bytes");
+        let header_tail: [u8; 16] = header_bytes[64..]
+            .try_into()
+            .expect("header tail must be 16 bytes");
+
+        assert_eq!(
+            bzm2_double_sha_from_midstate_and_tail(
+                &compute_midstate_le(&header_prefix),
+                &header_tail,
+            ),
+            sha256d::Hash::hash(&header_bytes).to_byte_array()
+        );
     }
 
     #[test]
