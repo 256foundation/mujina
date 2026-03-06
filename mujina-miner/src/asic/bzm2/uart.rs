@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::transport::{SerialReader, SerialWriter};
 
@@ -14,6 +15,7 @@ pub const NOTCH_REG: u16 = 0x0fff;
 pub const BROADCAST_GROUP_ASIC: u8 = BROADCAST_ASIC;
 pub const DEFAULT_DTS_VS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_ASIC_ID: u8 = 0xfa;
+pub const DEFAULT_NOOP_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
 const LOCAL_REG_ASIC_ID: u8 = 0x0b;
 const LOCAL_REG_SLOW_CLK_DIV: u8 = 0x08;
@@ -74,6 +76,9 @@ pub enum Bzm2UartError {
 
     #[error("unexpected NOOP payload from ASIC {asic:#x}: {data:02x?}")]
     UnexpectedNoopPayload { asic: u8, data: [u8; 3] },
+
+    #[error("timed out waiting for NOOP response from ASIC {asic:#x} after {timeout_ms} ms")]
+    NoopTimeout { asic: u8, timeout_ms: u64 },
 
     #[error("timed out waiting for DTS/VS frame from ASIC {asic:#x}")]
     DtsVsTimeout { asic: u8 },
@@ -274,8 +279,41 @@ impl Bzm2UartController {
         Ok(response[2..5].try_into().unwrap())
     }
 
+    pub async fn noop_with_timeout(
+        &mut self,
+        asic: u8,
+        wait: Duration,
+    ) -> Result<[u8; 3], Bzm2UartError> {
+        let request = encode_noop(asic);
+        self.writer.write_all(&request).await?;
+        self.writer.flush().await?;
+
+        let mut response = [0u8; 5];
+        timeout(wait, self.reader.read_exact(&mut response))
+            .await
+            .map_err(|_| Bzm2UartError::NoopTimeout {
+                asic,
+                timeout_ms: wait.as_millis().min(u128::from(u64::MAX)) as u64,
+            })??;
+        validate_response_header(asic, OPCODE_UART_NOOP, &response)?;
+        Ok(response[2..5].try_into().unwrap())
+    }
+
     pub async fn verify_noop_bz2(&mut self, asic: u8) -> Result<(), Bzm2UartError> {
         let data = self.noop(asic).await?;
+        if data == *b"BZ2" {
+            Ok(())
+        } else {
+            Err(Bzm2UartError::UnexpectedNoopPayload { asic, data })
+        }
+    }
+
+    pub async fn verify_noop_bz2_with_timeout(
+        &mut self,
+        asic: u8,
+        wait: Duration,
+    ) -> Result<(), Bzm2UartError> {
+        let data = self.noop_with_timeout(asic, wait).await?;
         if data == *b"BZ2" {
             Ok(())
         } else {
@@ -290,10 +328,26 @@ impl Bzm2UartController {
         max_asics: u8,
         start_id: u8,
     ) -> Result<Vec<u8>, Bzm2UartError> {
+        self.enumerate_chain_with_timeout(max_asics, start_id, DEFAULT_NOOP_PROBE_TIMEOUT)
+            .await
+    }
+
+    /// Enumerate a fresh chain using a bounded NOOP probe so the walk can stop
+    /// cleanly when the last default-id device has been assigned.
+    pub async fn enumerate_chain_with_timeout(
+        &mut self,
+        max_asics: u8,
+        start_id: u8,
+        probe_timeout: Duration,
+    ) -> Result<Vec<u8>, Bzm2UartError> {
         let mut assigned = Vec::new();
         for offset in 0..max_asics {
             let next_id = start_id.saturating_add(offset);
-            if self.verify_noop_bz2(DEFAULT_ASIC_ID).await.is_err() {
+            if self
+                .verify_noop_bz2_with_timeout(DEFAULT_ASIC_ID, probe_timeout)
+                .await
+                .is_err()
+            {
                 break;
             }
             self.assign_default_asic_id(next_id).await?;
@@ -615,5 +669,10 @@ mod tests {
     #[test]
     fn default_asic_id_matches_legacy_value() {
         assert_eq!(DEFAULT_ASIC_ID, 0xfa);
+    }
+
+    #[test]
+    fn default_noop_probe_timeout_is_bounded() {
+        assert_eq!(DEFAULT_NOOP_PROBE_TIMEOUT, Duration::from_millis(100));
     }
 }

@@ -68,6 +68,14 @@ Deliverables:
 3. Add optional board startup enumeration mode so `Bzm2Board` can populate bus
    layout from hardware rather than only from `MUJINA_BZM2_ASICS_PER_BUS`
 
+Status:
+
+- completed: low-level default-`ASIC_ID` enumeration helpers
+- completed: `enumerate-chain` CLI support
+- completed: opt-in `Bzm2Board` startup enumeration with fallback to
+  configured topology when no default-id ASICs are present
+- next: Phase 2, applied rail and reset control
+
 Exit criteria:
 
 - a powered chain can be discovered from software with no hard-coded ASIC count
