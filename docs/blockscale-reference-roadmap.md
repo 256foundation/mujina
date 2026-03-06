@@ -44,11 +44,9 @@ The current repo already has:
 
 The biggest missing pieces are:
 
-1. actual rail application for planned domain voltages
-2. hardware chain discovery and `ASIC_ID` assignment
-3. runtime engine/topology discovery instead of fixed assumptions
-4. closed-loop calibration and retune
-5. board/API diagnostics parity with the CLI
+1. runtime engine/topology discovery instead of fixed assumptions
+2. closed-loop calibration and retune
+3. board/API diagnostics parity with the CLI
 
 ## Phase 1: Discoverable Bring-Up
 
@@ -103,8 +101,8 @@ Status:
 
 - completed: `Bzm2BringupPlan` is now wired into `Bzm2Board` startup and
   shutdown through generic file-backed rail and reset adapters
-- next: map planned domain voltages and richer rail telemetry onto those
-  startup/shutdown hooks
+- completed: optional file-backed rail telemetry now flows into `BoardState`
+- next: map planned domain voltages onto those startup/shutdown hooks
 
 Exit criteria:
 
@@ -130,6 +128,16 @@ Deliverables:
 Exit criteria:
 
 - `Bzm2Board` can apply multi-domain operating points, not just PLL maps
+
+Status:
+
+- completed: planner-generated per-domain voltages are now mapped onto the
+  configured rail-control path before PLL ramp
+- completed: saved operating-point replay now reapplies persisted per-domain
+  voltages before clock replay
+- completed: live calibration persists per-domain rail targets for restart
+  replay
+- next: Phase 4, topology and defect discovery
 
 ## Phase 4: Topology And Defect Discovery
 
