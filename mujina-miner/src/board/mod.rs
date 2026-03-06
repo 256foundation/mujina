@@ -1,3 +1,4 @@
+pub(crate) mod bzm2;
 pub(crate) mod bitaxe;
 pub mod cpu;
 pub(crate) mod emberone00;
