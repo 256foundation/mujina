@@ -332,9 +332,7 @@ impl Backplane {
 
         Ok(())
     }
-<<<<<<< HEAD
-}
-=======
+
     /// Handle generic virtual device transport events.
     async fn handle_virtual_event(&mut self, event: VirtualTransportEvent) -> Result<()> {
         match event {
@@ -416,7 +414,9 @@ impl Backplane {
                     debug!(board = %model, id = %device_id, "Shutting down virtual board");
 
                     match board.shutdown().await {
-                        Ok(()) => info!(board = %model, id = %device_id, "Virtual board disconnected"),
+                        Ok(()) => {
+                            info!(board = %model, id = %device_id, "Virtual board disconnected")
+                        }
                         Err(e) => error!(
                             board = %model,
                             id = %device_id,
@@ -431,6 +431,3 @@ impl Backplane {
         Ok(())
     }
 }
-
-
->>>>>>> 816ad21 (Initial import with BZM2 Mujina port)

@@ -1,6 +1,25 @@
 # BZM2 UART Debug Guide
 
-This guide documents the direct BZM2 UART developer interface added to Mujina.
+This guide documents the direct BZM2 UART and silicon-validation interface added to Mujina.
+
+## Intent
+
+The current CLI folds in the portable parts of the legacy `silicon validation` BZM2 validation surface:
+
+- ASIC discovery and liveness scans
+- loopback data-path validation
+- explicit TDM enable and disable control
+- live TDM result, register, noop, and DTS/VS observation
+- broadcast TDM register-read observation across many ASICs
+- engine-wide timestamp, target, and leading-zero programming
+- deterministic grid-job exercisers for single-phase and back-to-back job dispatch
+- existing PLL and DLL diagnostics and bring-up helpers
+
+What is deliberately not ported here:
+
+- legacy board-reset and board-count orchestration
+- BCH-vector and nonce-golden-data regression harnesses
+- opaque manufacturing hooks and carrier-specific glue
 
 ## Routing Modes
 
@@ -16,7 +35,21 @@ Use [bzm2-debug.rs](C:/Users/prael/Documents/Codex/bzm2_mujina/mujina-miner/src/
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- <command> ...
 ```
 
-## Unicast Examples
+## Legacy Test Mapping
+
+The most useful `silicon validation` tests map to the following commands:
+
+- `test_noop_all_asic` -> `noop-scan`
+- `test_loopback` -> `loopback-scan`
+- `test_effbst_tdm_selectable_leadingzeros` -> `engine-zeros-all` plus `job-grid-watch`
+- `test_effbst_tdm_jobsubmit_with_writejobcmd` -> `job-grid` or `job-grid-watch`
+- `test_effbst_tdm_continuous_b2b_jobs` -> `job-grid-2phase-watch`
+- `uart_command_broadcast_readreg_tdm_async` flows -> `tdm-broadcast-read-watch`
+- general TDM callback validation -> `tdm-watch`
+
+The old multicasted-EFFBST and auto-clock-gating tests depended on the legacy BCH vector library and runtime board harness. The new CLI does not claim golden nonce validation there; it provides deterministic packet generation and live observation so developers can still exercise the same ASIC paths when debugging hardware.
+
+## Direct UART Examples
 
 Read one ASIC-local register:
 
@@ -32,51 +65,137 @@ cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   uart-write /dev/ttyUSB0 2 notch 0x12 01000000 5000000
 ```
 
-Run a NOOP sanity check:
+Run a NOOP sanity check across an ASIC range:
 
 ```text
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
-  uart-noop /dev/ttyUSB0 2 5000000
+  noop-scan /dev/ttyUSB0 0 15 5000000
 ```
 
-Run a loopback payload echo:
+Run deterministic loopback validation across an ASIC range:
 
 ```text
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
-  uart-loopback /dev/ttyUSB0 2 aabbccdd 5000000
+  loopback-scan /dev/ttyUSB0 0 15 8 5000000
 ```
 
-## Broadcast Examples
+Read one synchronous result frame from one ASIC:
 
-Broadcast-enable a PLL register across every ASIC on the bus:
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  uart-read-result /dev/ttyUSB0 2 gen2 5000000
+```
+
+## TDM Control and Observation
+
+The legacy `enable_tdm()` path is grounded in a local-register write to `LOCAL_REG_UART_TDM_CTL` (`0x07`) with control word:
+
+```text
+(prediv_raw << 9) | (tdm_counter << 1) | enable_bit
+```
+
+Enable TDM explicitly:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  tdm-enable /dev/ttyUSB0 0x12 16 5000000
+```
+
+Disable TDM explicitly:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  tdm-disable /dev/ttyUSB0 0x12 16 5000000
+```
+
+Watch the mixed TDM stream for five seconds:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  tdm-watch /dev/ttyUSB0 gen2 5 5000000
+```
+
+Broadcast a register read and collect returned TDM read frames from ASICs `0` through `15`:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  tdm-broadcast-read-watch /dev/ttyUSB0 gen2 0 15 notch 0x12 4 5000000
+```
+
+## Engine-Wide Programming Helpers
+
+Set the target register across every engine row on one ASIC or the whole bus:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  engine-target-all /dev/ttyUSB0 2 0x1705ffff 5000000
+```
+
+Set timestamp count across all engine rows:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  engine-timestamp-all /dev/ttyUSB0 2 60 5000000
+```
+
+Program selectable leading zeros across all engine rows:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  engine-zeros-all /dev/ttyUSB0 2 48 5000000
+```
+
+`engine-zeros-all` accepts `32..=64`, matching the legacy validation flow. The actual register value written is `zeros_to_find - 32`, which is what the C source used.
+
+## Job Exercisers
+
+These commands intentionally generate deterministic synthetic job material. They are designed to exercise the ASIC job path and TDM-result machinery without pretending to replace the legacy golden-vector regression harness.
+
+Dispatch one full grid of `WRITEJOB` packets:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  job-grid /dev/ttyUSB0 2 0 1700000000 60 5000000
+```
+
+Dispatch one full grid and watch live TDM responses:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  job-grid-watch /dev/ttyUSB0 2 0 1700000000 60 5 gen2 5000000
+```
+
+Dispatch back-to-back grids with the second phase offset by the legacy `MAX_EFFBST_SUBJOBS` sequence spacing:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  job-grid-2phase-watch /dev/ttyUSB0 2 0 1700000000 60 5 gen2 5000000
+```
+
+## Broadcast, Multicast, and Unicast Reference
+
+Use unicast when you need one ASIC-local or one engine-local change:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  uart-write /dev/ttyUSB0 2 notch 0x12 01000000 5000000
+```
+
+Use broadcast when every ASIC on the bus should receive the same packet:
 
 ```text
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   uart-write /dev/ttyUSB0 broadcast notch 0x12 01000000 5000000
 ```
 
-Broadcast a full PLL program and enable sequence:
-
-```text
-cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
-  pll-set /dev/ttyUSB0 broadcast pll0 625 0 5000000
-```
-
-Broadcast a DLL duty-cycle configuration:
-
-```text
-cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
-  dll-set /dev/ttyUSB0 broadcast dll0 50 5000000
-```
-
-## Multicast Example
-
-Set timestamp count across one ASIC row-group:
+Use multicast when one ASIC needs the same engine-register update across a full row group:
 
 ```text
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   uart-multicast-write /dev/ttyUSB0 2 7 0x48 3c 5000000
 ```
+
+The higher-level helpers such as `engine-timestamp-all`, `engine-zeros-all`, and `job-grid` are implemented on top of this same routing model so developers can either stay at the helper level or drop down to raw packet control when needed.
 
 ## Clock Diagnostics
 
@@ -101,14 +220,20 @@ cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   dll-set /dev/ttyUSB0 2 dll1 55 5000000
 ```
 
+Broadcast one PLL program and verify lock across ASIC ids `0` through `15`:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  pll-broadcast-lock-check /dev/ttyUSB0 pll0 625 0 0 15 5000000
+```
+
+Broadcast one DLL program and verify lock and `fincon` validity across ASIC ids `0` through `15`:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  dll-broadcast-lock-check /dev/ttyUSB0 dll0 50 0 15 5000000
+```
+
 ## Scope Boundary
 
-This interface is grounded in the legacy shipped UART path:
-
-- register read/write
-- multicast write
-- noop/loopback
-- PLL divider programming, enable, and lock polling
-- DLL duty-cycle programming, enable, lock polling, and fincon validation
-
-It is not a JTAG debug interface.
+This interface is grounded in the legacy shipped UART path and the `silicon validation` validation source. It is not a JTAG debug interface and it is not a full BCH-vector regression harness.
