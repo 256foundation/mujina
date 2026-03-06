@@ -12,6 +12,7 @@ The current CLI folds in the portable parts of the legacy `silicon validation` B
 - explicit TDM enable and disable control
 - live TDM result, register, noop, and DTS/VS observation
 - broadcast TDM register-read observation across many ASICs
+- engine presence probing and full physical engine-map discovery
 - engine-wide timestamp, target, and leading-zero programming
 - deterministic grid-job exercisers for single-phase and back-to-back job dispatch
 - existing PLL and DLL diagnostics and bring-up helpers
@@ -47,6 +48,7 @@ The most useful `silicon validation` tests map to the following commands:
 - `test_effbst_tdm_continuous_b2b_jobs` -> `job-grid-2phase-watch`
 - `uart_command_broadcast_readreg_tdm_async` flows -> `tdm-broadcast-read-watch`
 - general TDM callback validation -> `tdm-watch`
+- historical engine-detect flow -> `engine-probe` or `discover-engine-map`
 
 The old multicasted-EFFBST and auto-clock-gating tests depended on the legacy BCH vector library and runtime board harness. The new CLI does not claim golden nonce validation there; it provides deterministic packet generation and live observation so developers can still exercise the same ASIC paths when debugging hardware.
 
@@ -143,6 +145,31 @@ Broadcast a register read and collect returned TDM read frames from ASICs `0` th
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   tdm-broadcast-read-watch /dev/ttyUSB0 gen2 0 15 notch 0x12 4 5000000
 ```
+
+Probe one physical engine coordinate using the historical TDM-sync
+`ENGINE_REG_END_NONCE` detection rule:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  engine-probe /dev/ttyUSB0 2 0 0 0x0f 16 100 5000000
+```
+
+Scan the full `20 x 12` physical grid and report the discovered hole map for
+one ASIC:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  discover-engine-map /dev/ttyUSB0 2 0x0f 16 100 5000000
+```
+
+Notes:
+
+- these commands intentionally scan all physical coordinates, not the legacy
+  default engine list
+- discovery uses the source-grounded rule from the historical C path:
+  `ENGINE_REG_END_NONCE == 0xfffffffe` means the engine is present
+- the CLI reports whether the discovered missing coordinates still match the
+  default four-hole BZM2 map or whether the ASIC diverges from that assumption
 
 ## Engine-Wide Programming Helpers
 

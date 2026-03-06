@@ -6,8 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use mujina_miner::asic::bzm2::protocol::{
     DtsVsGeneration, ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND,
-    TdmFrame, TdmFrameParser, default_engine_coordinates, encode_read_register,
-    encode_read_result_command, logical_engine_address,
+    TdmFrame, TdmFrameParser, default_engine_coordinates, default_excluded_engines,
+    encode_read_register, encode_read_result_command, logical_engine_address,
 };
 use mujina_miner::asic::bzm2::{
     BROADCAST_GROUP_ASIC, Bzm2ClockController, Bzm2Dll, Bzm2DtsVsConfig, Bzm2Pll,
@@ -21,6 +21,7 @@ use tokio::time::{Instant, timeout};
 const DEFAULT_BAUD: u32 = 5_000_000;
 const DEFAULT_WATCH_POLL_MS: u64 = 100;
 const DEFAULT_BROADCAST_READ_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 const LOCAL_REG_UART_TDM_CTL: u8 = 0x07;
 const MAX_EFFBST_SUBJOBS: u8 = 4;
 
@@ -48,6 +49,8 @@ async fn main() -> Result<()> {
         "tdm-disable" => cmd_tdm_disable(&args[2..]).await,
         "tdm-watch" => cmd_tdm_watch(&args[2..]).await,
         "tdm-broadcast-read-watch" => cmd_tdm_broadcast_read_watch(&args[2..]).await,
+        "engine-probe" => cmd_engine_probe(&args[2..]).await,
+        "discover-engine-map" => cmd_discover_engine_map(&args[2..]).await,
         "engine-target-all" => cmd_engine_target_all(&args[2..]).await,
         "engine-timestamp-all" => cmd_engine_timestamp_all(&args[2..]).await,
         "engine-zeros-all" => cmd_engine_zeros_all(&args[2..]).await,
@@ -87,6 +90,12 @@ fn print_usage() {
     eprintln!("  tdm-watch <serial> <dts-gen> <watch-secs> [baud]");
     eprintln!(
         "  tdm-broadcast-read-watch <serial> <dts-gen> <asic-start> <asic-end> <engine|notch> <offset> <count> [baud]"
+    );
+    eprintln!(
+        "  engine-probe <serial> <asic> <row> <col> <tdm-prediv-raw> <tdm-counter> [timeout-ms] [baud]"
+    );
+    eprintln!(
+        "  discover-engine-map <serial> <asic> <tdm-prediv-raw> <tdm-counter> [timeout-ms] [baud]"
     );
     eprintln!();
     eprintln!("Engine-wide validation helpers:");
@@ -147,6 +156,19 @@ fn parse_timeout_duration(raw: Option<&String>) -> Result<Duration> {
             Ok(Duration::from_millis(millis as u64))
         }
         None => Ok(DEFAULT_DTS_VS_QUERY_TIMEOUT),
+    }
+}
+
+fn parse_engine_discovery_timeout(raw: Option<&String>) -> Result<Duration> {
+    match raw {
+        Some(raw) => {
+            let millis = parse_u32(raw)?;
+            if millis == 0 {
+                bail!("timeout-ms must be greater than zero");
+            }
+            Ok(Duration::from_millis(millis as u64))
+        }
+        None => Ok(Duration::from_millis(DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS)),
     }
 }
 
@@ -621,6 +643,71 @@ async fn cmd_tdm_broadcast_read_watch(args: &[String]) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_engine_probe(args: &[String]) -> Result<()> {
+    if args.len() < 6 || args.len() > 8 {
+        bail!(
+            "usage: engine-probe <serial> <asic> <row> <col> <tdm-prediv-raw> <tdm-counter> [timeout-ms] [baud]"
+        );
+    }
+    let mut uart = open_uart(&args[0], parse_baud(args.get(7))?)?;
+    let asic = parse_u8(&args[1])?;
+    let row = parse_u8(&args[2])?;
+    let col = parse_u8(&args[3])?;
+    let prediv = parse_u32(&args[4])?;
+    let counter = parse_u8(&args[5])?;
+    let timeout = parse_engine_discovery_timeout(args.get(6))?;
+
+    uart.enable_tdm(prediv, counter).await?;
+    let result = uart.detect_engine(asic, row, col, timeout).await;
+    let disable_result = uart.disable_tdm(prediv, counter).await;
+    let present = result?;
+    disable_result?;
+
+    println!(
+        "asic={asic} row={row} col={col} engine=0x{:03x} present={present}",
+        logical_engine_address(row, col)
+    );
+    Ok(())
+}
+
+async fn cmd_discover_engine_map(args: &[String]) -> Result<()> {
+    if args.len() < 4 || args.len() > 6 {
+        bail!(
+            "usage: discover-engine-map <serial> <asic> <tdm-prediv-raw> <tdm-counter> [timeout-ms] [baud]"
+        );
+    }
+    let mut uart = open_uart(&args[0], parse_baud(args.get(5))?)?;
+    let asic = parse_u8(&args[1])?;
+    let prediv = parse_u32(&args[2])?;
+    let counter = parse_u8(&args[3])?;
+    let timeout = parse_engine_discovery_timeout(args.get(4))?;
+
+    let discovery = uart
+        .discover_engine_map(asic, prediv, counter, timeout)
+        .await?;
+
+    let legacy_missing = default_excluded_engines();
+    let discovered_missing = discovery
+        .missing
+        .iter()
+        .map(|coord| (coord.row, coord.col))
+        .collect::<std::collections::BTreeSet<_>>();
+    println!(
+        "asic={} present={} missing={} legacy_default_holes_match={}",
+        asic,
+        discovery.present_count(),
+        discovery.missing_count(),
+        discovered_missing.len() == legacy_missing.len()
+            && discovered_missing
+                .iter()
+                .all(|coord| legacy_missing.contains(coord))
+    );
+    if !discovery.missing.is_empty() {
+        println!("missing: {}", format_engine_coordinates(&discovery.missing));
+    }
     Ok(())
 }
 
@@ -1238,6 +1325,19 @@ fn format_asic_ids(asics: &[u8]) -> String {
     asics
         .iter()
         .map(|asic| asic.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_engine_coordinates(coords: &[mujina_miner::asic::bzm2::Bzm2EngineCoordinate]) -> String {
+    coords
+        .iter()
+        .map(|coord| {
+            format!(
+                "r{}c{}(0x{:03x})",
+                coord.row, coord.col, coord.engine_address
+            )
+        })
         .collect::<Vec<_>>()
         .join(",")
 }

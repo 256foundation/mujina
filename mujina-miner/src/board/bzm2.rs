@@ -11,15 +11,18 @@ use tokio::task::JoinHandle;
 
 use super::{Board, BoardCommand, BoardError, BoardInfo, VirtualBoardDescriptor};
 use crate::{
-    api_client::types::{BoardState, Fan, PowerMeasurement, TemperatureSensor, ThreadState},
+    api_client::types::{
+        AsicState, BoardState, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor,
+        ThreadState,
+    },
     asic::{
         bzm2::{
             Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput, Bzm2BringupPlan,
             Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
-            Bzm2ClockController, Bzm2DomainMeasurement, Bzm2OperatingClass, Bzm2PerformanceMode,
-            Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle,
-            Bzm2UartController, Bzm2VoltageDomain, FileGpioPin, FilePowerRail, GpioResetLine,
-            VoltageStackStep, control::Bzm2PowerRail,
+            Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2DomainMeasurement,
+            Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread,
+            Bzm2ThreadConfig, Bzm2ThreadHandle, Bzm2UartController, Bzm2VoltageDomain, FileGpioPin,
+            FilePowerRail, GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -49,6 +52,7 @@ const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
 const DEFAULT_BRINGUP_RELEASE_RESET_MS: u64 = 25;
+const DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Bzm2VirtualDeviceConfig {
@@ -1013,6 +1017,7 @@ impl Bzm2Board {
 
         let state_tx = self.state_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
+        let serial_paths = self.config.serial_paths.clone();
         let board_name = self.config.device_id();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         self.command_shutdown = Some(shutdown_tx);
@@ -1037,6 +1042,49 @@ impl Bzm2Board {
                                         .await
                                         .map_err(|err| BoardError::HardwareControl(err.to_string()))?;
                                     publish_thread_telemetry(&state_tx, &update);
+                                    Ok(())
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                            BoardCommand::DiscoverBzm2Engines {
+                                thread_index,
+                                asic,
+                                tdm_prediv_raw,
+                                tdm_counter,
+                                timeout_ms,
+                                reply,
+                            } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    let serial_path = serial_paths.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "missing serial path for BZM2 thread index {thread_index} on board {board_name}"
+                                        ))
+                                    })?;
+                                    let discovery = handle
+                                        .discover_engine_map(
+                                            asic,
+                                            tdm_prediv_raw,
+                                            tdm_counter,
+                                            Duration::from_millis(u64::from(
+                                                timeout_ms.unwrap_or(
+                                                    DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS as u32,
+                                                ),
+                                            )),
+                                        )
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))?;
+                                    publish_discovered_engine_map(
+                                        &state_tx,
+                                        thread_index,
+                                        serial_path,
+                                        &discovery,
+                                    );
                                     Ok(())
                                 }
                                 .await;
@@ -1711,6 +1759,45 @@ fn publish_thread_telemetry(
                 })
                 .collect::<Vec<_>>(),
         );
+    });
+}
+
+fn publish_discovered_engine_map(
+    state_tx: &watch::Sender<BoardState>,
+    thread_index: usize,
+    serial_path: &str,
+    discovery: &Bzm2DiscoveredEngineMap,
+) {
+    let missing_engines = discovery
+        .missing
+        .iter()
+        .map(|engine| EngineCoordinate {
+            row: engine.row,
+            col: engine.col,
+        })
+        .collect::<Vec<_>>();
+
+    let _ = state_tx.send_modify(|state| {
+        if let Some(asic) = state
+            .asics
+            .iter_mut()
+            .find(|asic| asic.thread_index == Some(thread_index) && asic.id == discovery.asic)
+        {
+            asic.serial_path = Some(serial_path.to_owned());
+            asic.discovered_engine_count = Some(discovery.present_count() as u16);
+            asic.missing_engines = missing_engines.clone();
+        } else {
+            state.asics.push(AsicState {
+                id: discovery.asic,
+                thread_index: Some(thread_index),
+                serial_path: Some(serial_path.to_owned()),
+                discovered_engine_count: Some(discovery.present_count() as u16),
+                missing_engines: missing_engines.clone(),
+            });
+        }
+        state
+            .asics
+            .sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
     });
 }
 
@@ -2923,5 +3010,46 @@ mod tests {
             crate::types::HashRate::from_terahashes(42.0).0
         );
         assert!(state.threads[0].is_active);
+    }
+
+    #[test]
+    fn publish_discovered_engine_map_updates_board_state() {
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+
+        publish_discovered_engine_map(
+            &state_tx,
+            1,
+            "/dev/ttyUSB1",
+            &Bzm2DiscoveredEngineMap {
+                asic: 2,
+                present: vec![
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(0, 0),
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(0, 1),
+                ],
+                missing: vec![
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(3, 7),
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(5, 11),
+                ],
+            },
+        );
+
+        let state = state_rx.borrow().clone();
+        assert_eq!(state.asics.len(), 1);
+        assert_eq!(state.asics[0].id, 2);
+        assert_eq!(state.asics[0].thread_index, Some(1));
+        assert_eq!(state.asics[0].serial_path.as_deref(), Some("/dev/ttyUSB1"));
+        assert_eq!(state.asics[0].discovered_engine_count, Some(2));
+        assert_eq!(
+            state.asics[0].missing_engines,
+            vec![
+                EngineCoordinate { row: 3, col: 7 },
+                EngineCoordinate { row: 5, col: 11 },
+            ]
+        );
     }
 }
