@@ -11,13 +11,11 @@
 //! - validating returned results before forwarding shares upstream
 
 use std::{
-    collections::VecDeque,
     io,
     sync::{Arc, RwLock},
 };
 
 use async_trait::async_trait;
-use bitcoin::{block::Version as BlockVersion, hashes::Hash as _};
 use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
@@ -32,12 +30,12 @@ use crate::{
     tracing::prelude::*,
     types::{Difficulty, HashRate},
 };
+use hashing::{Bzm2CheckResult, task_midstate_versions};
 #[cfg(test)]
-use hashing::hash_bytes_bzm2_order;
 use hashing::{
-    Bzm2CheckResult, bzm2_double_sha_from_midstate_and_tail, bzm2_tail16_bytes, check_result,
-    leading_zero_bits, task_midstate_versions,
+    bzm2_double_sha_from_midstate_and_tail, bzm2_tail16_bytes, check_result, hash_bytes_bzm2_order,
 };
+use tracker::{AssignmentTracker, SelectedReadResultCandidate};
 use work::{
     AssignedTask, engine_id, is_invalid_engine, logical_engine_index, send_task_to_all_engines,
 };
@@ -45,6 +43,7 @@ use work::{
 use work::{EngineAssignment, task_to_bzm2_payload};
 
 mod hashing;
+mod tracker;
 mod work;
 
 const ENGINE_ROWS: u16 = 20;
@@ -451,101 +450,6 @@ fn calc_pll_dividers(freq_mhz: f32, post1_divider: u8) -> (u32, u32) {
 
     let post_div = (1 << 12) | (POST2_DIVIDER << 9) | ((post1_divider as u32) << 6) | REF_DIVIDER;
     (post_div, fb_div)
-}
-
-fn readresult_sequence_slot(sequence_id: u8) -> u8 {
-    sequence_id & 0x3f
-}
-
-fn writejob_effective_sequence_id(sequence_id: u8) -> u8 {
-    // Keep the thread's assignment tracking in the same sequence domain as
-    // Command::write_job (seq_start = (sequence_id % 2) * 4).
-    sequence_id % 2
-}
-
-fn retain_assigned_task(assigned_tasks: &mut VecDeque<AssignedTask>, new_task: AssignedTask) {
-    let slot = readresult_sequence_slot(new_task.sequence_id);
-    assigned_tasks.push_back(new_task);
-
-    // Keep a small per-slot history so delayed READRESULT frames can still be
-    // validated against recent predecessors in the same visible sequence slot.
-    let mut slot_count = assigned_tasks
-        .iter()
-        .filter(|task| readresult_sequence_slot(task.sequence_id) == slot)
-        .count();
-    while slot_count > READRESULT_SLOT_HISTORY {
-        if let Some(index) = assigned_tasks
-            .iter()
-            .position(|task| readresult_sequence_slot(task.sequence_id) == slot)
-        {
-            let _ = assigned_tasks.remove(index);
-            slot_count = slot_count.saturating_sub(1);
-        } else {
-            break;
-        }
-    }
-
-    while assigned_tasks.len() > READRESULT_ASSIGNMENT_HISTORY_LIMIT {
-        let _ = assigned_tasks.pop_front();
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ReadResultFields {
-    sequence: u8,
-    timecode: u8,
-    sequence_id: u8,
-    micro_job_id: u8,
-    used_masked_fields: bool,
-}
-
-fn resolve_readresult_fields(
-    sequence_raw: u8,
-    timecode_raw: u8,
-    has_sequence_slot: impl Fn(u8) -> bool,
-) -> Option<ReadResultFields> {
-    let sequence_id_raw = sequence_raw / (MIDSTATE_COUNT as u8);
-    let sequence_slot_raw = readresult_sequence_slot(sequence_id_raw);
-    if has_sequence_slot(sequence_slot_raw) {
-        return Some(ReadResultFields {
-            sequence: sequence_raw,
-            timecode: timecode_raw,
-            sequence_id: sequence_id_raw,
-            micro_job_id: sequence_raw % (MIDSTATE_COUNT as u8),
-            used_masked_fields: false,
-        });
-    }
-
-    let sequence_masked = sequence_raw & 0x7f;
-    let timecode_masked = timecode_raw & 0x7f;
-    let sequence_id_masked = sequence_masked / (MIDSTATE_COUNT as u8);
-    let sequence_slot_masked = readresult_sequence_slot(sequence_id_masked);
-    if (sequence_masked != sequence_raw || timecode_masked != timecode_raw)
-        && has_sequence_slot(sequence_slot_masked)
-    {
-        return Some(ReadResultFields {
-            sequence: sequence_masked,
-            timecode: timecode_masked,
-            sequence_id: sequence_id_masked,
-            micro_job_id: sequence_masked % (MIDSTATE_COUNT as u8),
-            used_masked_fields: true,
-        });
-    }
-
-    None
-}
-
-struct SelectedReadResultCandidate {
-    assigned: AssignedTask,
-    share_version: BlockVersion,
-    ntime_offset: u32,
-    share_ntime: u32,
-    nonce_adjusted: u32,
-    nonce_submit: u32,
-    hash_bytes: [u8; 32],
-    hash: bitcoin::BlockHash,
-    check_result: Bzm2CheckResult,
-    observed_leading_zeros: u16,
 }
 
 async fn configure_sensors<R, W>(
@@ -1132,9 +1036,7 @@ where
 
     let mut chip_initialized = false;
     let mut current_task: Option<HashTask> = None;
-    let mut assigned_tasks: VecDeque<AssignedTask> =
-        VecDeque::with_capacity(READRESULT_ASSIGNMENT_HISTORY_LIMIT);
-    let mut next_sequence_id: u8 = 0;
+    let mut assignment_tracker = AssignmentTracker::new();
     let mut zero_lz_diagnostic_samples: u64 = 0;
     let mut status_ticker = time::interval(Duration::from_secs(5));
     status_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1183,7 +1085,7 @@ where
                         }
 
                         let microjob_versions = task_midstate_versions(&new_task);
-                        let write_sequence_id = writejob_effective_sequence_id(next_sequence_id);
+                        let write_sequence_id = assignment_tracker.current_write_sequence_id();
 
                         let engine_assignments = match send_task_to_all_engines(
                             &mut chip_commands,
@@ -1222,14 +1124,14 @@ where
                             leading_zeros: ENGINE_LEADING_ZEROS,
                             nonce_minus_value: BZM2_NONCE_MINUS,
                         };
-                        retain_assigned_task(&mut assigned_tasks, new_assigned_task);
+                        assignment_tracker.retain(new_assigned_task);
 
                         debug!(
                             job_id = %new_task.template.id,
                             write_sequence_id,
                             "Sent BZM2 work to chip"
                         );
-                        next_sequence_id = next_sequence_id.wrapping_add(1);
+                        assignment_tracker.advance_sequence();
 
                         let old_task = current_task.replace(new_task);
                         {
@@ -1267,7 +1169,7 @@ where
                         }
 
                         let microjob_versions = task_midstate_versions(&new_task);
-                        let write_sequence_id = writejob_effective_sequence_id(next_sequence_id);
+                        let write_sequence_id = assignment_tracker.current_write_sequence_id();
 
                         let engine_assignments = match send_task_to_all_engines(
                             &mut chip_commands,
@@ -1306,14 +1208,14 @@ where
                             leading_zeros: ENGINE_LEADING_ZEROS,
                             nonce_minus_value: BZM2_NONCE_MINUS,
                         };
-                        retain_assigned_task(&mut assigned_tasks, new_assigned_task);
+                        assignment_tracker.retain(new_assigned_task);
 
                         debug!(
                             job_id = %new_task.template.id,
                             write_sequence_id,
                             "Sent BZM2 work to chip (old work invalidated)"
                         );
-                        next_sequence_id = next_sequence_id.wrapping_add(1);
+                        assignment_tracker.advance_sequence();
 
                         let old_task = current_task.replace(new_task);
                         {
@@ -1326,7 +1228,7 @@ where
                         debug!("Going idle");
 
                         let old_task = current_task.take();
-                        assigned_tasks.clear();
+                        assignment_tracker.clear();
                         {
                             let mut s = status.write().expect("status lock poisoned");
                             s.is_active = false;
@@ -1373,94 +1275,13 @@ where
                             continue;
                         };
 
-                        let Some(resolved_fields) =
-                            resolve_readresult_fields(sequence, timecode, |slot| {
-                                assigned_tasks.iter().rev().any(|task| {
-                                    readresult_sequence_slot(task.sequence_id) == slot
-                                })
-                            })
-                        else {
-                            continue;
-                        };
-                        let sequence_id = resolved_fields.sequence_id;
-                        let micro_job_id = resolved_fields.micro_job_id;
-                        let timecode_effective = resolved_fields.timecode;
-                        let sequence_slot = readresult_sequence_slot(sequence_id);
-                        let slot_candidates: Vec<AssignedTask> = assigned_tasks
-                            .iter()
-                            .rev()
-                            .filter(|task| readresult_sequence_slot(task.sequence_id) == sequence_slot)
-                            .cloned()
-                            .collect();
-                        let slot_candidate_count = slot_candidates.len();
-                        if slot_candidate_count == 0 {
-                            continue;
-                        }
-
                         let nonce_raw = nonce;
-                        let mut selected_candidate: Option<SelectedReadResultCandidate> = None;
-                        let mut selected_rank = 0u8;
-
-                        for mut candidate in slot_candidates {
-                            let Some(engine_assignment) =
-                                candidate.engine_assignments.get(logical_engine_id).cloned()
-                            else {
-                                continue;
-                            };
-                            candidate.merkle_root = engine_assignment.merkle_root;
-                            candidate.task.en2 = engine_assignment.extranonce2;
-                            let share_version = candidate.microjob_versions[micro_job_id as usize];
-                            let selected_midstate = engine_assignment.midstates[micro_job_id as usize];
-                            // Result time is reverse-counted and must be
-                            // converted into a forward ntime offset.
-                            let ntime_offset =
-                                u32::from(candidate.timestamp_count.wrapping_sub(timecode_effective));
-                            let share_ntime = candidate.task.ntime.wrapping_add(ntime_offset);
-                            // READRESULT mapping:
-                            // READRESULT nonce is first adjusted by nonce_minus, then byte-swapped
-                            // for reconstructed header hashing and Stratum submit nonce field.
-                            let nonce_adjusted = nonce_raw.wrapping_sub(candidate.nonce_minus_value);
-                            let nonce_submit = nonce_adjusted.swap_bytes();
-
-                            let tail16 = bzm2_tail16_bytes(&candidate, share_ntime, nonce_submit);
-                            let hash_bytes =
-                                bzm2_double_sha_from_midstate_and_tail(&selected_midstate, &tail16);
-                            let hash = bitcoin::BlockHash::from_byte_array(hash_bytes);
-                            let target_bytes = candidate.task.share_target.to_le_bytes();
-                            let check_result = check_result(
-                                &hash_bytes,
-                                &target_bytes,
-                                candidate.leading_zeros,
-                            );
-                            let observed_leading_zeros = leading_zero_bits(&hash_bytes);
-                            let rank = match check_result {
-                                Bzm2CheckResult::Correct => 3,
-                                Bzm2CheckResult::NotMeetTarget => 2,
-                                Bzm2CheckResult::Error => 1,
-                            };
-
-                            if selected_candidate.is_none() || rank > selected_rank {
-                                selected_rank = rank;
-                                selected_candidate = Some(SelectedReadResultCandidate {
-                                    assigned: candidate,
-                                    share_version,
-                                    ntime_offset,
-                                    share_ntime,
-                                    nonce_adjusted,
-                                    nonce_submit,
-                                    hash_bytes,
-                                    hash,
-                                    check_result,
-                                    observed_leading_zeros,
-                                });
-                                if rank == 3 {
-                                    break;
-                                }
-                            }
-                        }
-
                         let Some(SelectedReadResultCandidate {
                             assigned,
+                            sequence_id,
+                            micro_job_id,
+                            timecode_effective,
+                            slot_candidate_count,
                             share_version,
                             ntime_offset,
                             share_ntime,
@@ -1470,7 +1291,8 @@ where
                             hash,
                             check_result,
                             observed_leading_zeros,
-                        }) = selected_candidate
+                        }) = assignment_tracker
+                            .resolve_candidate(logical_engine_id, sequence, timecode, nonce_raw)
                         else {
                             continue;
                         };
@@ -1562,40 +1384,8 @@ mod tests {
         AssignedTask, BZM2_NONCE_MINUS, Bzm2CheckResult, ENGINE_LEADING_ZEROS,
         ENGINE_TIMESTAMP_COUNT, EngineAssignment, MIDSTATE_COUNT, WORK_ENGINE_COUNT,
         bzm2_double_sha_from_midstate_and_tail, bzm2_tail16_bytes, check_result,
-        hash_bytes_bzm2_order, protocol, resolve_readresult_fields, task_midstate_versions,
-        task_to_bzm2_payload,
+        hash_bytes_bzm2_order, protocol, task_midstate_versions, task_to_bzm2_payload,
     };
-
-    #[test]
-    fn test_resolve_readresult_fields_prefers_raw_when_slot_exists() {
-        let active_slots = [32u8, 0u8];
-        let fields = resolve_readresult_fields(0x80, 0xbc, |slot| active_slots.contains(&slot))
-            .expect("raw slot should resolve");
-        assert_eq!(fields.sequence, 0x80);
-        assert_eq!(fields.timecode, 0xbc);
-        assert_eq!(fields.sequence_id, 32);
-        assert_eq!(fields.micro_job_id, 0);
-        assert!(!fields.used_masked_fields);
-    }
-
-    #[test]
-    fn test_resolve_readresult_fields_uses_masked_fallback() {
-        let active_slots = [0u8];
-        let fields = resolve_readresult_fields(0x82, 0xbc, |slot| active_slots.contains(&slot))
-            .expect("masked slot should resolve");
-        assert_eq!(fields.sequence, 0x02);
-        assert_eq!(fields.timecode, 0x3c);
-        assert_eq!(fields.sequence_id, 0);
-        assert_eq!(fields.micro_job_id, 2);
-        assert!(fields.used_masked_fields);
-    }
-
-    #[test]
-    fn test_resolve_readresult_fields_none_when_no_slot_matches() {
-        let active_slots = [0u8];
-        let fields = resolve_readresult_fields(0xfd, 0x7f, |slot| active_slots.contains(&slot));
-        assert!(fields.is_none());
-    }
 
     #[test]
     fn test_readresult_hash_check_with_known_good_bzm2_share() {
