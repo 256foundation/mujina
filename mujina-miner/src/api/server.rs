@@ -137,7 +137,8 @@ mod tests {
     use super::*;
     use crate::api::commands::SchedulerCommand;
     use crate::api_client::types::{
-        BoardState, Bzm2DtsVsQueryRequest, SourceState, TemperatureSensor,
+        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, EngineCoordinate,
+        SourceState, TemperatureSensor,
     };
     use crate::board::{BoardCommand, BoardRegistration};
 
@@ -346,6 +347,84 @@ mod tests {
         assert!(board.temperatures.iter().any(
             |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
         ));
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_engine_discovery_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::DiscoverBzm2Engines {
+                thread_index,
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout_ms,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                assert_eq!(tdm_prediv_raw, 0x0f);
+                assert_eq!(tdm_counter, 16);
+                assert_eq!(timeout_ms, Some(150));
+                state_tx_for_command.send_modify(|state| {
+                    state.asics.push(AsicState {
+                        id: 2,
+                        thread_index: Some(0),
+                        serial_path: Some("/dev/ttyUSB0".into()),
+                        discovered_engine_count: Some(236),
+                        missing_engines: vec![
+                            EngineCoordinate { row: 3, col: 7 },
+                            EngineCoordinate { row: 5, col: 11 },
+                        ],
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/discover-engines",
+            &Bzm2EngineDiscoveryRequest {
+                thread_index: 0,
+                asic: 2,
+                tdm_prediv_raw: 0x0f,
+                tdm_counter: 16,
+                timeout_ms: Some(150),
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.asics.iter().any(|asic| {
+            asic.id == 2
+                && asic.thread_index == Some(0)
+                && asic.discovered_engine_count == Some(236)
+                && asic.missing_engines
+                    == vec![
+                        EngineCoordinate { row: 3, col: 7 },
+                        EngineCoordinate { row: 5, col: 11 },
+                    ]
+        }));
         drop(miner_tx);
         drop(cmd_rx);
     }

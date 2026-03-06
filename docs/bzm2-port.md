@@ -140,7 +140,6 @@ Startup enumeration notes:
   `MUJINA_BZM2_ASICS_PER_BUS` topology so warm-restart cases do not collapse to
   zero ASICs
 
-<<<<<<< HEAD
 Bring-up notes:
 
 - if bring-up is enabled, `Bzm2Board` applies the configured rail/reset
@@ -225,6 +224,44 @@ curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
 ```
 
 See [bzm2-uart-debug.md](bzm2-uart-debug.md) for CLI usage examples and expected output shape.
+
+## On-Demand Engine Discovery
+
+Mujina also supports explicit per-ASIC engine-map discovery when the thread is
+idle.
+
+This is useful when:
+
+- an ASIC is returning unstable shares and the default engine-hole assumption is
+  no longer trustworthy
+- developers need to compare the live engine map against the historical default
+  BZM2 hole pattern
+- operators want the discovered topology recorded in normal board API state
+
+The engine-discovery path runs through the live BZM2 hash-thread actor, just
+like the DTS/VS query path, so UART ownership stays correct. Successful scans
+update `BoardState.asics` with:
+
+- `id`
+- `thread_index`
+- `serial_path`
+- `discovered_engine_count`
+- `missing_engines`
+
+HTTP API:
+
+- `POST /api/v0/boards/{name}/bzm2/discover-engines`
+
+Example HTTP request:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/discover-engines \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2,"tdm_prediv_raw":15,"tdm_counter":16,"timeout_ms":150}'
+```
+
+The response returns the refreshed `BoardState`, including the updated
+`asics` topology entry for the queried ASIC.
 ## Design Boundary
 
 The legacy `bzmd` board-power path mixes three different concerns:
