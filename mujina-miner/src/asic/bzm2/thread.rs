@@ -1,7 +1,14 @@
 //! BZM2 HashThread implementation.
 //!
-//! This module mirrors the BM13xx actor model and performs full BZM2 bring-up
-//! before the first task is accepted.
+//! This module uses an actor-style `HashThread` implementation and performs
+//! full BZM2 bring-up before the first task is accepted.
+//!
+//! A `Bzm2Thread` represents the hashing worker for one BIRDS board data path.
+//! It is responsible for:
+//! - asserting and releasing ASIC reset through board-provided peripherals
+//! - programming the chip register set needed for mining
+//! - translating scheduler work into BZM2 micro-jobs
+//! - validating returned results before forwarding shares upstream
 
 use std::{
     collections::VecDeque,
@@ -21,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
 use tokio_stream::StreamExt;
 
-use super::protocol;
+use super::{HexBytes, protocol};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
@@ -118,7 +125,11 @@ enum ThreadCommand {
     Shutdown,
 }
 
-/// HashThread wrapper for a BZM2 board worker.
+/// `HashThread` wrapper for a BZM2 board worker.
+///
+/// This is a thin handle around a spawned actor task. The actor owns the
+/// serial transport and emits [`HashThreadEvent`] updates as it initializes
+/// the ASICs and processes work.
 pub struct Bzm2Thread {
     name: String,
     command_tx: mpsc::Sender<ThreadCommand>,
@@ -128,6 +139,11 @@ pub struct Bzm2Thread {
 }
 
 impl Bzm2Thread {
+    /// Create a new BZM2 hashing worker.
+    ///
+    /// The thread starts in an uninitialized state. Hardware bring-up happens
+    /// lazily when the first task is assigned so board discovery can complete
+    /// without immediately programming the ASICs.
     pub fn new<R, W>(
         name: String,
         chip_responses: R,
@@ -148,16 +164,16 @@ impl Bzm2Thread {
         let status_clone = Arc::clone(&status);
 
         tokio::spawn(async move {
-            bzm2_thread_actor(
+            bzm2_thread_actor(Bzm2ThreadActor {
                 cmd_rx,
                 evt_tx,
                 removal_rx,
-                status_clone,
+                status: status_clone,
                 chip_responses,
                 chip_commands,
                 peripherals,
                 asic_count,
-            )
+            })
             .await;
         });
 
@@ -263,12 +279,7 @@ async fn drain_input<R>(chip_responses: &mut R)
 where
     R: Stream<Item = Result<protocol::Response, io::Error>> + Unpin,
 {
-    loop {
-        match time::timeout(Duration::from_millis(20), chip_responses.next()).await {
-            Ok(Some(_)) => continue,
-            _ => break,
-        }
-    }
+    while let Ok(Some(_)) = time::timeout(Duration::from_millis(20), chip_responses.next()).await {}
 }
 
 async fn wait_for_noop<R>(
@@ -657,6 +668,27 @@ enum Bzm2CheckResult {
     Error,
 }
 
+struct SelectedReadResultCandidate {
+    assigned: AssignedTask,
+    share_version: BlockVersion,
+    selected_midstate: [u8; 32],
+    ntime_offset: u32,
+    share_ntime: u32,
+    nonce_adjusted: u32,
+    nonce_submit: u32,
+    header: BlockHeader,
+    tail16: [u8; 16],
+    hash_bytes: [u8; 32],
+    hash: bitcoin::BlockHash,
+    target_bytes: [u8; 32],
+    check_result: Bzm2CheckResult,
+    observed_leading_zeros: u16,
+    achieved_difficulty: Difficulty,
+    target_difficulty: Difficulty,
+    achieved_difficulty_f64: f64,
+    target_difficulty_f64: f64,
+}
+
 // Compute the four version-mask deltas used across the 4-midstate micro-jobs.
 fn midstate_version_mask_variants(version_mask: u32) -> [u32; MIDSTATE_COUNT] {
     if version_mask == 0 {
@@ -665,19 +697,19 @@ fn midstate_version_mask_variants(version_mask: u32) -> [u32; MIDSTATE_COUNT] {
 
     let mut mask = version_mask;
     let mut cnt: u32 = 0;
-    while (mask % 16) == 0 {
+    while mask.is_multiple_of(16) {
         cnt = cnt.saturating_add(1);
         mask /= 16;
     }
 
     let mut tmp_mask = 0u32;
-    if (mask % 16) != 0 {
+    if !mask.is_multiple_of(16) {
         tmp_mask = mask % 16;
-    } else if (mask % 8) != 0 {
+    } else if !mask.is_multiple_of(8) {
         tmp_mask = mask % 8;
-    } else if (mask % 4) != 0 {
+    } else if !mask.is_multiple_of(4) {
         tmp_mask = mask % 4;
-    } else if (mask % 2) != 0 {
+    } else if !mask.is_multiple_of(2) {
         tmp_mask = mask % 2;
     }
 
@@ -704,11 +736,7 @@ fn task_midstate_versions(task: &HashTask) -> [BlockVersion; MIDSTATE_COUNT] {
     variants.map(|variant| BlockVersion::from_consensus((base | variant) as i32))
 }
 
-fn check_result(
-    sha256_le: &[u8; 32],
-    target_le: &[u8; 32],
-    leading_zeros: u8,
-) -> Bzm2CheckResult {
+fn check_result(sha256_le: &[u8; 32], target_le: &[u8; 32], leading_zeros: u8) -> Bzm2CheckResult {
     let mut i: usize = 31;
     while i > 0 && sha256_le[i] == 0 {
         i -= 1;
@@ -856,13 +884,6 @@ fn bzm2_tail16_bytes(assigned: &AssignedTask, ntime: u32, nonce_submit: u32) -> 
 #[cfg(test)]
 fn hash_bytes_bzm2_order(hash: &bitcoin::BlockHash) -> [u8; 32] {
     *hash.as_byte_array()
-}
-
-fn format_hex(data: &[u8]) -> String {
-    data.iter()
-        .map(|byte| format!("{:02X}", byte))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn validation_probe_summary(
@@ -1259,8 +1280,8 @@ fn log_replay_check_for_task(config: &ReplayCheckConfig, assigned: &AssignedTask
         check_result = ?check_result,
         achieved_difficulty = %achieved_difficulty,
         target_difficulty = %target_difficulty,
-        hash_bzm2 = %format_hex(&hash_bzm2),
-        header = %format_hex(&header_bytes),
+        hash_bzm2 = %HexBytes(&hash_bzm2),
+        header = %HexBytes(&header_bytes),
         "BZM2 replay check"
     );
     true
@@ -1434,9 +1455,9 @@ fn log_bzm2_job_fingerprint(
     for (idx, version) in versions.iter().copied().enumerate() {
         let header = build_header_bytes(task, version, merkle_root)?;
         version_map.push(format!("mj{idx}={:#010x}", version.to_consensus() as u32));
-        header_tails.push(format!("mj{idx}={}", format_hex(&header[64..80])));
-        header_full.push(format!("mj{idx}={}", format_hex(&header)));
-        midstates_hex.push(format!("mj{idx}={}", format_hex(&payload.midstates[idx])));
+        header_tails.push(format!("mj{idx}={}", HexBytes(&header[64..80])));
+        header_full.push(format!("mj{idx}={}", HexBytes(&header)));
+        midstates_hex.push(format!("mj{idx}={}", HexBytes(&payload.midstates[idx])));
     }
 
     debug!(
@@ -1449,8 +1470,8 @@ fn log_bzm2_job_fingerprint(
         en2 = %en2_dbg,
         zeros_to_find,
         timestamp_count,
-        target_reg = %format_hex(&target_reg_bytes),
-        merkle_root = %format_hex(&merkle_root_bytes),
+        target_reg = %HexBytes(&target_reg_bytes),
+        merkle_root = %HexBytes(&merkle_root_bytes),
         payload_merkle_residue = format_args!("{:#010x}", payload.merkle_residue),
         payload_timestamp = format_args!("{:#010x}", payload.timestamp),
         versions = %version_map.join(" "),
@@ -1901,10 +1922,7 @@ where
     Ok(())
 }
 
-async fn set_asic_nonce_range<W>(
-    chip_commands: &mut W,
-    asic_id: u8,
-) -> Result<(), HashThreadError>
+async fn set_asic_nonce_range<W>(chip_commands: &mut W, asic_id: u8) -> Result<(), HashThreadError>
 where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
@@ -2153,20 +2171,34 @@ where
     Ok(asic_ids)
 }
 
-async fn bzm2_thread_actor<R, W>(
-    mut cmd_rx: mpsc::Receiver<ThreadCommand>,
+struct Bzm2ThreadActor<R, W> {
+    cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
-    mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
+    removal_rx: watch::Receiver<ThreadRemovalSignal>,
     status: Arc<RwLock<HashThreadStatus>>,
-    mut chip_responses: R,
-    mut chip_commands: W,
-    mut peripherals: BoardPeripherals,
+    chip_responses: R,
+    chip_commands: W,
+    peripherals: BoardPeripherals,
     asic_count: u8,
-) where
+}
+
+async fn bzm2_thread_actor<R, W>(actor: Bzm2ThreadActor<R, W>)
+where
     R: Stream<Item = Result<protocol::Response, io::Error>> + Unpin,
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
 {
+    let Bzm2ThreadActor {
+        mut cmd_rx,
+        evt_tx,
+        mut removal_rx,
+        status,
+        mut chip_responses,
+        mut chip_commands,
+        mut peripherals,
+        asic_count,
+    } = actor;
+
     if let Some(ref mut asic_enable) = peripherals.asic_enable
         && let Err(e) = asic_enable.disable().await
     {
@@ -2284,14 +2316,10 @@ async fn bzm2_thread_actor<R, W>(
                         retain_assigned_task(&mut assigned_tasks, new_assigned_task);
                         if let Some(cfg) = replay_check_config.as_ref()
                             && let Some(assigned) = assigned_tasks.back()
+                            && log_replay_check_for_task(cfg, assigned)
                         {
-                            if log_replay_check_for_task(cfg, assigned) {
-                                replay_check_hits = replay_check_hits.saturating_add(1);
-                                trace!(
-                                    replay_check_hits,
-                                    "BZM2 replay check matched on update_task"
-                                );
-                            }
+                            replay_check_hits = replay_check_hits.saturating_add(1);
+                            trace!(replay_check_hits, "BZM2 replay check matched on update_task");
                         }
 
                         debug!(
@@ -2370,14 +2398,13 @@ async fn bzm2_thread_actor<R, W>(
                         retain_assigned_task(&mut assigned_tasks, new_assigned_task);
                         if let Some(cfg) = replay_check_config.as_ref()
                             && let Some(assigned) = assigned_tasks.back()
+                            && log_replay_check_for_task(cfg, assigned)
                         {
-                            if log_replay_check_for_task(cfg, assigned) {
-                                replay_check_hits = replay_check_hits.saturating_add(1);
-                                trace!(
-                                    replay_check_hits,
-                                    "BZM2 replay check matched on replace_task"
-                                );
-                            }
+                            replay_check_hits = replay_check_hits.saturating_add(1);
+                            trace!(
+                                replay_check_hits,
+                                "BZM2 replay check matched on replace_task"
+                            );
                         }
 
                         debug!(
@@ -2567,26 +2594,7 @@ async fn bzm2_thread_actor<R, W>(
                         }
 
                         let nonce_raw = nonce;
-                        let mut selected_candidate: Option<(
-                            AssignedTask,
-                            BlockVersion,
-                            [u8; 32],
-                            u32,
-                            u32,
-                            u32,
-                            u32,
-                            BlockHeader,
-                            [u8; 16],
-                            [u8; 32],
-                            bitcoin::BlockHash,
-                            [u8; 32],
-                            Bzm2CheckResult,
-                            u16,
-                            Difficulty,
-                            Difficulty,
-                            f64,
-                            f64,
-                        )> = None;
+                        let mut selected_candidate: Option<SelectedReadResultCandidate> = None;
                         let mut selected_rank = 0u8;
 
                         for mut candidate in slot_candidates {
@@ -2644,8 +2652,8 @@ async fn bzm2_thread_actor<R, W>(
 
                             if selected_candidate.is_none() || rank > selected_rank {
                                 selected_rank = rank;
-                                selected_candidate = Some((
-                                    candidate,
+                                selected_candidate = Some(SelectedReadResultCandidate {
+                                    assigned: candidate,
                                     share_version,
                                     selected_midstate,
                                     ntime_offset,
@@ -2663,14 +2671,14 @@ async fn bzm2_thread_actor<R, W>(
                                     target_difficulty,
                                     achieved_difficulty_f64,
                                     target_difficulty_f64,
-                                ));
+                                });
                                 if rank == 3 {
                                     break;
                                 }
                             }
                         }
 
-                        let Some((
+                        let Some(SelectedReadResultCandidate {
                             assigned,
                             share_version,
                             selected_midstate,
@@ -2689,7 +2697,7 @@ async fn bzm2_thread_actor<R, W>(
                             target_difficulty,
                             achieved_difficulty_f64,
                             target_difficulty_f64,
-                        )) = selected_candidate
+                        }) = selected_candidate
                         else {
                             trace!(
                                 asic_hw_id,
@@ -2727,13 +2735,16 @@ async fn bzm2_thread_actor<R, W>(
                         }
 
                         sanity_candidates_total = sanity_candidates_total.saturating_add(1);
-                        if sanity_best_difficulty.map_or(true, |best| achieved_difficulty > best) {
+                        if sanity_best_difficulty
+                            .is_none_or(|best| achieved_difficulty > best)
+                        {
                             sanity_best_difficulty = Some(achieved_difficulty);
                         }
 
                         if let Some(cfg) = focused_readresult_config.as_ref() {
-                            let adjusted_match = cfg.adjusted_nonce.map_or(true, |n| n == nonce_adjusted);
-                            let raw_match = cfg.raw_nonce.map_or(true, |n| n == nonce_raw);
+                            let adjusted_match =
+                                cfg.adjusted_nonce.is_none_or(|n| n == nonce_adjusted);
+                            let raw_match = cfg.raw_nonce.is_none_or(|n| n == nonce_raw);
                             if adjusted_match && raw_match {
                                 let header_bytes = consensus::serialize(&header);
                                 let merkle_root_bytes = consensus::serialize(&assigned.merkle_root);
@@ -2762,15 +2773,15 @@ async fn bzm2_thread_actor<R, W>(
                                     version = format_args!("{:#010x}", share_version.to_consensus() as u32),
                                     bits = format_args!("{:#010x}", assigned.task.template.bits.to_consensus()),
                                     extranonce2 = ?assigned.task.en2,
-                                    merkle_root = %format_hex(&merkle_root_bytes),
-                                    midstate = %format_hex(&selected_midstate),
-                                    derived_midstate = %format_hex(&derived_midstate),
-                                    header = %format_hex(&header_bytes),
-                                    tail16 = %format_hex(&tail16),
-                                    hash_bzm2_order = %format_hex(&hash_bytes),
-                                    hash_reversed = %format_hex(&hash_rev),
+                                    merkle_root = %HexBytes(&merkle_root_bytes),
+                                    midstate = %HexBytes(&selected_midstate),
+                                    derived_midstate = %HexBytes(&derived_midstate),
+                                    header = %HexBytes(&header_bytes),
+                                    tail16 = %HexBytes(&tail16),
+                                    hash_bzm2_order = %HexBytes(&hash_bytes),
+                                    hash_reversed = %HexBytes(&hash_rev),
                                     hash_msb_bzm2 = format_args!("{:#04x}", hash_bytes[31]),
-                                    target = %format_hex(&target_bytes),
+                                    target = %HexBytes(&target_bytes),
                                     check_result = ?check_result,
                                     observed_leading_zeros_bits = observed_leading_zeros,
                                     achieved_difficulty = %achieved_difficulty,
@@ -2975,7 +2986,7 @@ async fn bzm2_thread_actor<R, W>(
                                     selected_ntime = format_args!("{:#x}", share_ntime),
                                     selected_version = format_args!("{:#x}", share_version.to_consensus() as u32),
                                     bits = format_args!("{:#x}", assigned.task.template.bits.to_consensus()),
-                                    header = %format_hex(&header_bytes),
+                                    header = %HexBytes(&header_bytes),
                                     focused = %focused,
                                     probes = %probes.join(" | "),
                                     "BZM2 READRESULT sanity diagnostic"
@@ -3001,7 +3012,7 @@ async fn bzm2_thread_actor<R, W>(
                             );
                         }
 
-                        if sanity_candidates_total % 500 == 0 {
+                        if sanity_candidates_total.is_multiple_of(500) {
                             debug!(
                                 total_candidates = sanity_candidates_total,
                                 candidates_meeting_task_target = sanity_candidates_meet_task,
@@ -3053,9 +3064,9 @@ mod tests {
     use super::{
         AssignedTask, BZM2_NONCE_MINUS, Bzm2CheckResult, ENGINE_LEADING_ZEROS,
         ENGINE_TIMESTAMP_COUNT, EngineAssignment, MIDSTATE_COUNT, WORK_ENGINE_COUNT,
-        bzm2_double_sha_from_midstate_and_tail, bzm2_tail16_bytes, midstate_version_mask_variants,
-        check_result, hash_bytes_bzm2_order, protocol, resolve_readresult_fields,
-        task_to_bzm2_payload, task_midstate_versions,
+        bzm2_double_sha_from_midstate_and_tail, bzm2_tail16_bytes, check_result,
+        hash_bytes_bzm2_order, midstate_version_mask_variants, protocol, resolve_readresult_fields,
+        task_midstate_versions, task_to_bzm2_payload,
     };
 
     #[test]
@@ -3107,10 +3118,7 @@ mod tests {
         let mut hash = [0u8; 32];
         let target = [0xffu8; 32];
         hash[31] = 0x80;
-        assert_eq!(
-            check_result(&hash, &target, 32),
-            Bzm2CheckResult::Error
-        );
+        assert_eq!(check_result(&hash, &target, 32), Bzm2CheckResult::Error);
     }
 
     #[test]
@@ -3118,10 +3126,7 @@ mod tests {
         let mut hash = [0u8; 32];
         let target = [0xffu8; 32];
         hash[27] = 0x3f;
-        assert_eq!(
-            check_result(&hash, &target, 34),
-            Bzm2CheckResult::Correct
-        );
+        assert_eq!(check_result(&hash, &target, 34), Bzm2CheckResult::Correct);
     }
 
     #[test]
@@ -3129,10 +3134,7 @@ mod tests {
         let mut hash = [0u8; 32];
         let target = [0xffu8; 32];
         hash[27] = 0x40;
-        assert_eq!(
-            check_result(&hash, &target, 34),
-            Bzm2CheckResult::Error
-        );
+        assert_eq!(check_result(&hash, &target, 34), Bzm2CheckResult::Error);
     }
 
     #[test]
@@ -3142,10 +3144,7 @@ mod tests {
 
         hash[1] = 0x10;
         target[1] = 0x20;
-        assert_eq!(
-            check_result(&hash, &target, 32),
-            Bzm2CheckResult::Correct
-        );
+        assert_eq!(check_result(&hash, &target, 32), Bzm2CheckResult::Correct);
 
         hash[1] = 0x30;
         target[1] = 0x20;
