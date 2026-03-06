@@ -959,15 +959,28 @@ mod tests {
         .await
         .unwrap();
 
-        let mut buf = vec![0u8; 512];
-        let n = tokio::time::timeout(Duration::from_millis(250), reader.read(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let bytes = &buf[..n];
-
         let expected_bytes_per_engine = 8 + 8 + 11 + (48 * 4);
-        assert_eq!(bytes.len(), expected_bytes_per_engine * engine_coords.len());
+        let expected_total = expected_bytes_per_engine * engine_coords.len();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let mut buf = vec![0u8; 512];
+        let mut bytes = Vec::with_capacity(expected_total);
+        while bytes.len() < expected_total {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out before collecting the full dispatch stream"
+            );
+            let n = tokio::time::timeout(remaining, reader.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+
+        assert_eq!(bytes.len(), expected_total);
         assert_eq!(engine_dispatches.len(), engine_coords.len());
 
         let first_packet_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;

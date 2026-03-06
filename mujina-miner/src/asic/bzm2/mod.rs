@@ -9,6 +9,10 @@ pub use clock::{
     Bzm2ClockController, Bzm2ClockDebugReport, Bzm2ClockError, Bzm2Dll, Bzm2DllConfig,
     Bzm2DllStatus, Bzm2Pll, Bzm2PllConfig, Bzm2PllStatus,
 };
+pub use control::{
+    Bzm2BringupPlan, FileGpioPin, FilePowerRail, GpioResetLine, PowerRailTelemetry,
+    Tps546PowerRail, VoltageStackStep,
+};
 pub use pnp::{
     Bzm2AsicMeasurement, Bzm2AsicPlan, Bzm2AsicTopology, Bzm2BoardCalibrationInput,
     Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlan, Bzm2CalibrationPlanner,

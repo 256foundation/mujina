@@ -19,6 +19,20 @@ In Mujina, those responsibilities map cleanly onto existing abstractions:
 
 A standalone Rust daemon is therefore not required for the mining path.
 
+## Bring-Up And Shutdown
+
+`Bzm2Board` now supports optional board-level power and reset sequencing through
+the existing `Bzm2BringupPlan`.
+
+The current generic integration path uses file-backed adapters:
+
+- rail setpoint files for coarse voltage application
+- optional rail enable files for regulator enable or precharge control
+- an optional reset file for ASIC reset assertion and release
+
+This keeps the implementation generic across custom Linux-based carriers without
+hard-coding one vendor board layout or management MCU protocol.
+
 ## Implemented Behavior
 
 The BZM2 Mujina thread now reimplements the core legacy data path and the generally reusable portions of the control path:
@@ -70,6 +84,28 @@ Supported environment variables:
 - `MUJINA_BZM2_ENUM_MAX_ASICS_PER_BUS`: comma-separated per-bus enumeration
   ceilings, default `100` per bus unless calibration topology already provides
   a larger configured count
+- `MUJINA_BZM2_ENABLE_BRINGUP`: enable startup and shutdown rail/reset
+  sequencing
+- `MUJINA_BZM2_BRINGUP_ENABLE`: alternate name for the same setting
+- `MUJINA_BZM2_RAIL_SET_PATHS`: comma-separated rail-control file paths
+- `MUJINA_BZM2_RAIL_TARGET_VOLTS`: comma-separated target rail voltages for the
+  bring-up plan
+- `MUJINA_BZM2_RAIL_WRITE_SCALES`: optional comma-separated scale factors used
+  when converting volts into the raw file value, for example `1000` for mV or
+  `1000000` for uV
+- `MUJINA_BZM2_RAIL_ENABLE_PATHS`: optional comma-separated enable/control file
+  paths paired with the rail list
+- `MUJINA_BZM2_RAIL_ENABLE_VALUES`: optional comma-separated values written to
+  the rail enable paths during rail initialization
+- `MUJINA_BZM2_RESET_PATH`: optional reset-control file path
+- `MUJINA_BZM2_RESET_ACTIVE_LOW`: whether the reset path is active-low, default
+  `true`
+- `MUJINA_BZM2_BRINGUP_PRE_POWER_MS`: delay before rail initialization, default
+  `10`
+- `MUJINA_BZM2_BRINGUP_POST_POWER_MS`: delay after the configured rail steps,
+  default `25`
+- `MUJINA_BZM2_BRINGUP_RELEASE_RESET_MS`: delay after reset release, default
+  `25`
 
 Startup enumeration notes:
 
@@ -81,6 +117,76 @@ Startup enumeration notes:
   `MUJINA_BZM2_ASICS_PER_BUS` topology so warm-restart cases do not collapse to
   zero ASICs
 
+<<<<<<< HEAD
+Bring-up notes:
+
+- if bring-up is enabled, `Bzm2Board` applies the configured rail/reset
+  sequence before chain discovery, calibration, and hash-thread creation
+- on board shutdown, the same plan is used in reverse order to assert reset and
+  drive the configured rails back to `0`
+- the current implementation is intentionally coarse-grained: it provides real
+  board lifecycle sequencing now, while richer rail telemetry and domain-aware
+  voltage application remain the next steps
+
+## API Telemetry
+
+When Gen2 `DTS_VS` frames are present on the UART path, Mujina now surfaces ASIC-internal telemetry through the normal board API state:
+
+- `BoardState.temperatures`
+- `BoardState.powers`
+
+The values are named per serial bus and per ASIC so they can coexist with host-side sensor files:
+
+- temperature: `ttyUSB0-asic-2-dts`
+- voltage channels: `ttyUSB0-asic-2-vs-ch0`, `ttyUSB0-asic-2-vs-ch1`, `ttyUSB0-asic-2-vs-ch2`
+
+Example JSON fragment:
+
+```json
+{
+  "temperatures": [
+    { "name": "ttyUSB0-asic-2-dts", "temperature_c": 64.5 }
+  ],
+  "powers": [
+    { "name": "ttyUSB0-asic-2-vs-ch0", "voltage_v": 0.78, "current_a": null, "power_w": null },
+    { "name": "ttyUSB0-asic-2-vs-ch1", "voltage_v": 0.79, "current_a": null, "power_w": null },
+    { "name": "ttyUSB0-asic-2-vs-ch2", "voltage_v": 0.77, "current_a": null, "power_w": null }
+  ]
+}
+```
+
+Notes:
+
+- these ASIC-originated entries are merged into board state and do not replace host-file telemetry
+- Celsius and voltage scaling follow the legacy `bzmd` DTS/VS conversion formulas
+- Gen1 currently exposes voltage through this path, but not a Celsius temperature reading
+
+## On-Demand ASIC Sensor Queries
+
+Mujina now supports explicit DTS/VS query operations in addition to passive frame reporting.
+
+This is useful when:
+
+- the miner is idle and no passive DTS/VS traffic is arriving
+- one ASIC is misbehaving and needs targeted inspection
+- developers want a direct sensor read without enabling a full TDM watch session
+
+Two access paths are implemented:
+
+- CLI: `mujina-bzm2-debug dts-vs-query` and `mujina-bzm2-debug dts-vs-scan`
+- HTTP API: `POST /api/v0/boards/{name}/bzm2/dts-vs-query`
+
+The query path runs through the live BZM2 hash-thread actor so UART ownership remains correct. Queried frames are converted through the same telemetry code path used for passive DTS/VS reporting, so the returned values land in normal `BoardState` telemetry.
+
+Example HTTP request:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2}'
+```
+
+See [bzm2-uart-debug.md](bzm2-uart-debug.md) for CLI usage examples and expected output shape.
 ## Design Boundary
 
 The legacy `bzmd` board-power path mixes three different concerns:
