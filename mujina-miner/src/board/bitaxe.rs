@@ -998,7 +998,10 @@ async fn create_from_usb(
         board.chip_count()
     );
 
-    let registration = super::BoardRegistration { state_rx };
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: None,
+    };
     Ok((Box::new(board), registration))
 }
 

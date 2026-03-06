@@ -136,8 +136,10 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api_client::types::{BoardState, SourceState};
-    use crate::board::BoardRegistration;
+    use crate::api_client::types::{
+        BoardState, Bzm2DtsVsQueryRequest, SourceState, TemperatureSensor,
+    };
+    use crate::board::{BoardCommand, BoardRegistration};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -158,7 +160,10 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { state_rx: rx });
+            registry.push(BoardRegistration {
+                state_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 
@@ -174,6 +179,23 @@ mod tests {
         let req = Request::builder()
             .uri(uri)
             .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        app: Router,
+        uri: &str,
+        body: &T,
+    ) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -270,6 +292,62 @@ mod tests {
         let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/boards/nonexistent").await;
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn bzm2_query_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2DtsVs {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                state_tx_for_command.send_modify(|state| {
+                    state.temperatures.push(TemperatureSensor {
+                        name: "ttyUSB0-asic-2-dts".into(),
+                        temperature_c: Some(64.5),
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/dts-vs-query",
+            &Bzm2DtsVsQueryRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.temperatures.iter().any(
+            |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
+        ));
+        drop(miner_tx);
+        drop(cmd_rx);
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ pub mod pattern;
 
 use async_trait::async_trait;
 use std::{error::Error, fmt, future::Future, pin::Pin};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
@@ -89,6 +89,19 @@ impl From<std::io::Error> for BoardError {
 pub struct BoardRegistration {
     /// Watch receiver for the board's current state.
     pub state_rx: watch::Receiver<BoardState>,
+
+    /// Optional command sender for board-specific control and queries.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
+}
+
+/// Board-specific control and query commands exposed to higher layers.
+pub enum BoardCommand {
+    /// Query one BZM2 ASIC's internal DTS/VS telemetry through a live hash thread.
+    QueryBzm2DtsVs {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
 }
 
 /// Helper type for async board factory functions

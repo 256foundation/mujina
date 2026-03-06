@@ -10,7 +10,8 @@ use mujina_miner::asic::bzm2::protocol::{
     encode_read_result_command, logical_engine_address,
 };
 use mujina_miner::asic::bzm2::{
-    BROADCAST_GROUP_ASIC, Bzm2ClockController, Bzm2Dll, Bzm2Pll, Bzm2UartController, NOTCH_REG,
+    BROADCAST_GROUP_ASIC, Bzm2ClockController, Bzm2Dll, Bzm2DtsVsConfig, Bzm2Pll,
+    Bzm2UartController, DEFAULT_DTS_VS_QUERY_TIMEOUT, NOTCH_REG,
 };
 use mujina_miner::transport::{SerialReader, SerialStream, SerialWriter};
 use sha2::{Digest, Sha256};
@@ -38,6 +39,8 @@ async fn main() -> Result<()> {
         "uart-noop" => cmd_uart_noop(&args[2..]).await,
         "uart-loopback" => cmd_uart_loopback(&args[2..]).await,
         "uart-read-result" => cmd_uart_read_result(&args[2..]).await,
+        "dts-vs-query" => cmd_dts_vs_query(&args[2..]).await,
+        "dts-vs-scan" => cmd_dts_vs_scan(&args[2..]).await,
         "noop-scan" => cmd_noop_scan(&args[2..]).await,
         "loopback-scan" => cmd_loopback_scan(&args[2..]).await,
         "tdm-enable" => cmd_tdm_enable(&args[2..]).await,
@@ -71,6 +74,8 @@ fn print_usage() {
     eprintln!("  uart-noop <serial> <asic> [baud]");
     eprintln!("  uart-loopback <serial> <asic> <hex-bytes> [baud]");
     eprintln!("  uart-read-result <serial> <asic> <dts-gen> [baud]");
+    eprintln!("  dts-vs-query <serial> <asic> <dts-gen> [timeout-ms] [baud]");
+    eprintln!("  dts-vs-scan <serial> <asic-start> <asic-end> <dts-gen> [timeout-ms] [baud]");
     eprintln!("  noop-scan <serial> <asic-start> <asic-end> [baud]");
     eprintln!("  loopback-scan <serial> <asic-start> <asic-end> <payload-len> [baud]");
     eprintln!();
@@ -127,6 +132,19 @@ fn parse_watch_duration(raw: &str) -> Result<Duration> {
         bail!("watch duration must be greater than zero");
     }
     Ok(Duration::from_secs_f32(seconds))
+}
+
+fn parse_timeout_duration(raw: Option<&String>) -> Result<Duration> {
+    match raw {
+        Some(raw) => {
+            let millis = parse_u32(raw)?;
+            if millis == 0 {
+                bail!("timeout-ms must be greater than zero");
+            }
+            Ok(Duration::from_millis(millis as u64))
+        }
+        None => Ok(DEFAULT_DTS_VS_QUERY_TIMEOUT),
+    }
 }
 
 fn parse_dts_generation(raw: &str) -> Result<DtsVsGeneration> {
@@ -343,6 +361,42 @@ async fn cmd_uart_read_result(args: &[String]) -> Result<()> {
 
     for frame in frames {
         print_tdm_frame(&frame);
+    }
+
+    Ok(())
+}
+
+async fn cmd_dts_vs_query(args: &[String]) -> Result<()> {
+    if args.len() < 3 || args.len() > 5 {
+        bail!("usage: dts-vs-query <serial> <asic> <dts-gen> [timeout-ms] [baud]");
+    }
+
+    let mut uart = open_uart(&args[0], parse_baud(args.get(4))?)?;
+    let asic = parse_u8(&args[1])?;
+    let generation = parse_dts_generation(&args[2])?;
+    let timeout = parse_timeout_duration(args.get(3))?;
+    let frame = uart
+        .query_dts_vs(asic, generation, Bzm2DtsVsConfig::default(), timeout)
+        .await?;
+    print_dts_vs_query_frame(&frame);
+    Ok(())
+}
+
+async fn cmd_dts_vs_scan(args: &[String]) -> Result<()> {
+    if args.len() < 4 || args.len() > 6 {
+        bail!("usage: dts-vs-scan <serial> <asic-start> <asic-end> <dts-gen> [timeout-ms] [baud]");
+    }
+
+    let mut uart = open_uart(&args[0], parse_baud(args.get(5))?)?;
+    let asics = parse_asic_range(&args[1], &args[2])?;
+    let generation = parse_dts_generation(&args[3])?;
+    let timeout = parse_timeout_duration(args.get(4))?;
+
+    for asic in asics {
+        let frame = uart
+            .query_dts_vs(asic, generation, Bzm2DtsVsConfig::default(), timeout)
+            .await?;
+        print_dts_vs_query_frame(&frame);
     }
 
     Ok(())
@@ -1033,6 +1087,79 @@ fn print_tdm_frame(frame: &TdmFrame) {
             }
         },
     }
+}
+
+fn print_dts_vs_query_frame(frame: &mujina_miner::asic::bzm2::protocol::TdmDtsVsFrame) {
+    match frame {
+        mujina_miner::asic::bzm2::protocol::TdmDtsVsFrame::Gen1(frame) => {
+            println!(
+                "asic={} gen=1 voltage_v={} temperature_c={} thermal_valid={} voltage_enabled={}",
+                frame.asic,
+                frame
+                    .voltage_enabled
+                    .then(|| format!("{:.4}", legacy_tune_code_to_voltage_v(frame.voltage)))
+                    .unwrap_or_else(|| "n/a".into()),
+                if frame.thermal_enabled && frame.thermal_validity {
+                    format!(
+                        "{:.2}",
+                        legacy_gen1_tune_code_to_temperature_c(frame.thermal_tune_code)
+                    )
+                } else {
+                    "n/a".into()
+                },
+                frame.thermal_validity,
+                frame.voltage_enabled,
+            );
+        }
+        mujina_miner::asic::bzm2::protocol::TdmDtsVsFrame::Gen2(frame) => {
+            let temperature = if frame.thermal_enabled && frame.thermal_validity {
+                format!(
+                    "{:.2}",
+                    legacy_tune_code_to_temperature_c(frame.thermal_tune_code)
+                )
+            } else {
+                "n/a".into()
+            };
+            let ch0 = frame
+                .voltage_enabled
+                .then(|| format!("{:.4}", legacy_tune_code_to_voltage_v(frame.ch0_voltage)))
+                .unwrap_or_else(|| "n/a".into());
+            let ch1 = frame
+                .voltage_enabled
+                .then(|| format!("{:.4}", legacy_tune_code_to_voltage_v(frame.ch1_voltage)))
+                .unwrap_or_else(|| "n/a".into());
+            let ch2 = frame
+                .voltage_enabled
+                .then(|| format!("{:.4}", legacy_tune_code_to_voltage_v(frame.ch2_voltage)))
+                .unwrap_or_else(|| "n/a".into());
+            println!(
+                "asic={} gen=2 temperature_c={} voltage_ch0_v={} voltage_ch1_v={} voltage_ch2_v={} thermal_trip={} thermal_fault={} voltage_fault={} pll_lock={} dll0_lock={} dll1_lock={}",
+                frame.asic,
+                temperature,
+                ch0,
+                ch1,
+                ch2,
+                frame.thermal_trip_status,
+                frame.thermal_fault,
+                frame.voltage_fault,
+                frame.pll_lock,
+                frame.dll0_lock,
+                frame.dll1_lock,
+            );
+        }
+    }
+}
+
+fn legacy_gen1_tune_code_to_temperature_c(tune_code: u8) -> f32 {
+    -293.8 + 631.8 * ((tune_code as f32) - (2048.0 / 4096.0)) / 4096.0
+}
+
+fn legacy_tune_code_to_temperature_c(tune_code: u16) -> f32 {
+    -293.8 + 631.8 * ((tune_code as f32) - (2048.0 / 4096.0)) / 4096.0
+}
+
+fn legacy_tune_code_to_voltage_v(tune_code: u16) -> f32 {
+    0.4 * 0.7067 * (6.0 * (tune_code as f32) / 16384.0 - 3.0 / 16384.0 - 1.0)
 }
 
 fn synthetic_job_material(

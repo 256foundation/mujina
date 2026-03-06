@@ -15,7 +15,10 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
-use crate::api_client::types::{BoardState, MinerPatchRequest, MinerState, SourceState};
+use crate::api_client::types::{
+    BoardState, Bzm2DtsVsQueryRequest, MinerPatchRequest, MinerState, SourceState,
+};
+use crate::board::BoardCommand;
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
@@ -24,6 +27,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
+        .routes(routes!(query_bzm2_dts_vs))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -133,6 +137,63 @@ async fn get_board(
         .boards()
         .into_iter()
         .find(|b| b.name == name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Trigger an explicit BZM2 DTS/VS query and return the refreshed board state.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/dts-vs-query",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2DtsVsQueryRequest,
+    responses(
+        (status = OK, description = "Refreshed board details", body = BoardState),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 telemetry queries"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_dts_vs(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2DtsVsQueryRequest>,
+) -> Result<Json<BoardState>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2DtsVs {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }

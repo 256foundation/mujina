@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use super::{Board, BoardError, BoardInfo, VirtualBoardDescriptor};
+use super::{Board, BoardCommand, BoardError, BoardInfo, VirtualBoardDescriptor};
 use crate::{
     api_client::types::{BoardState, Fan, PowerMeasurement, TemperatureSensor, ThreadState},
     asic::{
@@ -22,7 +22,7 @@ use crate::{
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-            HashThreadStatus,
+            HashThreadStatus, HashThreadTelemetryUpdate,
         },
     },
     tracing::prelude::*,
@@ -548,19 +548,29 @@ pub struct Bzm2Board {
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
     state_tx: watch::Sender<BoardState>,
+    command_rx: Option<mpsc::Receiver<BoardCommand>>,
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
+    command_shutdown: Option<watch::Sender<bool>>,
+    command_task: Option<JoinHandle<()>>,
 }
 
 impl Bzm2Board {
-    pub fn new(config: Bzm2VirtualDeviceConfig, state_tx: watch::Sender<BoardState>) -> Self {
+    pub fn new(
+        config: Bzm2VirtualDeviceConfig,
+        state_tx: watch::Sender<BoardState>,
+        command_rx: mpsc::Receiver<BoardCommand>,
+    ) -> Self {
         Self {
             config,
             shutdown_handles: Vec::new(),
             serial_controls: Vec::new(),
             state_tx,
+            command_rx: Some(command_rx),
             monitor_shutdown: None,
             monitor_task: None,
+            command_shutdown: None,
+            command_task: None,
         }
     }
 
@@ -590,8 +600,8 @@ impl Bzm2Board {
                         });
                         let _ = state_tx.send_modify(|state| {
                             state.fans = snapshot.fans.clone();
-                            state.temperatures = snapshot.temperatures.clone();
-                            state.powers = snapshot.powers.clone();
+                            merge_temperature_readings(&mut state.temperatures, &snapshot.temperatures);
+                            merge_power_readings(&mut state.powers, &snapshot.powers);
                         });
                         trace!(board = %board_name, bytes_read = total_stats.0, bytes_written = total_stats.1, "BZM2 board telemetry updated");
                         if let Some(reason) = snapshot.trip_reason.clone() {
@@ -606,6 +616,57 @@ impl Bzm2Board {
                                 }
                             });
                             break;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    fn spawn_command_loop(&mut self) {
+        if self.command_task.is_some() {
+            return;
+        }
+        let Some(mut command_rx) = self.command_rx.take() else {
+            return;
+        };
+
+        let state_tx = self.state_tx.clone();
+        let shutdown_handles = self.shutdown_handles.clone();
+        let board_name = self.config.device_id();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        self.command_shutdown = Some(shutdown_tx);
+
+        self.command_task = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            break;
+                        };
+                        match command {
+                            BoardCommand::QueryBzm2DtsVs { thread_index, asic, reply } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    let update = handle
+                                        .query_dts_vs(asic)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))?;
+                                    publish_thread_telemetry(&state_tx, &update);
+                                    Ok(())
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
                         }
                     }
                     changed = shutdown_rx.changed() => {
@@ -911,7 +972,13 @@ impl Board for Bzm2Board {
         if let Some(tx) = self.monitor_shutdown.take() {
             let _ = tx.send(true);
         }
+        if let Some(tx) = self.command_shutdown.take() {
+            let _ = tx.send(true);
+        }
         if let Some(handle) = self.monitor_task.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.command_task.take() {
             let _ = handle.await;
         }
         for handle in &self.shutdown_handles {
@@ -919,6 +986,7 @@ impl Board for Bzm2Board {
         }
         self.shutdown_handles.clear();
         self.serial_controls.clear();
+        self.command_rx = None;
         let _ = self.state_tx.send_modify(|state| {
             for thread in &mut state.threads {
                 thread.is_active = false;
@@ -934,8 +1002,8 @@ impl Board for Bzm2Board {
         let initial_snapshot = self.config.telemetry.snapshot();
         let _ = self.state_tx.send_modify(|state| {
             state.fans = initial_snapshot.fans.clone();
-            state.temperatures = initial_snapshot.temperatures.clone();
-            state.powers = initial_snapshot.powers.clone();
+            merge_temperature_readings(&mut state.temperatures, &initial_snapshot.temperatures);
+            merge_power_readings(&mut state.powers, &initial_snapshot.powers);
         });
 
         self.execute_live_calibration().await?;
@@ -976,6 +1044,7 @@ impl Board for Bzm2Board {
         });
 
         self.spawn_monitor();
+        self.spawn_command_loop();
         Ok(threads)
     }
 }
@@ -1044,8 +1113,14 @@ impl HashThread for Bzm2ManagedThread {
         let thread_index = self.thread_index;
         tokio::spawn(async move {
             while let Some(event) = inner_rx.recv().await {
-                if let HashThreadEvent::StatusUpdate(ref status) = event {
-                    publish_thread_status(&state_tx, thread_index, status);
+                match &event {
+                    HashThreadEvent::StatusUpdate(status) => {
+                        publish_thread_status(&state_tx, thread_index, status);
+                    }
+                    HashThreadEvent::TelemetryUpdate(update) => {
+                        publish_thread_telemetry(&state_tx, update);
+                    }
+                    _ => {}
                 }
                 if event_tx.send(event).await.is_err() {
                     break;
@@ -1072,6 +1147,70 @@ fn publish_thread_status(
         }
     });
 }
+
+fn publish_thread_telemetry(
+    state_tx: &watch::Sender<BoardState>,
+    update: &HashThreadTelemetryUpdate,
+) {
+    let _ = state_tx.send_modify(|state| {
+        merge_temperature_readings(
+            &mut state.temperatures,
+            &update
+                .temperatures
+                .iter()
+                .map(|reading| TemperatureSensor {
+                    name: reading.name.clone(),
+                    temperature_c: reading.temperature_c,
+                })
+                .collect::<Vec<_>>(),
+        );
+        merge_power_readings(
+            &mut state.powers,
+            &update
+                .powers
+                .iter()
+                .map(|reading| PowerMeasurement {
+                    name: reading.name.clone(),
+                    voltage_v: reading.voltage_v,
+                    current_a: reading.current_a,
+                    power_w: reading.power_w,
+                })
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
+fn merge_temperature_readings(
+    existing: &mut Vec<TemperatureSensor>,
+    updates: &[TemperatureSensor],
+) {
+    for update in updates {
+        if let Some(sensor) = existing
+            .iter_mut()
+            .find(|sensor| sensor.name == update.name)
+        {
+            sensor.temperature_c = update.temperature_c;
+        } else {
+            existing.push(update.clone());
+        }
+    }
+}
+
+fn merge_power_readings(existing: &mut Vec<PowerMeasurement>, updates: &[PowerMeasurement]) {
+    for update in updates {
+        if let Some(sensor) = existing
+            .iter_mut()
+            .find(|sensor| sensor.name == update.name)
+        {
+            sensor.voltage_v = update.voltage_v;
+            sensor.current_a = update.current_a;
+            sensor.power_w = update.power_w;
+        } else {
+            existing.push(update.clone());
+        }
+    }
+}
+
 fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2BusLayout> {
     let mut next_asic = 0u16;
     serial_paths
@@ -1421,9 +1560,13 @@ async fn create_bzm2_board()
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
+    let (command_tx, command_rx) = mpsc::channel(16);
 
-    let board = Bzm2Board::new(config, state_tx);
-    let registration = super::BoardRegistration { state_rx };
+    let board = Bzm2Board::new(config, state_tx, command_rx);
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: Some(command_tx),
+    };
     Ok((Box::new(board), registration))
 }
 
@@ -1482,7 +1625,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, state_tx);
+        let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
 
         board.execute_live_calibration().await.unwrap();
 
@@ -1553,7 +1696,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, state_tx);
+        let board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
 
         board.execute_live_calibration().await.unwrap();
 
@@ -1615,7 +1758,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let mut board = Bzm2Board::new(config, state_tx);
+        let mut board = Bzm2Board::new(config, state_tx, mpsc::channel(1).1);
 
         let mut threads = board.create_hash_threads().await.unwrap();
         let mut event_rx = threads[0].take_event_receiver().unwrap();
@@ -1677,6 +1820,67 @@ mod tests {
             telemetry
                 .trip_reason(Some(75.0), None, Some(1100.0))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn publish_thread_telemetry_updates_board_state() {
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            temperatures: vec![TemperatureSensor {
+                name: "host-board-temp".into(),
+                temperature_c: Some(52.0),
+            }],
+            powers: vec![PowerMeasurement {
+                name: "host-input".into(),
+                voltage_v: Some(12.0),
+                current_a: Some(10.0),
+                power_w: Some(120.0),
+            }],
+            ..Default::default()
+        });
+
+        publish_thread_telemetry(
+            &state_tx,
+            &HashThreadTelemetryUpdate {
+                temperatures: vec![crate::asic::hash_thread::HashThreadTemperatureReading {
+                    name: "ttyUSB0-asic-2-dts".into(),
+                    temperature_c: Some(64.5),
+                }],
+                powers: vec![crate::asic::hash_thread::HashThreadPowerReading {
+                    name: "ttyUSB0-asic-2-vs-ch0".into(),
+                    voltage_v: Some(0.78),
+                    current_a: None,
+                    power_w: None,
+                }],
+            },
+        );
+
+        let state = state_rx.borrow().clone();
+        assert_eq!(state.temperatures.len(), 2);
+        assert!(
+            state.temperatures.iter().any(
+                |sensor| sensor.name == "host-board-temp" && sensor.temperature_c == Some(52.0)
+            )
+        );
+        assert!(state.temperatures.iter().any(
+            |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
+        ));
+        assert_eq!(state.powers.len(), 2);
+        assert!(
+            state
+                .powers
+                .iter()
+                .any(|sensor| sensor.name == "host-input" && sensor.voltage_v == Some(12.0))
+        );
+        assert!(
+            state
+                .powers
+                .iter()
+                .any(|sensor| sensor.name == "ttyUSB0-asic-2-vs-ch0"
+                    && sensor.voltage_v == Some(0.78))
         );
     }
 

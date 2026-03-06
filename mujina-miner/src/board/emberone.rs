@@ -77,7 +77,10 @@ async fn create_from_usb(
     let board = EmberOne::new(device, state_tx)
         .map_err(|e| Error::Hardware(format!("Failed to create board: {}", e)))?;
 
-    let registration = super::BoardRegistration { state_rx };
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: None,
+    };
     Ok((Box::new(board), registration))
 }
 
