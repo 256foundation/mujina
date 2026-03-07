@@ -248,6 +248,19 @@ Deliverables:
    - saved operating-point replay path
    - current calibration and safety status
 
+Status:
+
+- completed: board/API parity now covers live BZM2 thread-routed commands for:
+  - `NOOP`
+  - loopback
+  - register read/write
+- completed: those diagnostics are exposed through HTTP endpoints that preserve
+  UART ownership by routing through the live BZM2 thread actor
+- next:
+  - add clock-report parity
+  - add chain enumeration summary
+  - surface more of the same diagnostics through board state where useful
+
 Exit criteria:
 
 - operators can perform high-value diagnostics through the board/API surface

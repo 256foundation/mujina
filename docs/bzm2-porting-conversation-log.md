@@ -94,7 +94,7 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - BZM2 hash-thread dispatch and result parsing
   - BZM2 board registration and transport integration
   - startup injection and config plumbing
-  - initial port note in `docs\bzm2-port.md`
+  - initial port note in `docs\bzm2\bzm2-port.md`
 - Added environment controls for serial ports, baud rate, timestamp count, nonce gap, dispatch cadence, and nominal hashrate.
 
 ## 4. Toolchain Bring-Up And Validation
@@ -278,7 +278,7 @@ This document captures the working session that produced the BZM2 Mujina port. I
 > Yes, let's build a concrete roadmap as suggested, and then begin tackling that. First, log this update into our conversation log file please. And then the roadmap.
 
 ### Assistant
-- Added `docs/blockscale-reference-roadmap.md`.
+- Added `docs/bzm2/blockscale-reference-roadmap.md`.
 - Started roadmap execution with chain-enumeration support as Phase 1.
 
 ## 34. Roadmap Phase 1 Through Phase 3
@@ -460,7 +460,7 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - engine-wide programming helpers
   - deterministic grid job exercisers
   - result polling
-- Documented the test mapping in `docs\bzm2-uart-debug.md`.
+- Documented the test mapping in `docs\bzm2\bzm2-uart-debug.md`.
 
 ### User
 > OK, great, let's commit it with a verbose message please!
@@ -542,8 +542,8 @@ This document captures the working session that produced the BZM2 Mujina port. I
 ### Assistant
 - Performed a docs-only pass to reduce remaining low-signal legacy phrasing.
 - Updated:
-  - `docs\bzm2-pnp.md`
-  - `docs\bzm2-port.md`
+  - `docs\bzm2\bzm2-pnp.md`
+  - `docs\bzm2\bzm2-port.md`
 - Shifted wording from:
   - `strategy/bin` -> `performance mode` / `operating class`
   - `stored profile` -> `saved operating point profile`
@@ -631,8 +631,8 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - calibration methodology
 - Kept the documentation scope generic and ASIC-centric rather than reproducing vendor reference-board guidance.
 - Added formal Markdown documentation:
-  - `docs/blockscale-asic-integration-guide.md`
-  - `docs/blockscale-uart-protocol-reference.md`
+  - `docs/bzm2/blockscale-asic-integration-guide.md`
+  - `docs/bzm2/blockscale-uart-protocol-reference.md`
 - Updated:
   - `README.md`
 - The new documents cover:
@@ -678,7 +678,7 @@ This document captures the working session that produced the BZM2 Mujina port. I
 - Removed Gen1 completion from the near-term roadmap scope.
 - Chose the first concrete execution item as generic ASIC-chain enumeration and `ASIC_ID` assignment, because it removes a major assumption from the current board runtime and is directly grounded in the documented UART behavior.
 - Added a dedicated roadmap note:
-  - `docs/blockscale-reference-roadmap.md`
+  - `docs/bzm2/blockscale-reference-roadmap.md`
 - Started Phase 1 with:
   - low-level default-`ASIC_ID` enumeration helpers in the UART layer
   - a new `enumerate-chain` command in the debug CLI
@@ -941,4 +941,225 @@ This document captures the working session that produced the BZM2 Mujina port. I
 - Ran:
   - `cargo fmt --all`
   - focused `cargo test -p mujina-miner bzm2 --message-format=human`
+  - full regression gate before commit
+
+## 40. Roadmap Phase 5 Step 2: Live Measurements Feed The Planner
+
+### Assistant
+- Continued Phase 5 by taking the live runtime measurement cache from step 1
+  and feeding it back into the existing BZM2 tuning planner.
+- Kept this step policy-only: evaluate continuously first, then add actual
+  retune triggers in the next step.
+
+### Assistant
+- Extended the live board tuning state to include the current planner decision:
+  - `reuse_saved_operating_point`
+  - `needs_retune`
+  - desired voltage / clock / accept-ratio targets
+  - planner notes
+- Stored the currently applied saved operating point alongside the live applied
+  voltage and PLL maps so runtime evaluation can compare real behavior against
+  the actual active operating point.
+
+### Assistant
+- Added a board-side runtime evaluation path that rebuilds planner inputs from:
+  - discovered ASIC topology
+  - live per-domain voltage and power measurements
+  - live per-ASIC throughput, pass-rate, and temperature measurements
+  - the current saved operating point
+- That evaluation now runs in the board monitor loop and updates the live
+  `BoardState.bzm2_tuning` view.
+
+### Assistant
+- Added regression coverage for a runtime underperformance case where the live
+  measurements correctly cause the planner to mark the saved operating point as
+  needing retune.
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner board::bzm2 --message-format=human`
+  - full regression gate before commit
+
+## 41. Roadmap Phase 5 Step 3: Persistent Runtime Retune Triggers
+
+### Assistant
+- Added explicit runtime retune trigger tracking on top of the live planner
+  output so BZM2 boards do not request retune on a single noisy sample.
+- Kept the trigger logic in the board monitor loop because it needs the joined
+  view of:
+  - live planner decisions
+  - ASIC DTS temperatures
+  - measured rail voltage
+
+### Assistant
+- Added configurable trigger controls for:
+  - runtime retune enablement
+  - persistence across monitor polls
+  - thermal drift threshold
+  - persistent voltage-imbalance threshold
+- Extended the live API-facing tuning state with:
+  - `retune_pending`
+  - `retune_reasons`
+
+### Assistant
+- Runtime retune now promotes only after repeated polls for:
+  - throughput regression
+  - thermal drift
+  - persistent voltage imbalance
+- Added a board regression test to prove that one bad sample does not request
+  retune, while repeated samples do.
+
+### Assistant
+- Ran:
+  - `cargo fmt --all`
+  - `cargo test -p mujina-miner --message-format=human`
+
+## 42. Roadmap Phase 5 Step 4: Saved Operating Point Validation State
+
+### Assistant
+- Continued Phase 5 by making saved operating point reuse survive or fail based
+  on runtime evidence rather than startup-only compatibility checks.
+- The key requirement was persistence: once a saved operating point is proven
+  bad at runtime, restart replay must stop reusing it.
+
+### Assistant
+- Added persisted saved operating point status to the stored profile format:
+  - `pending`
+  - `validated`
+  - `invalidated`
+- Replay compatibility now rejects explicitly invalidated profiles.
+- Planner seeding also skips invalidated profiles so a known-bad operating
+  point does not silently re-enter startup planning.
+
+### Assistant
+- Added board-runtime reconciliation that:
+  - marks a saved operating point `validated` after clean runtime sampling
+  - marks it `invalidated` when persistent retune triggers fire
+  - clears the in-memory saved operating point after invalidation so runtime
+    evaluation stops treating it as reusable
+- Extended the API-facing tuning state with:
+  - `saved_operating_point_status`
+  - `saved_operating_point_reasons`
+
+### Assistant
+- Added regression coverage for:
+  - runtime validation of a pending saved operating point profile
+  - runtime invalidation of a saved operating point profile with persisted
+    invalidation state on disk
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner board::bzm2 --message-format=human`
+  - full regression gate before commit
+
+## 43. Roadmap Phase 6 Step 1: Live API Diagnostics Primitives
+
+### Assistant
+- Started Phase 6 by taking the lowest-friction, highest-value UART
+  diagnostics already present in the standalone CLI and routing them through
+  the live BZM2 thread actor.
+- Scoped this first step to:
+  - `NOOP`
+  - loopback
+  - direct register read/write
+- Left clock reporting and chain-summary work for the next Phase 6 slice so the
+  transport-safe actor path lands first.
+
+### Assistant
+- Added new BZM2 thread commands and board commands for:
+  - `NOOP`
+  - loopback
+  - register read
+  - register write
+- Kept the commands thread-owned so the API never opens a competing serial
+  handle behind the board's back.
+
+### Assistant
+- Added HTTP endpoints for the same operations:
+  - `POST /api/v0/boards/{name}/bzm2/noop`
+  - `POST /api/v0/boards/{name}/bzm2/loopback`
+  - `POST /api/v0/boards/{name}/bzm2/register-read`
+  - `POST /api/v0/boards/{name}/bzm2/register-write`
+- Returned compact diagnostic payloads rather than refreshed board state when
+  the operation is primarily about direct UART results.
+
+### Assistant
+- Added a safety boundary in the live thread implementation:
+  - the target thread must be idle
+  - DTS/VS streaming must be inactive
+- That keeps these diagnostics from racing active mining or background
+  telemetry reads on the same UART.
+
+### Assistant
+- Added API regression coverage for the new endpoints and ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner api::server --message-format=human`
+  - full regression gate before commit
+
+## 44. Roadmap Phase 6 Step 2: Chain Summary Surface
+
+### Assistant
+- Continued Phase 6 with the lower-risk half of board/API parity: exposing the
+  current live chain layout and startup path without requiring raw serial
+  access.
+- Deferred clock-report parity again because it needs a fuller safe readback
+  composition path on top of the live register diagnostics.
+
+### Assistant
+- Added a board command and HTTP endpoint for:
+  - `GET /api/v0/boards/{name}/bzm2/chain-summary`
+- The summary returns:
+  - per-bus serial path
+  - per-bus global ASIC start/count
+  - total ASIC count
+  - active startup path (`saved_replay` vs `live_calibration`)
+  - saved operating point validation state
+
+### Assistant
+- Stored the startup calibration path alongside the applied operating point so
+  the API can distinguish between a replayed saved profile and a freshly
+  planned live calibration.
+- Reused the existing live board-owned state rather than reopening serial
+  ports, because chain summary is a runtime topology/status question rather
+  than a direct UART diagnostic.
+
+### Assistant
+- Added API regression coverage for the new endpoint and ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner api::server --message-format=human`
+  - full regression gate before commit
+
+## 45. Roadmap Phase 6 Step 3: Clock Report API Parity
+
+### Assistant
+- Completed the remaining planned Phase 6 parity gap by routing the existing
+  PLL/DLL status readback through the live BZM2 thread actor instead of opening
+  a second serial handle.
+- Kept the same safety boundary as the other direct UART diagnostics:
+  - thread must be idle
+  - DTS/VS streaming must be inactive
+
+### Assistant
+- Added a board command and HTTP endpoint for:
+  - `POST /api/v0/boards/{name}/bzm2/clock-report`
+- Returned a structured per-ASIC clock report containing:
+  - PLL enable/misc registers
+  - PLL enabled/locked bits
+  - DLL control registers
+  - DLL `coarsecon`
+  - DLL `fincon`
+  - DLL freeze/lock/fincon validity flags
+
+### Assistant
+- Reused the shipped clock debug semantics already present in the Rust BZM2
+  debug tooling and reconstructed the report through thread-owned register
+  reads.
+- Avoided opening a standalone `Bzm2ClockController` in the API path because
+  UART ownership and transport contention rules are already handled correctly by
+  the thread actor.
+
+### Assistant
+- Updated the roadmap and operator docs to mark Phase 6 board/API parity as
+  complete for the planned diagnostics slice.
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner api::server --message-format=human`
   - full regression gate before commit

@@ -193,6 +193,84 @@ pub struct Bzm2EngineDiscoveryRequest {
     pub timeout_ms: Option<u32>,
 }
 
+/// Request body for a live BZM2 NOOP diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2NoopRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
+/// Response body for a live BZM2 NOOP diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2NoopResponse {
+    /// Hex-encoded three-byte NOOP payload returned by the ASIC.
+    pub payload_hex: String,
+}
+
+/// Request body for a live BZM2 loopback diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2LoopbackRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Hex-encoded payload to round-trip through the ASIC loopback opcode.
+    pub payload_hex: String,
+}
+
+/// Response body for a live BZM2 loopback diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2LoopbackResponse {
+    /// Hex-encoded payload returned by the ASIC.
+    pub payload_hex: String,
+}
+
+/// Request body for a live BZM2 register read.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterReadRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Engine or local-register address.
+    pub engine_address: u16,
+    /// Register offset within the selected engine or local block.
+    pub offset: u8,
+    /// Number of bytes to read.
+    pub count: u8,
+}
+
+/// Response body for a live BZM2 register read.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterReadResponse {
+    /// Hex-encoded register payload.
+    pub value_hex: String,
+}
+
+/// Request body for a live BZM2 register write.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterWriteRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Engine or local-register address.
+    pub engine_address: u16,
+    /// Register offset within the selected engine or local block.
+    pub offset: u8,
+    /// Hex-encoded bytes to write.
+    pub value_hex: String,
+}
+
+/// Response body for a live BZM2 register write.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterWriteResponse {
+    /// Number of bytes written to the requested register.
+    pub bytes_written: usize,
+}
+
 /// Job source status.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceState {

@@ -102,6 +102,33 @@ pub enum BoardCommand {
         asic: u8,
         reply: oneshot::Sender<Result<(), BoardError>>,
     },
+    QueryBzm2Noop {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<[u8; 3], BoardError>>,
+    },
+    QueryBzm2Loopback {
+        thread_index: usize,
+        asic: u8,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, BoardError>>,
+    },
+    ReadBzm2Register {
+        thread_index: usize,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+        reply: oneshot::Sender<Result<Vec<u8>, BoardError>>,
+    },
+    WriteBzm2Register {
+        thread_index: usize,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
     DiscoverBzm2Engines {
         thread_index: usize,
         asic: u8,

@@ -137,8 +137,10 @@ mod tests {
     use super::*;
     use crate::api::commands::SchedulerCommand;
     use crate::api_client::types::{
-        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, EngineCoordinate,
-        SourceState, TemperatureSensor,
+        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
+        Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
+        Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
+        Bzm2RegisterWriteResponse, EngineCoordinate, SourceState, TemperatureSensor,
     };
     use crate::board::{BoardCommand, BoardRegistration};
 
@@ -347,6 +349,144 @@ mod tests {
         assert!(board.temperatures.iter().any(
             |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
         ));
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_diagnostic_endpoints_round_trip_payloads() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(4);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            while let Some(command) = board_cmd_rx.recv().await {
+                match command {
+                    BoardCommand::QueryBzm2Noop {
+                        thread_index,
+                        asic,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        let _ = reply.send(Ok(*b"BZ2"));
+                    }
+                    BoardCommand::QueryBzm2Loopback {
+                        thread_index,
+                        asic,
+                        payload,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(payload, vec![0x01, 0x02, 0xaa, 0xbb]);
+                        let _ = reply.send(Ok(payload));
+                    }
+                    BoardCommand::ReadBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(count, 4);
+                        let _ = reply.send(Ok(vec![0x11, 0x22, 0x33, 0x44]));
+                    }
+                    BoardCommand::WriteBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(value, vec![0xde, 0xad, 0xbe, 0xef]);
+                        let _ = reply.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/noop",
+            &Bzm2NoopRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let noop: Bzm2NoopResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(noop.payload_hex, "425a32");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/loopback",
+            &Bzm2LoopbackRequest {
+                thread_index: 0,
+                asic: 2,
+                payload_hex: "0102aabb".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let loopback: Bzm2LoopbackResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(loopback.payload_hex, "0102aabb");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let readback: Bzm2RegisterReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(readback.value_hex, "11223344");
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/register-write",
+            &Bzm2RegisterWriteRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                value_hex: "deadbeef".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let write_ack: Bzm2RegisterWriteResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(write_ack.bytes_written, 4);
+
         drop(miner_tx);
         drop(cmd_rx);
     }
