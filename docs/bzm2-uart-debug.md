@@ -4,7 +4,7 @@ This guide documents the direct BZM2 UART and silicon-validation interface added
 
 ## Intent
 
-The current CLI folds in the portable parts of the legacy `silicon validation` BZM2 validation surface:
+The current CLI folds in the portable parts of the legacy silicon validation surface:
 
 - chain enumeration and `ASIC_ID` assignment from the default bus id
 - ASIC discovery and liveness scans
@@ -31,7 +31,7 @@ What is deliberately not ported here:
 
 ## Binary
 
-Use [bzm2-debug.rs](C:/Users/prael/Documents/Codex/bzm2_mujina/mujina-miner/src/bin/bzm2-debug.rs) through Cargo:
+Use [bzm2-debug.rs](../mujina-miner/src/bin/bzm2-debug.rs) through Cargo:
 
 ```text
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- <command> ...
@@ -39,7 +39,7 @@ cargo run -p mujina-miner --bin mujina-bzm2-debug -- <command> ...
 
 ## Legacy Test Mapping
 
-The most useful `silicon validation` tests map to the following commands:
+The most useful silicon validation tests map to the following commands:
 
 - `test_noop_all_asic` -> `noop-scan`
 - `test_loopback` -> `loopback-scan`
@@ -109,6 +109,167 @@ Read one synchronous result frame from one ASIC:
 cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
   uart-read-result /dev/ttyUSB0 2 gen2 5000000
 ```
+
+## API Visibility
+
+Passive Gen2 `DTS_VS` traffic is now reflected in the board API as named ASIC telemetry.
+
+Expected sensor names:
+
+- temperature: `ttyUSB0-asic-2-dts`
+- voltage: `ttyUSB0-asic-2-vs-ch0`, `ttyUSB0-asic-2-vs-ch1`, `ttyUSB0-asic-2-vs-ch2`
+
+This is board-state telemetry, not a separate debug-only channel. If the miner is already receiving `DTS_VS` frames during operation, these entries appear in the normal board JSON under:
+
+- `temperatures`
+- `powers`
+
+Use `tdm-watch` when you need to correlate the raw UART frames with the API-visible values.
+
+## On-Demand DTS/VS Queries
+
+Passive telemetry is useful when the miner is already receiving `DTS_VS` traffic. When hardware is misbehaving, you often need an explicit query path that forces a fresh ASIC sensor read.
+
+The debug CLI now supports direct on-demand DTS/VS reads:
+
+Query one ASIC:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  dts-vs-query /dev/ttyUSB0 2 gen2 1500 5000000
+```
+
+Scan an ASIC range and print each returned DTS/VS frame:
+
+```text
+cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
+  dts-vs-scan /dev/ttyUSB0 0 15 gen2 1500 5000000
+```
+
+These commands:
+
+- enable the DTS/VS path if it is not already configured
+- wait for a matching DTS/VS frame from the requested ASIC
+- print temperature and voltage information in engineering units
+- preserve the normal passive telemetry path so the same readings can still appear in board state later
+
+The `dts-gen` argument should match the ASIC telemetry generation in use:
+
+- `gen1`
+- `gen2`
+
+Typical output includes:
+
+- ASIC id
+- thermal status and trip bits
+- Celsius temperature when available from the generation-specific decode path
+- voltage channels in volts
+
+## HTTP API Query Example
+
+Mujina also exposes the same operation through the board API for live boards:
+
+```text
+POST /api/v0/boards/{name}/bzm2/dts-vs-query
+```
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2}'
+```
+
+The response is the refreshed board JSON after the query completes. The relevant values appear in the normal board-state telemetry collections, for example:
+
+```json
+{
+  "temperatures": [
+    { "name": "ttyUSB0-asic-2-dts", "temperature_c": 64.5 }
+  ],
+  "powers": [
+    { "name": "ttyUSB0-asic-2-vs-ch0", "voltage_v": 0.78, "current_a": null, "power_w": null }
+  ]
+}
+```
+
+Request fields:
+
+- `thread_index`: which BZM2 hash thread owns the target UART bus
+- `asic`: ASIC id to query on that bus
+
+## HTTP API Diagnostics
+
+Mujina now exposes a first board/API parity slice for live UART diagnostics
+without dropping to a separate serial tool. These operations route through the
+live BZM2 thread actor, so they preserve UART ownership and operate against the
+same board instance visible in the normal API.
+
+Available endpoints:
+
+- `POST /api/v0/boards/{name}/bzm2/noop`
+- `POST /api/v0/boards/{name}/bzm2/loopback`
+- `POST /api/v0/boards/{name}/bzm2/register-read`
+- `POST /api/v0/boards/{name}/bzm2/register-write`
+- `POST /api/v0/boards/{name}/bzm2/clock-report`
+
+Examples:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/noop \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/loopback \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2,"payload_hex":"0102aabb"}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/register-read \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2,"engine_address":4095,"offset":18,"count":4}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/register-write \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2,"engine_address":4095,"offset":18,"value_hex":"deadbeef"}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/clock-report \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2}'
+```
+
+Representative responses:
+
+```json
+{ "payload_hex": "425a32" }
+```
+
+```json
+{ "payload_hex": "0102aabb" }
+```
+
+```json
+{ "value_hex": "11223344" }
+```
+
+```json
+{ "bytes_written": 4 }
+```
+
+Current safety boundary:
+
+- these live UART diagnostics require the target BZM2 thread to be idle
+- they also require DTS/VS streaming to be inactive on that thread
+- if those conditions are not met, the board command returns an error instead
+  of competing with active mining or background telemetry traffic
 
 ## TDM Control and Observation
 
@@ -285,4 +446,4 @@ cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
 
 ## Scope Boundary
 
-This interface is grounded in the legacy shipped UART path and the `silicon validation` validation source. It is not a JTAG debug interface and it is not a full BCH-vector regression harness.
+This interface is grounded in the legacy shipped UART path and the silicon validation source. It is not a JTAG debug interface and it is not a full BCH-vector regression harness.

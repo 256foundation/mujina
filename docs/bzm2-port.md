@@ -60,8 +60,8 @@ The BZM2 Mujina thread now reimplements the core legacy data path and the genera
 - reusable multi-rail bring-up and shutdown sequencing for single-rail, small-stack, and larger multi-stack designs
 - UART-register-based PLL diagnostic/control flow for divider programming, enable/disable, lock polling, and readback
 - UART-register-based DLL diagnostic/control flow for duty-cycle programming, enable/disable, lock polling, and fincon validation
-- developer-facing UART debug CLI documented in [bzm2-uart-debug.md](C:/Users/prael/Documents/Codex/bzm2_mujina/docs/bzm2-uart-debug.md) with unicast, multicast, and broadcast examples
-- domain-aware PnP calibration planner documented in [bzm2-pnp.md](C:/Users/prael/Documents/Codex/bzm2_mujina/docs/bzm2-pnp.md) for strategy/bin target selection, parameter sweeps, and per-domain plus per-ASIC tuning
+- developer-facing UART debug CLI documented in [bzm2-uart-debug.md](bzm2-uart-debug.md) with unicast, multicast, and broadcast examples
+- domain-aware BZM2 tuning planner documented in [bzm2-pnp.md](bzm2-pnp.md) for operating-class and performance-mode target selection, search-space generation, and per-domain plus per-ASIC tuning
 
 ## Configuration
 
@@ -240,13 +240,17 @@ This is useful when:
 
 The engine-discovery path runs through the live BZM2 hash-thread actor, just
 like the DTS/VS query path, so UART ownership stays correct. Successful scans
-update `BoardState.asics` with:
+update the live thread engine layout and `BoardState.asics` with:
 
 - `id`
 - `thread_index`
 - `serial_path`
 - `discovered_engine_count`
 - `missing_engines`
+
+After a successful idle-time scan, subsequent work dispatch and result
+reconstruction use the discovered active-engine layout instead of the built-in
+default four-hole map.
 
 HTTP API:
 
@@ -262,6 +266,61 @@ curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/discover-engines \
 
 The response returns the refreshed `BoardState`, including the updated
 `asics` topology entry for the queried ASIC.
+
+## API Diagnostics
+
+The board/API surface now exposes a first live UART diagnostics slice through
+the BZM2 thread actor:
+
+- `POST /api/v0/boards/{name}/bzm2/noop`
+- `POST /api/v0/boards/{name}/bzm2/loopback`
+- `POST /api/v0/boards/{name}/bzm2/register-read`
+- `POST /api/v0/boards/{name}/bzm2/register-write`
+- `POST /api/v0/boards/{name}/bzm2/clock-report`
+
+These commands intentionally route through the live board-owned thread instead
+of opening a second serial handle. That keeps UART ownership correct and avoids
+silent contention with the mining path.
+
+Current safety boundary:
+
+- the target thread must be idle
+- DTS/VS streaming must be inactive on that thread
+
+If either condition is false, the command is rejected rather than racing active
+mining traffic or background telemetry frames.
+
+`clock-report` returns the same PLL/DLL status surface already exposed by the
+standalone Rust debug CLI:
+
+- PLL enable register
+- PLL misc register
+- PLL enabled/locked bits
+- DLL control2/control5 values
+- DLL `coarsecon`
+- DLL `fincon`
+- DLL freeze-valid, lock, and fincon-valid state
+
+## Chain Summary
+
+The board/API surface also exposes the current BZM2 chain layout without
+opening a second serial handle:
+
+- `GET /api/v0/boards/{name}/bzm2/chain-summary`
+
+The response summarizes:
+
+- current UART bus count
+- serial path per bus
+- global ASIC start/count per bus
+- total ASIC count across the board
+- whether the active operating point came from saved replay or live calibration
+- current saved operating point validation state
+
+That gives operators a stable summary view of the active chain layout even when
+the underlying board was discovered by startup enumeration rather than static
+configuration alone.
+
 ## Design Boundary
 
 The legacy `bzmd` board-power path mixes three different concerns:
@@ -295,7 +354,13 @@ Still not implemented from the broader legacy stack:
 - JTAG workflows from the standalone platform documents
 - JTAG-only PLL debug sequences that are not represented in the shipped UART code
 - calibration and autotuning state machines
-- manufacturing and diagnostics RPC surface
+- full manufacturing and diagnostics RPC parity
+  - beyond the current live API surface for:
+    - `NOOP`
+    - loopback
+    - register read/write
+    - clock report
+    - chain summary
 - any board-MCU protocol that is specific to one carrier or backplane design
 
 The top-level `docs` PDFs reference additional JTAG and opcode material, but this port currently implements the opcode surface that is evidenced in the legacy shipping UART path and not an inferred JTAG control plane.
@@ -303,4 +368,4 @@ The top-level `docs` PDFs reference additional JTAG and opcode material, but thi
 
 See also:
 
-- docs/bzm2-opcode-grounding.md for the source-grounded opcode matrix and the current JTAG evidence boundary
+- [bzm2-opcode-grounding.md](bzm2-opcode-grounding.md) for the source-grounded opcode matrix and the current JTAG evidence boundary
