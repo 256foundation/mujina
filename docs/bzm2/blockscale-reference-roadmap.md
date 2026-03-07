@@ -225,7 +225,25 @@ Status:
   - per-ASIC average pass rate
   - per-PLL pass rate and throughput
   - per-domain measured voltage and power
-- next: feed those live measurements back into the tuning planner
+- completed: the board runtime now feeds those live measurements back into the
+  existing tuning planner and publishes the current planner decision through
+  board state, including:
+  - reuse-saved-operating-point decision
+  - needs-retune decision
+  - desired voltage / clock / accept-ratio targets
+  - planner notes
+- completed: runtime retune triggers are now promoted only after configurable
+  persistence across monitor polls for:
+  - throughput regression
+  - thermal drift
+  - persistent voltage imbalance
+- completed: saved operating point profiles now carry runtime validation state
+  and are automatically:
+  - marked `validated` after clean runtime sampling
+  - marked `invalidated` when persistent retune triggers fire
+  - excluded from direct replay and planner seeding on later restarts once
+    invalidated
+- next: Phase 6, diagnostics and API parity
 
 ## Phase 6: Diagnostics And API Parity
 
@@ -256,10 +274,20 @@ Status:
   - register read/write
 - completed: those diagnostics are exposed through HTTP endpoints that preserve
   UART ownership by routing through the live BZM2 thread actor
+- completed: the board/API surface now exposes `clock-report` parity through
+  the same live thread actor, so operators can inspect PLL/DLL lock state and
+  clock-control registers without dropping to the standalone CLI
+- completed: the board/API surface now exposes a chain-summary view with:
+  - current per-bus serial path
+  - global ASIC ranges
+  - total discovered/configured ASIC count
+  - the startup path that produced the active operating point
+  - saved operating point validation state
+- completed: Phase 6 exit criteria are now met for the planned board/API
+  diagnostics slice
 - next:
-  - add clock-report parity
-  - add chain enumeration summary
   - surface more of the same diagnostics through board state where useful
+  - only add broader manufacturing parity if there is a clear operator need
 
 Exit criteria:
 

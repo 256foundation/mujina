@@ -99,6 +99,14 @@ The planner is now wired into `Bzm2Board` startup so Mujina can:
 - normalize saved-throughput comparisons and planned board hashrate against
   actual active-engine capacity instead of assuming every ASIC still has the
   default full map
+- run the same planner against live runtime measurements during mining so the
+  board can continuously evaluate whether the current operating point is still
+  valid
+- automatically promote saved operating point state from `pending` to
+  `validated` after clean runtime sampling
+- automatically invalidate saved operating point profiles when persistent
+  runtime retune triggers fire, so restart replay will not reuse a known-bad
+  operating point
 
 Engine-capacity inputs now come from, in order:
 
@@ -114,7 +122,6 @@ That means tuning decisions can now distinguish between:
 What still remains outside the ASIC planner layer:
 
 - board-specific PSU ramp policy
-- automatic runtime retune decisions driven by the live measurements above
 - reimplementation of the legacy CSV/database layer
 
 Those pieces still belong above the ASIC planner, in board or daemon integration layers.
