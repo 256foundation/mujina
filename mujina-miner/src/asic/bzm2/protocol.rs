@@ -411,6 +411,59 @@ pub fn default_engine_coordinates() -> Vec<(u8, u8)> {
     coords
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bzm2EngineLayout {
+    active_coordinates: Vec<(u8, u8)>,
+    logical_ids_by_address: HashMap<u16, u16>,
+}
+
+impl Bzm2EngineLayout {
+    pub fn from_active_coordinates<I>(coords: I) -> Self
+    where
+        I: IntoIterator<Item = (u8, u8)>,
+    {
+        let mut active_coordinates = coords
+            .into_iter()
+            .filter(|(row, col)| *row < LOGICAL_ENGINE_ROWS && *col < LOGICAL_ENGINE_COLS)
+            .collect::<Vec<_>>();
+        active_coordinates.sort_by_key(|(row, col)| (*col, *row));
+        active_coordinates.dedup();
+
+        let logical_ids_by_address = active_coordinates
+            .iter()
+            .enumerate()
+            .map(|(logical_id, (row, col))| (logical_engine_address(*row, *col), logical_id as u16))
+            .collect();
+
+        Self {
+            active_coordinates,
+            logical_ids_by_address,
+        }
+    }
+
+    pub fn active_coordinates(&self) -> &[(u8, u8)] {
+        &self.active_coordinates
+    }
+
+    pub fn active_engine_count(&self) -> usize {
+        self.active_coordinates.len()
+    }
+
+    pub fn logical_engine_id(&self, row: u8, col: u8) -> Option<u16> {
+        self.logical_engine_id_from_address(logical_engine_address(row, col))
+    }
+
+    pub fn logical_engine_id_from_address(&self, engine_address: u16) -> Option<u16> {
+        self.logical_ids_by_address.get(&engine_address).copied()
+    }
+}
+
+impl Default for Bzm2EngineLayout {
+    fn default() -> Self {
+        Self::from_active_coordinates(default_engine_coordinates())
+    }
+}
+
 pub fn leading_zero_threshold(target: bitcoin::pow::Target) -> u8 {
     let bytes = target.to_be_bytes();
     let mut zeros = 0u8;
@@ -477,6 +530,35 @@ fn parse_dts_vs_gen2(asic: u8, payload: &[u8]) -> TdmDtsVsGen2Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_register_encoder_matches_legacy_wire_format() {
+        let encoded = encode_write_register(0x12, 0x0345, 0x67, &[0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(
+            encoded,
+            vec![
+                0x0b, 0x00, 0x12, 0x23, 0x45, 0x67, 0x03, 0x78, 0x56, 0x34, 0x12
+            ]
+        );
+    }
+
+    #[test]
+    fn read_register_encoder_matches_legacy_wire_format() {
+        let encoded = encode_read_register(0x12, 0x0345, 0x67, 4);
+        assert_eq!(
+            encoded,
+            vec![0x08, 0x00, 0x12, 0x33, 0x45, 0x67, 0x03, TARGET_BYTE]
+        );
+    }
+
+    #[test]
+    fn noop_and_loopback_encoders_match_legacy_wire_format() {
+        assert_eq!(encode_noop(0x12), vec![0x04, 0x00, 0x12, 0xf0]);
+        assert_eq!(
+            encode_loopback(0x12, &[0xaa, 0xbb, 0xcc]),
+            vec![0x08, 0x00, 0x12, 0xe0, 0x02, 0xaa, 0xbb, 0xcc]
+        );
+    }
 
     #[test]
     fn parser_decodes_tdm_result() {
