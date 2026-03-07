@@ -8,10 +8,13 @@
 //! access to the `trace!()`, `debug!()`, `info!()`, `warn!()`, and `error!()`
 //! macros.
 
-use std::{env, fmt};
+use std::fmt;
+#[cfg(target_os = "linux")]
+use std::env;
 use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+#[cfg(target_os = "linux")]
 use tracing_journald;
 use tracing_subscriber::{
     filter::{EnvFilter, LevelFilter},
@@ -34,8 +37,6 @@ pub mod prelude {
     #[allow(unused_imports)]
     pub use tracing::{debug, error, info, trace, warn};
 }
-
-use prelude::*;
 
 /// Check if stderr is connected to systemd journal by validating JOURNAL_STREAM.
 ///
@@ -91,7 +92,7 @@ pub fn init_journald_or_stdout() {
                 tracing_subscriber::registry().with(layer).init();
                 return;
             } else {
-                error!("Failed to initialize journald logging, using stdout.");
+                tracing::error!("Failed to initialize journald logging, using stdout.");
             }
         }
     }
