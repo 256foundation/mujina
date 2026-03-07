@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
@@ -18,13 +18,17 @@ use crate::asic::hash_thread::{
 use crate::job_source::{GeneralPurposeBits, MerkleRootKind};
 use crate::tracing::prelude::*;
 use crate::transport::serial::{SerialControl, SerialReader, SerialWriter};
-use crate::types::{Difficulty, HashRate};
+use crate::types::{Difficulty, HashRate, HashrateEstimator, Work};
 
+use super::clock::{
+    Bzm2ClockDebugReport, Bzm2Dll, Bzm2DllStatus, Bzm2Pll, Bzm2PllStatus, fincon_is_valid,
+};
 use super::protocol::{
-    self, BROADCAST_ASIC, DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT, DtsVsGeneration,
-    ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND, TdmDtsVsFrame,
-    TdmFrame, TdmFrameParser, default_engine_coordinates, encode_write_job, encode_write_register,
-    leading_zero_threshold, logical_engine_address,
+    self, BROADCAST_ASIC, Bzm2EngineLayout, DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT,
+    DtsVsGeneration, ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND,
+    OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP, OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame,
+    TdmFrameParser, encode_loopback, encode_noop, encode_read_register, encode_write_job,
+    encode_write_register, leading_zero_threshold, logical_engine_address,
 };
 use super::uart::{
     Bzm2DiscoveredEngineMap, Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT,
@@ -56,6 +60,171 @@ impl Bzm2ThreadConfig {
     }
 }
 
+const RUNTIME_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5 * 60);
+// Legacy source treats rows 0-9 as the bottom stack (PLL0) and rows 10-19 as
+// the top stack (PLL1).
+const PLL_STACK_SPLIT_ROW: u8 = 10;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bzm2PllRuntimeMetrics {
+    pub throughput_hs: Option<u64>,
+    pub scheduler_share_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bzm2AsicRuntimeMetrics {
+    pub asic: u8,
+    pub throughput_hs: Option<u64>,
+    pub scheduler_share_count: u64,
+    pub plls: [Bzm2PllRuntimeMetrics; 2],
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bzm2ThreadRuntimeMetrics {
+    pub throughput_hs: Option<u64>,
+    pub asics: Vec<Bzm2AsicRuntimeMetrics>,
+}
+
+struct PllRuntimeMeasurement {
+    estimator: HashrateEstimator,
+    scheduler_share_count: u64,
+}
+
+impl PllRuntimeMeasurement {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            scheduler_share_count: 0,
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, work: Work) {
+        self.estimator.record_at(at, work);
+        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> Bzm2PllRuntimeMetrics {
+        Bzm2PllRuntimeMetrics {
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            scheduler_share_count: self.scheduler_share_count,
+        }
+    }
+}
+
+struct AsicRuntimeMeasurement {
+    estimator: HashrateEstimator,
+    scheduler_share_count: u64,
+    plls: [PllRuntimeMeasurement; 2],
+}
+
+impl AsicRuntimeMeasurement {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            scheduler_share_count: 0,
+            plls: [PllRuntimeMeasurement::new(), PllRuntimeMeasurement::new()],
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, pll_index: usize, work: Work) {
+        self.estimator.record_at(at, work);
+        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
+        self.plls[pll_index].record_at(at, work);
+    }
+
+    fn snapshot_at(&mut self, now: Instant, asic: u8) -> Bzm2AsicRuntimeMetrics {
+        Bzm2AsicRuntimeMetrics {
+            asic,
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            scheduler_share_count: self.scheduler_share_count,
+            plls: [self.plls[0].snapshot_at(now), self.plls[1].snapshot_at(now)],
+        }
+    }
+}
+
+struct ThreadRuntimeMeasurementState {
+    estimator: HashrateEstimator,
+    asics: BTreeMap<u8, AsicRuntimeMeasurement>,
+}
+
+impl ThreadRuntimeMeasurementState {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            asics: BTreeMap::new(),
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, asic: u8, row: u8, work: Work) {
+        let pll_index = pll_index_for_row(row);
+        self.estimator.record_at(at, work);
+        self.asics
+            .entry(asic)
+            .or_insert_with(AsicRuntimeMeasurement::new)
+            .record_at(at, pll_index, work);
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> Bzm2ThreadRuntimeMetrics {
+        Bzm2ThreadRuntimeMetrics {
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            asics: self
+                .asics
+                .iter_mut()
+                .map(|(&asic, measurement)| measurement.snapshot_at(now, asic))
+                .collect(),
+        }
+    }
+
+    fn current_hashrate(
+        &mut self,
+        now: Instant,
+        is_active: bool,
+        nominal_hashrate_ths: f64,
+    ) -> HashRate {
+        if !is_active {
+            return HashRate::default();
+        }
+
+        let measured = self.estimator.settled_hashrate().or_else(|| {
+            self.estimator
+                .has_samples()
+                .then(|| self.estimator.hashrate_at(now))
+        });
+        match measured {
+            Some(hashrate) if !hashrate.is_zero() => hashrate,
+            _ => HashRate::from_terahashes(nominal_hashrate_ths),
+        }
+    }
+}
+
+fn pll_index_for_row(row: u8) -> usize {
+    if row < PLL_STACK_SPLIT_ROW { 0 } else { 1 }
+}
+
 #[derive(Clone)]
 pub struct Bzm2ThreadHandle {
     command_tx: mpsc::Sender<ThreadCommand>,
@@ -64,6 +233,78 @@ pub struct Bzm2ThreadHandle {
 impl Bzm2ThreadHandle {
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(ThreadCommand::Shutdown);
+    }
+
+    pub async fn noop(&self, asic: u8) -> Result<[u8; 3], HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryNoop { asic, response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn loopback(&self, asic: u8, payload: Vec<u8>) -> Result<Vec<u8>, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryLoopback {
+                asic,
+                payload,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn read_register(
+        &self,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+    ) -> Result<Vec<u8>, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::ReadRegister {
+                asic,
+                engine_address,
+                offset,
+                count,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn write_register(
+        &self,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+    ) -> Result<(), HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::WriteRegister {
+                asic,
+                engine_address,
+                offset,
+                value,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
     }
 
     pub async fn query_dts_vs(
@@ -78,6 +319,17 @@ impl Bzm2ThreadHandle {
         response_rx
             .await
             .map_err(|_| HashThreadError::TelemetryQueryFailed("thread dropped response".into()))?
+    }
+
+    pub async fn clock_report(&self, asic: u8) -> Result<Bzm2ClockDebugReport, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryClockReport { asic, response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
     }
 
     pub async fn discover_engine_map(
@@ -102,6 +354,17 @@ impl Bzm2ThreadHandle {
             .await
             .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
     }
+
+    pub async fn runtime_metrics(&self) -> Result<Bzm2ThreadRuntimeMetrics, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryRuntimeMetrics { response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
 }
 
 #[derive(Debug)]
@@ -117,6 +380,33 @@ enum ThreadCommand {
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
     },
+    QueryNoop {
+        asic: u8,
+        response_tx: oneshot::Sender<Result<[u8; 3], HashThreadError>>,
+    },
+    QueryLoopback {
+        asic: u8,
+        payload: Vec<u8>,
+        response_tx: oneshot::Sender<Result<Vec<u8>, HashThreadError>>,
+    },
+    QueryClockReport {
+        asic: u8,
+        response_tx: oneshot::Sender<Result<Bzm2ClockDebugReport, HashThreadError>>,
+    },
+    ReadRegister {
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+        response_tx: oneshot::Sender<Result<Vec<u8>, HashThreadError>>,
+    },
+    WriteRegister {
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+        response_tx: oneshot::Sender<Result<(), HashThreadError>>,
+    },
     QueryDtsVs {
         asic: u8,
         response_tx: oneshot::Sender<Result<HashThreadTelemetryUpdate, HashThreadError>>,
@@ -127,6 +417,9 @@ enum ThreadCommand {
         tdm_counter: u8,
         timeout: Duration,
         response_tx: oneshot::Sender<Result<Bzm2DiscoveredEngineMap, HashThreadError>>,
+    },
+    QueryRuntimeMetrics {
+        response_tx: oneshot::Sender<Result<Bzm2ThreadRuntimeMetrics, HashThreadError>>,
     },
     Shutdown,
 }
@@ -273,7 +566,7 @@ async fn bzm2_thread_actor(
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
 
-    let engine_coords = default_engine_coordinates();
+    let mut engine_layout = Bzm2EngineLayout::default();
     let mut parser = TdmFrameParser::new(config.dts_vs_generation);
     let mut current_task: Option<HashTask> = None;
     let mut engine_dispatches: HashMap<u16, EngineDispatch> = HashMap::new();
@@ -286,6 +579,7 @@ async fn bzm2_thread_actor(
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut read_buf = [0u8; 4096];
     let mut dts_vs_configured = false;
+    let mut runtime_measurements = ThreadRuntimeMeasurementState::new();
 
     loop {
         tokio::select! {
@@ -298,7 +592,7 @@ async fn bzm2_thread_actor(
                                 &mut writer,
                                 task,
                                 base_sequence,
-                                &engine_coords,
+                                &engine_layout,
                                 &mut engine_dispatches,
                                 &config,
                             ).await {
@@ -307,6 +601,11 @@ async fn bzm2_thread_actor(
                             }
                             base_sequence = base_sequence.wrapping_add(1);
                             set_active(&status, true, config.nominal_hashrate_ths);
+                            refresh_status_hashrate(
+                                &status,
+                                &mut runtime_measurements,
+                                config.nominal_hashrate_ths,
+                            );
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -319,7 +618,7 @@ async fn bzm2_thread_actor(
                                 &mut writer,
                                 task,
                                 base_sequence,
-                                &engine_coords,
+                                &engine_layout,
                                 &mut engine_dispatches,
                                 &config,
                             ).await {
@@ -328,6 +627,11 @@ async fn bzm2_thread_actor(
                             }
                             base_sequence = base_sequence.wrapping_add(1);
                             set_active(&status, true, config.nominal_hashrate_ths);
+                            refresh_status_hashrate(
+                                &status,
+                                &mut runtime_measurements,
+                                config.nominal_hashrate_ths,
+                            );
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -336,8 +640,97 @@ async fn bzm2_thread_actor(
                         engine_dispatches.clear();
                         let old = current_task.take();
                         set_active(&status, false, config.nominal_hashrate_ths);
+                        refresh_status_hashrate(
+                            &status,
+                            &mut runtime_measurements,
+                            config.nominal_hashrate_ths,
+                        );
                         let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         let _ = response_tx.send(Ok(old));
+                    }
+                    ThreadCommand::QueryNoop { asic, response_tx } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            dts_vs_configured,
+                            || async {
+                                query_noop(&mut reader, &mut writer, asic).await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryLoopback {
+                        asic,
+                        payload,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            dts_vs_configured,
+                            || async {
+                                query_loopback(&mut reader, &mut writer, asic, &payload).await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryClockReport { asic, response_tx } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            dts_vs_configured,
+                            || async { query_clock_report(&mut reader, &mut writer, asic).await },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::ReadRegister {
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            dts_vs_configured,
+                            || async {
+                                read_register(
+                                    &mut reader,
+                                    &mut writer,
+                                    asic,
+                                    engine_address,
+                                    offset,
+                                    count,
+                                )
+                                .await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::WriteRegister {
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            dts_vs_configured,
+                            || async {
+                                write_register(
+                                    &mut writer,
+                                    asic,
+                                    engine_address,
+                                    offset,
+                                    &value,
+                                )
+                                .await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
                     }
                     ThreadCommand::QueryDtsVs { asic, response_tx } => {
                         let result = query_dts_vs_telemetry(
@@ -346,9 +739,11 @@ async fn bzm2_thread_actor(
                             &mut writer,
                             &mut parser,
                             &engine_dispatches,
+                            &engine_layout,
                             &config,
                             &status,
                             &event_tx,
+                            &mut runtime_measurements,
                             &mut dts_vs_configured,
                         ).await;
                         let _ = response_tx.send(result);
@@ -375,8 +770,17 @@ async fn bzm2_thread_actor(
                             timeout,
                         )
                         .await
+                        .map(|discovery| {
+                            engine_layout = Bzm2EngineLayout::from_active_coordinates(
+                                discovery.present.iter().map(|engine| (engine.row, engine.col)),
+                            );
+                            discovery
+                        })
                         .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()));
                         let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryRuntimeMetrics { response_tx } => {
+                        let _ = response_tx.send(Ok(runtime_measurements.snapshot_at(Instant::now())));
                     }
                     ThreadCommand::Shutdown => break,
                 }
@@ -392,9 +796,11 @@ async fn bzm2_thread_actor(
                                     handle_result_frame(
                                         &frame,
                                         &engine_dispatches,
+                                        &engine_layout,
                                         &config,
                                         &status,
                                         &event_tx,
+                                        &mut runtime_measurements,
                                     )
                                     .await;
                                 }
@@ -424,7 +830,7 @@ async fn bzm2_thread_actor(
                         &mut writer,
                         task,
                         base_sequence,
-                        &engine_coords,
+                        &engine_layout,
                         &mut engine_dispatches,
                         &config,
                     ).await {
@@ -444,12 +850,22 @@ async fn bzm2_thread_actor(
                 }
             }
             _ = status_tick.tick() => {
+                refresh_status_hashrate(
+                    &status,
+                    &mut runtime_measurements,
+                    config.nominal_hashrate_ths,
+                );
                 let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
             }
         }
     }
 
     set_active(&status, false, config.nominal_hashrate_ths);
+    refresh_status_hashrate(
+        &status,
+        &mut runtime_measurements,
+        config.nominal_hashrate_ths,
+    );
     let _ = event_tx
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
@@ -521,15 +937,239 @@ async fn handle_dts_vs_frame(
     }
 }
 
+async fn run_idle_uart_diagnostic<F, Fut, T>(
+    thread_active: bool,
+    dts_vs_configured: bool,
+    operation: F,
+) -> Result<T, HashThreadError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, HashThreadError>>,
+{
+    if thread_active {
+        return Err(HashThreadError::DiagnosticsFailed(
+            "BZM2 UART diagnostics require the thread to be idle".into(),
+        ));
+    }
+    if dts_vs_configured {
+        return Err(HashThreadError::DiagnosticsFailed(
+            "BZM2 UART diagnostics require DTS/VS streaming to be inactive".into(),
+        ));
+    }
+    operation().await
+}
+
+async fn write_register(
+    writer: &mut SerialWriter,
+    asic: u8,
+    engine_address: u16,
+    offset: u8,
+    value: &[u8],
+) -> Result<(), HashThreadError> {
+    writer
+        .write_all(&encode_write_register(asic, engine_address, offset, value))
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    Ok(())
+}
+
+async fn read_local_reg_u8(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    offset: u8,
+) -> Result<u8, HashThreadError> {
+    let value = read_register(reader, writer, asic, super::uart::NOTCH_REG, offset, 1).await?;
+    value
+        .first()
+        .copied()
+        .ok_or_else(|| HashThreadError::DiagnosticsFailed("short local register response".into()))
+}
+
+async fn read_local_reg_u32(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    offset: u8,
+) -> Result<u32, HashThreadError> {
+    let value = read_register(reader, writer, asic, super::uart::NOTCH_REG, offset, 4).await?;
+    let bytes: [u8; 4] = value
+        .as_slice()
+        .try_into()
+        .map_err(|_| HashThreadError::DiagnosticsFailed("short local register response".into()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+async fn read_register(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    engine_address: u16,
+    offset: u8,
+    count: u8,
+) -> Result<Vec<u8>, HashThreadError> {
+    let request = encode_read_register(asic, engine_address, offset, count);
+    writer
+        .write_all(&request)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+
+    let expected = count as usize + 2;
+    let mut response = vec![0u8; expected];
+    reader
+        .read_exact(&mut response)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    validate_response_header(asic, OPCODE_UART_READREG, &response)?;
+    Ok(response[2..].to_vec())
+}
+
+async fn read_pll_status(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    pll: Bzm2Pll,
+) -> Result<Bzm2PllStatus, HashThreadError> {
+    let (_, _, enable_reg, misc_reg) = pll.register_block();
+    let enable = read_local_reg_u32(reader, writer, asic, enable_reg).await?;
+    let misc = read_local_reg_u32(reader, writer, asic, misc_reg).await?;
+    Ok(Bzm2PllStatus {
+        pll,
+        enable_register: enable,
+        misc_register: misc,
+        enabled: (enable & 0x1) != 0,
+        locked: (enable & 0x4) != 0,
+    })
+}
+
+async fn read_dll_status(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    dll: Bzm2Dll,
+) -> Result<Bzm2DllStatus, HashThreadError> {
+    let (control2_reg, _, _, control5_reg, coarse_reg) = dll.registers();
+    let control2 = read_local_reg_u8(reader, writer, asic, control2_reg).await?;
+    let control5 = read_local_reg_u8(reader, writer, asic, control5_reg).await?;
+    let coarse_raw = read_local_reg_u8(reader, writer, asic, coarse_reg).await?;
+    let fincon = read_local_reg_u8(reader, writer, asic, dll.fincon_register()).await?;
+
+    Ok(Bzm2DllStatus {
+        dll,
+        control2,
+        control5,
+        coarsecon: (coarse_raw >> 5) & 0x7,
+        fincon,
+        freeze_valid: (control2 & 0x2) != 0,
+        locked: (control5 & 0x2) != 0,
+        fincon_valid: fincon_is_valid(fincon),
+    })
+}
+
+async fn query_clock_report(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+) -> Result<Bzm2ClockDebugReport, HashThreadError> {
+    Ok(Bzm2ClockDebugReport {
+        asic,
+        pll0: read_pll_status(reader, writer, asic, Bzm2Pll::Pll0).await?,
+        pll1: read_pll_status(reader, writer, asic, Bzm2Pll::Pll1).await?,
+        dll0: read_dll_status(reader, writer, asic, Bzm2Dll::Dll0).await?,
+        dll1: read_dll_status(reader, writer, asic, Bzm2Dll::Dll1).await?,
+    })
+}
+
+async fn query_noop(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+) -> Result<[u8; 3], HashThreadError> {
+    let request = encode_noop(asic);
+    writer
+        .write_all(&request)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+
+    let mut response = [0u8; 5];
+    reader
+        .read_exact(&mut response)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    validate_response_header(asic, OPCODE_UART_NOOP, &response)?;
+    Ok(response[2..5].try_into().unwrap())
+}
+
+async fn query_loopback(
+    reader: &mut SerialReader,
+    writer: &mut SerialWriter,
+    asic: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, HashThreadError> {
+    let request = encode_loopback(asic, payload);
+    writer
+        .write_all(&request)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+
+    let expected = payload.len() + 2;
+    let mut response = vec![0u8; expected];
+    reader
+        .read_exact(&mut response)
+        .await
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    validate_response_header(asic, OPCODE_UART_LOOPBACK, &response)?;
+    Ok(response[2..].to_vec())
+}
+
+fn validate_response_header(
+    expected_asic: u8,
+    expected_opcode: u8,
+    response: &[u8],
+) -> Result<(), HashThreadError> {
+    if response.len() < 2 {
+        return Err(HashThreadError::DiagnosticsFailed(format!(
+            "short UART response: expected at least 2 bytes, got {}",
+            response.len()
+        )));
+    }
+    let actual_asic = response[0];
+    let actual_opcode = response[1];
+    if actual_asic != expected_asic || actual_opcode != expected_opcode {
+        return Err(HashThreadError::DiagnosticsFailed(format!(
+            "unexpected UART response header: expected asic {expected_asic:#x} opcode {expected_opcode:#x}, got asic {actual_asic:#x} opcode {actual_opcode:#x}"
+        )));
+    }
+    Ok(())
+}
+
 async fn query_dts_vs_telemetry(
     asic: u8,
     reader: &mut SerialReader,
     writer: &mut SerialWriter,
     parser: &mut TdmFrameParser,
     engine_dispatches: &HashMap<u16, EngineDispatch>,
+    engine_layout: &Bzm2EngineLayout,
     config: &Bzm2ThreadConfig,
     status: &Arc<RwLock<HashThreadStatus>>,
     event_tx: &mpsc::Sender<HashThreadEvent>,
+    runtime_measurements: &mut ThreadRuntimeMeasurementState,
     dts_vs_configured: &mut bool,
 ) -> Result<HashThreadTelemetryUpdate, HashThreadError> {
     if !*dts_vs_configured {
@@ -568,7 +1208,16 @@ async fn query_dts_vs_telemetry(
         for frame in parser.push(&read_buf[..read]) {
             match frame {
                 TdmFrame::Result(frame) => {
-                    handle_result_frame(&frame, engine_dispatches, config, status, event_tx).await;
+                    handle_result_frame(
+                        &frame,
+                        engine_dispatches,
+                        engine_layout,
+                        config,
+                        status,
+                        event_tx,
+                        runtime_measurements,
+                    )
+                    .await;
                 }
                 TdmFrame::DtsVs(frame) => {
                     let frame_asic = dts_vs_frame_asic(&frame);
@@ -599,7 +1248,7 @@ async fn dispatch_task_to_board(
     writer: &mut SerialWriter,
     task: &HashTask,
     base_sequence: u8,
-    engine_coords: &[(u8, u8)],
+    engine_layout: &Bzm2EngineLayout,
     engine_dispatches: &mut HashMap<u16, EngineDispatch>,
     config: &Bzm2ThreadConfig,
 ) -> Result<(), HashThreadError> {
@@ -634,7 +1283,7 @@ async fn dispatch_task_to_board(
     let timestamp_count = config.timestamp_count;
     let bits = task.template.bits.to_consensus();
 
-    for &(row, col) in engine_coords {
+    for &(row, col) in engine_layout.active_coordinates() {
         let engine_address = logical_engine_address(row, col);
 
         writer
@@ -695,7 +1344,7 @@ async fn dispatch_task_to_board(
         }
 
         engine_dispatches.insert(
-            protocol::logical_engine_id(row, col).unwrap(),
+            engine_layout.logical_engine_id(row, col).unwrap(),
             EngineDispatch {
                 task: task.clone(),
                 merkle_root,
@@ -711,12 +1360,14 @@ async fn dispatch_task_to_board(
 async fn handle_result_frame(
     frame: &protocol::TdmResultFrame,
     engine_dispatches: &HashMap<u16, EngineDispatch>,
+    engine_layout: &Bzm2EngineLayout,
     config: &Bzm2ThreadConfig,
     status: &Arc<RwLock<HashThreadStatus>>,
     event_tx: &mpsc::Sender<HashThreadEvent>,
+    runtime_measurements: &mut ThreadRuntimeMeasurementState,
 ) {
     let Some((share, target_diff, engine_id)) =
-        reconstruct_share_from_result(frame, engine_dispatches, config)
+        reconstruct_share_from_result(frame, engine_dispatches, engine_layout, config)
     else {
         return;
     };
@@ -727,6 +1378,9 @@ async fn handle_result_frame(
             .expect("dispatch must exist for reconstructed share");
         dispatch.task.share_tx.clone()
     };
+
+    runtime_measurements.record_at(Instant::now(), frame.asic, frame.row(), share.expected_work);
+    refresh_status_hashrate(status, runtime_measurements, config.nominal_hashrate_ths);
 
     if share_tx.send(share.clone()).await.is_ok() {
         let snapshot = {
@@ -751,13 +1405,14 @@ async fn handle_result_frame(
 fn reconstruct_share_from_result(
     frame: &protocol::TdmResultFrame,
     engine_dispatches: &HashMap<u16, EngineDispatch>,
+    engine_layout: &Bzm2EngineLayout,
     config: &Bzm2ThreadConfig,
 ) -> Option<(Share, Difficulty, u16)> {
     if !frame.nonce_valid() {
         return None;
     }
 
-    let engine_id = frame.logical_engine_id()?;
+    let engine_id = engine_layout.logical_engine_id(frame.row(), frame.col())?;
     let dispatch = engine_dispatches.get(&engine_id)?;
 
     let hardware_base_sequence = frame.sequence_id / 4;
@@ -846,6 +1501,17 @@ fn set_active(status: &Arc<RwLock<HashThreadStatus>>, is_active: bool, nominal_h
     } else {
         HashRate::default()
     };
+}
+
+fn refresh_status_hashrate(
+    status: &Arc<RwLock<HashThreadStatus>>,
+    runtime_measurements: &mut ThreadRuntimeMeasurementState,
+    nominal_hashrate_ths: f64,
+) {
+    let now = Instant::now();
+    let mut lock = status.write().unwrap();
+    lock.hashrate =
+        runtime_measurements.current_hashrate(now, lock.is_active, nominal_hashrate_ths);
 }
 
 fn record_hardware_error(status: &Arc<RwLock<HashThreadStatus>>) {
@@ -1005,12 +1671,13 @@ mod tests {
         let mut engine_dispatches = StdHashMap::new();
         let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
         let engine_coords = vec![(0, 0), (0, 1)];
+        let engine_layout = Bzm2EngineLayout::from_active_coordinates(engine_coords.clone());
 
         dispatch_task_to_board(
             &mut writer,
             &task,
             1,
-            &engine_coords,
+            &engine_layout,
             &mut engine_dispatches,
             &config,
         )
@@ -1058,8 +1725,9 @@ mod tests {
         let mut task = test_task();
         let merkle_root = bitcoin::TxMerkleNode::all_zeros();
         let versions = compute_micro_versions(&task);
-        let (row, col) = default_engine_coordinates()[0];
-        let engine_id = protocol::logical_engine_id(row, col).unwrap();
+        let engine_layout = Bzm2EngineLayout::default();
+        let (row, col) = protocol::default_engine_coordinates()[0];
+        let engine_id = engine_layout.logical_engine_id(row, col).unwrap();
         let nonce = 0;
         let expected_hash = bitcoin::block::Header {
             version: versions[0],
@@ -1089,6 +1757,7 @@ mod tests {
             is_active: true,
             ..Default::default()
         }));
+        let mut runtime_measurements = ThreadRuntimeMeasurementState::new();
         let (event_tx, mut event_rx) = tokio_mpsc::channel(4);
         let (share_tx, mut share_rx) = tokio_mpsc::channel(4);
         engine_dispatches.get_mut(&engine_id).unwrap().task.share_tx = share_tx;
@@ -1106,9 +1775,21 @@ mod tests {
         let mut parser = protocol::TdmResultParser::default();
         let frames = parser.push(&raw);
         assert_eq!(frames.len(), 1);
-        assert!(reconstruct_share_from_result(&frames[0], &engine_dispatches, &config).is_some());
+        assert!(
+            reconstruct_share_from_result(&frames[0], &engine_dispatches, &engine_layout, &config)
+                .is_some()
+        );
 
-        handle_result_frame(&frames[0], &engine_dispatches, &config, &status, &event_tx).await;
+        handle_result_frame(
+            &frames[0],
+            &engine_dispatches,
+            &engine_layout,
+            &config,
+            &status,
+            &event_tx,
+            &mut runtime_measurements,
+        )
+        .await;
 
         let share = tokio::time::timeout(Duration::from_millis(250), share_rx.recv())
             .await
@@ -1127,10 +1808,36 @@ mod tests {
             HashThreadEvent::StatusUpdate(snapshot) => {
                 assert!(snapshot.is_active);
                 assert_eq!(snapshot.chip_shares_found, 1);
-                assert_eq!(snapshot.hashrate, HashRate::from_terahashes(40.0));
+                assert!(u64::from(snapshot.hashrate) > 0);
             }
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    #[test]
+    fn runtime_metrics_track_per_asic_and_per_pll_throughput() {
+        let base = Instant::now();
+        let mut runtime = ThreadRuntimeMeasurementState::new();
+        let work = bitcoin::pow::Work::from_le_bytes({
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&1_000u64.to_le_bytes());
+            bytes
+        });
+
+        runtime.record_at(base, 2, 0, work);
+        runtime.record_at(base + Duration::from_secs(10), 2, 12, work);
+        runtime.record_at(base + Duration::from_secs(20), 2, 12, work);
+        let snapshot = runtime.snapshot_at(base + Duration::from_secs(20));
+
+        assert_eq!(snapshot.asics.len(), 1);
+        let asic = &snapshot.asics[0];
+        assert_eq!(asic.asic, 2);
+        assert_eq!(asic.scheduler_share_count, 3);
+        assert_eq!(asic.throughput_hs, Some(150));
+        assert_eq!(asic.plls[0].scheduler_share_count, 1);
+        assert_eq!(asic.plls[0].throughput_hs, Some(50));
+        assert_eq!(asic.plls[1].scheduler_share_count, 2);
+        assert_eq!(asic.plls[1].throughput_hs, Some(200));
     }
     #[tokio::test]
     async fn gen2_dts_vs_emits_api_telemetry() {
@@ -1251,8 +1958,9 @@ mod tests {
 
         let merkle_root = bitcoin::TxMerkleNode::all_zeros();
         let versions = compute_micro_versions(&task);
-        let (row, col) = default_engine_coordinates()[0];
-        let engine_id = protocol::logical_engine_id(row, col).unwrap();
+        let engine_layout = Bzm2EngineLayout::default();
+        let (row, col) = protocol::default_engine_coordinates()[0];
+        let engine_id = engine_layout.logical_engine_id(row, col).unwrap();
         let nonce = 0;
         let expected_hash = bitcoin::block::Header {
             version: versions[0],
@@ -1286,7 +1994,8 @@ mod tests {
 
         let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
         let (share, target_diff, reconstructed_engine_id) =
-            reconstruct_share_from_result(&frame, &engine_dispatches, &config).unwrap();
+            reconstruct_share_from_result(&frame, &engine_dispatches, &engine_layout, &config)
+                .unwrap();
 
         assert_eq!(reconstructed_engine_id, engine_id);
         assert_eq!(share.nonce, nonce);
@@ -1305,5 +2014,71 @@ mod tests {
             .block_hash()
         );
         assert_eq!(target_diff, Difficulty::from_target(task.share_target));
+    }
+
+    #[test]
+    fn runtime_engine_layout_compresses_logical_ids_after_missing_engines() {
+        let layout = Bzm2EngineLayout::from_active_coordinates([(0, 0), (0, 6), (19, 10)]);
+
+        assert_eq!(layout.active_engine_count(), 3);
+        assert_eq!(layout.logical_engine_id(0, 0), Some(0));
+        assert_eq!(layout.logical_engine_id(0, 6), Some(1));
+        assert_eq!(layout.logical_engine_id(19, 10), Some(2));
+        assert_eq!(layout.logical_engine_id(0, 1), None);
+    }
+
+    #[tokio::test]
+    async fn dispatch_uses_runtime_engine_layout() {
+        let pty = openpty(None, None).unwrap();
+        let writer_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let reader_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader_a, mut writer, _control_a) = writer_side.split();
+        let (mut reader, _writer_b, _control_b) = reader_side.split();
+
+        let task = test_task();
+        let mut engine_dispatches = StdHashMap::new();
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
+        let engine_layout = Bzm2EngineLayout::from_active_coordinates([(0, 0), (19, 10)]);
+
+        dispatch_task_to_board(
+            &mut writer,
+            &task,
+            1,
+            &engine_layout,
+            &mut engine_dispatches,
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 512];
+        let mut bytes = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while bytes.len() < (8 + 8 + 11 + (48 * 4)) * engine_layout.active_engine_count() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(remaining, reader.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+
+        let first_engine = logical_engine_address(0, 0).to_be_bytes();
+        let second_engine = logical_engine_address(19, 10).to_be_bytes();
+        assert!(bytes.windows(2).any(|window| window == first_engine));
+        assert!(bytes.windows(2).any(|window| window == second_engine));
+        assert!(
+            !bytes
+                .windows(2)
+                .any(|window| window == logical_engine_address(0, 1).to_be_bytes())
+        );
+        assert_eq!(engine_dispatches.len(), 2);
+        assert!(engine_dispatches.contains_key(&0));
+        assert!(engine_dispatches.contains_key(&1));
     }
 }

@@ -211,6 +211,22 @@ Exit criteria:
 - tuning decisions are based on measured runtime behavior, not just startup
   heuristics and persisted estimates
 
+Status:
+
+- completed: live BZM2 threads now maintain work-based runtime throughput
+  estimators for:
+  - whole-thread throughput
+  - per-ASIC throughput
+  - per-PLL throughput using the documented row 0-9 / row 10-19 stack split
+- completed: `Bzm2Board` now samples and stores runtime tuning measurements
+  into live board state and an internal cache, including:
+  - board throughput
+  - per-ASIC throughput
+  - per-ASIC average pass rate
+  - per-PLL pass rate and throughput
+  - per-domain measured voltage and power
+- next: feed those live measurements back into the tuning planner
+
 ## Phase 6: Diagnostics And API Parity
 
 Objective:

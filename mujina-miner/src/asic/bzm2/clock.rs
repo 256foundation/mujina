@@ -75,7 +75,7 @@ pub enum Bzm2Pll {
 }
 
 impl Bzm2Pll {
-    fn register_block(self) -> (u8, u8, u8, u8) {
+    pub(crate) fn register_block(self) -> (u8, u8, u8, u8) {
         match self {
             Self::Pll0 => (
                 LOCAL_REG_PLL_POSTDIV,
@@ -100,7 +100,7 @@ pub enum Bzm2Dll {
 }
 
 impl Bzm2Dll {
-    fn registers(self) -> (u8, u8, u8, u8, u8) {
+    pub(crate) fn registers(self) -> (u8, u8, u8, u8, u8) {
         match self {
             Self::Dll0 => (
                 LOCAL_REG_CKDCCR_2_0,
@@ -119,7 +119,7 @@ impl Bzm2Dll {
         }
     }
 
-    fn fincon_register(self) -> u8 {
+    pub(crate) fn fincon_register(self) -> u8 {
         match self {
             Self::Dll0 => LOCAL_REG_CKDLLR_1_0,
             Self::Dll1 => LOCAL_REG_CKDLLR_1_1,
@@ -549,7 +549,7 @@ impl Bzm2ClockController {
     }
 }
 
-fn fincon_is_valid(fincon: u8) -> bool {
+pub(crate) fn fincon_is_valid(fincon: u8) -> bool {
     !matches!(fincon & 0xf0, 0xf0 | 0x00) && !matches!(fincon & 0xe0, 0xe0 | 0x00)
 }
 

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -12,8 +13,8 @@ use tokio::task::JoinHandle;
 use super::{Board, BoardCommand, BoardError, BoardInfo, VirtualBoardDescriptor};
 use crate::{
     api_client::types::{
-        AsicState, BoardState, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor,
-        ThreadState,
+        AsicState, BoardState, Bzm2AsicTuningState, Bzm2DomainTuningState, Bzm2PllTuningState,
+        Bzm2TuningState, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor, ThreadState,
     },
     asic::{
         bzm2::{
@@ -22,8 +23,8 @@ use crate::{
             Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2DomainMeasurement,
             Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2Pll, Bzm2SavedEngineCoordinate,
             Bzm2SavedEngineTopology, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig,
-            Bzm2ThreadHandle, Bzm2UartController, Bzm2VoltageDomain, FileGpioPin, FilePowerRail,
-            GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
+            Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController, Bzm2VoltageDomain,
+            FileGpioPin, FilePowerRail, GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -870,6 +871,11 @@ impl Bzm2BusLayout {
         global_asic_id >= self.asic_start && global_asic_id < self.asic_start + self.asic_count
     }
 
+    fn global_asic_id(&self, local_asic_id: u8) -> Option<u16> {
+        (u16::from(local_asic_id) < self.asic_count)
+            .then_some(self.asic_start + u16::from(local_asic_id))
+    }
+
     fn local_asic_id(&self, global_asic_id: u16) -> Option<u8> {
         self.contains(global_asic_id)
             .then_some((global_asic_id - self.asic_start) as u8)
@@ -920,11 +926,26 @@ struct Bzm2LoadedCalibrationProfile {
     saved_state: Bzm2SavedOperatingPoint,
 }
 
+#[derive(Debug, Clone, Default)]
+struct Bzm2AppliedOperatingState {
+    per_domain_voltage_mv: BTreeMap<u16, u32>,
+    per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Bzm2RuntimeMeasurementCache {
+    domain_measurements: BTreeMap<u16, Bzm2DomainMeasurement>,
+    asic_measurements: BTreeMap<u16, Bzm2AsicMeasurement>,
+}
+
 pub struct Bzm2Board {
     config: Bzm2VirtualDeviceConfig,
     bringup_applied: bool,
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
+    bus_layouts: Arc<Mutex<Vec<Bzm2BusLayout>>>,
+    applied_operating_state: Arc<Mutex<Bzm2AppliedOperatingState>>,
+    runtime_measurements: Arc<Mutex<Bzm2RuntimeMeasurementCache>>,
     state_tx: watch::Sender<BoardState>,
     command_rx: Option<mpsc::Receiver<BoardCommand>>,
     monitor_shutdown: Option<watch::Sender<bool>>,
@@ -944,6 +965,9 @@ impl Bzm2Board {
             bringup_applied: false,
             shutdown_handles: Vec::new(),
             serial_controls: Vec::new(),
+            bus_layouts: Arc::new(Mutex::new(Vec::new())),
+            applied_operating_state: Arc::new(Mutex::new(Bzm2AppliedOperatingState::default())),
+            runtime_measurements: Arc::new(Mutex::new(Bzm2RuntimeMeasurementCache::default())),
             state_tx,
             command_rx: Some(command_rx),
             monitor_shutdown: None,
@@ -1000,9 +1024,13 @@ impl Bzm2Board {
 
         let telemetry = self.config.telemetry.clone();
         let rail_telemetry = self.config.bringup.clone();
+        let calibration = self.config.calibration.clone();
         let state_tx = self.state_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
         let serial_controls = self.serial_controls.clone();
+        let bus_layouts = Arc::clone(&self.bus_layouts);
+        let applied_operating_state = Arc::clone(&self.applied_operating_state);
+        let runtime_measurements = Arc::clone(&self.runtime_measurements);
         let board_name = self.config.device_id();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         self.monitor_shutdown = Some(shutdown_tx);
@@ -1015,6 +1043,23 @@ impl Bzm2Board {
                     _ = interval.tick() => {
                         let snapshot = telemetry.snapshot();
                         let rail_snapshot = rail_telemetry.snapshot_telemetry();
+                        let thread_metrics = collect_thread_runtime_metrics(&shutdown_handles).await;
+                        let bus_layouts = bus_layouts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let applied_operating_state = applied_operating_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let current_state = state_tx.borrow().clone();
+                        let (tuning_state, measurement_cache) = build_runtime_tuning_state(
+                            &current_state.asics,
+                            &current_state.temperatures,
+                            &bus_layouts,
+                            &calibration,
+                            &rail_telemetry,
+                            &rail_snapshot,
+                            &applied_operating_state,
+                            &thread_metrics,
+                        );
+                        let runtime_domain_count = measurement_cache.domain_measurements.len();
+                        let runtime_asic_count = measurement_cache.asic_measurements.len();
+                        *runtime_measurements.lock().unwrap_or_else(|e| e.into_inner()) = measurement_cache;
                         let total_stats = serial_controls.iter().fold((0u64, 0u64), |acc, control| {
                             let stats = control.stats();
                             (acc.0 + stats.bytes_read, acc.1 + stats.bytes_written)
@@ -1025,8 +1070,19 @@ impl Bzm2Board {
                             merge_power_readings(&mut state.powers, &snapshot.powers);
                             merge_temperature_readings(&mut state.temperatures, &rail_snapshot.temperatures);
                             merge_power_readings(&mut state.powers, &rail_snapshot.powers);
+                            state.bzm2_tuning =
+                                (!tuning_state.asics.is_empty() || !tuning_state.domains.is_empty()
+                                    || tuning_state.board_throughput_hs.is_some())
+                                    .then_some(tuning_state.clone());
                         });
-                        trace!(board = %board_name, bytes_read = total_stats.0, bytes_written = total_stats.1, "BZM2 board telemetry updated");
+                        trace!(
+                            board = %board_name,
+                            bytes_read = total_stats.0,
+                            bytes_written = total_stats.1,
+                            runtime_domain_count,
+                            runtime_asic_count,
+                            "BZM2 board telemetry updated"
+                        );
                         if let Some(reason) = snapshot.trip_reason.clone() {
                             warn!(board = %board_name, reason = %reason, "BZM2 safety trip triggered");
                             for handle in &shutdown_handles {
@@ -1334,6 +1390,11 @@ impl Bzm2Board {
             &per_asic_pll_mhz,
         )
         .await?;
+        store_applied_operating_state(
+            &self.applied_operating_state,
+            &per_domain_voltage_mv,
+            &per_asic_pll_mhz,
+        );
 
         if let Some(profile_path) = calibration.profile_path.as_deref() {
             let saved_operating_point = Bzm2SavedOperatingPoint {
@@ -1492,6 +1553,11 @@ impl Bzm2Board {
             )
             .await?;
         }
+        store_applied_operating_state(
+            &self.applied_operating_state,
+            &profile.saved_state.per_domain_voltage_mv,
+            &profile.saved_state.per_asic_pll_mhz,
+        );
         Ok(())
     }
 
@@ -1716,6 +1782,7 @@ impl Board for Bzm2Board {
         let mut thread_states = Vec::new();
         self.apply_bringup_sequence().await?;
         let bus_layouts = self.resolve_bus_layouts().await?;
+        *self.bus_layouts.lock().unwrap_or_else(|e| e.into_inner()) = bus_layouts.clone();
         let initial_snapshot = self.config.telemetry.snapshot();
         let initial_rail_snapshot = self.config.bringup.snapshot_telemetry();
         let _ = self.state_tx.send_modify(|state| {
@@ -2180,6 +2247,274 @@ fn distribute_saved_throughput(
             )
         })
         .collect()
+}
+
+fn store_applied_operating_state(
+    state: &Arc<Mutex<Bzm2AppliedOperatingState>>,
+    per_domain_voltage_mv: &BTreeMap<u16, u32>,
+    per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
+) {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.per_domain_voltage_mv = per_domain_voltage_mv.clone();
+    guard.per_asic_pll_mhz = per_asic_pll_mhz.clone();
+}
+
+async fn collect_thread_runtime_metrics(
+    handles: &[Bzm2ThreadHandle],
+) -> BTreeMap<usize, Bzm2ThreadRuntimeMetrics> {
+    let mut metrics = BTreeMap::new();
+    for (thread_index, handle) in handles.iter().enumerate() {
+        match handle.runtime_metrics().await {
+            Ok(snapshot) => {
+                metrics.insert(thread_index, snapshot);
+            }
+            Err(err) => {
+                warn!(thread_index, error = %err, "Failed to query BZM2 runtime metrics");
+            }
+        }
+    }
+    metrics
+}
+
+fn build_runtime_tuning_state(
+    asics: &[AsicState],
+    temperatures: &[TemperatureSensor],
+    bus_layouts: &[Bzm2BusLayout],
+    calibration: &Bzm2CalibrationConfig,
+    bringup: &Bzm2BringupConfig,
+    rail_snapshot: &Bzm2TelemetrySnapshot,
+    applied_operating_state: &Bzm2AppliedOperatingState,
+    thread_metrics: &BTreeMap<usize, Bzm2ThreadRuntimeMetrics>,
+) -> (Bzm2TuningState, Bzm2RuntimeMeasurementCache) {
+    let total_asics = bus_layouts.iter().map(|bus| bus.asic_count).sum::<u16>();
+    let (domains, _domain_lookup) = build_voltage_domains(
+        total_asics,
+        &calibration.asics_per_domain,
+        &calibration.domain_voltage_offsets_mv,
+    );
+
+    let mut tuning_domains = Vec::new();
+    let mut cache_domains = BTreeMap::new();
+    for domain in domains {
+        let rail_index = bringup.rail_index_for_domain(domain.domain_id);
+        let rail_output_name = rail_index.map(|index| format!("rail{index}-output"));
+        let measured_voltage_mv = rail_output_name
+            .as_ref()
+            .and_then(|name| {
+                rail_snapshot
+                    .powers
+                    .iter()
+                    .find(|power| power.name == *name)
+            })
+            .and_then(|power| power.voltage_v)
+            .map(|voltage| (voltage * 1000.0).round() as u32);
+        let measured_power_w = rail_output_name
+            .as_ref()
+            .and_then(|name| {
+                rail_snapshot
+                    .powers
+                    .iter()
+                    .find(|power| power.name == *name)
+            })
+            .and_then(|power| power.power_w);
+        tuning_domains.push(Bzm2DomainTuningState {
+            domain_id: domain.domain_id,
+            rail_index,
+            target_voltage_mv: applied_operating_state
+                .per_domain_voltage_mv
+                .get(&domain.domain_id)
+                .copied(),
+            measured_voltage_mv,
+            measured_power_w,
+        });
+        cache_domains.insert(
+            domain.domain_id,
+            Bzm2DomainMeasurement {
+                domain_id: domain.domain_id,
+                measured_voltage_mv,
+                measured_power_w,
+            },
+        );
+    }
+    tuning_domains.sort_by_key(|domain| domain.domain_id);
+
+    let mut board_throughput_hs = 0u64;
+    let mut board_has_throughput = false;
+    let mut tuning_asics = Vec::new();
+    let mut cache_asics = BTreeMap::new();
+
+    for asic in asics {
+        let Some(thread_index) = asic.thread_index else {
+            continue;
+        };
+        let Some(bus) = bus_layouts.get(thread_index) else {
+            continue;
+        };
+        let Some(global_asic_id) = bus.global_asic_id(asic.id) else {
+            continue;
+        };
+        let runtime_asic = thread_metrics
+            .get(&thread_index)
+            .and_then(|metrics| metrics.asics.iter().find(|metrics| metrics.asic == asic.id));
+        let missing_engines =
+            if asic.missing_engines.is_empty() && asic.discovered_engine_count.is_none() {
+                default_saved_engine_topology()
+                    .missing_engines
+                    .into_iter()
+                    .map(|engine| EngineCoordinate {
+                        row: engine.row,
+                        col: engine.col,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                asic.missing_engines.clone()
+            };
+        let (stack0_active, stack1_active) =
+            split_active_engine_counts(asic.discovered_engine_count, &missing_engines);
+        let frequencies = applied_operating_state
+            .per_asic_pll_mhz
+            .get(&global_asic_id)
+            .copied();
+        let mut pll_states = Vec::with_capacity(2);
+        let mut pll_pass_rates = [None, None];
+
+        for pll_index in 0..2usize {
+            let throughput_hs = runtime_asic.and_then(|asic| asic.plls[pll_index].throughput_hs);
+            let frequency_mhz = frequencies.map(|freq| freq[pll_index]);
+            let active_engines = if pll_index == 0 {
+                stack0_active
+            } else {
+                stack1_active
+            };
+            let pass_rate =
+                throughput_hs
+                    .zip(frequency_mhz)
+                    .and_then(|(throughput_hs, frequency_mhz)| {
+                        expected_stack_throughput_hs(active_engines, frequency_mhz)
+                            .map(|expected| throughput_hs as f32 / expected.max(1) as f32)
+                    });
+            pll_pass_rates[pll_index] = pass_rate;
+            pll_states.push(Bzm2PllTuningState {
+                pll_index: pll_index as u8,
+                frequency_mhz,
+                throughput_hs,
+                pass_rate,
+            });
+        }
+
+        let average_pass_rate = weighted_average_pass_rate(&[
+            (pll_pass_rates[0], stack0_active),
+            (pll_pass_rates[1], stack1_active),
+        ]);
+        let throughput_hs = runtime_asic.and_then(|asic| asic.throughput_hs);
+        if let Some(throughput_hs) = throughput_hs {
+            board_throughput_hs = board_throughput_hs.saturating_add(throughput_hs);
+            board_has_throughput = true;
+        }
+
+        tuning_asics.push(Bzm2AsicTuningState {
+            id: asic.id,
+            thread_index: asic.thread_index,
+            active_engine_count: asic.discovered_engine_count,
+            throughput_hs,
+            average_pass_rate,
+            scheduler_share_count: runtime_asic.map(|asic| asic.scheduler_share_count),
+            plls: pll_states,
+        });
+
+        cache_asics.insert(
+            global_asic_id,
+            Bzm2AsicMeasurement {
+                asic_id: global_asic_id,
+                temperature_c: asic_temperature_for_sensor(
+                    temperatures,
+                    bus.serial_path.as_str(),
+                    asic.id,
+                ),
+                throughput_ths: throughput_hs
+                    .map(|throughput| throughput as f32 / 1_000_000_000_000.0),
+                average_pass_rate,
+                pll_pass_rates,
+            },
+        );
+    }
+    tuning_asics.sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
+
+    (
+        Bzm2TuningState {
+            board_throughput_hs: board_has_throughput.then_some(board_throughput_hs),
+            domains: tuning_domains,
+            asics: tuning_asics,
+        },
+        Bzm2RuntimeMeasurementCache {
+            domain_measurements: cache_domains,
+            asic_measurements: cache_asics,
+        },
+    )
+}
+
+fn split_active_engine_counts(
+    active_engine_count: Option<u16>,
+    missing_engines: &[EngineCoordinate],
+) -> (u16, u16) {
+    if missing_engines.is_empty() {
+        if let Some(active_engine_count) = active_engine_count {
+            let lower = active_engine_count / 2;
+            return (lower, active_engine_count.saturating_sub(lower));
+        }
+    }
+    let mut bottom_missing = 0u16;
+    let mut top_missing = 0u16;
+    for engine in missing_engines {
+        if engine.row < 10 {
+            bottom_missing = bottom_missing.saturating_add(1);
+        } else {
+            top_missing = top_missing.saturating_add(1);
+        }
+    }
+    let engines_per_stack = (10u16 * 12u16) as u16;
+    (
+        engines_per_stack.saturating_sub(bottom_missing),
+        engines_per_stack.saturating_sub(top_missing),
+    )
+}
+
+fn expected_stack_throughput_hs(active_engines: u16, frequency_mhz: f32) -> Option<u64> {
+    (frequency_mhz > 0.0).then(|| {
+        let ghs = active_engines as f32 * 4.0 * (frequency_mhz / 1000.0) / 3.0;
+        (ghs * 1_000_000_000.0).round() as u64
+    })
+}
+
+fn weighted_average_pass_rate(samples: &[(Option<f32>, u16)]) -> Option<f32> {
+    let mut weighted = 0.0f32;
+    let mut total_weight = 0u32;
+    for (pass_rate, weight) in samples {
+        if let Some(pass_rate) = pass_rate {
+            weighted += pass_rate * *weight as f32;
+            total_weight += u32::from(*weight);
+        }
+    }
+    (total_weight > 0).then_some(weighted / total_weight as f32)
+}
+
+fn asic_temperature_for_sensor(
+    temperatures: &[TemperatureSensor],
+    serial_path: &str,
+    asic: u8,
+) -> Option<f32> {
+    let prefix = Path::new(serial_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(serial_path)
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let name = format!("{prefix}-asic-{asic}-dts");
+    temperatures
+        .iter()
+        .find(|sensor| sensor.name == name)
+        .and_then(|sensor| sensor.temperature_c)
 }
 
 fn load_saved_operating_point_profile(
@@ -3339,5 +3674,106 @@ mod tests {
                 EngineCoordinate { row: 5, col: 11 },
             ]
         );
+    }
+
+    #[test]
+    fn build_runtime_tuning_state_maps_live_measurements() {
+        let asics = vec![AsicState {
+            id: 0,
+            thread_index: Some(0),
+            serial_path: Some("/dev/ttyUSB0".into()),
+            discovered_engine_count: Some(236),
+            missing_engines: Vec::new(),
+        }];
+        let temperatures = vec![TemperatureSensor {
+            name: "ttyUSB0-asic-0-dts".into(),
+            temperature_c: Some(67.0),
+        }];
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 1,
+        }];
+        let calibration = Bzm2CalibrationConfig::default();
+        let bringup = Bzm2BringupConfig {
+            rail_set_paths: vec!["/tmp/rail0".into()],
+            ..Default::default()
+        };
+        let rail_snapshot = Bzm2TelemetrySnapshot {
+            powers: vec![PowerMeasurement {
+                name: "rail0-output".into(),
+                voltage_v: Some(0.9),
+                current_a: Some(44.0),
+                power_w: Some(40.0),
+            }],
+            ..Default::default()
+        };
+        let applied = Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: BTreeMap::from([(0, 18_500)]),
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
+        };
+        let thread_metrics = BTreeMap::from([(
+            0usize,
+            Bzm2ThreadRuntimeMetrics {
+                throughput_hs: Some(358_720_000_000),
+                asics: vec![crate::asic::bzm2::Bzm2AsicRuntimeMetrics {
+                    asic: 0,
+                    throughput_hs: Some(358_720_000_000),
+                    scheduler_share_count: 12,
+                    plls: [
+                        crate::asic::bzm2::Bzm2PllRuntimeMetrics {
+                            throughput_hs: Some(179_360_000_000),
+                            scheduler_share_count: 6,
+                        },
+                        crate::asic::bzm2::Bzm2PllRuntimeMetrics {
+                            throughput_hs: Some(179_360_000_000),
+                            scheduler_share_count: 6,
+                        },
+                    ],
+                }],
+            },
+        )]);
+
+        let (tuning, cache) = build_runtime_tuning_state(
+            &asics,
+            &temperatures,
+            &bus_layouts,
+            &calibration,
+            &bringup,
+            &rail_snapshot,
+            &applied,
+            &thread_metrics,
+        );
+
+        assert_eq!(tuning.board_throughput_hs, Some(358_720_000_000));
+        assert_eq!(tuning.domains.len(), 1);
+        assert_eq!(tuning.domains[0].target_voltage_mv, Some(18_500));
+        assert_eq!(tuning.domains[0].measured_voltage_mv, Some(900));
+        assert_eq!(tuning.domains[0].measured_power_w, Some(40.0));
+        assert_eq!(tuning.asics.len(), 1);
+        assert_eq!(tuning.asics[0].throughput_hs, Some(358_720_000_000));
+        assert_eq!(tuning.asics[0].scheduler_share_count, Some(12));
+        assert!(
+            tuning.asics[0]
+                .average_pass_rate
+                .is_some_and(|pass_rate| (pass_rate - 0.95).abs() < 0.0001)
+        );
+        assert!(
+            tuning.asics[0].plls[0]
+                .pass_rate
+                .is_some_and(|pass_rate| (pass_rate - 0.95).abs() < 0.0001)
+        );
+        assert!(
+            cache.asic_measurements[&0]
+                .temperature_c
+                .is_some_and(|temp| (temp - 67.0).abs() < 0.0001)
+        );
+        assert!(
+            cache.asic_measurements[&0]
+                .throughput_ths
+                .is_some_and(|throughput| (throughput - 0.35872).abs() < 0.0001)
+        );
+        assert_eq!(cache.domain_measurements[&0].measured_voltage_mv, Some(900));
+        assert_eq!(cache.domain_measurements[&0].measured_power_w, Some(40.0));
     }
 }
