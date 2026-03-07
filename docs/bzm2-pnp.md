@@ -90,6 +90,12 @@ The planner is now wired into `Bzm2Board` startup so Mujina can:
 - execute a live pre-thread calibration phase
 - persist applied calibration results as a saved operating point profile
 - replay a compatible saved operating point profile directly on restart before falling back to retune
+- collect live runtime tuning measurements during mining for:
+  - board throughput
+  - per-ASIC throughput
+  - per-ASIC average pass rate
+  - per-PLL throughput and pass rate
+  - per-domain measured rail voltage and power
 - normalize saved-throughput comparisons and planned board hashrate against
   actual active-engine capacity instead of assuming every ASIC still has the
   default full map
@@ -108,7 +114,7 @@ That means tuning decisions can now distinguish between:
 What still remains outside the ASIC planner layer:
 
 - board-specific PSU ramp policy
-- dynamic runtime retune from live pass-rate or throughput feedback
+- automatic runtime retune decisions driven by the live measurements above
 - reimplementation of the legacy CSV/database layer
 
 Those pieces still belong above the ASIC planner, in board or daemon integration layers.

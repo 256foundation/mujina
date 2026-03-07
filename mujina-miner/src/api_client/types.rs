@@ -33,6 +33,8 @@ pub struct BoardState {
     pub threads: Vec<ThreadState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asics: Vec<AsicState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bzm2_tuning: Option<Bzm2TuningState>,
 }
 
 /// Fan status.
@@ -84,6 +86,61 @@ pub struct AsicState {
     pub discovered_engine_count: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_engines: Vec<EngineCoordinate>,
+}
+
+/// BZM2 runtime tuning measurements derived from live mining operation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2TuningState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_throughput_hs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<Bzm2DomainTuningState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asics: Vec<Bzm2AsicTuningState>,
+}
+
+/// Per-domain live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DomainTuningState {
+    pub domain_id: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rail_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_power_w: Option<f32>,
+}
+
+/// Per-PLL live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2PllTuningState {
+    pub pll_index: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_rate: Option<f32>,
+}
+
+/// Per-ASIC live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2AsicTuningState {
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_engine_count: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_pass_rate: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler_share_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plls: Vec<Bzm2PllTuningState>,
 }
 
 /// Physical engine coordinate on one ASIC.

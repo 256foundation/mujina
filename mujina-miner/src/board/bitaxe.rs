@@ -809,6 +809,7 @@ impl BitaxeBoard {
                     ],
                     threads: Vec::new(),
                     asics: Vec::new(),
+                    bzm2_tuning: None,
                 });
 
                 // -- Log summary (throttled) --

@@ -900,3 +900,45 @@ This document captures the working session that produced the BZM2 Mujina port. I
   - focused `cargo test -p mujina-miner pnp --message-format=human`
   - focused `cargo test -p mujina-miner board::bzm2 --message-format=human`
   - full regression gate before commit
+
+## 39. Roadmap Phase 5 Step 1: Runtime Tuning Measurements
+
+### Assistant
+- Started Phase 5 by replacing startup-only placeholder measurements with live
+  runtime operating data from the active BZM2 mining path.
+- Kept the step scoped to measurement capture and storage so the next step can
+  consume real data without mixing policy and instrumentation changes.
+
+### Assistant
+- Added work-based runtime throughput estimators inside the BZM2 thread actor
+  for:
+  - whole-thread throughput
+  - per-ASIC throughput
+  - per-PLL throughput
+- Used the documented stack split for per-PLL attribution:
+  - rows `0-9` => bottom stack / `PLL0`
+  - rows `10-19` => top stack / `PLL1`
+
+### Assistant
+- Added board-side runtime tuning state construction that joins:
+  - live thread runtime measurements
+  - discovered ASIC topology
+  - applied operating-point frequencies and voltages
+  - measured rail voltage and power
+  - live ASIC temperature readings
+- Exposed the resulting live measurements through `BoardState.bzm2_tuning`.
+
+### Assistant
+- Captured runtime measurements in a board-local cache shaped like the planner
+  input types so the next roadmap step can feed them back into tuning without
+  rebuilding the data model.
+
+### Assistant
+- Added regression coverage for:
+  - per-ASIC / per-PLL runtime throughput tracking
+  - runtime tuning-state construction from live board inputs
+  - the existing parsed-UART share path under the new throughput estimator
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner bzm2 --message-format=human`
+  - full regression gate before commit
