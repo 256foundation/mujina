@@ -12,9 +12,9 @@ Before this change, Mujina's BZM2 support had:
 - UART register access
 - PLL and DLL control
 
-What it did not have was the legacy PnP calibration planner:
+What it did not have was a native Mujina tuning planner for BZM2:
 
-- strategy and bin-specific target selection
+- operating-class and performance-mode target selection
 - parameter sweep generation
 - initial voltage and frequency selection from site temperature
 - saved operating point reuse checks
@@ -35,8 +35,8 @@ The original C implementation mixed:
 
 The reusable algorithmic parts are:
 
-- derive target voltage, frequency, and pass rate from operating class and performance mode
-- derive initial voltage and frequency from site thermal conditions
+- derive voltage, clock, and acceptance targets from operating class and performance mode
+- derive initial voltage and clock from site thermal conditions
 - broadcast a starting frequency
 - sweep upward while respecting power and thermal guard rails
 - tune back down on individual ASICs or stacks when pass rate falls outside the target window
@@ -45,12 +45,12 @@ The reusable algorithmic parts are:
 ## Mujina Ported Behavior
 
 The new Rust module at
-[C:\Users\prael\Documents\Codex\bzm2_mujina\mujina-miner\src\asic\bzm2\pnp.rs](C:\Users\prael\Documents\Codex\bzm2_mujina\mujina-miner\src\asic\bzm2\pnp.rs)
+`mujina-miner/src/asic/bzm2/pnp.rs`
 implements the reusable planner without pulling board-MCU or PSU glue into the ASIC layer.
 
 Implemented:
 
-- performance mode targets for:
+- operating-class target tables for:
   - generic
   - EarlyValidation
   - ProductionValidation
@@ -58,8 +58,8 @@ Implemented:
   - StackTunedB
   - ExtendedHeadroom
   - ExtendedHeadroomB
-- parameter sweep generation analogous to legacy `pnp_create_paramters_vector()`
-- ambient-aware initial voltage and frequency planning analogous to `pnp_set_initial_voltage_frequency()`
+- search-space generation corresponding to the historical C sweep helper
+- site-temperature-aware initial voltage and clock planning corresponding to the historical C startup helper
 - saved operating point reuse vs. full retune decisions
 - domain-aware voltage planning using explicit voltage-domain offsets and guards
 - per-domain frequency planning using aggregated pass-rate, thermal, and power data
@@ -88,8 +88,22 @@ That is materially more scalable than treating a 100-ASIC machine as 100 indepen
 The planner is now wired into `Bzm2Board` startup so Mujina can:
 
 - execute a live pre-thread calibration phase
-- persist applied calibration results as a stored profile
-- replay a compatible stored profile directly on restart before falling back to retune
+- persist applied calibration results as a saved operating point profile
+- replay a compatible saved operating point profile directly on restart before falling back to retune
+- normalize saved-throughput comparisons and planned board hashrate against
+  actual active-engine capacity instead of assuming every ASIC still has the
+  default full map
+
+Engine-capacity inputs now come from, in order:
+
+- live pre-calibration engine discovery when enabled
+- saved per-ASIC topology embedded in the saved operating point profile
+- default BZM2 hole-map fallback when no better topology data is available
+
+That means tuning decisions can now distinguish between:
+
+- a slow ASIC that still has full engine capacity
+- an ASIC that is throughput-limited because it has permanently missing engines
 
 What still remains outside the ASIC planner layer:
 

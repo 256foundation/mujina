@@ -17,7 +17,8 @@ pub use pnp::{
     Bzm2AsicMeasurement, Bzm2AsicPlan, Bzm2AsicTopology, Bzm2BoardCalibrationInput,
     Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlan, Bzm2CalibrationPlanner,
     Bzm2CalibrationSweepRequest, Bzm2DomainMeasurement, Bzm2DomainPlan, Bzm2OperatingClass,
-    Bzm2PerformanceMode, Bzm2SavedOperatingPoint, Bzm2VoltageDomain,
+    Bzm2PerformanceMode, Bzm2SavedEngineCoordinate, Bzm2SavedEngineTopology,
+    Bzm2SavedOperatingPoint, Bzm2VoltageDomain,
 };
 pub use thread::{Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle};
 pub use uart::{

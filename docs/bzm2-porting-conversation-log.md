@@ -833,3 +833,70 @@ This document captures the working session that produced the BZM2 Mujina port. I
     - work dispatch
     - validation helpers
     - tuning calculations
+
+## 37. Roadmap Phase 4 Step 3: Runtime Dispatch Uses Discovered Engine Layout
+
+### Assistant
+- Continued Phase 4 by moving the discovered engine topology into the actual
+  mining runtime rather than leaving it as metadata only.
+- Kept the change scoped to runtime dispatch and result reconstruction first,
+  leaving tuning-policy changes for the next step.
+
+### Assistant
+- Added a reusable `Bzm2EngineLayout` abstraction that:
+  - tracks active physical coordinates
+  - assigns compact logical engine ids in physical scan order
+  - can be seeded from the legacy default map or a discovered live map
+
+### Assistant
+- Updated the BZM2 thread actor so a successful idle-time discovery scan now
+  replaces the thread's active engine layout in memory.
+- Updated dispatch and result reconstruction to use that runtime layout instead
+  of the static default exclusion map.
+
+### Assistant
+- Added regression coverage for:
+  - compact logical-id assignment after missing engines
+  - dispatch fanout over a discovered sparse engine set
+  - existing share-reconstruction and UART tests under the new layout path
+
+### Assistant
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner bzm2 --message-format=human`
+  - focused `cargo test -p mujina-miner --bin mujina-bzm2-debug --message-format=human`
+  - full regression gate before commit
+
+## 38. Roadmap Phase 4 Step 4: Tuning Uses Engine Capacity
+
+### Assistant
+- Continued Phase 4 by making the tuning path aware of real engine capacity,
+  not just ASIC count.
+- Kept the change focused on startup calibration and saved operating-point reuse
+  so it would remain compatible with the existing planner structure.
+
+### Assistant
+- Extended the saved operating-point format with per-ASIC engine topology data:
+  - active engine count
+  - missing engine coordinates
+- Added board-side calibration discovery inputs that can source topology from:
+  - live pre-calibration engine discovery
+  - saved operating-point replay
+  - default-map fallback
+
+### Assistant
+- Updated the planner so throughput comparisons are normalized by active-engine
+  capacity.
+- Updated planned board-hashrate estimation so persisted profiles no longer
+  assume every alive ASIC still has the default full engine map.
+- Added notes when an ASIC or board is operating with reduced engine capacity.
+
+### Assistant
+- Added regression coverage for:
+  - planner reuse when throughput is correct for a reduced active-engine count
+  - saved profile persistence of per-ASIC engine topology
+- Ran:
+  - `cargo fmt --all`
+  - focused `cargo test -p mujina-miner pnp --message-format=human`
+  - focused `cargo test -p mujina-miner board::bzm2 --message-format=human`
+  - full regression gate before commit

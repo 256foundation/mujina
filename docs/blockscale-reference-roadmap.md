@@ -171,8 +171,20 @@ Status:
   - `Bzm2Board` command handling
   - the live BZM2 thread actor
   - `POST /api/v0/boards/{name}/bzm2/discover-engines`
-- next: feed the discovered engine map into work dispatch, validation helpers,
-  and tuning calculations
+- completed: successful discovery scans now update the live BZM2 runtime engine
+  layout used by:
+  - work dispatch fanout
+  - result reconstruction
+  - share validation helpers
+- completed: calibration input now consumes active-engine counts and missing
+  coordinates through:
+  - live pre-calibration engine discovery when enabled
+  - saved operating-point topology replay
+  - default-map fallback when no topology data exists
+- completed: saved operating-point reuse and planned hashrate estimation now
+  normalize against real engine capacity instead of assuming every ASIC has the
+  default full map
+- next: Phase 5, closed-loop calibration and retune
 
 ## Phase 5: Closed-Loop Calibration And Retune
 

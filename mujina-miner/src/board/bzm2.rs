@@ -20,9 +20,10 @@ use crate::{
             Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput, Bzm2BringupPlan,
             Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
             Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2DomainMeasurement,
-            Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2Pll, Bzm2SavedOperatingPoint, Bzm2Thread,
-            Bzm2ThreadConfig, Bzm2ThreadHandle, Bzm2UartController, Bzm2VoltageDomain, FileGpioPin,
-            FilePowerRail, GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
+            Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2Pll, Bzm2SavedEngineCoordinate,
+            Bzm2SavedEngineTopology, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig,
+            Bzm2ThreadHandle, Bzm2UartController, Bzm2VoltageDomain, FileGpioPin, FilePowerRail,
+            GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -48,6 +49,9 @@ const DEFAULT_CALIBRATION_SITE_TEMP_C: f32 = 20.0;
 const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
 const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
@@ -471,6 +475,7 @@ impl Bzm2BringupConfig {
 pub struct Bzm2CalibrationConfig {
     pub enabled: bool,
     pub apply_saved_operating_point: bool,
+    pub discover_engine_topology: bool,
     pub operating_class: Bzm2OperatingClass,
     pub performance_mode: Bzm2PerformanceMode,
     pub mode: Bzm2CalibrationMode,
@@ -485,6 +490,9 @@ pub struct Bzm2CalibrationConfig {
     pub skip_lock_check: bool,
     pub lock_timeout: Duration,
     pub lock_poll_interval: Duration,
+    pub engine_discovery_tdm_prediv_raw: u32,
+    pub engine_discovery_tdm_counter: u8,
+    pub engine_discovery_timeout: Duration,
 }
 
 impl Default for Bzm2CalibrationConfig {
@@ -492,6 +500,7 @@ impl Default for Bzm2CalibrationConfig {
         Self {
             enabled: false,
             apply_saved_operating_point: true,
+            discover_engine_topology: true,
             operating_class: Bzm2OperatingClass::Generic,
             performance_mode: Bzm2PerformanceMode::Standard,
             mode: Bzm2CalibrationMode::default(),
@@ -506,6 +515,11 @@ impl Default for Bzm2CalibrationConfig {
             skip_lock_check: false,
             lock_timeout: Duration::from_millis(DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS),
             lock_poll_interval: Duration::from_millis(DEFAULT_CALIBRATION_LOCK_POLL_MS),
+            engine_discovery_tdm_prediv_raw: DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW,
+            engine_discovery_tdm_counter: DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER,
+            engine_discovery_timeout: Duration::from_millis(
+                DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS,
+            ),
         }
     }
 }
@@ -518,6 +532,13 @@ impl Bzm2CalibrationConfig {
                 &[
                     "MUJINA_BZM2_APPLY_SAVED_OPERATING_POINT",
                     "MUJINA_BZM2_REPLAY_STORED_CALIBRATION",
+                ],
+                true,
+            ),
+            discover_engine_topology: env_flag_default_any(
+                &[
+                    "MUJINA_BZM2_CALIBRATION_DISCOVER_ENGINES",
+                    "MUJINA_BZM2_DISCOVER_ENGINES_FOR_CALIBRATION",
                 ],
                 true,
             ),
@@ -586,6 +607,29 @@ impl Bzm2CalibrationConfig {
                     .ok()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(DEFAULT_CALIBRATION_LOCK_POLL_MS),
+            ),
+            engine_discovery_tdm_prediv_raw: env_var_any(&[
+                "MUJINA_BZM2_ENGINE_DISCOVERY_TDM_PREDIV_RAW",
+                "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW",
+            ])
+            .as_deref()
+            .and_then(parse_u32_any_radix)
+            .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW),
+            engine_discovery_tdm_counter: env_var_any(&[
+                "MUJINA_BZM2_ENGINE_DISCOVERY_TDM_COUNTER",
+                "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER",
+            ])
+            .as_deref()
+            .and_then(parse_u8_any_radix)
+            .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER),
+            engine_discovery_timeout: Duration::from_millis(
+                env_var_any(&[
+                    "MUJINA_BZM2_ENGINE_DISCOVERY_TIMEOUT_MS",
+                    "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS",
+                ])
+                .as_deref()
+                .and_then(parse_u64_any_radix)
+                .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS),
             ),
         };
 
@@ -1214,16 +1258,18 @@ impl Bzm2Board {
         let saved_operating_point = loaded_profile
             .as_ref()
             .map(|loaded| loaded.saved_state.clone());
+        let engine_topology = self
+            .resolve_engine_topology_for_calibration(&bus_layouts, saved_operating_point.as_ref())
+            .await;
         let (voltage_domains, domain_lookup) = build_voltage_domains(
             total_asics as u16,
             &calibration.asics_per_domain,
             &calibration.domain_voltage_offsets_mv,
         );
-        let asics = build_topology(&bus_layouts, &domain_lookup);
-        let alive_asics = asics.iter().filter(|asic| asic.alive).count().max(1);
+        let asics = build_topology(&bus_layouts, &domain_lookup, &engine_topology);
         let per_asic_throughput = saved_operating_point
             .as_ref()
-            .map(|stored| stored.board_throughput_ths / alive_asics as f32);
+            .map(|stored| distribute_saved_throughput(stored.board_throughput_ths, &asics));
         let shared_temp = snapshot_temperature(&telemetry, "asic")
             .or_else(|| snapshot_temperature(&telemetry, "board"));
         let asic_measurements = asics
@@ -1231,7 +1277,9 @@ impl Bzm2Board {
             .map(|asic| Bzm2AsicMeasurement {
                 asic_id: asic.asic_id,
                 temperature_c: shared_temp,
-                throughput_ths: per_asic_throughput,
+                throughput_ths: per_asic_throughput
+                    .as_ref()
+                    .and_then(|throughput| throughput.get(&asic.asic_id).copied()),
                 average_pass_rate: None,
                 pll_pass_rates: [None, None],
             })
@@ -1296,9 +1344,10 @@ impl Bzm2Board {
                 board_throughput_ths: estimate_planned_hashrate(
                     &plan,
                     self.config.nominal_hashrate_ths as f32,
-                    self.config.serial_paths.len(),
+                    &asics,
                 ),
                 per_domain_voltage_mv,
+                per_asic_engine_topology: engine_topology,
                 per_asic_pll_mhz,
             };
             let profile = Bzm2PersistedCalibrationProfile {
@@ -1315,6 +1364,106 @@ impl Bzm2Board {
 
         info!(board = %self.config.device_id(), reuse_saved_operating_point = plan.reuse_saved_operating_point, needs_retune = plan.needs_retune, initial_frequency_mhz = plan.initial_frequency_mhz, asic_count = plan.asic_plans.len(), "BZM2 live calibration completed");
         Ok(())
+    }
+
+    async fn resolve_engine_topology_for_calibration(
+        &self,
+        bus_layouts: &[Bzm2BusLayout],
+        saved_operating_point: Option<&Bzm2SavedOperatingPoint>,
+    ) -> BTreeMap<u16, Bzm2SavedEngineTopology> {
+        let mut topology = saved_operating_point
+            .map(|saved| saved.per_asic_engine_topology.clone())
+            .unwrap_or_default();
+
+        if self.config.calibration.discover_engine_topology {
+            for (asic_id, discovery) in self
+                .discover_engine_topology_for_calibration(bus_layouts)
+                .await
+            {
+                topology.insert(asic_id, saved_engine_topology_from_discovery(&discovery));
+            }
+        }
+
+        for (thread_index, bus) in bus_layouts.iter().enumerate() {
+            for asic_id in bus.asic_start..bus.asic_start + bus.asic_count {
+                let saved = topology
+                    .entry(asic_id)
+                    .or_insert_with(default_saved_engine_topology)
+                    .clone();
+                if let Some(local_asic) = bus.local_asic_id(asic_id) {
+                    publish_saved_engine_topology(
+                        &self.state_tx,
+                        thread_index,
+                        &bus.serial_path,
+                        local_asic,
+                        &saved,
+                    );
+                }
+            }
+        }
+
+        topology
+    }
+
+    async fn discover_engine_topology_for_calibration(
+        &self,
+        bus_layouts: &[Bzm2BusLayout],
+    ) -> BTreeMap<u16, Bzm2DiscoveredEngineMap> {
+        let mut topology = BTreeMap::new();
+
+        for (thread_index, bus) in bus_layouts.iter().enumerate() {
+            if bus.asic_count == 0 {
+                continue;
+            }
+            let stream = match SerialStream::new(&bus.serial_path, self.config.baud_rate) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(
+                        board = %self.config.device_id(),
+                        path = %bus.serial_path,
+                        error = %err,
+                        "Failed to open BZM2 calibration discovery transport"
+                    );
+                    continue;
+                }
+            };
+            let (reader, writer, _control) = stream.split();
+            let mut uart = Bzm2UartController::new(reader, writer);
+
+            for local_asic in 0..bus.asic_count {
+                let global_asic = bus.asic_start + local_asic;
+                match uart
+                    .discover_engine_map(
+                        local_asic as u8,
+                        self.config.calibration.engine_discovery_tdm_prediv_raw,
+                        self.config.calibration.engine_discovery_tdm_counter,
+                        self.config.calibration.engine_discovery_timeout,
+                    )
+                    .await
+                {
+                    Ok(discovery) => {
+                        publish_discovered_engine_map(
+                            &self.state_tx,
+                            thread_index,
+                            &bus.serial_path,
+                            &discovery,
+                        );
+                        topology.insert(global_asic, discovery);
+                    }
+                    Err(err) => {
+                        warn!(
+                            board = %self.config.device_id(),
+                            path = %bus.serial_path,
+                            asic = local_asic,
+                            error = %err,
+                            "BZM2 calibration engine discovery failed; falling back to saved or default topology"
+                        );
+                    }
+                }
+            }
+        }
+
+        topology
     }
 
     async fn apply_saved_operating_point(
@@ -1768,30 +1917,70 @@ fn publish_discovered_engine_map(
     serial_path: &str,
     discovery: &Bzm2DiscoveredEngineMap,
 ) {
-    let missing_engines = discovery
-        .missing
-        .iter()
-        .map(|engine| EngineCoordinate {
-            row: engine.row,
-            col: engine.col,
-        })
-        .collect::<Vec<_>>();
+    upsert_asic_state(
+        state_tx,
+        thread_index,
+        serial_path,
+        discovery.asic,
+        discovery.present_count() as u16,
+        discovery
+            .missing
+            .iter()
+            .map(|engine| EngineCoordinate {
+                row: engine.row,
+                col: engine.col,
+            })
+            .collect(),
+    );
+}
 
+fn publish_saved_engine_topology(
+    state_tx: &watch::Sender<BoardState>,
+    thread_index: usize,
+    serial_path: &str,
+    asic_id: u8,
+    topology: &Bzm2SavedEngineTopology,
+) {
+    upsert_asic_state(
+        state_tx,
+        thread_index,
+        serial_path,
+        asic_id,
+        topology.active_engine_count,
+        topology
+            .missing_engines
+            .iter()
+            .map(|engine| EngineCoordinate {
+                row: engine.row,
+                col: engine.col,
+            })
+            .collect(),
+    );
+}
+
+fn upsert_asic_state(
+    state_tx: &watch::Sender<BoardState>,
+    thread_index: usize,
+    serial_path: &str,
+    asic_id: u8,
+    active_engine_count: u16,
+    missing_engines: Vec<EngineCoordinate>,
+) {
     let _ = state_tx.send_modify(|state| {
         if let Some(asic) = state
             .asics
             .iter_mut()
-            .find(|asic| asic.thread_index == Some(thread_index) && asic.id == discovery.asic)
+            .find(|asic| asic.thread_index == Some(thread_index) && asic.id == asic_id)
         {
             asic.serial_path = Some(serial_path.to_owned());
-            asic.discovered_engine_count = Some(discovery.present_count() as u16);
+            asic.discovered_engine_count = Some(active_engine_count);
             asic.missing_engines = missing_engines.clone();
         } else {
             state.asics.push(AsicState {
-                id: discovery.asic,
+                id: asic_id,
                 thread_index: Some(thread_index),
                 serial_path: Some(serial_path.to_owned()),
-                discovered_engine_count: Some(discovery.present_count() as u16),
+                discovered_engine_count: Some(active_engine_count),
                 missing_engines: missing_engines.clone(),
             });
         }
@@ -1922,19 +2111,75 @@ fn build_voltage_domains(
 fn build_topology(
     bus_layouts: &[Bzm2BusLayout],
     domain_lookup: &BTreeMap<u16, u16>,
+    engine_topology: &BTreeMap<u16, Bzm2SavedEngineTopology>,
 ) -> Vec<Bzm2AsicTopology> {
     let mut asics = Vec::new();
     for layout in bus_layouts {
         for asic_id in layout.asic_start..layout.asic_start + layout.asic_count {
+            let saved_topology = engine_topology
+                .get(&asic_id)
+                .cloned()
+                .unwrap_or_else(default_saved_engine_topology);
             asics.push(Bzm2AsicTopology {
                 asic_id,
                 domain_id: *domain_lookup.get(&asic_id).unwrap_or(&0),
                 pll_count: 2,
                 alive: true,
+                active_engine_count: saved_topology.active_engine_count,
+                missing_engines: saved_topology.missing_engines,
             });
         }
     }
     asics
+}
+
+fn default_saved_engine_topology() -> Bzm2SavedEngineTopology {
+    Bzm2SavedEngineTopology {
+        active_engine_count: crate::asic::bzm2::protocol::default_engine_coordinates().len() as u16,
+        missing_engines: crate::asic::bzm2::protocol::default_excluded_engines()
+            .into_iter()
+            .map(|(row, col)| Bzm2SavedEngineCoordinate { row, col })
+            .collect(),
+    }
+}
+
+fn saved_engine_topology_from_discovery(
+    discovery: &Bzm2DiscoveredEngineMap,
+) -> Bzm2SavedEngineTopology {
+    Bzm2SavedEngineTopology {
+        active_engine_count: discovery.present_count() as u16,
+        missing_engines: discovery
+            .missing
+            .iter()
+            .map(|coord| Bzm2SavedEngineCoordinate {
+                row: coord.row,
+                col: coord.col,
+            })
+            .collect(),
+    }
+}
+
+fn distribute_saved_throughput(
+    total_throughput_ths: f32,
+    asics: &[Bzm2AsicTopology],
+) -> BTreeMap<u16, f32> {
+    let total_active = asics
+        .iter()
+        .filter(|asic| asic.alive)
+        .map(|asic| asic.active_engine_count.max(1) as f32)
+        .sum::<f32>()
+        .max(1.0);
+
+    asics
+        .iter()
+        .filter(|asic| asic.alive)
+        .map(|asic| {
+            (
+                asic.asic_id,
+                total_throughput_ths * (asic.active_engine_count.max(1) as f32 / total_active),
+            )
+        })
+        .collect()
 }
 
 fn load_saved_operating_point_profile(
@@ -2004,9 +2249,10 @@ fn store_calibration_profile(
 fn estimate_planned_hashrate(
     plan: &crate::asic::bzm2::Bzm2CalibrationPlan,
     nominal_hashrate_ths: f32,
-    thread_count: usize,
+    asics: &[Bzm2AsicTopology],
 ) -> f32 {
-    let nominal_board_hashrate = nominal_hashrate_ths * thread_count.max(1) as f32;
+    let nominal_board_hashrate =
+        nominal_hashrate_ths * asics.iter().filter(|asic| asic.alive).count().max(1) as f32;
     let average_frequency_mhz = if plan.asic_plans.is_empty() {
         plan.desired_clock_mhz
     } else {
@@ -2021,7 +2267,18 @@ fn estimate_planned_hashrate(
     } else {
         1.0
     };
-    nominal_board_hashrate * ratio.max(0.1)
+    let active_engine_ratio = {
+        let total_active = asics
+            .iter()
+            .filter(|asic| asic.alive)
+            .map(|asic| asic.active_engine_count.max(1) as f32)
+            .sum::<f32>()
+            .max(1.0);
+        let total_nominal = asics.iter().filter(|asic| asic.alive).count().max(1) as f32
+            * default_saved_engine_topology().active_engine_count as f32;
+        (total_active / total_nominal).max(0.1)
+    };
+    nominal_board_hashrate * ratio.max(0.1) * active_engine_ratio
 }
 
 fn snapshot_temperature(snapshot: &Bzm2TelemetrySnapshot, name: &str) -> Option<f32> {
@@ -2050,6 +2307,26 @@ fn parse_scaled_sensor_value(raw: &str, scale: f32) -> Option<f32> {
 
 fn env_var_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok())
+}
+
+fn parse_u8_any_radix(raw: &str) -> Option<u8> {
+    parse_u64_any_radix(raw).and_then(|value| u8::try_from(value).ok())
+}
+
+fn parse_u32_any_radix(raw: &str) -> Option<u32> {
+    parse_u64_any_radix(raw).and_then(|value| u32::try_from(value).ok())
+}
+
+fn parse_u64_any_radix(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
 }
 
 fn env_csv_strings_any(keys: &[&str]) -> Vec<String> {
@@ -2389,6 +2666,16 @@ mod tests {
             .unwrap();
         assert_eq!(profile.saved_state.per_asic_pll_mhz.len(), 2);
         assert_eq!(profile.saved_state.per_domain_voltage_mv.len(), 2);
+        assert_eq!(profile.saved_state.per_asic_engine_topology.len(), 2);
+        assert_eq!(
+            profile
+                .saved_state
+                .per_asic_engine_topology
+                .get(&0)
+                .unwrap()
+                .active_engine_count,
+            default_saved_engine_topology().active_engine_count
+        );
         assert_eq!(
             fs::read_to_string(&rail0_path).unwrap().trim(),
             profile
@@ -2443,6 +2730,7 @@ mod tests {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 80.0,
                 per_domain_voltage_mv: BTreeMap::from([(0, 17_450), (1, 17_600)]),
+                per_asic_engine_topology: BTreeMap::new(),
                 per_asic_pll_mhz: BTreeMap::from([
                     (0, [1_100.0, 1_125.0]),
                     (1, [1_150.0, 1_175.0]),
