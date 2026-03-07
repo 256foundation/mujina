@@ -137,10 +137,12 @@ mod tests {
     use super::*;
     use crate::api::commands::SchedulerCommand;
     use crate::api_client::types::{
-        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
-        Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
-        Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
-        Bzm2RegisterWriteResponse, EngineCoordinate, SourceState, TemperatureSensor,
+        AsicState, BoardState, Bzm2ChainSummaryResponse, Bzm2ClockReportRequest,
+        Bzm2ClockReportResponse, Bzm2DllClockStatus, Bzm2DtsVsQueryRequest,
+        Bzm2EngineDiscoveryRequest, Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest,
+        Bzm2NoopResponse, Bzm2PllClockStatus, Bzm2RegisterReadRequest, Bzm2RegisterReadResponse,
+        Bzm2RegisterWriteRequest, Bzm2RegisterWriteResponse, Bzm2SavedOperatingPointStatus,
+        Bzm2StartupPath, EngineCoordinate, SourceState, TemperatureSensor,
     };
     use crate::board::{BoardCommand, BoardRegistration};
 
@@ -486,6 +488,149 @@ mod tests {
         assert_eq!(status, 200);
         let write_ack: Bzm2RegisterWriteResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(write_ack.bytes_written, 4);
+
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_chain_summary_endpoint_returns_live_layout() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2ChainSummary { reply }) = board_cmd_rx.recv().await {
+                let _ = reply.send(Ok(Bzm2ChainSummaryResponse {
+                    total_asics: 6,
+                    startup_path: Some(Bzm2StartupPath::SavedReplay),
+                    saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
+                    buses: vec![
+                        crate::api_client::types::Bzm2BusSummary {
+                            thread_index: 0,
+                            serial_path: "/dev/ttyUSB0".into(),
+                            asic_start: 0,
+                            asic_count: 2,
+                        },
+                        crate::api_client::types::Bzm2BusSummary {
+                            thread_index: 1,
+                            serial_path: "/dev/ttyUSB1".into(),
+                            asic_start: 2,
+                            asic_count: 4,
+                        },
+                    ],
+                }));
+            }
+        });
+
+        let (status, body) = get(router, "/api/v0/boards/bzm2-test/bzm2/chain-summary").await;
+        assert_eq!(status, 200);
+        let summary: Bzm2ChainSummaryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(summary.total_asics, 6);
+        assert_eq!(summary.startup_path, Some(Bzm2StartupPath::SavedReplay));
+        assert_eq!(
+            summary.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Validated)
+        );
+        assert_eq!(summary.buses.len(), 2);
+        assert_eq!(summary.buses[1].serial_path, "/dev/ttyUSB1");
+        assert_eq!(summary.buses[1].asic_start, 2);
+        assert_eq!(summary.buses[1].asic_count, 4);
+
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_clock_report_endpoint_returns_payload() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2ClockReport {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                let _ = reply.send(Ok(Bzm2ClockReportResponse {
+                    asic,
+                    pll0: Bzm2PllClockStatus {
+                        enable_register: 0x0000_0005,
+                        misc_register: 0x0000_0012,
+                        enabled: true,
+                        locked: true,
+                    },
+                    pll1: Bzm2PllClockStatus {
+                        enable_register: 0x0000_0001,
+                        misc_register: 0x0000_001a,
+                        enabled: true,
+                        locked: false,
+                    },
+                    dll0: Bzm2DllClockStatus {
+                        control2: 0x04,
+                        control5: 0x07,
+                        coarsecon: 0x03,
+                        fincon: 0x9c,
+                        freeze_valid: false,
+                        locked: true,
+                        fincon_valid: true,
+                    },
+                    dll1: Bzm2DllClockStatus {
+                        control2: 0x06,
+                        control5: 0x03,
+                        coarsecon: 0x02,
+                        fincon: 0x10,
+                        freeze_valid: true,
+                        locked: true,
+                        fincon_valid: true,
+                    },
+                }));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/clock-report",
+            &Bzm2ClockReportRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let report: Bzm2ClockReportResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(report.asic, 2);
+        assert_eq!(report.pll0.enable_register, 0x0000_0005);
+        assert!(report.pll0.locked);
+        assert!(!report.pll1.locked);
+        assert_eq!(report.dll0.fincon, 0x9c);
+        assert!(report.dll1.freeze_valid);
 
         drop(miner_tx);
         drop(cmd_rx);

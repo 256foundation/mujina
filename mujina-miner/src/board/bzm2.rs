@@ -14,8 +14,10 @@ use tokio::task::JoinHandle;
 use super::{Board, BoardCommand, BoardError, BoardInfo, VirtualBoardDescriptor};
 use crate::{
     api_client::types::{
-        AsicState, BoardState, Bzm2AsicTuningState, Bzm2DomainTuningState, Bzm2PllTuningState,
-        Bzm2TuningState, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor, ThreadState,
+        AsicState, BoardState, Bzm2AsicTuningState, Bzm2BusSummary, Bzm2ChainSummaryResponse,
+        Bzm2ClockReportResponse, Bzm2DllClockStatus, Bzm2DomainTuningState, Bzm2PllClockStatus,
+        Bzm2PllTuningState, Bzm2SavedOperatingPointStatus, Bzm2StartupPath, Bzm2TuningState,
+        EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor, ThreadState,
     },
     asic::{
         bzm2::{
@@ -60,6 +62,9 @@ const DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ: f32 = 800.0;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
+const DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS: u8 = 3;
+const DEFAULT_RUNTIME_RETUNE_THERMAL_C: f32 = 85.0;
+const DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV: u32 = 150;
 const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
@@ -501,6 +506,10 @@ pub struct Bzm2CalibrationConfig {
     pub engine_discovery_tdm_prediv_raw: u32,
     pub engine_discovery_tdm_counter: u8,
     pub engine_discovery_timeout: Duration,
+    pub runtime_retune_enabled: bool,
+    pub runtime_retune_persistence_polls: u8,
+    pub runtime_retune_thermal_c: f32,
+    pub runtime_retune_voltage_imbalance_mv: u32,
 }
 
 impl Default for Bzm2CalibrationConfig {
@@ -528,6 +537,10 @@ impl Default for Bzm2CalibrationConfig {
             engine_discovery_timeout: Duration::from_millis(
                 DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS,
             ),
+            runtime_retune_enabled: true,
+            runtime_retune_persistence_polls: DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS,
+            runtime_retune_thermal_c: DEFAULT_RUNTIME_RETUNE_THERMAL_C,
+            runtime_retune_voltage_imbalance_mv: DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV,
         }
     }
 }
@@ -639,6 +652,32 @@ impl Bzm2CalibrationConfig {
                 .and_then(parse_u64_any_radix)
                 .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS),
             ),
+            runtime_retune_enabled: env_flag_default_any(
+                &[
+                    "MUJINA_BZM2_RUNTIME_RETUNE",
+                    "MUJINA_BZM2_ENABLE_RUNTIME_RETUNE",
+                ],
+                true,
+            ),
+            runtime_retune_persistence_polls: env_var_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_PERSISTENCE_POLLS",
+                "MUJINA_BZM2_RETUNE_PERSISTENCE_POLLS",
+            ])
+            .as_deref()
+            .and_then(parse_u8_any_radix)
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS),
+            runtime_retune_thermal_c: env_f32_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_THERMAL_C",
+                "MUJINA_BZM2_RETUNE_THERMAL_C",
+            ])
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_THERMAL_C),
+            runtime_retune_voltage_imbalance_mv: env_var_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV",
+                "MUJINA_BZM2_RETUNE_VOLTAGE_IMBALANCE_MV",
+            ])
+            .as_deref()
+            .and_then(parse_u32_any_radix)
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV),
         };
 
         if config.asics_per_bus.is_empty() && serial_count > 0 {
@@ -898,6 +937,10 @@ struct Bzm2PersistedCalibrationProfile {
     performance_mode: String,
     asics_per_bus: Vec<u16>,
     pll_post1_divider: u8,
+    #[serde(default)]
+    saved_operating_point_status: Bzm2SavedOperatingPointStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    saved_operating_point_reasons: Vec<String>,
     #[serde(alias = "calibration")]
     saved_state: Bzm2SavedOperatingPoint,
 }
@@ -911,6 +954,7 @@ impl Bzm2PersistedCalibrationProfile {
         bus_layouts: &[Bzm2BusLayout],
     ) -> bool {
         self.schema_version == Self::SCHEMA_VERSION
+            && self.saved_operating_point_status != Bzm2SavedOperatingPointStatus::Invalidated
             && self.operating_class == operating_class_name(calibration.operating_class)
             && self.performance_mode == performance_mode_name(calibration.performance_mode)
             && self.pll_post1_divider == calibration.pll_post1_divider
@@ -937,12 +981,23 @@ struct Bzm2LoadedCalibrationProfile {
 struct Bzm2AppliedOperatingState {
     per_domain_voltage_mv: BTreeMap<u16, u32>,
     per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
+    saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    startup_path: Option<Bzm2StartupPath>,
+    saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    saved_operating_point_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Bzm2RuntimeMeasurementCache {
     domain_measurements: BTreeMap<u16, Bzm2DomainMeasurement>,
     asic_measurements: BTreeMap<u16, Bzm2AsicMeasurement>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Bzm2RetuneTriggerTracker {
+    throughput_regression_polls: u8,
+    thermal_drift_polls: u8,
+    voltage_imbalance_polls: u8,
 }
 
 pub struct Bzm2Board {
@@ -1045,6 +1100,7 @@ impl Bzm2Board {
         self.monitor_task = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(telemetry.poll_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut retune_tracker = Bzm2RetuneTriggerTracker::default();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
@@ -1052,7 +1108,7 @@ impl Bzm2Board {
                         let rail_snapshot = rail_telemetry.snapshot_telemetry();
                         let thread_metrics = collect_thread_runtime_metrics(&shutdown_handles).await;
                         let bus_layouts = bus_layouts.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let applied_operating_state = applied_operating_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let applied_operating_snapshot = applied_operating_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let current_state = state_tx.borrow().clone();
                         let (tuning_state, measurement_cache) = build_runtime_tuning_state(
                             &current_state.asics,
@@ -1061,8 +1117,31 @@ impl Bzm2Board {
                             &calibration,
                             &rail_telemetry,
                             &rail_snapshot,
-                            &applied_operating_state,
+                            &applied_operating_snapshot,
                             &thread_metrics,
+                        );
+                        let tuning_state = apply_runtime_tuning_plan(
+                            tuning_state,
+                            evaluate_runtime_tuning_plan(
+                                &current_state.asics,
+                                &current_state.temperatures,
+                                &bus_layouts,
+                                &calibration,
+                                &applied_operating_snapshot,
+                                &measurement_cache,
+                            ),
+                        );
+                        let tuning_state = apply_runtime_retune_triggers(
+                            tuning_state,
+                            &calibration,
+                            &measurement_cache,
+                            &mut retune_tracker,
+                        );
+                        let tuning_state = reconcile_saved_operating_point_status(
+                            tuning_state,
+                            &calibration,
+                            &bus_layouts,
+                            &applied_operating_state,
                         );
                         let runtime_domain_count = measurement_cache.domain_measurements.len();
                         let runtime_asic_count = measurement_cache.asic_measurements.len();
@@ -1125,6 +1204,8 @@ impl Bzm2Board {
         let state_tx = self.state_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
         let serial_paths = self.config.serial_paths.clone();
+        let bus_layouts = Arc::clone(&self.bus_layouts);
+        let applied_operating_state = Arc::clone(&self.applied_operating_state);
         let board_name = self.config.device_id();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         self.command_shutdown = Some(shutdown_tx);
@@ -1165,6 +1246,53 @@ impl Bzm2Board {
                                         .noop(asic)
                                         .await
                                         .map_err(|err| BoardError::HardwareControl(err.to_string()))
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                            BoardCommand::QueryBzm2ChainSummary { reply } => {
+                                let bus_layouts =
+                                    bus_layouts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                let applied = applied_operating_state
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                let summary = Bzm2ChainSummaryResponse {
+                                    total_asics: bus_layouts
+                                        .iter()
+                                        .map(|bus| bus.asic_count)
+                                        .sum::<u16>(),
+                                    startup_path: applied.startup_path,
+                                    saved_operating_point_status: applied.saved_operating_point_status,
+                                    buses: bus_layouts
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(thread_index, bus)| Bzm2BusSummary {
+                                            thread_index,
+                                            serial_path: bus.serial_path.clone(),
+                                            asic_start: bus.asic_start,
+                                            asic_count: bus.asic_count,
+                                        })
+                                        .collect(),
+                                };
+                                let _ = reply.send(Ok(summary));
+                            }
+                            BoardCommand::QueryBzm2ClockReport {
+                                thread_index,
+                                asic,
+                                reply,
+                            } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    let report = handle
+                                        .clock_report(asic)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))?;
+                                    Ok(map_clock_report(report))
                                 }
                                 .await;
                                 let _ = reply.send(result);
@@ -1399,7 +1527,7 @@ impl Bzm2Board {
             .unwrap_or(DEFAULT_CALIBRATION_SITE_TEMP_C);
         let saved_operating_point = loaded_profile
             .as_ref()
-            .map(|loaded| loaded.saved_state.clone());
+            .and_then(saved_operating_point_from_loaded_profile);
         let engine_topology = self
             .resolve_engine_topology_for_calibration(&bus_layouts, saved_operating_point.as_ref())
             .await;
@@ -1476,34 +1604,38 @@ impl Bzm2Board {
             &per_asic_pll_mhz,
         )
         .await?;
+        let current_saved_operating_point = Bzm2SavedOperatingPoint {
+            board_voltage_mv: average_u32(plan.domain_plans.iter().map(|domain| domain.voltage_mv))
+                .unwrap_or(plan.desired_voltage_mv),
+            board_throughput_ths: estimate_planned_hashrate(
+                &plan,
+                self.config.nominal_hashrate_ths as f32,
+                &asics,
+            ),
+            per_domain_voltage_mv: per_domain_voltage_mv.clone(),
+            per_asic_engine_topology: engine_topology.clone(),
+            per_asic_pll_mhz: per_asic_pll_mhz.clone(),
+        };
         store_applied_operating_state(
             &self.applied_operating_state,
             &per_domain_voltage_mv,
             &per_asic_pll_mhz,
+            Some(current_saved_operating_point.clone()),
+            Some(Bzm2StartupPath::LiveCalibration),
+            Some(Bzm2SavedOperatingPointStatus::Pending),
+            &[],
         );
 
         if let Some(profile_path) = calibration.profile_path.as_deref() {
-            let saved_operating_point = Bzm2SavedOperatingPoint {
-                board_voltage_mv: average_u32(
-                    plan.domain_plans.iter().map(|domain| domain.voltage_mv),
-                )
-                .unwrap_or(plan.desired_voltage_mv),
-                board_throughput_ths: estimate_planned_hashrate(
-                    &plan,
-                    self.config.nominal_hashrate_ths as f32,
-                    &asics,
-                ),
-                per_domain_voltage_mv,
-                per_asic_engine_topology: engine_topology,
-                per_asic_pll_mhz,
-            };
             let profile = Bzm2PersistedCalibrationProfile {
                 schema_version: Bzm2PersistedCalibrationProfile::SCHEMA_VERSION,
                 operating_class: operating_class_name(calibration.operating_class).into(),
                 performance_mode: performance_mode_name(calibration.performance_mode).into(),
                 asics_per_bus: bus_layouts.iter().map(|bus| bus.asic_count).collect(),
                 pll_post1_divider: calibration.pll_post1_divider,
-                saved_state: saved_operating_point,
+                saved_operating_point_status: Bzm2SavedOperatingPointStatus::Pending,
+                saved_operating_point_reasons: Vec::new(),
+                saved_state: current_saved_operating_point,
             };
             store_calibration_profile(profile_path, &profile)
                 .map_err(BoardError::InitializationFailed)?;
@@ -1643,6 +1775,10 @@ impl Bzm2Board {
             &self.applied_operating_state,
             &profile.saved_state.per_domain_voltage_mv,
             &profile.saved_state.per_asic_pll_mhz,
+            Some(profile.saved_state.clone()),
+            Some(Bzm2StartupPath::SavedReplay),
+            Some(profile.saved_operating_point_status),
+            &profile.saved_operating_point_reasons,
         );
         Ok(())
     }
@@ -2168,6 +2304,42 @@ fn merge_power_readings(existing: &mut Vec<PowerMeasurement>, updates: &[PowerMe
     }
 }
 
+fn map_clock_report(report: crate::asic::bzm2::Bzm2ClockDebugReport) -> Bzm2ClockReportResponse {
+    Bzm2ClockReportResponse {
+        asic: report.asic,
+        pll0: Bzm2PllClockStatus {
+            enable_register: report.pll0.enable_register,
+            misc_register: report.pll0.misc_register,
+            enabled: report.pll0.enabled,
+            locked: report.pll0.locked,
+        },
+        pll1: Bzm2PllClockStatus {
+            enable_register: report.pll1.enable_register,
+            misc_register: report.pll1.misc_register,
+            enabled: report.pll1.enabled,
+            locked: report.pll1.locked,
+        },
+        dll0: Bzm2DllClockStatus {
+            control2: report.dll0.control2,
+            control5: report.dll0.control5,
+            coarsecon: report.dll0.coarsecon,
+            fincon: report.dll0.fincon,
+            freeze_valid: report.dll0.freeze_valid,
+            locked: report.dll0.locked,
+            fincon_valid: report.dll0.fincon_valid,
+        },
+        dll1: Bzm2DllClockStatus {
+            control2: report.dll1.control2,
+            control5: report.dll1.control5,
+            coarsecon: report.dll1.coarsecon,
+            fincon: report.dll1.fincon,
+            freeze_valid: report.dll1.freeze_valid,
+            locked: report.dll1.locked,
+            fincon_valid: report.dll1.fincon_valid,
+        },
+    }
+}
+
 fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2BusLayout> {
     build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 1)
 }
@@ -2333,10 +2505,18 @@ fn store_applied_operating_state(
     state: &Arc<Mutex<Bzm2AppliedOperatingState>>,
     per_domain_voltage_mv: &BTreeMap<u16, u32>,
     per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
+    saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    startup_path: Option<Bzm2StartupPath>,
+    saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    saved_operating_point_reasons: &[String],
 ) {
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
     guard.per_domain_voltage_mv = per_domain_voltage_mv.clone();
     guard.per_asic_pll_mhz = per_asic_pll_mhz.clone();
+    guard.saved_operating_point = saved_operating_point;
+    guard.startup_path = startup_path;
+    guard.saved_operating_point_status = saved_operating_point_status;
+    guard.saved_operating_point_reasons = saved_operating_point_reasons.to_vec();
 }
 
 async fn collect_thread_runtime_metrics(
@@ -2523,6 +2703,18 @@ fn build_runtime_tuning_state(
     (
         Bzm2TuningState {
             board_throughput_hs: board_has_throughput.then_some(board_throughput_hs),
+            reuse_saved_operating_point: None,
+            needs_retune: None,
+            desired_voltage_mv: None,
+            desired_clock_mhz: None,
+            desired_accept_ratio: None,
+            retune_pending: None,
+            retune_reasons: Vec::new(),
+            saved_operating_point_status: applied_operating_state.saved_operating_point_status,
+            saved_operating_point_reasons: applied_operating_state
+                .saved_operating_point_reasons
+                .clone(),
+            planner_notes: Vec::new(),
             domains: tuning_domains,
             asics: tuning_asics,
         },
@@ -2531,6 +2723,307 @@ fn build_runtime_tuning_state(
             asic_measurements: cache_asics,
         },
     )
+}
+
+fn apply_runtime_tuning_plan(
+    mut tuning_state: Bzm2TuningState,
+    plan: Option<crate::tuning::blockscale::Bzm2CalibrationPlan>,
+) -> Bzm2TuningState {
+    if let Some(plan) = plan {
+        tuning_state.reuse_saved_operating_point = Some(plan.reuse_saved_operating_point);
+        tuning_state.needs_retune = Some(plan.needs_retune);
+        tuning_state.desired_voltage_mv = Some(plan.desired_voltage_mv);
+        tuning_state.desired_clock_mhz = Some(plan.desired_clock_mhz);
+        tuning_state.desired_accept_ratio = Some(plan.desired_accept_ratio);
+        tuning_state.planner_notes = plan.notes;
+    }
+    tuning_state
+}
+
+fn apply_runtime_retune_triggers(
+    mut tuning_state: Bzm2TuningState,
+    calibration: &Bzm2CalibrationConfig,
+    measurement_cache: &Bzm2RuntimeMeasurementCache,
+    tracker: &mut Bzm2RetuneTriggerTracker,
+) -> Bzm2TuningState {
+    if !calibration.runtime_retune_enabled {
+        tuning_state.retune_pending = Some(false);
+        tuning_state.retune_reasons.clear();
+        return tuning_state;
+    }
+
+    let persistence = calibration.runtime_retune_persistence_polls.max(1);
+    let throughput_regression = tuning_state.needs_retune.unwrap_or(false);
+    let thermal_drift = measurement_cache
+        .asic_measurements
+        .values()
+        .filter_map(|asic| asic.temperature_c)
+        .any(|temp| temp >= calibration.runtime_retune_thermal_c);
+    let voltage_imbalance = tuning_state.domains.iter().any(|domain| {
+        domain
+            .target_voltage_mv
+            .zip(domain.measured_voltage_mv)
+            .is_some_and(|(target, measured)| {
+                target.abs_diff(measured) >= calibration.runtime_retune_voltage_imbalance_mv
+            })
+    });
+
+    let mut retune_reasons = Vec::new();
+    if update_trigger_counter(
+        &mut tracker.throughput_regression_polls,
+        throughput_regression,
+    ) >= persistence
+    {
+        retune_reasons.push("throughput regression".into());
+    }
+    if update_trigger_counter(&mut tracker.thermal_drift_polls, thermal_drift) >= persistence {
+        retune_reasons.push("thermal drift".into());
+    }
+    if update_trigger_counter(&mut tracker.voltage_imbalance_polls, voltage_imbalance)
+        >= persistence
+    {
+        retune_reasons.push("persistent voltage imbalance".into());
+    }
+
+    tuning_state.retune_pending = Some(!retune_reasons.is_empty());
+    tuning_state.retune_reasons = retune_reasons;
+    tuning_state
+}
+
+fn reconcile_saved_operating_point_status(
+    mut tuning_state: Bzm2TuningState,
+    calibration: &Bzm2CalibrationConfig,
+    bus_layouts: &[Bzm2BusLayout],
+    applied_operating_state: &Arc<Mutex<Bzm2AppliedOperatingState>>,
+) -> Bzm2TuningState {
+    let mut guard = applied_operating_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let desired = if tuning_state.retune_pending == Some(true) {
+        Some((
+            Bzm2SavedOperatingPointStatus::Invalidated,
+            tuning_state.retune_reasons.clone(),
+        ))
+    } else if guard.saved_operating_point.is_some() {
+        Some((Bzm2SavedOperatingPointStatus::Validated, Vec::new()))
+    } else {
+        guard
+            .saved_operating_point_status
+            .map(|status| (status, guard.saved_operating_point_reasons.clone()))
+    };
+
+    if let Some((status, reasons)) = desired.clone() {
+        let status_changed = guard.saved_operating_point_status != Some(status)
+            || guard.saved_operating_point_reasons != reasons;
+        if status_changed {
+            if let (Some(profile_path), Some(saved_state)) = (
+                calibration.profile_path.as_deref(),
+                guard.saved_operating_point.as_ref(),
+            ) {
+                if let Err(err) = store_saved_operating_point_status(
+                    profile_path,
+                    calibration,
+                    bus_layouts,
+                    saved_state,
+                    status,
+                    &reasons,
+                ) {
+                    warn!(
+                        path = %profile_path.display(),
+                        error = %err,
+                        "Failed to persist BZM2 saved operating point status"
+                    );
+                }
+            }
+            guard.saved_operating_point_status = Some(status);
+            guard.saved_operating_point_reasons = reasons.clone();
+            if status == Bzm2SavedOperatingPointStatus::Invalidated {
+                guard.saved_operating_point = None;
+            }
+        }
+
+        tuning_state.saved_operating_point_status = Some(status);
+        tuning_state.saved_operating_point_reasons = reasons;
+        if status == Bzm2SavedOperatingPointStatus::Invalidated {
+            tuning_state.reuse_saved_operating_point = Some(false);
+        }
+    } else {
+        tuning_state.saved_operating_point_status = None;
+        tuning_state.saved_operating_point_reasons.clear();
+    }
+
+    tuning_state
+}
+
+fn update_trigger_counter(counter: &mut u8, active: bool) -> u8 {
+    if active {
+        *counter = counter.saturating_add(1);
+    } else {
+        *counter = 0;
+    }
+    *counter
+}
+
+fn evaluate_runtime_tuning_plan(
+    asics: &[AsicState],
+    temperatures: &[TemperatureSensor],
+    bus_layouts: &[Bzm2BusLayout],
+    calibration: &Bzm2CalibrationConfig,
+    applied_operating_state: &Bzm2AppliedOperatingState,
+    measurement_cache: &Bzm2RuntimeMeasurementCache,
+) -> Option<crate::tuning::blockscale::Bzm2CalibrationPlan> {
+    if bus_layouts.is_empty() {
+        return None;
+    }
+
+    let total_asics = bus_layouts.iter().map(|bus| bus.asic_count).sum::<u16>();
+    if total_asics == 0 {
+        return None;
+    }
+
+    let (_voltage_domains, domain_lookup) = build_voltage_domains(
+        total_asics,
+        &calibration.asics_per_domain,
+        &calibration.domain_voltage_offsets_mv,
+    );
+    let engine_topology = saved_engine_topology_from_state(asics, bus_layouts);
+    let voltage_domains = build_voltage_domains(
+        total_asics,
+        &calibration.asics_per_domain,
+        &calibration.domain_voltage_offsets_mv,
+    )
+    .0;
+    let asic_topology = build_topology(bus_layouts, &domain_lookup, &engine_topology);
+    let domain_measurements = voltage_domains
+        .iter()
+        .map(|domain| {
+            measurement_cache
+                .domain_measurements
+                .get(&domain.domain_id)
+                .cloned()
+                .unwrap_or(Bzm2DomainMeasurement {
+                    domain_id: domain.domain_id,
+                    measured_voltage_mv: None,
+                    measured_power_w: None,
+                })
+        })
+        .collect::<Vec<_>>();
+    let asic_measurements = asic_topology
+        .iter()
+        .map(|asic| {
+            measurement_cache
+                .asic_measurements
+                .get(&asic.asic_id)
+                .cloned()
+                .unwrap_or(Bzm2AsicMeasurement {
+                    asic_id: asic.asic_id,
+                    temperature_c: temperatures
+                        .iter()
+                        .find(|sensor| {
+                            bus_layouts
+                                .iter()
+                                .find(|layout| layout.contains(asic.asic_id))
+                                .and_then(|layout| layout.local_asic_id(asic.asic_id))
+                                .map(|local_asic| {
+                                    sensor.name
+                                        == format!(
+                                            "{}-asic-{local_asic}-dts",
+                                            sensor_prefix_from_serial(
+                                                bus_layouts
+                                                    .iter()
+                                                    .find(|layout| layout.contains(asic.asic_id))
+                                                    .map(|layout| layout.serial_path.as_str())
+                                                    .unwrap_or(""),
+                                            )
+                                        )
+                                })
+                                .unwrap_or(false)
+                        })
+                        .and_then(|sensor| sensor.temperature_c),
+                    throughput_ths: None,
+                    average_pass_rate: None,
+                    pll_pass_rates: [None, None],
+                })
+        })
+        .collect::<Vec<_>>();
+    let site_temp_c = temperatures
+        .iter()
+        .find(|sensor| sensor.name == "board")
+        .and_then(|sensor| sensor.temperature_c)
+        .or_else(|| {
+            temperatures
+                .iter()
+                .find(|sensor| sensor.name == "asic")
+                .and_then(|sensor| sensor.temperature_c)
+        })
+        .or(calibration.site_temp_c)
+        .unwrap_or(DEFAULT_CALIBRATION_SITE_TEMP_C);
+
+    Some(Bzm2CalibrationPlanner.plan(&Bzm2BoardCalibrationInput {
+        operating_class: calibration.operating_class,
+        site_temp_c,
+        target_mode: calibration.performance_mode,
+        mode: calibration.mode,
+        per_stack_clocking: calibration.per_stack_clocking,
+        voltage_domains,
+        asics: asic_topology,
+        saved_operating_point: applied_operating_state.saved_operating_point.clone(),
+        domain_measurements,
+        asic_measurements,
+        constraints: Bzm2CalibrationConstraints::default(),
+        force_retune: calibration.force_retune,
+    }))
+}
+
+fn saved_engine_topology_from_state(
+    asics: &[AsicState],
+    bus_layouts: &[Bzm2BusLayout],
+) -> BTreeMap<u16, Bzm2SavedEngineTopology> {
+    let mut topology = BTreeMap::new();
+    for asic in asics {
+        let Some(thread_index) = asic.thread_index else {
+            continue;
+        };
+        let Some(bus) = bus_layouts.get(thread_index) else {
+            continue;
+        };
+        let Some(global_asic_id) = bus.global_asic_id(asic.id) else {
+            continue;
+        };
+        topology.insert(
+            global_asic_id,
+            Bzm2SavedEngineTopology {
+                active_engine_count: asic
+                    .discovered_engine_count
+                    .unwrap_or_else(|| default_saved_engine_topology().active_engine_count),
+                missing_engines: if asic.missing_engines.is_empty()
+                    && asic.discovered_engine_count.is_none()
+                {
+                    default_saved_engine_topology().missing_engines
+                } else {
+                    asic.missing_engines
+                        .iter()
+                        .map(|engine| Bzm2SavedEngineCoordinate {
+                            row: engine.row,
+                            col: engine.col,
+                        })
+                        .collect()
+                },
+            },
+        );
+    }
+    topology
+}
+
+fn sensor_prefix_from_serial(serial_path: &str) -> String {
+    Path::new(serial_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(serial_path)
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
 }
 
 fn split_active_engine_counts(
@@ -2637,6 +3130,20 @@ fn load_saved_operating_point_profile(
         })
 }
 
+fn saved_operating_point_from_loaded_profile(
+    profile: &Bzm2LoadedCalibrationProfile,
+) -> Option<Bzm2SavedOperatingPoint> {
+    match profile.persisted.as_ref() {
+        Some(persisted)
+            if persisted.saved_operating_point_status
+                == Bzm2SavedOperatingPointStatus::Invalidated =>
+        {
+            None
+        }
+        _ => Some(profile.saved_state.clone()),
+    }
+}
+
 fn store_calibration_profile(
     path: &Path,
     profile: &Bzm2PersistedCalibrationProfile,
@@ -2659,6 +3166,29 @@ fn store_calibration_profile(
             err
         )
     })
+}
+
+fn store_saved_operating_point_status(
+    path: &Path,
+    calibration: &Bzm2CalibrationConfig,
+    bus_layouts: &[Bzm2BusLayout],
+    saved_state: &Bzm2SavedOperatingPoint,
+    status: Bzm2SavedOperatingPointStatus,
+    reasons: &[String],
+) -> Result<(), String> {
+    store_calibration_profile(
+        path,
+        &Bzm2PersistedCalibrationProfile {
+            schema_version: Bzm2PersistedCalibrationProfile::SCHEMA_VERSION,
+            operating_class: operating_class_name(calibration.operating_class).into(),
+            performance_mode: performance_mode_name(calibration.performance_mode).into(),
+            asics_per_bus: bus_layouts.iter().map(|bus| bus.asic_count).collect(),
+            pll_post1_divider: calibration.pll_post1_divider,
+            saved_operating_point_status: status,
+            saved_operating_point_reasons: reasons.to_vec(),
+            saved_state: saved_state.clone(),
+        },
+    )
 }
 
 fn estimate_planned_hashrate(
@@ -3139,6 +3669,8 @@ mod tests {
             performance_mode: performance_mode_name(Bzm2PerformanceMode::Standard).into(),
             asics_per_bus: vec![2],
             pll_post1_divider: DEFAULT_CALIBRATION_POST1_DIVIDER,
+            saved_operating_point_status: Bzm2SavedOperatingPointStatus::Validated,
+            saved_operating_point_reasons: Vec::new(),
             saved_state: Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 80.0,
@@ -3789,6 +4321,10 @@ mod tests {
         let applied = Bzm2AppliedOperatingState {
             per_domain_voltage_mv: BTreeMap::from([(0, 18_500)]),
             per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
+            saved_operating_point: None,
+            startup_path: None,
+            saved_operating_point_status: None,
+            saved_operating_point_reasons: Vec::new(),
         };
         let thread_metrics = BTreeMap::from([(
             0usize,
@@ -3853,5 +4389,267 @@ mod tests {
         );
         assert_eq!(cache.domain_measurements[&0].measured_voltage_mv, Some(900));
         assert_eq!(cache.domain_measurements[&0].measured_power_w, Some(40.0));
+    }
+
+    #[test]
+    fn evaluate_runtime_tuning_plan_flags_underperforming_saved_point() {
+        let asics = vec![AsicState {
+            id: 0,
+            thread_index: Some(0),
+            serial_path: Some("/dev/ttyUSB0".into()),
+            discovered_engine_count: Some(236),
+            missing_engines: Vec::new(),
+        }];
+        let temperatures = vec![TemperatureSensor {
+            name: "ttyUSB0-asic-0-dts".into(),
+            temperature_c: Some(72.0),
+        }];
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 1,
+        }];
+        let calibration = Bzm2CalibrationConfig::default();
+        let applied = Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: BTreeMap::from([(0, 18_500)]),
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
+            saved_operating_point: Some(Bzm2SavedOperatingPoint {
+                board_voltage_mv: 18_500,
+                board_throughput_ths: 0.40,
+                per_domain_voltage_mv: BTreeMap::from([(0, 18_500)]),
+                per_asic_engine_topology: BTreeMap::new(),
+                per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
+            }),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
+            saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
+            saved_operating_point_reasons: Vec::new(),
+        };
+        let measurement_cache = Bzm2RuntimeMeasurementCache {
+            domain_measurements: BTreeMap::from([(
+                0,
+                Bzm2DomainMeasurement {
+                    domain_id: 0,
+                    measured_voltage_mv: Some(18_300),
+                    measured_power_w: Some(55.0),
+                },
+            )]),
+            asic_measurements: BTreeMap::from([(
+                0,
+                Bzm2AsicMeasurement {
+                    asic_id: 0,
+                    temperature_c: Some(72.0),
+                    throughput_ths: Some(0.20),
+                    average_pass_rate: Some(0.94),
+                    pll_pass_rates: [Some(0.94), Some(0.94)],
+                },
+            )]),
+        };
+
+        let plan = evaluate_runtime_tuning_plan(
+            &asics,
+            &temperatures,
+            &bus_layouts,
+            &calibration,
+            &applied,
+            &measurement_cache,
+        )
+        .unwrap();
+
+        assert!(plan.needs_retune);
+        assert!(!plan.reuse_saved_operating_point);
+    }
+
+    #[test]
+    fn runtime_retune_triggers_require_persistence() {
+        let mut calibration = Bzm2CalibrationConfig::default();
+        calibration.runtime_retune_persistence_polls = 2;
+        calibration.runtime_retune_thermal_c = 80.0;
+        let measurement_cache = Bzm2RuntimeMeasurementCache {
+            domain_measurements: BTreeMap::new(),
+            asic_measurements: BTreeMap::from([(
+                0,
+                Bzm2AsicMeasurement {
+                    asic_id: 0,
+                    temperature_c: Some(82.0),
+                    throughput_ths: Some(0.30),
+                    average_pass_rate: Some(0.97),
+                    pll_pass_rates: [Some(0.97), Some(0.97)],
+                },
+            )]),
+        };
+        let mut tracker = Bzm2RetuneTriggerTracker::default();
+        let tuning = Bzm2TuningState {
+            needs_retune: Some(true),
+            domains: vec![Bzm2DomainTuningState {
+                domain_id: 0,
+                rail_index: Some(0),
+                target_voltage_mv: Some(18_500),
+                measured_voltage_mv: Some(18_650),
+                measured_power_w: Some(40.0),
+            }],
+            ..Default::default()
+        };
+
+        let first = apply_runtime_retune_triggers(
+            tuning.clone(),
+            &calibration,
+            &measurement_cache,
+            &mut tracker,
+        );
+        assert_eq!(first.retune_pending, Some(false));
+        assert!(first.retune_reasons.is_empty());
+
+        let second =
+            apply_runtime_retune_triggers(tuning, &calibration, &measurement_cache, &mut tracker);
+        assert_eq!(second.retune_pending, Some(true));
+        assert!(
+            second
+                .retune_reasons
+                .iter()
+                .any(|reason| reason == "throughput regression")
+        );
+        assert!(
+            second
+                .retune_reasons
+                .iter()
+                .any(|reason| reason == "thermal drift")
+        );
+        assert!(
+            second
+                .retune_reasons
+                .iter()
+                .any(|reason| reason == "persistent voltage imbalance")
+        );
+    }
+
+    #[test]
+    fn reconcile_saved_operating_point_status_validates_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_path = std::env::temp_dir().join(format!(
+            "bzm2-validate-profile-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
+        let mut calibration = Bzm2CalibrationConfig::default();
+        calibration.profile_path = Some(profile_path.clone());
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 1,
+        }];
+        let saved_state = Bzm2SavedOperatingPoint {
+            board_voltage_mv: 17_500,
+            board_throughput_ths: 40.0,
+            per_domain_voltage_mv: BTreeMap::from([(0, 17_500)]),
+            per_asic_engine_topology: BTreeMap::new(),
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_100.0, 1_100.0])]),
+        };
+        let applied_state = Arc::new(Mutex::new(Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
+            per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
+            saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::LiveCalibration),
+            saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Pending),
+            saved_operating_point_reasons: vec!["awaiting runtime validation".into()],
+        }));
+
+        let tuning = reconcile_saved_operating_point_status(
+            Bzm2TuningState::default(),
+            &calibration,
+            &bus_layouts,
+            &applied_state,
+        );
+        assert_eq!(
+            tuning.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Validated)
+        );
+        assert!(tuning.saved_operating_point_reasons.is_empty());
+
+        let stored = load_saved_operating_point_profile(Some(&profile_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.persisted.unwrap().saved_operating_point_status,
+            Bzm2SavedOperatingPointStatus::Validated
+        );
+
+        let _ = fs::remove_file(profile_path);
+    }
+
+    #[test]
+    fn reconcile_saved_operating_point_status_invalidates_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_path = std::env::temp_dir().join(format!(
+            "bzm2-invalidate-profile-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
+        let mut calibration = Bzm2CalibrationConfig::default();
+        calibration.profile_path = Some(profile_path.clone());
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 1,
+        }];
+        let saved_state = Bzm2SavedOperatingPoint {
+            board_voltage_mv: 17_500,
+            board_throughput_ths: 40.0,
+            per_domain_voltage_mv: BTreeMap::from([(0, 17_500)]),
+            per_asic_engine_topology: BTreeMap::new(),
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_100.0, 1_100.0])]),
+        };
+        let applied_state = Arc::new(Mutex::new(Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
+            per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
+            saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
+            saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
+            saved_operating_point_reasons: Vec::new(),
+        }));
+
+        let tuning = reconcile_saved_operating_point_status(
+            Bzm2TuningState {
+                retune_pending: Some(true),
+                retune_reasons: vec!["throughput regression".into()],
+                ..Default::default()
+            },
+            &calibration,
+            &bus_layouts,
+            &applied_state,
+        );
+        assert_eq!(
+            tuning.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Invalidated)
+        );
+        assert_eq!(
+            tuning.saved_operating_point_reasons,
+            vec!["throughput regression"]
+        );
+
+        let applied = applied_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(applied.saved_operating_point.is_none());
+        assert_eq!(
+            applied.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Invalidated)
+        );
+
+        let stored = load_saved_operating_point_profile(Some(&profile_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.persisted.unwrap().saved_operating_point_status,
+            Bzm2SavedOperatingPointStatus::Invalidated
+        );
+
+        let _ = fs::remove_file(profile_path);
     }
 }

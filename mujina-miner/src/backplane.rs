@@ -300,7 +300,6 @@ impl Backplane {
 
         Ok(())
     }
-
     /// Attach a configured board directly without going through a synthetic transport.
     pub async fn attach_configured_board(
         &mut self,

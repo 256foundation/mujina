@@ -534,6 +534,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_register_encoder_matches_legacy_wire_format() {
+        let encoded = encode_write_register(0x12, 0x0345, 0x67, &[0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(
+            encoded,
+            vec![
+                0x0b, 0x00, 0x12, 0x23, 0x45, 0x67, 0x03, 0x78, 0x56, 0x34, 0x12
+            ]
+        );
+    }
+
+    #[test]
+    fn read_register_encoder_matches_legacy_wire_format() {
+        let encoded = encode_read_register(0x12, 0x0345, 0x67, 4);
+        assert_eq!(
+            encoded,
+            vec![0x08, 0x00, 0x12, 0x33, 0x45, 0x67, 0x03, TARGET_BYTE]
+        );
+    }
+
+    #[test]
+    fn noop_and_loopback_encoders_match_legacy_wire_format() {
+        assert_eq!(encode_noop(0x12), vec![0x04, 0x00, 0x12, 0xf0]);
+        assert_eq!(
+            encode_loopback(0x12, &[0xaa, 0xbb, 0xcc]),
+            vec![0x08, 0x00, 0x12, 0xe0, 0x02, 0xaa, 0xbb, 0xcc]
+        );
+    }
+
+    #[test]
     fn parser_decodes_tdm_result() {
         let mut parser = TdmResultParser::default();
         let frame = [
@@ -640,6 +669,26 @@ mod tests {
             other => panic!("unexpected frame: {other:?}"),
         }
         match &parsed[1] {
+            TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_resyncs_after_unknown_prefix_and_partial_frames() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen2);
+        parser.expect_read_register_bytes(0x03, 4);
+
+        let first = parser.push(&[0xfe, 0xaa, 0x03, OPCODE_UART_READREG, 0x78, 0x56]);
+        assert!(first.is_empty());
+
+        let second = parser.push(&[0x34, 0x12, 0x01, OPCODE_UART_NOOP, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(second.len(), 2);
+        match &second[0] {
+            TdmFrame::Register(frame) => assert_eq!(frame.data, vec![0x78, 0x56, 0x34, 0x12]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        match &second[1] {
             TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
             other => panic!("unexpected frame: {other:?}"),
         }

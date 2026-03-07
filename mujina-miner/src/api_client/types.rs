@@ -97,10 +97,46 @@ pub struct AsicState {
 pub struct Bzm2TuningState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub board_throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_saved_operating_point: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_retune: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_clock_mhz: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_accept_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retune_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retune_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_operating_point_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner_notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<Bzm2DomainTuningState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asics: Vec<Bzm2AsicTuningState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Bzm2SavedOperatingPointStatus {
+    #[default]
+    Pending,
+    Validated,
+    Invalidated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Bzm2StartupPath {
+    SavedReplay,
+    LiveCalibration,
 }
 
 /// Per-domain live tuning measurement.
@@ -273,6 +309,67 @@ pub struct Bzm2RegisterWriteRequest {
 pub struct Bzm2RegisterWriteResponse {
     /// Number of bytes written to the requested register.
     pub bytes_written: usize,
+}
+
+/// Per-bus BZM2 chain layout summary.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2BusSummary {
+    pub thread_index: usize,
+    pub serial_path: String,
+    pub asic_start: u16,
+    pub asic_count: u16,
+}
+
+/// Current BZM2 chain summary for a live board.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ChainSummaryResponse {
+    pub total_asics: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_path: Option<Bzm2StartupPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buses: Vec<Bzm2BusSummary>,
+}
+
+/// Request body for a live BZM2 clock-report query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ClockReportRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
+/// One PLL status block in a BZM2 clock report.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2PllClockStatus {
+    pub enable_register: u32,
+    pub misc_register: u32,
+    pub enabled: bool,
+    pub locked: bool,
+}
+
+/// One DLL status block in a BZM2 clock report.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DllClockStatus {
+    pub control2: u8,
+    pub control5: u8,
+    pub coarsecon: u8,
+    pub fincon: u8,
+    pub freeze_valid: bool,
+    pub locked: bool,
+    pub fincon_valid: bool,
+}
+
+/// Response body for a live BZM2 clock-report query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ClockReportResponse {
+    pub asic: u8,
+    pub pll0: Bzm2PllClockStatus,
+    pub pll1: Bzm2PllClockStatus,
+    pub dll0: Bzm2DllClockStatus,
+    pub dll1: Bzm2DllClockStatus,
 }
 
 /// Job source status.

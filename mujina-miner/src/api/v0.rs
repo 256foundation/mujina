@@ -16,10 +16,11 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, Bzm2LoopbackRequest,
-    Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse, Bzm2RegisterReadRequest,
-    Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest, Bzm2RegisterWriteResponse,
-    MinerPatchRequest, MinerState, SourceState,
+    BoardState, Bzm2ChainSummaryResponse, Bzm2ClockReportRequest, Bzm2ClockReportResponse,
+    Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, Bzm2LoopbackRequest, Bzm2LoopbackResponse,
+    Bzm2NoopRequest, Bzm2NoopResponse, Bzm2RegisterReadRequest, Bzm2RegisterReadResponse,
+    Bzm2RegisterWriteRequest, Bzm2RegisterWriteResponse, MinerPatchRequest, MinerState,
+    SourceState,
 };
 use crate::board::BoardCommand;
 
@@ -35,6 +36,8 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(query_bzm2_loopback))
         .routes(routes!(read_bzm2_register))
         .routes(routes!(write_bzm2_register))
+        .routes(routes!(query_bzm2_clock_report))
+        .routes(routes!(get_bzm2_chain_summary))
         .routes(routes!(discover_bzm2_engines))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
@@ -428,6 +431,102 @@ async fn write_bzm2_register(
     };
 
     Ok(Json(Bzm2RegisterWriteResponse { bytes_written }))
+}
+
+/// Return a live BZM2 clock report through a board-owned UART thread.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/clock-report",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2ClockReportRequest,
+    responses(
+        (status = OK, description = "Clock status payload", body = Bzm2ClockReportResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_clock_report(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2ClockReportRequest>,
+) -> Result<Json<Bzm2ClockReportResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2ClockReport {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Ok(Ok(Ok(report))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    Ok(Json(report))
+}
+
+/// Return the current BZM2 chain summary for a live board.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/bzm2/chain-summary",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Current BZM2 chain summary", body = Bzm2ChainSummaryResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 chain summary"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn get_bzm2_chain_summary(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<Bzm2ChainSummaryResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2ChainSummary { reply: tx })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let Ok(Ok(Ok(summary))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
+    Ok(Json(summary))
 }
 
 /// Trigger an explicit BZM2 engine-discovery scan and return the refreshed board state.

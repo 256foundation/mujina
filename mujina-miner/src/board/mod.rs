@@ -11,7 +11,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::{BoardState, Bzm2ChainSummaryResponse, Bzm2ClockReportResponse},
+    asic::hash_thread::HashThread,
+    transport::UsbDeviceInfo,
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -108,6 +110,14 @@ pub enum BoardCommand {
         thread_index: usize,
         asic: u8,
         reply: oneshot::Sender<Result<[u8; 3], BoardError>>,
+    },
+    QueryBzm2ChainSummary {
+        reply: oneshot::Sender<Result<Bzm2ChainSummaryResponse, BoardError>>,
+    },
+    QueryBzm2ClockReport {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<Bzm2ClockReportResponse, BoardError>>,
     },
     QueryBzm2Loopback {
         thread_index: usize,
