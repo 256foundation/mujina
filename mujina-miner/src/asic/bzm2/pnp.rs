@@ -33,6 +33,7 @@ const DEFAULT_POWER_THRESHOLD_W: f32 = 4_900.0;
 const DEFAULT_FREQ_INCREASE_RATIO_HIGH: f32 = 0.28;
 const DEFAULT_FREQ_INCREASE_RATIO_LOW: f32 = 0.24;
 const DEFAULT_RECALIBRATE_THROUGHPUT_RATIO: f32 = 0.80;
+const NOMINAL_ACTIVE_ENGINE_COUNT: u16 = 236;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Bzm2PerformanceMode {
@@ -111,7 +112,23 @@ pub struct Bzm2SavedOperatingPoint {
     pub board_throughput_ths: f32,
     #[serde(default)]
     pub per_domain_voltage_mv: BTreeMap<u16, u32>,
+    #[serde(default)]
+    pub per_asic_engine_topology: BTreeMap<u16, Bzm2SavedEngineTopology>,
     pub per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Bzm2SavedEngineCoordinate {
+    pub row: u8,
+    pub col: u8,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Bzm2SavedEngineTopology {
+    #[serde(default)]
+    pub active_engine_count: u16,
+    #[serde(default)]
+    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +137,8 @@ pub struct Bzm2AsicTopology {
     pub domain_id: u16,
     pub pll_count: usize,
     pub alive: bool,
+    pub active_engine_count: u16,
+    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,22 +306,37 @@ impl Bzm2CalibrationPlanner {
             .asic_measurements
             .iter()
             .any(|asic| asic.throughput_ths.is_some());
+        let live_active_engines = total_active_engine_count(&input.asics);
         let reuse_saved_operating_point =
             input.saved_operating_point.as_ref().is_some_and(|stored| {
+                let current_normalized_throughput =
+                    normalize_throughput(current_throughput, live_active_engines);
+                let stored_normalized_throughput = normalize_throughput(
+                    stored.board_throughput_ths,
+                    stored_total_active_engine_count(
+                        stored,
+                        input.asics.iter().filter(|asic| asic.alive).count(),
+                    ),
+                );
                 !input.force_retune
                     && stored.per_asic_pll_mhz.len()
                         == input.asics.iter().filter(|asic| asic.alive).count()
                     && (!has_live_throughput
-                        || current_throughput
-                            >= stored.board_throughput_ths
+                        || current_normalized_throughput
+                            >= stored_normalized_throughput
                                 * input.constraints.recalibrate_throughput_ratio)
             });
         let needs_retune = input.force_retune
             || (has_live_throughput
                 && input.saved_operating_point.as_ref().is_some_and(|stored| {
-                    current_throughput
-                        < stored.board_throughput_ths
-                            * input.constraints.recalibrate_throughput_ratio
+                    normalize_throughput(current_throughput, live_active_engines)
+                        < normalize_throughput(
+                            stored.board_throughput_ths,
+                            stored_total_active_engine_count(
+                                stored,
+                                input.asics.iter().filter(|asic| asic.alive).count(),
+                            ),
+                        ) * input.constraints.recalibrate_throughput_ratio
                 }));
 
         let (initial_voltage_mv, freq_increase_threshold_mhz) = initial_voltage_and_threshold(
@@ -467,6 +501,13 @@ impl Bzm2CalibrationPlanner {
                 if domain_guarded {
                     asic_notes.push("bounded by domain power guard".into());
                 }
+                if asic.active_engine_count < NOMINAL_ACTIVE_ENGINE_COUNT {
+                    asic_notes.push(format!(
+                        "ASIC has {} active engines and {} missing coordinates",
+                        asic.active_engine_count,
+                        asic.missing_engines.len()
+                    ));
+                }
 
                 asic_plans.push(Bzm2AsicPlan {
                     asic_id: asic.asic_id,
@@ -485,6 +526,14 @@ impl Bzm2CalibrationPlanner {
             );
         } else {
             notes.push("building fresh domain-aware calibration plan".into());
+        }
+
+        if live_active_engines < total_nominal_engine_capacity(&input.asics) {
+            notes.push(format!(
+                "tuning normalized throughput against {:.1}% active engine capacity",
+                (live_active_engines as f32 / total_nominal_engine_capacity(&input.asics) as f32)
+                    * 100.0
+            ));
         }
 
         if input.voltage_domains.len() > 1 {
@@ -509,6 +558,37 @@ impl Bzm2CalibrationPlanner {
             notes,
         }
     }
+}
+
+fn total_active_engine_count(asics: &[Bzm2AsicTopology]) -> u32 {
+    asics
+        .iter()
+        .filter(|asic| asic.alive)
+        .map(|asic| u32::from(asic.active_engine_count.max(1)))
+        .sum::<u32>()
+        .max(1)
+}
+
+fn total_nominal_engine_capacity(asics: &[Bzm2AsicTopology]) -> u32 {
+    (asics.iter().filter(|asic| asic.alive).count() as u32 * u32::from(NOMINAL_ACTIVE_ENGINE_COUNT))
+        .max(1)
+}
+
+fn stored_total_active_engine_count(stored: &Bzm2SavedOperatingPoint, alive_asics: usize) -> u32 {
+    if stored.per_asic_engine_topology.is_empty() {
+        return (alive_asics as u32 * u32::from(NOMINAL_ACTIVE_ENGINE_COUNT)).max(1);
+    }
+
+    stored
+        .per_asic_engine_topology
+        .values()
+        .map(|topology| u32::from(topology.active_engine_count.max(1)))
+        .sum::<u32>()
+        .max(1)
+}
+
+fn normalize_throughput(throughput_ths: f32, active_engine_count: u32) -> f32 {
+    throughput_ths / active_engine_count.max(1) as f32
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -705,11 +785,14 @@ mod tests {
                 domain_id: 0,
                 pll_count: 2,
                 alive: true,
+                active_engine_count: NOMINAL_ACTIVE_ENGINE_COUNT,
+                missing_engines: Vec::new(),
             }],
             saved_operating_point: Some(Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 42.0,
                 per_domain_voltage_mv: BTreeMap::new(),
+                per_asic_engine_topology: BTreeMap::new(),
                 per_asic_pll_mhz: stored,
             }),
             domain_measurements: vec![Bzm2DomainMeasurement {
@@ -755,11 +838,14 @@ mod tests {
                 domain_id: 0,
                 pll_count: 2,
                 alive: true,
+                active_engine_count: NOMINAL_ACTIVE_ENGINE_COUNT,
+                missing_engines: Vec::new(),
             }],
             saved_operating_point: Some(Bzm2SavedOperatingPoint {
                 board_voltage_mv: 17_500,
                 board_throughput_ths: 50.0,
                 per_domain_voltage_mv: BTreeMap::new(),
+                per_asic_engine_topology: BTreeMap::new(),
                 per_asic_pll_mhz: stored,
             }),
             domain_measurements: vec![],
@@ -779,6 +865,65 @@ mod tests {
     }
 
     #[test]
+    fn planner_normalizes_saved_throughput_by_active_engine_capacity() {
+        let planner = Bzm2CalibrationPlanner;
+        let mut stored = BTreeMap::new();
+        stored.insert(0, [1_075.0, 1_075.0]);
+        let plan = planner.plan(&Bzm2BoardCalibrationInput {
+            operating_class: Bzm2OperatingClass::Generic,
+            site_temp_c: 15.0,
+            target_mode: Bzm2PerformanceMode::Standard,
+            mode: Bzm2CalibrationMode::default(),
+            per_stack_clocking: false,
+            voltage_domains: vec![Bzm2VoltageDomain {
+                domain_id: 0,
+                asic_ids: vec![0],
+                voltage_offset_mv: 0,
+                max_power_w: None,
+            }],
+            asics: vec![Bzm2AsicTopology {
+                asic_id: 0,
+                domain_id: 0,
+                pll_count: 2,
+                alive: true,
+                active_engine_count: NOMINAL_ACTIVE_ENGINE_COUNT / 2,
+                missing_engines: vec![Bzm2SavedEngineCoordinate { row: 0, col: 1 }],
+            }],
+            saved_operating_point: Some(Bzm2SavedOperatingPoint {
+                board_voltage_mv: 17_500,
+                board_throughput_ths: 42.0,
+                per_domain_voltage_mv: BTreeMap::new(),
+                per_asic_engine_topology: BTreeMap::from([(
+                    0,
+                    Bzm2SavedEngineTopology {
+                        active_engine_count: NOMINAL_ACTIVE_ENGINE_COUNT,
+                        missing_engines: Vec::new(),
+                    },
+                )]),
+                per_asic_pll_mhz: stored,
+            }),
+            domain_measurements: vec![],
+            asic_measurements: vec![Bzm2AsicMeasurement {
+                asic_id: 0,
+                temperature_c: Some(70.0),
+                throughput_ths: Some(21.0),
+                average_pass_rate: Some(0.98),
+                pll_pass_rates: [Some(0.98), Some(0.98)],
+            }],
+            constraints: Bzm2CalibrationConstraints::default(),
+            force_retune: false,
+        });
+
+        assert!(plan.reuse_saved_operating_point);
+        assert!(!plan.needs_retune);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("active engine capacity"))
+        );
+    }
+
+    #[test]
     fn multi_domain_plan_scales_to_large_topology() {
         let planner = Bzm2CalibrationPlanner;
         let domains: Vec<Bzm2VoltageDomain> = (0..25)
@@ -795,6 +940,8 @@ mod tests {
                 domain_id: asic_id / 4,
                 pll_count: 2,
                 alive: true,
+                active_engine_count: NOMINAL_ACTIVE_ENGINE_COUNT,
+                missing_engines: Vec::new(),
             })
             .collect();
         let domain_measurements: Vec<Bzm2DomainMeasurement> = (0..25)
