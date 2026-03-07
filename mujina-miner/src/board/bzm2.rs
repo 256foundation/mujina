@@ -1147,6 +1147,85 @@ impl Bzm2Board {
                                 .await;
                                 let _ = reply.send(result);
                             }
+                            BoardCommand::QueryBzm2Noop { thread_index, asic, reply } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    handle
+                                        .noop(asic)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                            BoardCommand::QueryBzm2Loopback {
+                                thread_index,
+                                asic,
+                                payload,
+                                reply,
+                            } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    handle
+                                        .loopback(asic, payload)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                            BoardCommand::ReadBzm2Register {
+                                thread_index,
+                                asic,
+                                engine_address,
+                                offset,
+                                count,
+                                reply,
+                            } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    handle
+                                        .read_register(asic, engine_address, offset, count)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
+                            BoardCommand::WriteBzm2Register {
+                                thread_index,
+                                asic,
+                                engine_address,
+                                offset,
+                                value,
+                                reply,
+                            } => {
+                                let result = async {
+                                    let handle = shutdown_handles.get(thread_index).ok_or_else(|| {
+                                        BoardError::HardwareControl(format!(
+                                            "invalid BZM2 thread index {thread_index} for board {board_name}"
+                                        ))
+                                    })?;
+                                    handle
+                                        .write_register(asic, engine_address, offset, value)
+                                        .await
+                                        .map_err(|err| BoardError::HardwareControl(err.to_string()))
+                                }
+                                .await;
+                                let _ = reply.send(result);
+                            }
                             BoardCommand::DiscoverBzm2Engines {
                                 thread_index,
                                 asic,
