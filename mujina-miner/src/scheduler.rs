@@ -265,12 +265,10 @@ impl Scheduler {
             return source_target;
         }
 
-        // 1 share/sec -> more hashes per share -> harder (lower) target
-        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-        // 10 shares/sec -> fewer hashes per share -> easier (higher) target
-        let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+        let measurement_target = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+        let flood_cap_target = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
 
-        source_target.clamp(hardest, easiest)
+        source_target.clamp(measurement_target, flood_cap_target)
     }
 
     /// Collects hashrate command senders from all sources.
@@ -990,8 +988,11 @@ mod tests {
         let very_hard = Difficulty::from(1_000_000).to_target();
         let result = Scheduler::compute_scheduler_target(hashrate, very_hard);
 
-        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-        assert_eq!(result, hardest, "should clamp to measurement floor");
+        let measurement_target = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+        assert_eq!(
+            result, measurement_target,
+            "should clamp to measurement floor"
+        );
         assert!(result > very_hard, "clamped target should be easier");
     }
 
