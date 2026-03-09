@@ -13,8 +13,6 @@ mod share_rate;
 
 use std::time::Duration;
 
-use crate::u256::U256;
-
 // Re-export frequently used bitcoin types for convenience
 pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
@@ -62,23 +60,6 @@ pub fn expected_time_to_share_from_target(target: Target, hashrate: HashRate) ->
         return Duration::MAX;
     }
     Duration::from_secs_f64(1.0 / shares_per_sec)
-}
-
-/// Calculate target to achieve the given share rate at the given hashrate.
-///
-/// A hash is valid if hash < target. With hashes uniform over [0, 2^256),
-/// expected hashes per share = 2^256 / target, so target = 2^256 / hashes_per_share.
-///
-/// The returned target may exceed `Target::MAX` (Bitcoin difficulty-1,
-/// ~2^224) at low hashrates. This is fine for scheduler use -- it
-/// just means every hash qualifies as a share.
-pub fn target_for_share_rate(rate: ShareRate, hashrate: HashRate) -> Target {
-    let hashes_per_share = hashrate.hashes_in(rate.as_interval());
-    if hashes_per_share <= 1.0 {
-        Target::from(U256::MAX)
-    } else {
-        Target::from(U256::MAX / hashes_per_share)
-    }
 }
 
 #[cfg(test)]
@@ -130,7 +111,7 @@ mod tests {
         // 1 TH/s with 6 shares/min (10 second interval) = ~2328 difficulty
         let hashrate = HashRate::from_terahashes(1.0);
         let rate = ShareRate::per_minute(6.0);
-        let target = target_for_share_rate(rate, hashrate);
+        let target = rate.to_target(hashrate);
         // 1e12 * 10 / 2^32 ≈ 2328 difficulty
         let diff = Difficulty::from_target(target);
         assert!((diff.as_u64() as i64 - 2328).abs() < 10);
@@ -140,7 +121,7 @@ mod tests {
         let hashrate = HashRate::from_gigahashes(1.0);
         let interval = expected_time_to_share_from_target(original, hashrate);
         let rate = ShareRate::from_interval(interval);
-        let recovered = target_for_share_rate(rate, hashrate);
+        let recovered = rate.to_target(hashrate);
         // Compare via difficulty since target comparison is awkward
         let recovered_diff = Difficulty::from_target(recovered);
         assert!((recovered_diff.as_u64() as i64 - 1024).abs() < 2);

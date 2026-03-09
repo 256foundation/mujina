@@ -16,7 +16,7 @@ use crate::stratum_v1::{
     ClientCommand, ClientEvent, Connector, JobNotification, PoolConfig, StratumV1Client,
 };
 use crate::tracing::prelude::*;
-use crate::types::{Difficulty, HashRate, ShareRate, target_for_share_rate};
+use crate::types::{Difficulty, HashRate, ShareRate};
 
 use super::{
     Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
@@ -382,7 +382,7 @@ impl StratumV1Source {
         if hashrate.is_zero() {
             return None;
         }
-        let target = target_for_share_rate(SUGGESTED_SHARE_RATE, hashrate);
+        let target = SUGGESTED_SHARE_RATE.to_target(hashrate);
         let diff = Difficulty::from_target(target).as_u64().max(1);
         Some(diff)
     }

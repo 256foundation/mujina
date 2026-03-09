@@ -2,6 +2,11 @@
 
 use std::time::Duration;
 
+use bitcoin::Target;
+
+use super::HashRate;
+use crate::u256::U256;
+
 /// Share submission rate (shares per unit time).
 ///
 /// Used to express rate limits for share submission to pools. The scheduler
@@ -57,6 +62,26 @@ impl ShareRate {
     /// Get the average interval between shares.
     pub fn as_interval(&self) -> Duration {
         self.0
+    }
+
+    /// Compute the target needed to achieve this share rate at the
+    /// given hashrate.
+    ///
+    /// A hash is valid if hash < target. With hashes uniform over
+    /// [0, 2^256), expected hashes per share = 2^256 / target, so
+    /// target = 2^256 / hashes_per_share.
+    ///
+    /// The returned target may exceed `Target::MAX` (Bitcoin
+    /// difficulty-1, ~2^224) at low hashrates. This is fine for
+    /// scheduler use -- it just means every hash qualifies as a
+    /// share.
+    pub fn to_target(&self, hashrate: HashRate) -> Target {
+        let hashes_per_share = hashrate.hashes_in(self.0);
+        if hashes_per_share <= 1.0 {
+            Target::from(U256::MAX)
+        } else {
+            Target::from(U256::MAX / hashes_per_share)
+        }
     }
 }
 

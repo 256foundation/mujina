@@ -50,7 +50,7 @@ use crate::job_source::{
 use crate::tracing::prelude::*;
 use crate::types::{
     AlarmStatus, DebouncedAlarm, Difficulty, HashRate, HashrateEstimator, ShareRate, Target,
-    expected_time_to_share_from_target, target_for_share_rate,
+    expected_time_to_share_from_target,
 };
 
 /// Unique identifier for a job source, assigned by the scheduler.
@@ -265,8 +265,8 @@ impl Scheduler {
             return source_target;
         }
 
-        let measurement_target = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-        let flood_cap_target = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+        let measurement_target = MEASUREMENT_SHARE_RATE.to_target(hashrate);
+        let flood_cap_target = FLOOD_CAP_RATE.to_target(hashrate);
 
         source_target.clamp(measurement_target, flood_cap_target)
     }
@@ -988,7 +988,7 @@ mod tests {
         let very_hard = Difficulty::from(1_000_000).to_target();
         let result = Scheduler::compute_scheduler_target(hashrate, very_hard);
 
-        let measurement_target = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
+        let measurement_target = MEASUREMENT_SHARE_RATE.to_target(hashrate);
         assert_eq!(
             result, measurement_target,
             "should clamp to measurement floor"
@@ -1004,7 +1004,7 @@ mod tests {
         let very_easy = Target::MAX;
         let result = Scheduler::compute_scheduler_target(hashrate, very_easy);
 
-        let flood_cap_target = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+        let flood_cap_target = FLOOD_CAP_RATE.to_target(hashrate);
         assert_eq!(result, flood_cap_target, "should clamp to flood ceiling");
         assert!(result < very_easy, "clamped target should be harder");
     }
