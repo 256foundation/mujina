@@ -19,12 +19,9 @@ bytes = { workspace = true }
 crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
-hyper = { workspace = true }
 inventory = { workspace = true }
-modular-bitfield = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

@@ -20,12 +20,9 @@ bytes = "1"
 crc_all = "0.2"
 futures = "0.3"
 hex = "0.4"
-hyper = { version = "1", features = ["full"] }
 inventory = "0.3"
-modular-bitfield = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
 strum = { version = "0.27", features = ["derive"] }
 test-case = "3.3.1"
 thiserror = "2.0"
