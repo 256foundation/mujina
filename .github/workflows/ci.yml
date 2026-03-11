@@ -1,0 +1,77 @@
+# CI Design Principles
+#
+# 1. The justfile is the source of truth. This workflow is plumbing
+#    (checkout, cache, `just ci`). Test logic lives in the justfile
+#    where contributors can run it locally.
+#
+# 2. Build the toolchain container from source, don't pull it. The
+#    image is defined by build.Containerfile in the same commit being
+#    tested---full traceability and repeatability, no external
+#    registry to trust or keep in sync.
+#
+# 3. Use `pull_request`, not `pull_request_target`. PR workflows run
+#    the code from the PR (including any Containerfile changes), with
+#    read-only repo access and no secrets. A PR author can modify the
+#    container and workflow, but that's visible in the diff and is the
+#    reviewer's job to catch.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: just ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+
+      # Cache the build toolchain image as a portable tar archive.
+      # Podman's overlay storage can't be cached directly (tar fails
+      # on overlay whiteout files), so we round-trip through podman
+      # save/load. The cache key is the hash of build.Containerfile.
+      # The image is tagged with a short hash of the Containerfile so
+      # that build-image in the justfile recognizes it and skips the
+      # build.
+      - uses: actions/cache@v5
+        id: image-cache
+        with:
+          path: /tmp/mujina-build.tar
+          key: build-image-${{ hashFiles('build.Containerfile') }}
+
+      - name: Load cached build image
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: podman load -i /tmp/mujina-build.tar
+
+      # Cache compiled dependencies and downloaded crates to speed
+      # up builds. The key includes the toolchain (Containerfile)
+      # so a compiler bump invalidates stale artifacts.
+      - uses: actions/cache@v5
+        with:
+          path: |
+            target
+            .cache
+          key: cargo-${{ hashFiles('build.Containerfile') }}-${{ hashFiles('Cargo.lock') }}
+
+      - run: just ci
+
+      # Prune project crate artifacts before the cache saves,
+      # keeping only compiled dependencies.
+      - name: Prune project artifacts from target cache
+        run: |
+          find target -name 'mujina*' -delete 2>/dev/null || true
+          find target -name 'libmujina*' -delete 2>/dev/null || true
+
+      - name: Save build image for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          TAG=$(sha256sum build.Containerfile | cut -c1-12)
+          podman save -o /tmp/mujina-build.tar "mujina-build:$TAG"
