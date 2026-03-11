@@ -8,11 +8,10 @@
 //! access to the `trace!()`, `debug!()`, `info!()`, `warn!()`, and `error!()`
 //! macros.
 
-use std::{env, fmt};
+use std::fmt;
 use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_journald;
 use tracing_subscriber::{
     filter::{EnvFilter, LevelFilter},
     fmt::{
@@ -25,16 +24,20 @@ use tracing_subscriber::{
 };
 
 #[cfg(target_os = "linux")]
-use std::{io, os::unix::io::AsRawFd};
+use std::{env, io, os::unix::io::AsRawFd};
 
 #[cfg(target_os = "linux")]
 use nix::libc;
+
+#[cfg(target_os = "linux")]
+use tracing_journald;
 
 pub mod prelude {
     #[allow(unused_imports)]
     pub use tracing::{debug, error, info, trace, warn};
 }
 
+#[cfg(target_os = "linux")]
 use prelude::*;
 
 /// Check if stderr is connected to systemd journal by validating JOURNAL_STREAM.

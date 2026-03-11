@@ -34,7 +34,6 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 tracing = { workspace = true }
-tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 nix = { workspace = true }
 parking_lot = { workspace = true }
@@ -47,6 +46,7 @@ ruint = "1.17.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-udev = { workspace = true }
+tracing-journald = { workspace = true }
 udev = { workspace = true }
 
 [[bin]]
