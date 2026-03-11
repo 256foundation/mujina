@@ -3,6 +3,7 @@ members = ["mujina-miner", "tools/mujina-dissect"]
 resolver = "2"
 
 [workspace.package]
+# When bumping the compiler version, also update build.Containerfile.
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Ryan Kuester <rkuester@insymbols.com>"]
