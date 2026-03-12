@@ -136,25 +136,8 @@ Use standard Rust documentation format:
 See CODING_GUIDELINES.md for guidance on what to document and comment
 style.
 
-### Commit Messages [D.commit](#D.commit)
+### Commits [D.commit](#D.commit)
 
-Follow conventional commits with prose body paragraphs:
-```
-feat(board): add temperature monitoring
-
-Implement continuous temperature monitoring for all connected boards.
-Readings are cached and updated every 5 seconds to reduce I2C bus
-traffic. The TemperatureMonitor struct integrates with the board
-lifecycle and exposes readings via the REST API.
-
-Closes #45
-```
-
-Use bulleted lists only when items are truly independent:
-```
-chore: update dependencies
-
-Update the following dependencies to address security advisories:
-- tokio 1.35 -> 1.36 (RUSTSEC-2024-001)
-- serde 1.0.195 -> 1.0.196 (RUSTSEC-2024-002)
-```
+See CONTRIBUTING.md for commit message format, conventional commit
+types, and atomic commit guidelines (revertability, bisectability,
+reviewability).

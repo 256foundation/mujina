@@ -1,24 +1,19 @@
 # Contributing to Mujina Miner
 
-Thank you for your interest in contributing to mujina-miner! We're excited to
-have you here. This document will help you understand how to contribute
-effectively and get your changes merged quickly.
-
-The workflow described here is designed to make contributing easier---not
-harder. By discussing changes before implementation, you'll get early
-feedback, avoid wasted effort, and increase the chances your contribution
-will be merged.
+This document explains how to contribute effectively and get your
+changes merged quickly. The workflow is designed to make contributing
+easier, not harder.
 
 ## Quick Guide
 
 ### I have a bug or something isn't working
 
-1. Search [discussions] and the [issue tracker] for similar problems. Tip:
-   also search [closed issues] and [closed discussions]---your issue might
-   have already been fixed!
-2. If your issue hasn't been reported, open an ["Issue Triage" discussion]
-   and fill in the template completely. Use this category only for bug
-   reports---thank you!
+1. Search [discussions] and the [issue tracker] for similar
+   problems. Tip: also search [closed issues] and [closed
+   discussions]---your issue might have already been fixed!
+2. If your issue hasn't been reported, open an ["Issue Triage"
+   discussion] and fill in the template completely. Use this
+   category only for bug reports.
 
 [discussions]: https://github.com/256foundation/mujina/discussions
 [issue tracker]: https://github.com/256foundation/mujina/issues
@@ -28,85 +23,71 @@ will be merged.
 
 ### I have an idea for a feature
 
-Open a discussion in the ["Ideas" category] to propose and discuss the
-feature before implementation.
+Open a discussion in the ["Ideas" category] to propose and discuss
+the feature before implementation.
 
 ["Ideas" category]: https://github.com/256foundation/mujina/discussions/new?category=ideas
 
 ### I've implemented a feature
 
 1. If there's an issue for the feature, open a pull request.
-2. If there's no issue, open a discussion first and link to your branch.
-   Getting feedback before the PR makes the review process smoother.
+2. If there's no issue, open a discussion first and link to your
+   branch. Getting feedback before the PR makes the review process
+   smoother.
 
 ### I'd like to contribute
 
-All issues are actionable---pick one and start working on it. Thank you! If
-you need help or guidance, comment on the issue. Issues tagged with "good
-first issue" are extra friendly to new contributors.
+All [issues][issue tracker] are actionable---pick one and start
+working on it. If you need help or guidance, comment on the issue.
+Issues tagged with ["good first issue"] are extra friendly to new
+contributors.
+
+["good first issue"]: https://github.com/256foundation/mujina/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
 
 ### I have a question
 
-Open a [Q&A discussion] or ask in our community chat (if available).
+Open a [Q&A discussion] or ask in our [Telegram group].
 
 [Q&A discussion]: https://github.com/256foundation/mujina/discussions/new?category=q-a
+[Telegram group]: https://t.me/the256foundation
 
-## General Patterns
+## Workflow: Discussion, Issue, Pull Request
 
-### Issues are Actionable
+The path from idea to merged code has three steps:
 
-**This workflow is adapted from [Ghostty]**. Thanks to Mitchell Hashimoto
-and contributors for the pattern!
+1. **Discussion.** Propose ideas, report bugs, or ask questions in
+   GitHub [discussions]. This is where design conversations happen.
+2. **Issue.** Once a discussion produces a well-understood,
+   actionable item, it moves to the [issue tracker]. Every issue in
+   the tracker is ready to be worked on.
+3. **Pull request.** Implement the issue and open a PR.
 
-[Ghostty]: https://github.com/ghostty-org/ghostty
-
-The mujina-miner [issue tracker] is for _actionable items_.
-
-Unlike some projects, mujina-miner **does not use the issue tracker for
-discussion or feature requests**. Instead, we use GitHub [discussions] for
-that. Once a discussion reaches a point where a well-understood, actionable
-item is identified, it's moved to the issue tracker. **This pattern makes it
-easier for maintainers or contributors to find issues to work on since
-_every issue_ is ready to be worked on.**
-
-If you're experiencing a bug and have clear steps to reproduce it, open an
-issue triage discussion. If you're experiencing a bug but aren't sure how to
-reproduce it or aren't sure if it's a bug, open a discussion. If you have an
-idea for a feature, open a discussion.
-
-### Pull Requests Implement an Issue
-
-Pull requests should be associated with a previously accepted issue. This
-helps ensure your effort aligns with project goals and increases the
-likelihood of a quick merge.
-
-**Why this matters:** Without prior discussion, you risk spending time on
-work that conflicts with planned changes, doesn't fit the project direction,
-or solves a problem in a way that won't be merged. A quick discussion up
-front saves everyone time.
-
-**Exception:** Trivial improvements don't need discussion or an issue. This
-includes typo fixes, wording improvements, spelling corrections, log level
-adjustments, comment improvements, and documentation clarifications. Use
-your judgment---if the change is obviously correct and self-contained, just
-open the PR.
+This sequence matters. Without prior discussion, you risk spending
+time on work that conflicts with planned changes, doesn't fit the
+project direction, or solves a problem in a way that won't be
+merged. A quick discussion up front saves everyone time.
 
 Issues tagged with "feature" or "enhancement" represent accepted,
-well-scoped work. If you implement an issue as described, your pull request
-will be accepted with a high degree of certainty.
+well-scoped work. If you implement an issue as described, your pull
+request will be accepted with a high degree of certainty.
 
-> [!NOTE]
-> **Design discussions belong in Discussions, not PRs.** If you want
-> feedback on an approach before committing to the full implementation, open
-> a discussion and link to your branch.
+**Exception:** Trivial improvements don't need discussion or an
+issue. This includes typo fixes, wording improvements, spelling
+corrections, log level adjustments, comment improvements, and
+documentation clarifications. Use your judgment---if the change is
+obviously correct and self-contained, just open the PR.
+
+The above workflow is adapted from [Ghostty]. Thanks to Mitchell
+Hashimoto and contributors for the pattern!
+
+[Ghostty]: https://github.com/ghostty-org/ghostty
 
 ## Getting Started
 
 ### Prerequisites
 
-- Rust toolchain (stable)
+- [Rust](https://rustup.rs/) toolchain (stable)
 - [just](https://just.systems/) command runner
-- Linux development environment
 - Git
 - Optional: [Podman](https://podman.io/) for reproducing CI locally
 - Optional: Hardware for testing (Bitaxe boards, etc.)
@@ -117,94 +98,60 @@ will be accepted with a high degree of certainty.
 2. Clone your fork:
    ```bash
    git clone https://github.com/YOUR_USERNAME/mujina.git
-   cd mujina-miner
+   cd mujina
    ```
 3. Add the upstream repository:
    ```bash
-   git remote add upstream https://github.com/256foundation/mujina.git
+   git remote add upstream \
+       https://github.com/256foundation/mujina.git
    ```
-4. **Set up Git hooks** (required):
+4. **Setup git hooks** (highly recommended):
    ```bash
    ./scripts/setup-hooks.sh
    ```
-   This configures automatic checks for whitespace errors and other issues.
-5. Create a feature branch:
+5. Create a branch:
    ```bash
-   git checkout -b feature/your-feature-name
+   git checkout -b fix-double-free-on-shutdown
    ```
 
-## Development Process
+Before diving into the code, read
+[`CODE_STYLE.md`](CODE_STYLE.md) and
+[`CODING_GUIDELINES.md`](CODING_GUIDELINES.md). These define the
+project's standards.
 
-### Before You Start
+## Development
 
-1. Check existing discussions and issues to avoid duplicate work
-2. For significant changes, open a discussion first to get feedback on the
-   approach before implementation
-3. Read the architecture documentation in `docs/architecture.md`
-4. Familiarize yourself with `CODE_STYLE.md` and `CODING_GUIDELINES.md`
+### Running Checks
 
-### Making Changes
+Run all checks before committing:
 
-1. Write clean, idiomatic Rust code
-2. Follow the project's module structure
-3. Add tests for new functionality
-4. Update documentation as needed
-5. Run all checks before committing:
-   ```bash
-   just checks
-   ```
-   This runs `cargo fmt --check`, `cargo clippy`, and `cargo test`
-   using your local Rust toolchain.
+```bash
+just checks
+```
 
-#### Reproducing CI locally
+This runs `cargo fmt --check`, `cargo clippy`, and `cargo test`
+using your local Rust toolchain.
 
 Pull requests are gated on CI that runs inside a Podman container
 with a pinned Rust toolchain. If `just checks` passes locally but
-CI fails (or vice versa), you can run the same checks in the same
-container CI uses:
+CI fails (or vice versa), reproduce the CI environment with:
 
 ```bash
 just ci
 ```
 
 This builds a toolchain container from `build.Containerfile` and
-runs `just checks` inside it. The container image is cached
-locally and only rebuilds when the Containerfile changes. Podman
-is required for this step but not for regular development.
+runs `just checks` inside it. Podman is required for this step but
+not for regular development.
 
-### Testing
+### Documenting Known Bugs with `#[should_panic]`
 
-- **Unit tests**: Required for all new functionality
-- **Integration tests**: For cross-module functionality
-- **Hardware tests**: Mark with `#[ignore]` and document requirements
-- **Protocol tests**: Use captured data when possible
-
-Example test structure:
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_functionality() {
-        // Your test here
-    }
-
-    #[test]
-    #[ignore] // Requires hardware
-    fn test_with_hardware() {
-        // Hardware-dependent test
-    }
-}
-```
-
-#### Documenting Known Bugs with `#[should_panic]`
-
-When a bug is found in already-pushed code, we sometimes add a test
-that asserts the correct behavior and mark it `#[should_panic]`
-with a brief comment. This documents the bug and keeps CI green.
-The fix then removes the `#[should_panic]` annotation in a
-separate commit, turning the test into a normal regression test.
+When a bug is found in already-pushed code, we sometimes add a
+test that asserts the correct behavior and mark it
+`#[should_panic]` with a brief comment. This documents the bug and
+keeps CI green. The fix then removes the `#[should_panic]`
+annotation in a separate commit, turning the test into a normal
+regression test.
 
 ```rust
 #[test]
@@ -215,79 +162,71 @@ fn descriptive_name() {
 }
 ```
 
-### Documentation
+### Commits
 
-- Add doc comments to all public items
-- Update module-level documentation
-- Include examples in doc comments where helpful
-- Keep markdown files wrapped at 79 characters
-- Update architecture docs for significant changes
-- Use asciiflow.com for creating ASCII diagrams in documentation
+#### Atomic Commits
 
-### Commit Messages
+Each commit should be exactly one logical change, and the tree
+should build and pass tests after every commit. This matters for
+three reasons:
 
-Write proper commit messages following these guidelines (adapted from the
-Linux kernel contribution standards):
+- **Revertability.** If a commit introduces a regression, `git
+  revert` should cleanly undo that one change without dragging
+  unrelated work along with it.
+- **Bisectability.** `git bisect` needs every commit to be a
+  working state. Mixed commits force you to debug multiple changes
+  at once.
+- **Reviewability.** Small, focused commits are easier to review
+  and reason about than large ones that do several things.
 
-#### The Seven Rules of a Great Commit Message
+A good test: if you need "and" in the subject line, you probably
+have two commits.
 
-1. **Separate subject from body with a blank line**
-2. **Limit the subject line to 50 characters**
-3. **Capitalize the subject line**
-4. **Do not end the subject line with a period**
-5. **Use the imperative mood in the subject line**
-6. **Wrap the body at 72 characters**
-7. **Use the body to explain what and why vs. how**
+**Good (two separate commits):**
+- `fix(protocol): prevent buffer overflow in parser`
+- `perf(protocol): optimize parser performance`
 
-#### Format
+**Bad (two unrelated changes lumped together):**
+- `fix(protocol): prevent buffer overflow and optimize performance`
+
+**Good (feature split into buildable steps):**
+- `feat(board): add temperature sensor reading`
+- `feat(board): add overheat shutdown using temperature sensor`
+
+**Bad (entire feature in one commit):**
+- `feat(board): add temperature monitoring with overheat shutdown`
+
+#### Message Format
+
+We use [conventional commits].
+
+[conventional commits]: https://www.conventionalcommits.org/
 
 ```
-type(scope): Subject in imperative mood
+type(scope): subject in imperative mood
 
-Longer explanation of what this commit does and why it was necessary.
-The body should provide context for the change and explain what problem
-it solves.
+Explain what this commit does and why. The code shows how.
 
-Wrap the body at 72 characters. Use the body to explain what changed
-and why, not how (the code shows how).
-
-Further paragraphs come after blank lines.
-
-- Bullet points are okay too
-- Use a hyphen or asterisk for bullets
+Wrap the body at 72 characters.
 
 Fixes: #123
-Closes: #456
-See-also: #789
 ```
 
-#### Write Atomic Commits
+The subject should complete the sentence "if applied, this commit
+will ___." Use imperative mood ("add", "fix", "refactor"), not
+past tense or gerunds:
 
-Each commit should be a single logical change. Don't make several logical
-changes in one commit. For example, if a patch fixes a bug and optimizes
-the performance of a feature, split it into two separate commits.
-
-**Good commit separation:**
-- Commit 1: Fix buffer overflow in protocol parser
-- Commit 2: Optimize protocol parser performance
-
-**Bad commit (does too much):**
-- Fix buffer overflow and optimize parser performance
-
-#### Use Imperative Mood
-
-Write your commit message as if you're giving orders to the codebase:
-- GOOD: "Add temperature monitoring to board controller"
-- GOOD: "Fix race condition in share submission"
-- GOOD: "Refactor protocol handler to use async/await"
-- BAD: "Added temperature monitoring"
-- BAD: "Fixes race condition"
-- BAD: "Refactoring protocol handler"
-
-A properly formed Git commit subject should complete this sentence:
-"If applied, this commit will _your subject here_"
+- GOOD: `feat(board): add temperature monitoring`
+- GOOD: `fix(scheduler): prevent race in share submission`
+- BAD: `feat(board): added temperature monitoring`
+- BAD: `fix(scheduler): fixes race condition`
 
 #### Types
+
+`feat` and `fix` signal behavioral changes and are the most common
+types. The remaining types are for changes that don't alter
+behavior (refactoring, documentation, tests, etc.).
+
 - `feat`: Add a new feature
 - `fix`: Fix a bug
 - `docs`: Change documentation only
@@ -297,15 +236,14 @@ A properly formed Git commit subject should complete this sentence:
 - `test`: Add or correct tests
 - `chore`: Update build process, dependencies, etc.
 
-#### Examples
+#### Example
 
-**Good commit message:**
 ```
 fix(board): prevent double-free in shutdown sequence
 
 The board shutdown sequence could trigger a double-free when called
-multiple times due to missing state check. This adds a proper state
-machine to track shutdown progress and prevent multiple cleanup attempts.
+multiple times due to missing state check. Add a state machine to
+track shutdown progress and prevent multiple cleanup attempts.
 
 The issue was discovered during stress testing with rapid board
 connect/disconnect cycles.
@@ -313,25 +251,7 @@ connect/disconnect cycles.
 Fixes: #234
 ```
 
-**Another good example:**
-```
-feat(scheduler): implement work-stealing algorithm
-
-Replace the simple round-robin scheduler with a work-stealing algorithm
-that better balances load across multiple boards. Idle boards now steal
-work from busy boards' queues.
-
-Performance testing shows 15% improvement in share submission rate with
-heterogeneous board configurations.
-```
-
-## Pull Request Process
-
-**Before opening a PR:** Ensure there's an accepted issue for your change. If
-not, open a discussion first to get feedback. (Exception: trivial improvements,
-including typos, wording, log levels, comments, and documentation don't need an
-issue. Use your judgment---if it's obviously correct and self-contained, just
-open the PR.)
+## Pull Requests
 
 1. Update your branch with the latest upstream changes:
    ```bash
@@ -339,70 +259,33 @@ open the PR.)
    git rebase upstream/main
    ```
 
-2. Push your branch to your fork:
+2. Run checks to make sure everything still passes:
    ```bash
-   git push origin feature/your-feature-name
+   just checks
    ```
 
-3. Create a pull request on GitHub with:
-   - Clear title describing the change
-   - Description of what changed and why
-   - **Reference to the issue being implemented** (required)
-   - Link to the discussion that led to the issue (helpful context)
-   - Screenshots/logs if applicable
+3. Push your branch to your fork:
+   ```bash
+   git push origin fix-double-free-on-shutdown
+   ```
 
-4. Address review feedback promptly
+4. Create a pull request on GitHub with:
+   - Title in conventional commit format (e.g.,
+     `feat(board): add temperature monitoring`)
+   - Reference to the issue being implemented (if applicable)
+   - Link to the discussion that led to the issue (helpful
+     context)
+   - The commit messages should describe individual changes;
+     use the PR body for big-picture context that ties the
+     commits together or doesn't belong in any single commit
+   - Relevant logs if applicable
 
-5. Once approved, your PR will be merged
+5. If the work isn't finished but you want early feedback, open
+   the PR as a **draft**. Mark it ready for review when the code
+   is complete. This keeps the review queue clear so reviewers can
+   trust that non-draft PRs represent finished work they can act
+   on.
 
-**Tip:** Following this process (discussion -> issue -> PR) dramatically
-increases the chances of a quick merge. It shows you've done your homework
-and the work aligns with project goals.
+6. Address review feedback promptly.
 
-## Areas for Contribution
-
-All issues in the [issue tracker] are actionable and ready to be worked on.
-Pick one that matches your interests and skill level!
-
-### Good First Issues
-
-Look for issues labeled `good first issue` for beginner-friendly tasks:
-- Documentation improvements
-- Test coverage additions
-- Small bug fixes
-- Code cleanup
-
-### High-Priority Areas
-
-Check the issue tracker for issues labeled `priority` or `enhancement` in
-these areas:
-- Pool protocol implementations (Stratum v2)
-- Additional ASIC chip support
-- Hardware monitoring and safety features
-- API endpoint implementations
-- Performance optimizations
-
-If you want to work on something not yet in the issue tracker, open a
-discussion first to propose it.
-
-## Hardware Testing
-
-If you have mining hardware:
-1. Test changes thoroughly before submitting
-2. Document hardware-specific behavior
-3. Provide debug logs with hardware interactions
-4. Note any hardware limitations or quirks
-
-## Questions and Support
-
-See the [Quick Guide](#quick-guide) at the top of this document for routing
-your question or request to the right place.
-
-## Recognition
-
-Contributors will be recognized in:
-- The project's contributor list
-- Release notes for significant contributions
-- Special thanks for major features
-
-Thank you for contributing to mujina-miner!
+7. Once approved, your PR will be merged.
