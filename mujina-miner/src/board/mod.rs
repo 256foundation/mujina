@@ -1,6 +1,6 @@
 pub(crate) mod bitaxe;
 pub mod cpu;
-pub(crate) mod emberone;
+pub(crate) mod emberone00;
 pub mod pattern;
 
 use anyhow::Result;
