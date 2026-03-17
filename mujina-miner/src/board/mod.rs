@@ -9,7 +9,7 @@ use std::{future::Future, pin::Pin};
 use tokio::sync::watch;
 
 use crate::{
-    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -56,8 +56,8 @@ pub struct BoardInfo {
 /// with a board. The backplane forwards this to the API server after
 /// creating a board.
 pub struct BoardRegistration {
-    /// Watch receiver for the board's current state.
-    pub state_rx: watch::Receiver<BoardState>,
+    /// Watch receiver for the board's telemetry.
+    pub telemetry_rx: watch::Receiver<BoardTelemetry>,
 }
 
 /// Helper type for async board factory functions
@@ -68,7 +68,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// The factory is responsible for:
 ///
 /// 1. Opening hardware resources (serial ports, etc.)
-/// 2. Creating a `watch::channel<BoardState>` seeded with the board's
+/// 2. Creating a `watch::channel<BoardTelemetry>` seeded with the board's
 ///    identity (model, serial) and storing the sender in the board
 /// 3. Initializing the board hardware
 /// 4. Returning the board and a [`BoardRegistration`] containing the

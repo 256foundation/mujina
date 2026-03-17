@@ -16,13 +16,13 @@ pub struct MinerState {
     pub hashrate: u64,
     pub shares_submitted: u64,
     pub paused: bool,
-    pub boards: Vec<BoardState>,
+    pub boards: Vec<BoardTelemetry>,
     pub sources: Vec<SourceState>,
 }
 
-/// Board status.
+/// Board telemetry snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
-pub struct BoardState {
+pub struct BoardTelemetry {
     /// URL-friendly identifier (e.g. "bitaxe-e2f56f9b").
     pub name: String,
     pub model: String,

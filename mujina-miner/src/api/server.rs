@@ -138,21 +138,24 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api_client::types::{BoardState, SourceState};
+    use crate::api_client::types::{BoardTelemetry, SourceState};
     use crate::board::BoardRegistration;
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
         router: Router,
         /// Keep alive to prevent board watch channels from closing.
-        _board_senders: Vec<watch::Sender<BoardState>>,
+        _board_senders: Vec<watch::Sender<BoardTelemetry>>,
         /// Publish updated miner state (e.g. after handling a command).
         _miner_tx: watch::Sender<MinerState>,
         /// Receives commands sent by PATCH handlers.
         _cmd_rx: mpsc::Receiver<SchedulerCommand>,
     }
 
-    fn build_test_router(miner_state: MinerState, board_states: Vec<BoardState>) -> TestFixtures {
+    fn build_test_router(
+        miner_state: MinerState,
+        board_states: Vec<BoardTelemetry>,
+    ) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
 
@@ -160,7 +163,7 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { state_rx: rx });
+            registry.push(BoardRegistration { telemetry_rx: rx });
             board_senders.push(tx);
         }
 
@@ -204,7 +207,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let board = BoardState {
+        let board = BoardTelemetry {
             name: "test-board".into(),
             model: "TestModel".into(),
             ..Default::default()
@@ -227,12 +230,12 @@ mod tests {
     #[tokio::test]
     async fn boards_returns_list() {
         let boards = vec![
-            BoardState {
+            BoardTelemetry {
                 name: "board-a".into(),
                 model: "A".into(),
                 ..Default::default()
             },
-            BoardState {
+            BoardTelemetry {
                 name: "board-b".into(),
                 model: "B".into(),
                 ..Default::default()
@@ -243,7 +246,7 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards").await;
         assert_eq!(status, 200);
 
-        let boards: Vec<BoardState> = serde_json::from_str(&body).unwrap();
+        let boards: Vec<BoardTelemetry> = serde_json::from_str(&body).unwrap();
         assert_eq!(boards.len(), 2);
         assert_eq!(boards[0].name, "board-a");
         assert_eq!(boards[1].name, "board-b");
@@ -251,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn board_by_name_returns_match() {
-        let board = BoardState {
+        let board = BoardTelemetry {
             name: "bitaxe-abc123".into(),
             model: "Bitaxe".into(),
             serial: Some("abc123".into()),
@@ -262,7 +265,7 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards/bitaxe-abc123").await;
         assert_eq!(status, 200);
 
-        let board: BoardState = serde_json::from_str(&body).unwrap();
+        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
         assert_eq!(board.name, "bitaxe-abc123");
         assert_eq!(board.serial, Some("abc123".into()));
     }

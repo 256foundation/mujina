@@ -15,7 +15,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
-use crate::api_client::types::{BoardState, MinerPatchRequest, MinerState, SourceState};
+use crate::api_client::types::{BoardTelemetry, MinerPatchRequest, MinerState, SourceState};
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
@@ -96,10 +96,10 @@ async fn patch_miner(
     path = "/boards",
     tag = "boards",
     responses(
-        (status = OK, description = "List of connected boards", body = Vec<BoardState>),
+        (status = OK, description = "List of connected boards", body = Vec<BoardTelemetry>),
     ),
 )]
-async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardState>> {
+async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardTelemetry>> {
     Json(
         state
             .board_registry
@@ -118,14 +118,14 @@ async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardState>> {
         ("name" = String, Path, description = "Board name"),
     ),
     responses(
-        (status = OK, description = "Board details", body = BoardState),
+        (status = OK, description = "Board details", body = BoardTelemetry),
         (status = NOT_FOUND, description = "Board not found"),
     ),
 )]
 async fn get_board(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<BoardState>, StatusCode> {
+) -> Result<Json<BoardTelemetry>, StatusCode> {
     state
         .board_registry
         .lock()
