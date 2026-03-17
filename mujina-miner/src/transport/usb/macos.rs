@@ -11,10 +11,9 @@
 //! - Map IOKit device properties to UsbDeviceInfo
 //! - Handle macOS-specific device paths and serial port naming
 
-use crate::{
-    error::{Error, Result},
-    transport::TransportEvent,
-};
+use anyhow::Result;
+
+use crate::transport::TransportEvent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -24,9 +23,7 @@ pub struct MacOsIoKitDiscovery;
 impl MacOsIoKitDiscovery {
     /// Create a new macOS USB discovery instance.
     pub fn new() -> Result<Self> {
-        Err(Error::Other(
-            "USB discovery is not yet implemented for macOS".to_string(),
-        ))
+        anyhow::bail!("USB discovery is not yet implemented for macOS")
     }
 }
 

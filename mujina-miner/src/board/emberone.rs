@@ -13,8 +13,7 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::BoardState, asic::hash_thread::HashThread, error::Error,
-    transport::UsbDeviceInfo,
+    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
 };
 
 /// EmberOne mining board (stub).
@@ -64,7 +63,7 @@ impl Board for EmberOne {
 // Factory function to create EmberOne board from USB device info
 async fn create_from_usb(
     device: UsbDeviceInfo,
-) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+) -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     let serial = device.serial_number.clone();
     let initial_state = BoardState {
         name: format!("emberone-{}", serial.as_deref().unwrap_or("unknown")),
@@ -74,8 +73,7 @@ async fn create_from_usb(
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let board = EmberOne::new(device, state_tx)
-        .map_err(|e| Error::Hardware(format!("Failed to create board: {}", e)))?;
+    let board = EmberOne::new(device, state_tx)?;
 
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))

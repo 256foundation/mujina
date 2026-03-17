@@ -9,8 +9,10 @@
 //! - **Linux**: Uses udev for device enumeration and hotplug monitoring
 //! - **macOS**: Stub implementation (IOKit support planned for future)
 
-use crate::{error::Result, tracing::prelude::*};
+use anyhow::Result;
 use std::sync::OnceLock;
+
+use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -59,7 +61,7 @@ impl UsbDeviceInfo {
             })
             .as_ref()
             .map(|v| v.as_slice())
-            .map_err(|e| crate::error::Error::Other(e.to_string()))
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
 
     /// Create a UsbDeviceInfo for testing purposes.
@@ -149,9 +151,7 @@ impl UsbTransport {
                     error!("USB monitoring failed: {}", e);
                 }
             })
-            .map_err(|e| {
-                crate::error::Error::Other(format!("Failed to spawn USB monitor thread: {}", e))
-            })?;
+            .map_err(|e| anyhow::anyhow!("failed to spawn USB monitor thread: {}", e))?;
 
         Ok(())
     }

@@ -1,3 +1,4 @@
+use anyhow::{Context as _, bail};
 use async_trait::async_trait;
 use futures::sink::SinkExt;
 use std::{
@@ -944,7 +945,7 @@ impl Board for BitaxeBoard {
 // Factory function to create a Bitaxe board from USB device info
 async fn create_from_usb(
     device: crate::transport::UsbDeviceInfo,
-) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+) -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     use tokio_serial::SerialPortBuilderExt;
 
     // Get serial ports
@@ -952,10 +953,10 @@ async fn create_from_usb(
 
     // Bitaxe Gamma requires exactly 2 serial ports
     if serial_ports.len() != 2 {
-        return Err(crate::error::Error::Hardware(format!(
+        bail!(
             "Bitaxe Gamma requires exactly 2 serial ports, found {}",
             serial_ports.len()
-        )));
+        );
     }
 
     debug!(
@@ -985,13 +986,13 @@ async fn create_from_usb(
         device.serial_number.clone(),
         state_tx,
     )
-    .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
+    .context("failed to create board")?;
 
     // Initialize the board (reset, discover chips, start event monitoring)
     board
         .initialize()
         .await
-        .map_err(|e| crate::error::Error::Hardware(format!("Failed to initialize board: {}", e)))?;
+        .context("failed to initialize board")?;
 
     debug!(
         "Bitaxe board initialized successfully with {} chips",

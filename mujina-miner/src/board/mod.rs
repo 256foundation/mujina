@@ -110,7 +110,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type BoardFactoryFn =
     fn(
         UsbDeviceInfo,
-    ) -> BoxFuture<'static, crate::error::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
+    ) -> BoxFuture<'static, anyhow::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
 
 /// Board descriptor that gets collected by inventory.
 ///
@@ -147,7 +147,7 @@ inventory::collect!(BoardDescriptor);
 /// receive USB device info---they're configured via environment
 /// variables or other means.
 pub type VirtualBoardFactoryFn =
-    fn() -> BoxFuture<'static, crate::error::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
+    fn() -> BoxFuture<'static, anyhow::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
 
 /// Descriptor for virtual boards (CPU miner, test boards, etc.).
 ///

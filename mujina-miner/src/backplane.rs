@@ -5,18 +5,19 @@
 //! boards to plug into, routes events between components, and manages board
 //! lifecycle (hotplug, emergency shutdown, etc.).
 
+use anyhow::Result;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
 use crate::{
     asic::hash_thread::HashThread,
     board::{Board, BoardDescriptor, BoardRegistration, VirtualBoardRegistry},
-    error::Result,
     tracing::prelude::*,
     transport::{
         TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
         usb::TransportEvent as UsbTransportEvent,
     },
 };
-use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 /// Board registry that uses inventory to find registered boards.
 pub struct BoardRegistry;

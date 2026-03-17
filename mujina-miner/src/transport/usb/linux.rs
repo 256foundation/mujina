@@ -30,8 +30,10 @@
 //! reconnections. This is critical for boards that expect a specific port for
 //! control vs data communication.
 
+use anyhow::{Context, Result};
+
 use super::{TransportEvent as UsbEvent, UsbDeviceInfo};
-use crate::{error::Result, tracing::prelude::*, transport::TransportEvent};
+use crate::{tracing::prelude::*, transport::TransportEvent};
 use futures::stream::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -57,18 +59,17 @@ pub(super) fn find_serial_ports_for_device(device_path: &str) -> Result<Vec<Stri
     let mut ports = Vec::new();
 
     // Create an enumerator to find tty devices
-    let mut enumerator = udev::Enumerator::new()
-        .map_err(|e| crate::error::Error::Other(format!("Failed to create enumerator: {}", e)))?;
+    let mut enumerator = udev::Enumerator::new().context("failed to create enumerator")?;
 
     // Look for tty subsystem devices
     enumerator
         .match_subsystem("tty")
-        .map_err(|e| crate::error::Error::Other(format!("Failed to filter by subsystem: {}", e)))?;
+        .context("failed to filter by subsystem")?;
 
     // Scan all tty devices and check if they're children of our USB device
     for tty_device in enumerator
         .scan_devices()
-        .map_err(|e| crate::error::Error::Other(format!("Failed to scan devices: {}", e)))?
+        .context("failed to scan devices")?
     {
         // Check if this tty device is a descendant of our USB device
         // by walking up the parent chain
@@ -121,19 +122,19 @@ impl LinuxUdevDiscovery {
         let vid_str = device
             .attribute_value("idVendor")
             .and_then(|v| v.to_str())
-            .ok_or_else(|| crate::error::Error::Other("Missing idVendor attribute".to_string()))?;
+            .ok_or_else(|| anyhow::anyhow!("missing idVendor attribute"))?;
 
         let vid = u16::from_str_radix(vid_str, 16)
-            .map_err(|e| crate::error::Error::Other(format!("Invalid VID '{}': {}", vid_str, e)))?;
+            .with_context(|| format!("invalid VID '{}'", vid_str))?;
 
         // Extract PID (product ID) - typically 4 hex digits like "6015"
         let pid_str = device
             .attribute_value("idProduct")
             .and_then(|v| v.to_str())
-            .ok_or_else(|| crate::error::Error::Other("Missing idProduct attribute".to_string()))?;
+            .ok_or_else(|| anyhow::anyhow!("missing idProduct attribute"))?;
 
         let pid = u16::from_str_radix(pid_str, 16)
-            .map_err(|e| crate::error::Error::Other(format!("Invalid PID '{}': {}", pid_str, e)))?;
+            .with_context(|| format!("invalid PID '{}'", pid_str))?;
 
         // Extract serial number (optional)
         let serial_number = device
@@ -175,7 +176,7 @@ impl LinuxUdevDiscovery {
         let device_path = device
             .syspath()
             .to_str()
-            .ok_or_else(|| crate::error::Error::Other("Invalid device path".to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("invalid device path"))?
             .to_string();
 
         Ok(UsbDeviceInfo {
@@ -192,21 +193,19 @@ impl LinuxUdevDiscovery {
     /// Enumerate currently connected USB devices.
     fn enumerate_devices(&self) -> Result<Vec<UsbDeviceInfo>> {
         // Create enumerator for USB devices
-        let mut enumerator = udev::Enumerator::new().map_err(|e| {
-            crate::error::Error::Other(format!("Failed to create enumerator: {}", e))
-        })?;
+        let mut enumerator = udev::Enumerator::new().context("failed to create enumerator")?;
 
         // Filter for USB subsystem
         enumerator
             .match_subsystem("usb")
-            .map_err(|e| crate::error::Error::Other(format!("Failed to match subsystem: {}", e)))?;
+            .context("failed to match subsystem")?;
 
         // Scan devices and build info for each
         // We filter to actual devices (not interfaces) by checking for idVendor/idProduct
         let mut devices = Vec::new();
         for device in enumerator
             .scan_devices()
-            .map_err(|e| crate::error::Error::Other(format!("Failed to scan devices: {}", e)))?
+            .context("failed to scan devices")?
         {
             // Skip if this doesn't have idVendor (means it's an interface, not a device)
             if device.attribute_value("idVendor").is_none() {
@@ -246,7 +245,7 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| crate::error::Error::Other(format!("Failed to create runtime: {}", e)))?;
+            .context("failed to create runtime")?;
 
         // Run the async monitoring loop on this thread's runtime
         runtime.block_on(async {
@@ -263,21 +262,16 @@ impl super::UsbDiscoveryImpl for LinuxUdevDiscovery {
 
             // Create async udev monitor using tokio-udev
             let builder = tokio_udev::MonitorBuilder::new()
-                .map_err(|e| {
-                    crate::error::Error::Other(format!("Failed to create monitor: {}", e))
-                })?
+                .context("failed to create monitor")?
                 .match_subsystem("usb")
-                .map_err(|e| {
-                    crate::error::Error::Other(format!("Failed to filter monitor: {}", e))
-                })?;
+                .context("failed to filter monitor")?;
 
             let socket = builder
                 .listen()
-                .map_err(|e| crate::error::Error::Other(format!("Failed to listen: {}", e)))?;
+                .context("failed to listen")?;
 
-            let mut monitor = tokio_udev::AsyncMonitorSocket::new(socket).map_err(|e| {
-                crate::error::Error::Other(format!("Failed to create async socket: {}", e))
-            })?;
+            let mut monitor = tokio_udev::AsyncMonitorSocket::new(socket)
+                .context("failed to create async socket")?;
 
             // Event loop using tokio::select! to wait on both events and shutdown
             // This is clean, safe async code with no manual polling required

@@ -80,11 +80,9 @@ impl Board for CpuBoard {
 // ---------------------------------------------------------------------------
 
 /// Factory function for creating CpuBoard instances.
-async fn create_cpu_board()
--> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let config = CpuMinerConfig::from_env().ok_or_else(|| {
-        crate::error::Error::Config("CPU miner not configured (MUJINA_CPU_MINER not set)".into())
-    })?;
+async fn create_cpu_board() -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+    let config = CpuMinerConfig::from_env()
+        .ok_or_else(|| anyhow::anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
 
     let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
     let initial_state = BoardState {
