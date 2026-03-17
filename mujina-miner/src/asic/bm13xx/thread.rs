@@ -9,6 +9,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
 use futures::{SinkExt, sink::Sink, stream::Stream};
@@ -18,8 +19,8 @@ use tokio_stream::StreamExt;
 use super::protocol;
 use crate::{
     asic::hash_thread::{
-        BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadError,
-        HashThreadEvent, HashThreadStatus, Share, ThreadRemovalSignal,
+        BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
+        HashThreadStatus, Share, ThreadRemovalSignal,
     },
     tracing::prelude::*,
     types::{Difficulty, HashRate},
@@ -67,18 +68,18 @@ enum ThreadCommand {
     /// Update task (old shares still valid)
     UpdateTask {
         new_task: HashTask,
-        response_tx: oneshot::Sender<std::result::Result<Option<HashTask>, HashThreadError>>,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Replace task (old shares invalid)
     ReplaceTask {
         new_task: HashTask,
-        response_tx: oneshot::Sender<std::result::Result<Option<HashTask>, HashThreadError>>,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Go idle (stop hashing, low power)
     GoIdle {
-        response_tx: oneshot::Sender<std::result::Result<Option<HashTask>, HashThreadError>>,
+        response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Shutdown the thread
@@ -174,10 +175,7 @@ impl HashThread for BM13xxThread {
         &self.capabilities
     }
 
-    async fn update_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> std::result::Result<Option<HashTask>, HashThreadError> {
+    async fn update_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.command_tx
@@ -186,17 +184,14 @@ impl HashThread for BM13xxThread {
                 response_tx,
             })
             .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
-    async fn replace_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> std::result::Result<Option<HashTask>, HashThreadError> {
+    async fn replace_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.command_tx
@@ -205,24 +200,24 @@ impl HashThread for BM13xxThread {
                 response_tx,
             })
             .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
-    async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError> {
+    async fn go_idle(&mut self) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.command_tx
             .send(ThreadCommand::GoIdle { response_tx })
             .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
@@ -237,10 +232,7 @@ impl HashThread for BM13xxThread {
 /// Initialize BM13xx chip for mining.
 ///
 /// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W>(
-    chip_commands: &mut W,
-    peripherals: &mut BoardPeripherals,
-) -> Result<(), HashThreadError>
+async fn initialize_chip<W>(chip_commands: &mut W, peripherals: &mut BoardPeripherals) -> Result<()>
 where
     W: Sink<protocol::Command> + Unpin,
     W::Error: std::fmt::Debug,
@@ -250,29 +242,40 @@ where
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
         debug!("Enabling ASIC");
-        asic_enable.enable().await.map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Failed to enable ASIC: {}", e))
-        })?;
+        asic_enable
+            .enable()
+            .await
+            .context("failed to enable ASIC")?;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+    // Send a register write command, converting the sink error to anyhow.
+    async fn send_reg<W>(chip_commands: &mut W, broadcast: bool, register: Register) -> Result<()>
+    where
+        W: Sink<protocol::Command> + Unpin,
+        W::Error: std::fmt::Debug,
+    {
+        chip_commands
+            .send(Command::WriteRegister {
+                broadcast,
+                chip_address: 0x00,
+                register,
+            })
+            .await
+            .map_err(|e| anyhow!("{e:?}"))
+    }
+
     // Send version mask configuration (3 times)
     debug!("Configuring version mask");
     for _ in 1..=3 {
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: Register::VersionMask(protocol::VersionMask::full_rolling()),
-            })
-            .await
-            .map_err(|e| {
-                HashThreadError::InitializationFailed(format!(
-                    "Failed to send version mask: {:?}",
-                    e
-                ))
-            })?;
+        send_reg(
+            chip_commands,
+            true,
+            Register::VersionMask(protocol::VersionMask::full_rolling()),
+        )
+        .await
+        .context("failed to send version mask")?;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
@@ -281,70 +284,54 @@ where
     // Pre-configuration registers
     debug!("Sending pre-configuration registers");
 
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::InitControl {
-                raw_value: 0x00000700,
-            },
-        })
-        .await
-        .map_err(|e| HashThreadError::InitializationFailed(format!("Init send failed: {:?}", e)))?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::MiscControl {
-                raw_value: 0x00C100F0,
-            },
-        })
-        .await
-        .map_err(|e| HashThreadError::InitializationFailed(format!("Misc send failed: {:?}", e)))?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::InitControl {
+            raw_value: 0x00000700,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::MiscControl {
+            raw_value: 0x00C100F0,
+        },
+    )
+    .await?;
 
     chip_commands
         .send(Command::ChainInactive)
         .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("ChainInactive failed: {:?}", e))
-        })?;
+        .map_err(|e| anyhow!("{e:?}"))
+        .context("failed to send ChainInactive")?;
 
     chip_commands
         .send(Command::SetChipAddress { chip_address: 0x00 })
         .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("SetChipAddress failed: {:?}", e))
-        })?;
+        .map_err(|e| anyhow!("{e:?}"))
+        .context("failed to send SetChipAddress")?;
 
     // Core configuration (broadcast)
     debug!("Sending broadcast core configuration");
 
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8B00,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core1 send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_800C,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core2 send failed: {:?}", e))
-        })?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::Core {
+            raw_value: 0x8000_8B00,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::Core {
+            raw_value: 0x8000_800C,
+        },
+    )
+    .await?;
 
     // Ticket mask, IO strength
     // Target: ~1 nonce per second at 1 TH/s (1000 GiH/s = 1.074 TH/s)
@@ -355,164 +342,100 @@ where
     );
     let ticket_mask = TicketMask::new(reporting_interval);
 
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::TicketMask(ticket_mask),
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("TicketMask send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("IoDriver send failed: {:?}", e))
-        })?;
+    send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
+    )
+    .await?;
 
     // Chip-specific configuration
     debug!("Sending chip-specific configuration");
 
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: Register::InitControl {
-                raw_value: 0xF0010700,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("InitControl chip send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: Register::MiscControl {
-                raw_value: 0x00C100F0,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("MiscControl chip send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8B00,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core chip1 send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_800C,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core chip2 send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: false,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_82AA,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core chip3 send failed: {:?}", e))
-        })?;
+    send_reg(
+        chip_commands,
+        false,
+        Register::InitControl {
+            raw_value: 0xF0010700,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        false,
+        Register::MiscControl {
+            raw_value: 0x00C100F0,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        false,
+        Register::Core {
+            raw_value: 0x8000_8B00,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        false,
+        Register::Core {
+            raw_value: 0x8000_800C,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        false,
+        Register::Core {
+            raw_value: 0x8000_82AA,
+        },
+    )
+    .await?;
 
     // Additional settings
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::MiscSettings {
-                raw_value: 0x80440000,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("MiscSettings send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::AnalogMux {
-                raw_value: 0x02000000,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("AnalogMux send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::MiscSettings {
-                raw_value: 0x80440000,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("MiscSettings2 send failed: {:?}", e))
-        })?;
-
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::Core {
-                raw_value: 0x8000_8DEE,
-            },
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Core final send failed: {:?}", e))
-        })?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::MiscSettings {
+            raw_value: 0x80440000,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::AnalogMux {
+            raw_value: 0x02000000,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::MiscSettings {
+            raw_value: 0x80440000,
+        },
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::Core {
+            raw_value: 0x8000_8DEE,
+        },
+    )
+    .await?;
 
     // Frequency ramping (56.25 MHz -> 525 MHz)
     debug!("Ramping frequency from 56.25 MHz to 525 MHz");
     let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
-        chip_commands
-            .send(Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: Register::PllDivider(*pll_config),
-            })
+        send_reg(chip_commands, true, Register::PllDivider(*pll_config))
             .await
-            .map_err(|e| {
-                HashThreadError::InitializationFailed(format!("PLL ramp failed: {:?}", e))
-            })?;
+            .context("PLL ramp failed")?;
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -524,28 +447,18 @@ where
     debug!("Frequency ramping complete");
 
     // Final configuration
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("NonceRange send failed: {:?}", e))
-        })?;
-
-    // Final version mask
-    chip_commands
-        .send(Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: Register::VersionMask(protocol::VersionMask::full_rolling()),
-        })
-        .await
-        .map_err(|e| {
-            HashThreadError::InitializationFailed(format!("Final version mask failed: {:?}", e))
-        })?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+    )
+    .await?;
+    send_reg(
+        chip_commands,
+        true,
+        Register::VersionMask(protocol::VersionMask::full_rolling()),
+    )
+    .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -579,10 +492,7 @@ fn generate_frequency_ramp_steps(
 /// Extracts or computes the merkle root, then builds a JobFullFormat with all
 /// block header fields. For computed merkle roots, requires EN2. For fixed merkle
 /// roots (Stratum v2 header-only), uses the template's fixed value directly.
-fn task_to_job_full(
-    task: &HashTask,
-    chip_job_id: u8,
-) -> Result<protocol::JobFullFormat, HashThreadError> {
+fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFullFormat> {
     use crate::job_source::MerkleRootKind;
 
     let template = task.template.as_ref();
@@ -591,19 +501,15 @@ fn task_to_job_full(
     let merkle_root = match &template.merkle_root {
         MerkleRootKind::Computed(_) => {
             // Extract EN2 (required for computed merkle roots)
-            let en2 = task.en2.as_ref().ok_or_else(|| {
-                HashThreadError::WorkAssignmentFailed(
-                    "EN2 required for computed merkle root".into(),
-                )
-            })?;
+            let en2 = task
+                .en2
+                .as_ref()
+                .ok_or_else(|| anyhow!("EN2 required for computed merkle root"))?;
 
             // Compute merkle root for this EN2
-            template.compute_merkle_root(en2).map_err(|e| {
-                HashThreadError::WorkAssignmentFailed(format!(
-                    "Merkle root computation failed: {}",
-                    e
-                ))
-            })?
+            template
+                .compute_merkle_root(en2)
+                .context("merkle root computation failed")?
         }
         MerkleRootKind::Fixed(merkle_root) => *merkle_root,
     };
@@ -768,9 +674,8 @@ async fn bm13xx_thread_actor<R, W>(
                             Ok(job_data) => {
                                 if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    response_tx.send(Err(HashThreadError::WorkAssignmentFailed(
-                                        format!("Failed to send job to chip: {:?}", e)
-                                    ))).ok();
+                                    let err = anyhow!("failed to send job to chip: {e:?}");
+                                    response_tx.send(Err(err)).ok();
                                     continue;
                                 } else {
                                     debug!("Sent initial job to chip");
@@ -822,9 +727,8 @@ async fn bm13xx_thread_actor<R, W>(
                             Ok(job_data) => {
                                 if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
-                                    response_tx.send(Err(HashThreadError::WorkAssignmentFailed(
-                                        format!("Failed to send job to chip: {:?}", e)
-                                    ))).ok();
+                                    let err = anyhow!("failed to send job to chip: {e:?}");
+                                    response_tx.send(Err(err)).ok();
                                     continue;
                                 } else {
                                     debug!("Sent initial job to chip (old work invalidated)");

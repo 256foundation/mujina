@@ -3,8 +3,9 @@ pub mod cpu;
 pub(crate) mod emberone;
 pub mod pattern;
 
+use anyhow::Result;
 use async_trait::async_trait;
-use std::{error::Error, fmt, future::Future, pin::Pin};
+use std::{future::Future, pin::Pin};
 use tokio::sync::watch;
 
 use crate::{
@@ -26,7 +27,7 @@ pub trait Board: Send {
     /// This should stop all mining activity and put the hardware in a safe
     /// state. The exact implementation is board-specific but typically includes
     /// stopping hashing and ensuring chips are in a low-power or reset state.
-    async fn shutdown(&mut self) -> Result<(), BoardError>;
+    async fn shutdown(&mut self) -> Result<()>;
 
     /// Create hash threads for this board.
     ///
@@ -35,7 +36,7 @@ pub trait Board: Send {
     ///
     /// Board-to-thread shutdown is implementation-specific (not exposed through
     /// HashThread trait). Call board.shutdown() to trigger thread shutdown.
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError>;
+    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>>;
 }
 
 /// Information about a board
@@ -47,37 +48,6 @@ pub struct BoardInfo {
     pub firmware_version: Option<String>,
     /// Serial number if available
     pub serial_number: Option<String>,
-}
-
-/// Board-specific errors
-#[derive(Debug)]
-pub enum BoardError {
-    /// Hardware initialization failed
-    InitializationFailed(String),
-    /// Communication error with board
-    Communication(std::io::Error),
-    /// GPIO or hardware control error
-    HardwareControl(String),
-}
-
-impl fmt::Display for BoardError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BoardError::InitializationFailed(msg) => {
-                write!(f, "Board initialization failed: {}", msg)
-            }
-            BoardError::Communication(err) => write!(f, "Board communication error: {}", err),
-            BoardError::HardwareControl(msg) => write!(f, "Hardware control error: {}", msg),
-        }
-    }
-}
-
-impl Error for BoardError {}
-
-impl From<std::io::Error> for BoardError {
-    fn from(err: std::io::Error) -> Self {
-        BoardError::Communication(err)
-    }
 }
 
 /// Registration data returned by board factory functions.
@@ -108,9 +78,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// discovered, then forwards the [`BoardRegistration`] to the API
 /// server.
 pub type BoardFactoryFn =
-    fn(
-        UsbDeviceInfo,
-    ) -> BoxFuture<'static, anyhow::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
+    fn(UsbDeviceInfo) -> BoxFuture<'static, Result<(Box<dyn Board + Send>, BoardRegistration)>>;
 
 /// Board descriptor that gets collected by inventory.
 ///
@@ -147,7 +115,7 @@ inventory::collect!(BoardDescriptor);
 /// receive USB device info---they're configured via environment
 /// variables or other means.
 pub type VirtualBoardFactoryFn =
-    fn() -> BoxFuture<'static, anyhow::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
+    fn() -> BoxFuture<'static, Result<(Box<dyn Board + Send>, BoardRegistration)>>;
 
 /// Descriptor for virtual boards (CPU miner, test boards, etc.).
 ///

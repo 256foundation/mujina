@@ -5,11 +5,12 @@
 //!
 //! This is currently a stub implementation pending full support.
 
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use tokio::sync::watch;
 
 use super::{
-    Board, BoardDescriptor, BoardError, BoardInfo,
+    Board, BoardDescriptor, BoardInfo,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
@@ -27,10 +28,7 @@ pub struct EmberOne {
 
 impl EmberOne {
     /// Create a new EmberOne board instance.
-    pub fn new(
-        device_info: UsbDeviceInfo,
-        state_tx: watch::Sender<BoardState>,
-    ) -> Result<Self, BoardError> {
+    pub fn new(device_info: UsbDeviceInfo, state_tx: watch::Sender<BoardState>) -> Result<Self> {
         Ok(Self {
             device_info,
             state_tx,
@@ -48,22 +46,20 @@ impl Board for EmberOne {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), BoardError> {
+    async fn shutdown(&mut self) -> Result<()> {
         tracing::info!("EmberOne stub shutdown (no-op)");
         Ok(())
     }
 
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
-        Err(BoardError::InitializationFailed(
-            "EmberOne not yet implemented".into(),
-        ))
+    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
+        bail!("EmberOne hash threads not yet implemented")
     }
 }
 
 // Factory function to create EmberOne board from USB device info
 async fn create_from_usb(
     device: UsbDeviceInfo,
-) -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     let serial = device.serial_number.clone();
     let initial_state = BoardState {
         name: format!("emberone-{}", serial.as_deref().unwrap_or("unknown")),

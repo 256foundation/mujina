@@ -3,10 +3,11 @@
 //! Provides a virtual board that uses CPU cores for SHA-256 hashing.
 //! Configured via environment variables, creates one HashThread per core.
 
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-use super::{Board, BoardError, BoardInfo, VirtualBoardDescriptor};
+use super::{Board, BoardInfo, VirtualBoardDescriptor};
 use crate::{
     api_client::types::BoardState,
     asic::hash_thread::HashThread,
@@ -54,7 +55,7 @@ impl Board for CpuBoard {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), BoardError> {
+    async fn shutdown(&mut self) -> Result<()> {
         // Signal all threads to stop
         for thread in &self.threads {
             thread.shutdown();
@@ -63,7 +64,7 @@ impl Board for CpuBoard {
         Ok(())
     }
 
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
+    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
 
         for i in 0..self.config.thread_count {
@@ -80,9 +81,9 @@ impl Board for CpuBoard {
 // ---------------------------------------------------------------------------
 
 /// Factory function for creating CpuBoard instances.
-async fn create_cpu_board() -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+async fn create_cpu_board() -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     let config = CpuMinerConfig::from_env()
-        .ok_or_else(|| anyhow::anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
+        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
 
     let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
     let initial_state = BoardState {

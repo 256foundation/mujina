@@ -1,4 +1,4 @@
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::sink::SinkExt;
 use std::{
@@ -42,7 +42,7 @@ use crate::{
 };
 
 use super::{
-    Board, BoardError, BoardInfo,
+    Board, BoardInfo,
     pattern::{Match, StringMatch},
 };
 
@@ -54,20 +54,20 @@ struct BitaxeAsicEnable {
 
 #[async_trait]
 impl crate::asic::hash_thread::AsicEnable for BitaxeAsicEnable {
-    async fn enable(&mut self) -> anyhow::Result<()> {
+    async fn enable(&mut self) -> Result<()> {
         // Release reset (nRST is active-low, so High = running)
         self.nrst_pin
             .write(PinValue::High)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to release reset: {}", e))
+            .map_err(|e| anyhow!("failed to release reset: {}", e))
     }
 
-    async fn disable(&mut self) -> anyhow::Result<()> {
+    async fn disable(&mut self) -> Result<()> {
         // Assert reset (nRST is active-low, so Low = reset)
         self.nrst_pin
             .write(PinValue::Low)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to assert reset: {}", e))
+            .map_err(|e| anyhow!("failed to assert reset: {}", e))
     }
 }
 
@@ -176,15 +176,14 @@ impl BitaxeBoard {
         data_path: &str,
         serial_number: Option<String>,
         state_tx: watch::Sender<BoardState>,
-    ) -> Result<Self, BoardError> {
+    ) -> Result<Self> {
         // Create control channel and I2C controller
         let control_channel = ControlChannel::new(control);
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Create SerialStream for data channel at initial baud rate
-        let data_stream = SerialStream::new(data_path, 115200).map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to open data port: {}", e))
-        })?;
+        let data_stream =
+            SerialStream::new(data_path, 115200).context("failed to open data port")?;
         let (data_reader, data_writer, data_control) = data_stream.split();
 
         // Wrap the data reader with tracing
@@ -212,7 +211,7 @@ impl BitaxeBoard {
     /// This function toggles the reset line low for 100ms, then high for 100ms
     /// to properly reset all connected mining chips.
     #[expect(dead_code, reason = "will be used for error recovery")]
-    pub async fn momentary_reset(&mut self) -> Result<(), BoardError> {
+    pub async fn momentary_reset(&mut self) -> Result<()> {
         const WAIT: Duration = Duration::from_millis(100);
 
         // Assert reset
@@ -227,20 +226,21 @@ impl BitaxeBoard {
     }
 
     /// Release the mining chips from reset state.
-    async fn release_reset(&mut self) -> Result<(), BoardError> {
+    async fn release_reset(&mut self) -> Result<()> {
         let reset_pin = self
             .asic_nrst
             .as_mut()
-            .ok_or_else(|| BoardError::HardwareControl("Reset pin not initialized".to_string()))?;
+            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
 
         // Set reset high (inactive - active low signal)
         debug!(
             "De-asserting ASIC nRST (GPIO {} = high)",
             Self::ASIC_RESET_PIN
         );
-        reset_pin.write(PinValue::High).await.map_err(|e| {
-            BoardError::HardwareControl(format!("Failed to de-assert reset: {}", e))
-        })?;
+        reset_pin
+            .write(PinValue::High)
+            .await
+            .context("failed to de-assert reset")?;
 
         Ok(())
     }
@@ -250,17 +250,17 @@ impl BitaxeBoard {
     /// This function sets the reset line low and keeps it there,
     /// effectively disabling all connected mining chips. This is used
     /// during shutdown to ensure chips are in a safe, non-hashing state.
-    pub async fn hold_in_reset(&mut self) -> Result<(), BoardError> {
+    pub async fn hold_in_reset(&mut self) -> Result<()> {
         let reset_pin = self
             .asic_nrst
             .as_mut()
-            .ok_or_else(|| BoardError::HardwareControl("Reset pin not initialized".to_string()))?;
+            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
 
         // Hold reset low (active - active low signal)
         reset_pin
             .write(PinValue::Low)
             .await
-            .map_err(|e| BoardError::HardwareControl(format!("Failed to hold reset: {}", e)))?;
+            .context("failed to hold reset")?;
 
         Ok(())
     }
@@ -272,18 +272,18 @@ impl BitaxeBoard {
     /// Send a configuration command to the chips.
     ///
     /// This is used during initialization to configure PLL, version rolling, etc.
-    pub async fn send_config_command(&mut self, command: Command) -> Result<(), BoardError> {
+    pub async fn send_config_command(&mut self, command: Command) -> Result<()> {
         self.data_writer
             .as_mut()
             .expect("data_writer should be available during initialization")
             .send(command)
             .await
-            .map_err(BoardError::Communication)
+            .context("failed to send config command")
     }
 
     /// Send multiple configuration commands in sequence.
     #[expect(dead_code, reason = "Will be used for batch configuration")]
-    pub async fn send_config_commands(&mut self, commands: Vec<Command>) -> Result<(), BoardError> {
+    pub async fn send_config_commands(&mut self, commands: Vec<Command>) -> Result<()> {
         for command in commands {
             self.send_config_command(command).await?;
             // Small delay between commands to avoid overwhelming the chip
@@ -292,11 +292,12 @@ impl BitaxeBoard {
         Ok(())
     }
 
-    async fn discover_chips(&mut self) -> Result<(), BoardError> {
+    async fn discover_chips(&mut self) -> Result<()> {
         // Get a mutable reference to the reader
-        let reader = self.data_reader.as_mut().ok_or_else(|| {
-            BoardError::InitializationFailed("Data reader already taken".to_string())
-        })?;
+        let reader = self
+            .data_reader
+            .as_mut()
+            .ok_or_else(|| anyhow!("data reader already taken"))?;
 
         // Send a broadcast read to discover chips
         let discover_cmd = BM13xxProtocol::discover_chips();
@@ -306,7 +307,7 @@ impl BitaxeBoard {
             .expect("data_writer should be available during chip discovery")
             .send(discover_cmd)
             .await
-            .map_err(BoardError::Communication)?;
+            .context("failed to send chip discovery command")?;
 
         // Wait a bit for responses
         let timeout = Duration::from_millis(500);
@@ -349,16 +350,13 @@ impl BitaxeBoard {
         }
 
         if self.chip_infos.is_empty() {
-            Err(BoardError::InitializationFailed(
-                "No chips discovered".to_string(),
-            ))
-        } else {
-            Ok(())
+            bail!("no chips discovered");
         }
+        Ok(())
     }
 
     /// Initialize the power controller
-    async fn init_power_controller(&mut self) -> Result<(), BoardError> {
+    async fn init_power_controller(&mut self) -> Result<()> {
         // Clone the I2C bus for the power controller
         let power_i2c = self.i2c.clone();
 
@@ -441,10 +439,7 @@ impl BitaxeBoard {
                     }
                     Err(e) => {
                         error!("Failed to set initial core voltage: {}", e);
-                        return Err(BoardError::InitializationFailed(format!(
-                            "Failed to set core voltage: {}",
-                            e
-                        )));
+                        return Err(e).context("failed to set core voltage");
                     }
                 }
 
@@ -453,16 +448,13 @@ impl BitaxeBoard {
             }
             Err(e) => {
                 error!("Failed to initialize TPS546D24A power controller: {}", e);
-                Err(BoardError::InitializationFailed(format!(
-                    "Power controller init failed: {}",
-                    e
-                )))
+                Err(e).context("power controller init failed")
             }
         }
     }
 
     /// Initialize the fan controller
-    async fn init_fan_controller(&mut self) -> Result<(), BoardError> {
+    async fn init_fan_controller(&mut self) -> Result<()> {
         // Clone the I2C bus for the fan controller
         let fan_i2c = self.i2c.clone();
         let mut fan = Emc2101::new(fan_i2c);
@@ -611,15 +603,13 @@ impl BitaxeBoard {
     /// Initialize the board and discover connected chips.
     ///
     /// After initialization, the board is ready for `create_hash_threads()`.
-    pub async fn initialize(&mut self) -> Result<(), BoardError> {
+    pub async fn initialize(&mut self) -> Result<()> {
         // Create GPIO controller and get reset pin handle
         let mut gpio_controller = BitaxeRawGpioController::new(self.control_channel.clone());
         let reset_pin = gpio_controller
             .pin(Self::ASIC_RESET_PIN)
             .await
-            .map_err(|e| {
-                BoardError::InitializationFailed(format!("Failed to get reset pin: {}", e))
-            })?;
+            .context("failed to get reset pin")?;
         self.asic_nrst = Some(reset_pin);
 
         // Phase 1: Hold ASIC in reset during power configuration
@@ -627,9 +617,10 @@ impl BitaxeBoard {
         self.hold_in_reset().await?;
 
         // Phase 2: Initialize power controller while ASIC is in reset
-        self.i2c.set_frequency(100_000).await.map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to set I2C frequency: {}", e))
-        })?;
+        self.i2c
+            .set_frequency(100_000)
+            .await
+            .context("failed to set I2C frequency")?;
 
         self.init_fan_controller().await?;
         self.init_power_controller().await?;
@@ -667,13 +658,13 @@ impl BitaxeBoard {
         if let Some(first_chip) = self.chip_infos.first()
             && first_chip.chip_id != Self::EXPECTED_CHIP_ID
         {
-            return Err(BoardError::InitializationFailed(format!(
-                "Wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
+            bail!(
+                "wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
                 Self::EXPECTED_CHIP_ID[0],
                 Self::EXPECTED_CHIP_ID[1],
                 first_chip.chip_id[0],
                 first_chip.chip_id[1]
-            )));
+            );
         }
 
         // Put chip back in reset
@@ -846,7 +837,7 @@ impl Board for BitaxeBoard {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), BoardError> {
+    async fn shutdown(&mut self) -> Result<()> {
         // Signal hash threads to shut down gracefully
         if let Some(ref tx) = self.thread_shutdown {
             if let Err(e) = tx.send(ThreadRemovalSignal::Shutdown) {
@@ -884,7 +875,7 @@ impl Board for BitaxeBoard {
         Ok(())
     }
 
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
+    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
         // Create removal signal channel (starts as Running)
         let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
 
@@ -895,24 +886,18 @@ impl Board for BitaxeBoard {
         let data_reader = self
             .data_reader
             .take()
-            .ok_or(BoardError::InitializationFailed(
-                "No data reader available - already taken or not initialized".into(),
-            ))?;
+            .ok_or_else(|| anyhow!("no data reader available"))?;
 
         let data_writer = self
             .data_writer
             .take()
-            .ok_or(BoardError::InitializationFailed(
-                "No data writer available - already taken or not initialized".into(),
-            ))?;
+            .ok_or_else(|| anyhow!("no data writer available"))?;
 
         // Create ASIC enable adapter (wraps GPIO pin)
         let nrst_pin = self
             .asic_nrst
             .clone()
-            .ok_or(BoardError::InitializationFailed(
-                "Reset pin not initialized".into(),
-            ))?;
+            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
         let asic_enable = BitaxeAsicEnable { nrst_pin };
 
         // Bundle peripherals for thread
@@ -945,7 +930,7 @@ impl Board for BitaxeBoard {
 // Factory function to create a Bitaxe board from USB device info
 async fn create_from_usb(
     device: crate::transport::UsbDeviceInfo,
-) -> anyhow::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     use tokio_serial::SerialPortBuilderExt;
 
     // Get serial ports

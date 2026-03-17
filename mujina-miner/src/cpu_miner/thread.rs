@@ -9,14 +9,14 @@ use std::sync::{
     mpsc,
 };
 
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::hasher::{self, MinerCommand};
 use crate::{
     asic::hash_thread::{
-        HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-        HashThreadStatus,
+        HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus,
     },
     types::HashRate,
 };
@@ -126,10 +126,7 @@ impl HashThread for CpuHashThread {
         &self.capabilities
     }
 
-    async fn update_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    async fn update_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         self.command_tx
@@ -137,17 +134,14 @@ impl HashThread for CpuHashThread {
                 task: new_task,
                 response_tx,
             })
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
-    async fn replace_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    async fn replace_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         self.command_tx
@@ -155,23 +149,23 @@ impl HashThread for CpuHashThread {
                 task: new_task,
                 response_tx,
             })
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
-    async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
+    async fn go_idle(&mut self) -> Result<Option<HashTask>> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
         self.command_tx
             .send(MinerCommand::GoIdle { response_tx })
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+            .map_err(|_| anyhow!("command channel closed"))?;
 
         response_rx
             .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("no response from thread".into()))?
+            .map_err(|_| anyhow!("no response from thread"))?
     }
 
     fn take_event_receiver(&mut self) -> Option<tokio_mpsc::Receiver<HashThreadEvent>> {
