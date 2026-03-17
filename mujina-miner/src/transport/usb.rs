@@ -34,7 +34,7 @@ pub struct UsbDeviceInfo {
     /// Serial port device nodes associated with this USB device.
     /// Lazily populated on first access via serial_ports() method.
     /// Stores a Result so we can cache both success and failure.
-    serial_ports: OnceLock<Result<Vec<String>>>,
+    pub(crate) serial_ports: OnceLock<Result<Vec<String>>>,
     // Future: other interfaces like HID, mass storage, etc.
 }
 
@@ -63,26 +63,18 @@ impl UsbDeviceInfo {
             .map(|v| v.as_slice())
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
+}
 
-    /// Create a UsbDeviceInfo for testing purposes.
-    ///
-    /// Serial ports are not scanned and will be empty when accessed.
-    #[cfg(test)]
-    pub fn new_for_test(
-        vid: u16,
-        pid: u16,
-        serial_number: Option<String>,
-        manufacturer: Option<String>,
-        product: Option<String>,
-        device_path: String,
-    ) -> Self {
+#[cfg(test)]
+impl Default for UsbDeviceInfo {
+    fn default() -> Self {
         Self {
-            vid,
-            pid,
-            serial_number,
-            manufacturer,
-            product,
-            device_path,
+            vid: 0,
+            pid: 0,
+            serial_number: None,
+            manufacturer: None,
+            product: None,
+            device_path: String::new(),
             serial_ports: OnceLock::new(),
         }
     }

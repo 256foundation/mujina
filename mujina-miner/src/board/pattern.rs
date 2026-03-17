@@ -241,14 +241,15 @@ mod tests {
         product: Option<&str>,
         serial: Option<&str>,
     ) -> UsbDeviceInfo {
-        UsbDeviceInfo::new_for_test(
+        UsbDeviceInfo {
             vid,
             pid,
-            serial.map(|s| s.to_string()),
-            manufacturer.map(|s| s.to_string()),
-            product.map(|s| s.to_string()),
-            "/sys/devices/test".to_string(),
-        )
+            serial_number: serial.map(|s| s.to_string()),
+            manufacturer: manufacturer.map(|s| s.to_string()),
+            product: product.map(|s| s.to_string()),
+            device_path: "/sys/devices/test".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
