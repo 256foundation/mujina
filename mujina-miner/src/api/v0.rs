@@ -149,7 +149,7 @@ async fn get_board(
     ),
 )]
 async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceTelemetry>> {
-    Json(state.miner_telemetry().sources)
+    Json(state.miner_telemetry_rx.borrow().sources.clone())
 }
 
 /// Return a single source by name, or 404 if not found.
@@ -170,10 +170,12 @@ async fn get_source(
     Path(name): Path<String>,
 ) -> Result<Json<SourceTelemetry>, StatusCode> {
     state
-        .miner_telemetry()
+        .miner_telemetry_rx
+        .borrow()
         .sources
-        .into_iter()
+        .iter()
         .find(|s| s.name == name)
+        .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
