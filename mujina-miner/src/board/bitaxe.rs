@@ -1,4 +1,6 @@
 use anyhow::{Context as _, Result, anyhow, bail};
+mod fan_controller;
+
 use async_trait::async_trait;
 use futures::sink::SinkExt;
 use std::{
@@ -22,6 +24,7 @@ use crate::{
         bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
         hash_thread::{BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
+    board::bitaxe::fan_controller::FanController,
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
         i2c::I2c,
@@ -45,6 +48,8 @@ use super::{
     Board, BoardInfo,
     pattern::{Match, StringMatch},
 };
+
+use fan_controller::FanControllerConfig;
 
 /// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
 struct BitaxeAsicEnable {
@@ -123,8 +128,8 @@ pub struct BitaxeBoard {
     asic_nrst: Option<BitaxeRawGpioPin>,
     /// I2C bus controller
     i2c: BitaxeRawI2c,
-    /// Fan controller (board-controlled only, not shared with thread)
-    fan_controller: Option<Emc2101<BitaxeRawI2c>>,
+    /// Concurrent fan controller
+    fan: Option<Arc<Mutex<Emc2101<BitaxeRawI2c>>>>,
     /// Voltage regulator (shared with thread, cached state)
     regulator: Option<Arc<Mutex<Tps546<BitaxeRawI2c>>>>,
     /// Writer for sending commands to chips (transferred to hash thread)
@@ -145,6 +150,12 @@ pub struct BitaxeBoard {
     /// Channel for publishing board state to the API server.
     /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
     state_tx: Option<watch::Sender<BoardState>>,
+    /// Fan controller configuration (target temperature, etc.)
+    fan_config: FanControllerConfig,
+    /// Handles for the thermal monitor async task
+    thermal_task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Channel for receiving
+    thermal_readings_rx: Option<watch::Receiver<Option<(Fan, TemperatureSensor)>>>,
 }
 
 impl BitaxeBoard {
@@ -193,7 +204,7 @@ impl BitaxeBoard {
             control_channel,
             asic_nrst: None,
             i2c,
-            fan_controller: None,
+            fan: None,
             regulator: None,
             data_writer: Some(FramedWrite::new(data_writer, bm13xx::FrameCodec)),
             data_reader: Some(FramedRead::new(tracing_reader, bm13xx::FrameCodec)),
@@ -203,6 +214,9 @@ impl BitaxeBoard {
             stats_task_handle: None,
             serial_number,
             state_tx: Some(state_tx),
+            fan_config: FanControllerConfig::default(),
+            thermal_task_handle: None,
+            thermal_readings_rx: None,
         })
     }
 
@@ -449,31 +463,24 @@ impl BitaxeBoard {
         }
     }
 
-    /// Initialize the fan controller
+    /// Initialize the EMC2101 and set fan speed to 100% for safety
+    /// until the thermal task kicks in.
     async fn init_fan_controller(&mut self) -> Result<()> {
-        // Clone the I2C bus for the fan controller
         let fan_i2c = self.i2c.clone();
         let mut fan = Emc2101::new(fan_i2c);
 
-        // Initialize the EMC2101
         match fan.init().await {
             Ok(()) => {
-                // Set fan to full speed until closed-loop control is implemented
                 match fan.set_fan_speed(Percent::FULL).await {
-                    Ok(()) => {
-                        debug!("Fan speed set to 100%");
-                    }
-                    Err(e) => {
-                        warn!("Failed to set fan speed: {}", e);
-                    }
+                    Ok(()) => debug!("Fan initialized at 100%"),
+                    Err(e) => warn!("Failed to set initial fan speed: {}", e),
                 }
 
-                self.fan_controller = Some(fan);
+                self.fan = Some(Arc::new(Mutex::new(fan)));
                 Ok(())
             }
             Err(e) => {
                 warn!("Failed to initialize EMC2101 fan controller: {}", e);
-                // Continue without fan control - not critical for operation
                 Ok(())
             }
         }
@@ -666,6 +673,9 @@ impl BitaxeBoard {
         // Put chip back in reset
         self.hold_in_reset().await?;
 
+        // Spawn thermal monitoring task
+        self.spawn_thermal_task();
+
         // Spawn statistics monitoring task
         self.spawn_stats_monitor();
 
@@ -679,9 +689,6 @@ impl BitaxeBoard {
 
     /// Spawn a task to periodically log and publish board telemetry.
     fn spawn_stats_monitor(&mut self) {
-        // Clone data needed for the monitoring task
-        let i2c = self.i2c.clone();
-
         // Clone the regulator Arc for stats monitoring
         let regulator = self
             .regulator
@@ -703,13 +710,15 @@ impl BitaxeBoard {
             .take()
             .expect("state_tx must be present when spawning stats monitor");
 
+        let thermal_readings_rx = self
+            .thermal_readings_rx
+            .take()
+            .expect("Thermal monitor must be initialized before stats monitor");
+
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(5);
             let mut interval = tokio::time::interval(STATS_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            // Create fan controller for the stats task
-            let mut fan_ctrl = Emc2101::new(i2c);
 
             const LOG_INTERVAL: Duration = Duration::from_secs(30);
             let mut last_log = tokio::time::Instant::now();
@@ -720,11 +729,21 @@ impl BitaxeBoard {
             loop {
                 interval.tick().await;
 
-                // -- Read sensor values --
+                // -- Get latest thermal readings --
 
-                let asic_temp = fan_ctrl.get_external_temperature().await.ok();
-                let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
-                let fan_rpm = fan_ctrl.get_rpm().await.ok();
+                let (fan, asic_temperature_sensor) =
+                    thermal_readings_rx.borrow().as_ref().cloned().unwrap_or((
+                        Fan {
+                            name: "fan".into(),
+                            rpm: None,
+                            percent: None,
+                            target_percent: None,
+                        },
+                        TemperatureSensor {
+                            name: "asic".into(),
+                            temperature_c: None,
+                        },
+                    ));
 
                 let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
                     let mut reg = regulator.lock().await;
@@ -765,17 +784,9 @@ impl BitaxeBoard {
                     name: board_name.clone(),
                     model: board_model.clone(),
                     serial: board_serial.clone(),
-                    fans: vec![Fan {
-                        name: "fan".into(),
-                        rpm: fan_rpm,
-                        percent: fan_percent,
-                        target_percent: None,
-                    }],
+                    fans: vec![fan.clone()],
                     temperatures: vec![
-                        TemperatureSensor {
-                            name: "asic".into(),
-                            temperature_c: asic_temp,
-                        },
+                        asic_temperature_sensor.clone(),
                         TemperatureSensor {
                             name: "vr".into(),
                             temperature_c: vr_temp.map(|t| t as f32),
@@ -805,9 +816,9 @@ impl BitaxeBoard {
                     info!(
                         board = %board_model,
                         serial = ?board_serial,
-                        asic_temp_c = ?asic_temp,
-                        fan_percent = ?fan_percent,
-                        fan_rpm = ?fan_rpm,
+                        asic_temp_c = ?asic_temperature_sensor.temperature_c,
+                        fan_percent = ?fan.percent,
+                        fan_rpm = ?fan.rpm,
                         vr_temp_c = ?vr_temp,
                         power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
                         current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
@@ -820,6 +831,68 @@ impl BitaxeBoard {
         });
 
         self.stats_task_handle = Some(handle);
+    }
+
+    /// Spawn a task to periodically log and publish board telemetry.
+    fn spawn_thermal_task(&mut self) {
+        let (thermal_readings_tx, thermal_readings_rx) =
+            watch::channel::<Option<(Fan, TemperatureSensor)>>(None);
+        self.thermal_readings_rx = Some(thermal_readings_rx);
+
+        let Some(emc2101) = self.fan.clone() else {
+            warn!("Skipping thermal monitor: EMC2101 fan controller is not available");
+            return;
+        };
+
+        let mut fan_controller = FanController::new(self.fan_config.clone());
+
+        let handle = tokio::spawn(async move {
+            const THERMAL_INTERVAL: Duration = Duration::from_secs(4);
+            let mut interval = tokio::time::interval(THERMAL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                let mut fan_lock = emc2101.lock().await;
+
+                // -- Read sensor values --
+
+                let fan = Fan {
+                    name: "fan".into(),
+                    rpm: fan_lock.get_rpm().await.ok(),
+                    percent: fan_lock.get_fan_speed().await.ok().map(u8::from),
+                    target_percent: None,
+                };
+
+                let temperature_sensor = TemperatureSensor {
+                    name: "asic".into(),
+                    temperature_c: fan_lock.get_external_temperature().await.ok(),
+                };
+
+                // -- Run PI controller and set the fan --
+
+                if let Some(temp) = temperature_sensor.temperature_c
+                    && let Some(speed) = fan_controller.update(temp, THERMAL_INTERVAL)
+                {
+                    match fan_lock.set_fan_speed(speed).await {
+                        Ok(_) => {
+                            debug!("Fan speed set to {}", u8::from(speed));
+                        }
+                        Err(e) => {
+                            warn!("Failed to set fan speed: {e}");
+                        }
+                    }
+                }
+
+                // -- Publish Fan and TemperatureSensor readings --
+                thermal_readings_tx
+                    .send(Some((fan, temperature_sensor)))
+                    .ok();
+            }
+        });
+
+        self.thermal_task_handle = Some(handle);
     }
 }
 
@@ -856,11 +929,23 @@ impl Board for BitaxeBoard {
         }
 
         // Reduce fan speed (no more heat generation)
-        if let Some(ref mut fan) = self.fan_controller {
-            let shutdown_speed = Percent::new_clamped(25);
-            if let Err(e) = fan.set_fan_speed(shutdown_speed).await {
-                warn!("Failed to set fan speed: {}", e);
-            }
+        if let Some(ref fan_controller) = self.fan {
+            match fan_controller
+                .lock()
+                .await
+                .set_fan_speed(Percent::new_clamped(
+                    self.fan_config.fan_speed_min_pct as u8,
+                ))
+                .await
+            {
+                Ok(()) => debug!("Fan set to {}%", self.fan_config.fan_speed_min_pct as u8),
+                Err(e) => warn!("Failed to set the fan speed: {}", e),
+            };
+        }
+
+        // Cancel the thermal monitoring task
+        if let Some(handle) = self.thermal_task_handle.take() {
+            handle.abort();
         }
 
         // Cancel the statistics monitoring task
