@@ -363,7 +363,7 @@ Still not implemented from the broader legacy stack:
     - chain summary
 - any board-MCU protocol that is specific to one carrier or backplane design
 
-The top-level `docs` PDFs reference additional JTAG and opcode material, but this port currently implements the opcode surface that is evidenced in the legacy shipping UART path and not an inferred JTAG control plane.
+This port currently implements the opcode surface that is evidenced in the legacy shipping UART path and not an inferred JTAG control plane.
 
 
 See also:
