@@ -8,7 +8,7 @@ pub mod types;
 use anyhow::{Context, Result};
 use reqwest::Client as HttpClient;
 
-use types::MinerState;
+use types::MinerTelemetry;
 
 /// Default API base URL.
 ///
@@ -39,7 +39,7 @@ impl Client {
     }
 
     /// Fetch the current miner state snapshot.
-    pub async fn get_miner(&self) -> Result<MinerState> {
+    pub async fn get_miner(&self) -> Result<MinerTelemetry> {
         self.get_json("miner").await
     }
 

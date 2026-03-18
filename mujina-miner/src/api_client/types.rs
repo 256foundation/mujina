@@ -8,16 +8,16 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Full miner state snapshot.
+/// Full miner telemetry snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
-pub struct MinerState {
+pub struct MinerTelemetry {
     pub uptime_secs: u64,
     /// Aggregate hashrate in hashes per second.
     pub hashrate: u64,
     pub shares_submitted: u64,
     pub paused: bool,
     pub boards: Vec<BoardTelemetry>,
-    pub sources: Vec<SourceState>,
+    pub sources: Vec<SourceTelemetry>,
 }
 
 /// Board telemetry snapshot.
@@ -30,7 +30,7 @@ pub struct BoardTelemetry {
     pub fans: Vec<Fan>,
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
-    pub threads: Vec<ThreadState>,
+    pub threads: Vec<ThreadTelemetry>,
 }
 
 /// Fan status.
@@ -61,9 +61,9 @@ pub struct PowerMeasurement {
     pub power_w: Option<f32>,
 }
 
-/// Per-thread runtime status.
+/// Per-thread telemetry.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ThreadState {
+pub struct ThreadTelemetry {
     pub name: String,
     /// Hashrate in hashes per second.
     pub hashrate: u64,
@@ -88,9 +88,9 @@ pub struct SetFanTargetRequest {
     pub target_percent: Option<u8>,
 }
 
-/// Job source status.
+/// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
-pub struct SourceState {
+pub struct SourceTelemetry {
     pub name: String,
     /// Connection URL (e.g. "stratum+tcp://pool:3333"), if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
