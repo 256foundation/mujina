@@ -2,27 +2,12 @@
 
 ## Scope
 
-This note captures only behavior that is grounded in material available in this workspace:
+This note captures only behavior that is grounded in material included in this repository:
 
-- top-level PDFs in `../docs`
 - legacy UART implementation in [uart.h](../bzm2_cgminer/feeds/mining_src/bzmd/uart.h) and [uart.c](../bzm2_cgminer/feeds/mining_src/bzmd/uart.c)
 - legacy exercised behavior in [test.c](../bzm2_cgminer/feeds/mining_src/bzmd/tests/test.c)
 
 Anything not evidenced there is intentionally excluded from the Mujina port.
-
-## What The PDFs Proved
-
-The top-level PDFs are present:
-
-- the vendor JTAG usage guide
-- the vendor opcode explanation guide
-
-From this shell, the PDFs are not extractable into reliable body text. The only recoverable textual evidence was:
-
-- JTAG PDF bookmark text: `PLL0/PLL1 debug signals`
-- opcode PDF outline text: `1 Document Revision History`
-
-That is not enough to justify implementing a JTAG protocol layer or inventing undocumented opcode semantics.
 
 ## What The Legacy Source Proved
 
@@ -77,4 +62,4 @@ Not implemented from the docs side:
 Reason:
 
 - the available source in this workspace proves the UART mining/control path
-- the available PDF extraction on this machine does not provide enough packet-level JTAG detail to implement anything defensible
+- the repository-visible sources do not provide enough packet-level JTAG detail to implement anything defensible

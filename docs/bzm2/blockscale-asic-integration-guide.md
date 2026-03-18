@@ -33,7 +33,7 @@ clock, load, and protect it correctly.
 
 ## ASIC At A Glance
 
-The vendor collateral and legacy host software consistently describe the
+The shipped software and observable ASIC behavior consistently indicate the
 following ASIC-level properties:
 
 - `236` hashing engine tiles per ASIC
@@ -102,7 +102,7 @@ The ASIC-facing requirements remain the same.
 
 ## Package, IO, And Mechanical Constraints
 
-The extracted vendor collateral describes:
+The package and interface behavior used by the shipped software indicate:
 
 - package size: `7.5 x 7 mm`
 - package type: exposed-die molded `FCLGA`
@@ -128,7 +128,7 @@ engine-stack ranges:
 - bottom stack: approximately `0.0 V` to `0.355 V`
 - top stack: approximately `0.355 V` to `0.71 V`
 
-Additional named rails described in the vendor material:
+Additional named rails used by the legacy platform:
 
 - GPIO / control IO: `1.2 V`
 - `VDD_HASH`: nominal `0.71 V`
@@ -161,14 +161,14 @@ debug-only data.
 
 ### External reference clock
 
-The ASIC expects an external reference clock on `REFCLKIN`. The extracted
-datasheet text describes:
+The ASIC expects an external reference clock on `REFCLKIN`. The hardware
+interface used by the shipped software assumes:
 
 - `REFCLKIN` as the ASIC reference clock input
 - maximum reference clock on that pin up to `50 MHz`
 
-The same collateral also exposes `REFCLKOUT1` and `REFCLKOUT2`, primarily as
-debug-oriented outputs.
+The same interface model also exposes `REFCLKOUT1` and `REFCLKOUT2`, primarily
+as debug-oriented outputs.
 
 ### Internal PLLs
 
@@ -215,7 +215,7 @@ UART is the primary host interface for:
 
 ### Practical UART assumptions
 
-The extracted materials and legacy software consistently use:
+The shipped software consistently uses:
 
 - default ASIC baud: `5 Mbps`
 - host notch / slow clock during bring-up: `50 MHz`
@@ -226,7 +226,7 @@ scheme.
 
 ### Chain orientation and pin muxing
 
-The vendor material describes a `PINSEL`-based pin muxing arrangement where the
+The hardware interface uses a `PINSEL`-based pin muxing arrangement where the
 same physical pins can serve as:
 
 - `RX_IN` / `TX_OUT`
@@ -241,7 +241,7 @@ the important point is:
 
 ### ASIC enumeration model
 
-The documented enumeration flow is:
+The enumeration flow implemented by the legacy stack is:
 
 1. all ASICs start with default `ASIC_ID = 0xFA`
 2. the host addresses `0xFA`
@@ -277,8 +277,7 @@ Reserve unicast for:
 
 ## Power-Up And Bring-Up Sequence
 
-The vendor documents describe a specific reference flow, but the reusable logic
-for any custom board is:
+The reusable logic for any custom board is:
 
 ```mermaid
 flowchart TD
@@ -310,8 +309,8 @@ flowchart TD
 
 ### Dummy-job use is not optional in stacked systems
 
-The software guide and calibration material both treat dummy jobs as part of
-power balancing, not merely a debug trick. In practice, dummy jobs help:
+The shipped software treats dummy jobs as part of power balancing, not merely a
+debug trick. In practice, dummy jobs help:
 
 - keep engines drawing current
 - maintain stack balance during ramp-up
@@ -322,7 +321,7 @@ power balancing, not merely a debug trick. In practice, dummy jobs help:
 
 ### Enhanced mode
 
-Enhanced mode is the default engine programming mode. The documented sequence
+Enhanced mode is the default engine programming mode. The implemented sequence
 for a valid four-lane engine-tile submission is:
 
 1. enable TCE clocks
@@ -343,7 +342,7 @@ They differ by:
 
 ### Job control behavior
 
-The documented `JobControl` modes matter operationally:
+The `JobControl` modes matter operationally:
 
 - `0x1`: mark pending job ready
 - `0x2`: cancel current and pending job, return to idle
@@ -353,7 +352,8 @@ That cancel path is essential for recovery from invalid or stale engine state.
 
 ### Partial and invalid programming
 
-The hardware documents are explicit about failure behavior:
+The legacy software behavior and protocol handling make the failure behavior
+clear:
 
 - partial programming can consume bytes from a following write and create
   unintended nonces
@@ -367,8 +367,8 @@ Do not assume the ASIC silently sanitizes malformed software behavior.
 
 ### Temperature sensing
 
-The ASIC exposes a digital temperature sensor. The developer guide and legacy
-software both use the same conversion family:
+The ASIC exposes a digital temperature sensor. The legacy software uses the
+following conversion family:
 
 ```text
 T = K + Y * (N - 2^11 / 2^R) / 2^12
@@ -387,7 +387,7 @@ At default 12-bit resolution, a raw code near `2084` maps to approximately
 
 ### Voltage sensing
 
-The voltage conversion used by the vendor guide and legacy implementation is:
+The voltage conversion used by the legacy implementation is:
 
 ```text
 V = 1000 * (2 / 5) * VREF * (6 * N / 2^14 - 3 / 2^R - 1)

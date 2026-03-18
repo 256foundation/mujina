@@ -15,7 +15,7 @@ It is written as a practical reference for:
 
 ## Link Characteristics
 
-The vendor material and legacy host software consistently assume:
+The legacy host software consistently assumes:
 
 - default ASIC UART baud: `5 Mbps`
 - `1.2 V` IO signaling on UART-related pads
@@ -42,8 +42,8 @@ The documented system addressing model allocates:
 - top `0xFxx` engine-ID region for non-engine / local functions such as PLLs,
   sensors, and internal controller blocks
 
-Do not assume engine IDs are contiguous or fully populated. The vendor material
-explicitly allows holes due to disabled or missing engines.
+Do not assume engine IDs are contiguous or fully populated. Disabled or missing
+engines create holes that software must tolerate.
 
 ## ASIC Identification
 
@@ -85,8 +85,8 @@ Use multicast when you need:
 - efficient fanout inside one ASIC or across ASICs
 - validation flows that target equivalent engine positions
 
-The vendor material treats multicast write as a row-group fanout mechanism and
-also uses it as the basis for some broadcast-style write patterns.
+Multicast write acts as a row-group fanout mechanism and is also used as the
+basis for some broadcast-style write patterns.
 
 ## Opcode Summary
 
@@ -311,14 +311,14 @@ functional correctness problems.
 TDM lets ASICs stream data back to the host in time slots associated with ASIC
 IDs.
 
-The extracted datasheet text describes:
+The hardware interface used by the shipped software assumes:
 
 - an ASIC owns TX opportunity when the slot matches its `ASIC_ID`
 - the ASIC begins transmission after a programmed TDM delay
 - TDM can carry multiple response classes including register responses, results,
   `NOOP`, and thermal / voltage data
 
-The software guide gives a practical example:
+The shipped software implies a practical example:
 
 - with `128` bit-time slots at `5 MHz`, a TDM frame is approximately `2.5 ms`
 
@@ -326,7 +326,7 @@ That matters because it bounds result and telemetry latency across a long chain.
 
 ## Result Aggregation Model
 
-The software guide describes a two-stage buffering model:
+The shipped software uses a two-stage buffering model:
 
 - each engine tile has an `8`-deep local result FIFO
 - the ASIC notch block has a `16`-deep ASIC-level result FIFO
@@ -342,9 +342,9 @@ Host-visible implications:
 
 ### TDM sensor behavior
 
-The datasheet describes thermal and voltage telemetry as a TDM payload source.
-The voltage / thermal packet is described as the fourth packet class in TDM
-operation.
+Thermal and voltage telemetry are exposed as a TDM payload source in the
+implemented interface. The voltage / thermal packet is treated as the fourth
+packet class in TDM operation.
 
 ### Direct query behavior
 
@@ -356,8 +356,7 @@ repository.
 
 ## DTS / VS Payload Layout
 
-The vendor material describes an 8-byte sensor payload. At a practical level,
-the host needs to extract:
+The implemented 8-byte sensor payload requires the host to extract:
 
 - thermal tune code
 - thermal validity / enable bits
@@ -409,7 +408,7 @@ Where:
 
 ## `NOOP` Timing Caution
 
-The datasheet text includes a specific warning for `NOOP`:
+The legacy timing rules include a specific warning for `NOOP`:
 
 - do not issue back-to-back `NOOP` commands with only one stop bit of spacing
 - in non-TDM mode, maintain at least a three-byte gap between consecutive
