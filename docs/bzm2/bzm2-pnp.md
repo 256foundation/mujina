@@ -45,7 +45,7 @@ The reusable algorithmic parts are:
 ## Mujina Ported Behavior
 
 The new Rust module at
-`mujina-miner/src/asic/bzm2/pnp.rs`
+`mujina-miner/src/tuning/blockscale.rs`
 implements the reusable planner without pulling board-MCU or PSU glue into the ASIC layer.
 
 Implemented:
@@ -125,4 +125,3 @@ What still remains outside the ASIC planner layer:
 - reimplementation of the legacy CSV/database layer
 
 Those pieces still belong above the ASIC planner, in board or daemon integration layers.
-

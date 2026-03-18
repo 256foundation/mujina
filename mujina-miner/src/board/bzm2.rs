@@ -18,12 +18,8 @@ use crate::{
     },
     asic::{
         bzm2::{
-            Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput, Bzm2BringupPlan,
-            Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
-            Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2DomainMeasurement,
-            Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2Pll, Bzm2SavedEngineCoordinate,
-            Bzm2SavedEngineTopology, Bzm2SavedOperatingPoint, Bzm2Thread, Bzm2ThreadConfig,
-            Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController, Bzm2VoltageDomain,
+            Bzm2BringupPlan, Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2Pll, Bzm2Thread,
+            Bzm2ThreadConfig, Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController,
             FileGpioPin, FilePowerRail, GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
         },
         hash_thread::{
@@ -33,6 +29,12 @@ use crate::{
     },
     tracing::prelude::*,
     transport::{SerialControl, SerialStream},
+    tuning::blockscale::{
+        Bzm2AsicMeasurement, Bzm2AsicTopology, Bzm2BoardCalibrationInput,
+        Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlanner,
+        Bzm2DomainMeasurement, Bzm2OperatingClass, Bzm2PerformanceMode, Bzm2SavedEngineCoordinate,
+        Bzm2SavedEngineTopology, Bzm2SavedOperatingPoint, Bzm2VoltageDomain,
+    },
 };
 
 const DEFAULT_BAUD_RATE: u32 = 5_000_000;
@@ -2661,7 +2663,7 @@ fn store_calibration_profile(
 }
 
 fn estimate_planned_hashrate(
-    plan: &crate::asic::bzm2::Bzm2CalibrationPlan,
+    plan: &crate::tuning::blockscale::Bzm2CalibrationPlan,
     nominal_hashrate_ths: f32,
     asics: &[Bzm2AsicTopology],
 ) -> f32 {

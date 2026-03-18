@@ -1,6 +1,5 @@
 pub mod clock;
 pub mod control;
-pub mod pnp;
 pub mod protocol;
 pub mod thread;
 pub mod uart;
@@ -12,13 +11,6 @@ pub use clock::{
 pub use control::{
     Bzm2BringupPlan, FileGpioPin, FilePowerRail, GpioResetLine, PowerRailTelemetry,
     Tps546PowerRail, VoltageStackStep,
-};
-pub use pnp::{
-    Bzm2AsicMeasurement, Bzm2AsicPlan, Bzm2AsicTopology, Bzm2BoardCalibrationInput,
-    Bzm2CalibrationConstraints, Bzm2CalibrationMode, Bzm2CalibrationPlan, Bzm2CalibrationPlanner,
-    Bzm2CalibrationSweepRequest, Bzm2DomainMeasurement, Bzm2DomainPlan, Bzm2OperatingClass,
-    Bzm2PerformanceMode, Bzm2SavedEngineCoordinate, Bzm2SavedEngineTopology,
-    Bzm2SavedOperatingPoint, Bzm2VoltageDomain,
 };
 pub use protocol::Bzm2EngineLayout;
 pub use thread::{
