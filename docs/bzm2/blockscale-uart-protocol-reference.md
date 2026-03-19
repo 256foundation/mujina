@@ -351,8 +351,8 @@ packet class in TDM operation.
 `DTS_VS` can also be used as a direct query opcode when explicit on-demand
 sensor retrieval is needed.
 
-This is the model now exposed in the Rust debug CLI and HTTP API in this
-repository.
+This is the model now exposed through the runtime thread path and HTTP API in
+this repository.
 
 ## DTS / VS Payload Layout
 
@@ -433,16 +433,11 @@ That is also how the Rust tooling in this repository is structured.
 Relevant follow-on references in this repository:
 
 - [ASIC Integration Guide](blockscale-asic-integration-guide.md)
-- [BZM2 UART Debug Guide](bzm2-uart-debug.md)
 - [BZM2 Port Note](bzm2-port.md)
 
-The Rust debug CLI already exposes:
+The Rust implementation already exposes:
 
-- `NOOP` scans
-- loopback scans
-- TDM watch mode
-- direct `DTS_VS` queries
-- result polling
-- PLL and DLL diagnostics
-- broadcast and multicast helpers
-- silicon-validation flows
+- board and API diagnostics for `NOOP`, loopback, register reads and writes,
+  and clock reporting
+- direct `DTS_VS` telemetry query through the board API
+- result parsing and engine-map discovery through the runtime thread path

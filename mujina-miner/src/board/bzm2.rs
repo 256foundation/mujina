@@ -65,7 +65,7 @@ const DEFAULT_BRINGUP_RELEASE_RESET_MS: u64 = 25;
 const DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
-pub struct Bzm2VirtualDeviceConfig {
+pub struct Bzm2RuntimeConfig {
     pub serial_paths: Vec<String>,
     pub baud_rate: u32,
     pub timestamp_count: u8,
@@ -79,7 +79,7 @@ pub struct Bzm2VirtualDeviceConfig {
     pub bringup: Bzm2BringupConfig,
 }
 
-impl Bzm2VirtualDeviceConfig {
+impl Bzm2RuntimeConfig {
     pub fn from_env() -> Option<Self> {
         let raw_paths = env::var("MUJINA_BZM2_SERIAL")
             .ok()
@@ -944,7 +944,7 @@ struct Bzm2RuntimeMeasurementCache {
 }
 
 pub struct Bzm2Board {
-    config: Bzm2VirtualDeviceConfig,
+    config: Bzm2RuntimeConfig,
     bringup_applied: bool,
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
@@ -961,7 +961,7 @@ pub struct Bzm2Board {
 
 impl Bzm2Board {
     pub fn new(
-        config: Bzm2VirtualDeviceConfig,
+        config: Bzm2RuntimeConfig,
         state_tx: watch::Sender<BoardState>,
         command_rx: mpsc::Receiver<BoardCommand>,
     ) -> Self {
@@ -2935,7 +2935,7 @@ fn calibration_error(serial_path: &str, err: impl std::fmt::Display) -> BoardErr
 
 async fn create_bzm2_board()
 -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let config = Bzm2VirtualDeviceConfig::from_env().ok_or_else(|| {
+    let config = Bzm2RuntimeConfig::from_env().ok_or_else(|| {
         crate::error::Error::Config("BZM2 not configured (MUJINA_BZM2_SERIAL not set)".into())
     })?;
 
@@ -3041,7 +3041,7 @@ mod tests {
         let rail0_path = std::env::temp_dir().join(format!("bzm2-domain-rail0-{unique}.txt"));
         let rail1_path = std::env::temp_dir().join(format!("bzm2-domain-rail1-{unique}.txt"));
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3159,7 +3159,7 @@ mod tests {
         let original = serde_json::to_string_pretty(&persisted).unwrap();
         fs::write(&profile_path, &original).unwrap();
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3227,7 +3227,7 @@ mod tests {
             .into_owned();
         let emulator = spawn_chain_emulator(master, 2, 0);
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3283,7 +3283,7 @@ mod tests {
             .unwrap();
         });
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3335,7 +3335,7 @@ mod tests {
         let enable1_path = std::env::temp_dir().join(format!("bzm2-enable1-{unique}.txt"));
         let reset_path = std::env::temp_dir().join(format!("bzm2-reset-{unique}.txt"));
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3438,7 +3438,7 @@ mod tests {
         fs::write(&power_path, "1275\n").unwrap();
         fs::write(&temp_path, "47000\n").unwrap();
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
@@ -3536,7 +3536,7 @@ mod tests {
         ));
         fs::write(&sensor_path, "90\n").unwrap();
 
-        let config = Bzm2VirtualDeviceConfig {
+        let config = Bzm2RuntimeConfig {
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,

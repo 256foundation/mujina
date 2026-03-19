@@ -39,7 +39,7 @@ reviving the original split `cgminer` plus `bzmd` process model.
   and a single [Bitaxe](mujina-miner/src/board/bitaxe_gamma.md) board is enough
   to contribute meaningfully
 - **BZM2 Port In Progress**: Native Rust BZM2 support with direct UART work
-  dispatch, result parsing, telemetry, debug tooling, and startup tuning flows
+  dispatch, result parsing, telemetry, API diagnostics, and startup tuning flows
 
 ## Supported Hardware
 
@@ -53,8 +53,8 @@ Experimental support in this repository:
   - direct UART mining path
   - PLL and DLL diagnostics
   - DTS/VS telemetry through the API
-  - on-demand DTS/VS query support through CLI and HTTP API
-  - silicon-validation helpers adapted from the legacy silicon validation stack
+  - on-demand DTS/VS query support through the HTTP API
+  - board/API diagnostics for chain state, register access, and clock reporting
 
 Planned support:
 - **EmberOne** with BM1362 ASIC
@@ -75,8 +75,6 @@ ASIC path.
 - [REST API](docs/api.md) - API contract, conventions, and endpoints
 - [BZM2 Port Note](docs/bzm2/bzm2-port.md) - Architecture, implemented behavior,
   telemetry, and current scope boundaries for the BZM2 port
-- [BZM2 UART Debug Guide](docs/bzm2/bzm2-uart-debug.md) - CLI usage for UART,
-  telemetry queries, TDM observation, clock diagnostics, and validation flows
 - [BZM2 Tuning Planner](docs/bzm2/bzm2-pnp.md) - Tuning-planner behavior and current
   calibration scope
 - [BZM2 Opcode Grounding](docs/bzm2/bzm2-opcode-grounding.md) - Source-grounded UART
@@ -171,24 +169,16 @@ Enable the BZM2 path by pointing Mujina at one or more serial devices:
 MUJINA_BZM2_SERIAL="/dev/ttyUSB0" \
 MUJINA_BZM2_BAUD="5000000" \
 MUJINA_BZM2_DTS_VS_GEN="2" \
-cargo run -p mujina-miner --bin minerd
+cargo run -p mujina-miner --bin mujina-minerd
 ```
 
-Useful companion tooling:
+Query refreshed ASIC telemetry over HTTP:
 
 ```bash
-# Query one ASIC's DTS/VS telemetry directly
-cargo run -p mujina-miner --bin mujina-bzm2-debug -- \
-  dts-vs-query /dev/ttyUSB0 2 gen2 1500 5000000
-
-# Read refreshed board telemetry over HTTP
 curl -X POST http://127.0.0.1:7785/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
   -H "Content-Type: application/json" \
   -d '{"thread_index":0,"asic":2}'
 ```
-
-See [BZM2 UART Debug Guide](docs/bzm2/bzm2-uart-debug.md) for the full command
-surface.
 
 ### API Server
 

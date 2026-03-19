@@ -11,8 +11,8 @@ The legacy split looked like this:
 
 In Mujina, those responsibilities map cleanly onto existing abstractions:
 
-- `Daemon` injects a virtual `bzm2` board when configured
-- `Backplane` instantiates the virtual board through `inventory`
+- `Daemon` can attach a configured `bzm2` board directly from serial-path configuration
+- `Backplane` instantiates the board through the virtual-board registry
 - `board::bzm2::Bzm2Board` opens serial transports and creates hash threads
 - `asic::bzm2::Bzm2Thread` performs direct UART job dispatch, telemetry parsing, and share validation
 - `board::power` provides reusable GPIO-reset and PMBus/I2C rail sequencing primitives
@@ -60,7 +60,6 @@ The BZM2 Mujina thread now reimplements the core legacy data path and the genera
 - reusable multi-rail bring-up and shutdown sequencing for single-rail, small-stack, and larger multi-stack designs
 - UART-register-based PLL diagnostic/control flow for divider programming, enable/disable, lock polling, and readback
 - UART-register-based DLL diagnostic/control flow for duty-cycle programming, enable/disable, lock polling, and fincon validation
-- developer-facing UART debug CLI documented in [bzm2-uart-debug.md](bzm2-uart-debug.md) with unicast, multicast, and broadcast examples
 - domain-aware BZM2 tuning planner documented in [bzm2-pnp.md](bzm2-pnp.md) for operating-class and performance-mode target selection, search-space generation, and per-domain plus per-ASIC tuning
 
 ## Configuration
@@ -208,10 +207,9 @@ This is useful when:
 - one ASIC is misbehaving and needs targeted inspection
 - developers want a direct sensor read without enabling a full TDM watch session
 
-Two access paths are implemented:
+The query path is exposed through the HTTP API:
 
-- CLI: `mujina-bzm2-debug dts-vs-query` and `mujina-bzm2-debug dts-vs-scan`
-- HTTP API: `POST /api/v0/boards/{name}/bzm2/dts-vs-query`
+- `POST /api/v0/boards/{name}/bzm2/dts-vs-query`
 
 The query path runs through the live BZM2 hash-thread actor so UART ownership remains correct. Queried frames are converted through the same telemetry code path used for passive DTS/VS reporting, so the returned values land in normal `BoardState` telemetry.
 
@@ -222,8 +220,6 @@ curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
   -H "Content-Type: application/json" \
   -d '{"thread_index":0,"asic":2}'
 ```
-
-See [bzm2-uart-debug.md](bzm2-uart-debug.md) for CLI usage examples and expected output shape.
 
 ## On-Demand Engine Discovery
 
@@ -290,8 +286,8 @@ Current safety boundary:
 If either condition is false, the command is rejected rather than racing active
 mining traffic or background telemetry frames.
 
-`clock-report` returns the same PLL/DLL status surface already exposed by the
-standalone Rust debug CLI:
+`clock-report` returns the same PLL/DLL status surface used by the low-level
+UART diagnostics during development:
 
 - PLL enable register
 - PLL misc register

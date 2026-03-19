@@ -15,7 +15,7 @@ use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
-    board::bzm2::Bzm2VirtualDeviceConfig,
+    board::bzm2::Bzm2RuntimeConfig,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -25,10 +25,7 @@ use crate::{
     },
     scheduler::{self, SourceRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    transport::{
-        CpuDeviceInfo, TransportEvent, UsbTransport, VirtualDeviceInfo, cpu as cpu_transport,
-        virtual_device,
-    },
+    transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
 /// The main daemon.
@@ -82,28 +79,22 @@ impl Daemon {
             }
         }
 
-        if let Some(config) = Bzm2VirtualDeviceConfig::from_env() {
-            info!(
-                serials = config.serial_paths.len(),
-                baud = config.baud_rate,
-                "BZM2 virtual board enabled"
-            );
-            let event = TransportEvent::Virtual(
-                virtual_device::TransportEvent::VirtualDeviceConnected(VirtualDeviceInfo {
-                    device_type: "bzm2".into(),
-                    device_id: config.device_id(),
-                }),
-            );
-            if let Err(e) = transport_tx.send(event).await {
-                error!("Failed to send BZM2 virtual board event: {}", e);
-            }
-        }
         // Board registration channel: backplane forwards board
         // registrations here, the API server collects and serves them.
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx);
+        if let Some(config) = Bzm2RuntimeConfig::from_env() {
+            info!(
+                serials = config.serial_paths.len(),
+                baud = config.baud_rate,
+                "BZM2 board enabled from configured serial paths"
+            );
+            backplane
+                .attach_configured_board("bzm2", config.device_id())
+                .await?;
+        }
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
