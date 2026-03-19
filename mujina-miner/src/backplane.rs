@@ -117,7 +117,7 @@ impl Backplane {
     async fn start_board(
         &mut self,
         board_id: String,
-        mut board: Box<dyn Board + Send>,
+        board: Box<dyn Board + Send>,
         registration: BoardRegistration,
     ) {
         let board_info = board.board_info();
@@ -130,7 +130,15 @@ impl Backplane {
             );
         }
 
-        match board.create_hash_threads().await {
+        self.boards.insert(board_id.clone(), board);
+
+        match self
+            .boards
+            .get_mut(&board_id)
+            .unwrap()
+            .create_hash_threads()
+            .await
+        {
             Ok(threads) => {
                 info!(
                     board = %board_info.model,
@@ -138,9 +146,6 @@ impl Backplane {
                     threads = threads.len(),
                     "Board started."
                 );
-
-                // Store board for lifecycle management
-                self.boards.insert(board_id.clone(), board);
 
                 for thread in threads {
                     if let Err(e) = self.scheduler_tx.send(thread).await {
