@@ -3,6 +3,7 @@ pub(crate) mod bzm2;
 pub mod cpu;
 pub(crate) mod emberone;
 pub mod pattern;
+pub mod power;
 
 use anyhow::Result;
 use async_trait::async_trait;
