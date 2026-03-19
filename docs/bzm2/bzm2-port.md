@@ -15,14 +15,14 @@ In Mujina, those responsibilities map cleanly onto existing abstractions:
 - `Backplane` instantiates the virtual board through `inventory`
 - `board::bzm2::Bzm2Board` opens serial transports and creates hash threads
 - `asic::bzm2::Bzm2Thread` performs direct UART job dispatch, telemetry parsing, and share validation
-- `asic::bzm2::control` provides reusable GPIO-reset and PMBus/I2C rail sequencing primitives
+- `board::power` provides reusable GPIO-reset and PMBus/I2C rail sequencing primitives
 
 A standalone Rust daemon is therefore not required for the mining path.
 
 ## Bring-Up And Shutdown
 
 `Bzm2Board` now supports optional board-level power and reset sequencing through
-the existing `Bzm2BringupPlan`.
+the existing `VoltageStackBringupPlan`.
 
 The current generic integration path uses file-backed adapters:
 
@@ -369,3 +369,4 @@ This port currently implements the opcode surface that is evidenced in the legac
 See also:
 
 - [bzm2-opcode-grounding.md](bzm2-opcode-grounding.md) for the source-grounded opcode matrix and the current JTAG evidence boundary
+

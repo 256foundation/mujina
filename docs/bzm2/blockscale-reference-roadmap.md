@@ -89,7 +89,7 @@ Objective:
 
 Deliverables:
 
-1. Wire `Bzm2BringupPlan` into `Bzm2Board`
+1. Wire `VoltageStackBringupPlan` into `Bzm2Board`
 2. Add a concrete board-facing rail bundle abstraction:
    - one or more rails
    - optional reset line
@@ -99,7 +99,7 @@ Deliverables:
 
 Status:
 
-- completed: `Bzm2BringupPlan` is now wired into `Bzm2Board` startup and
+- completed: `VoltageStackBringupPlan` is now wired into `Bzm2Board` startup and
   shutdown through generic file-backed rail and reset adapters
 - completed: optional file-backed rail telemetry now flows into `BoardState`
 - next: map planned domain voltages onto those startup/shutdown hooks
@@ -330,3 +330,4 @@ Reason:
 - enumeration removes a major assumption from the current board runtime
 - it is ASIC-generic
 - it is directly grounded in documented and legacy UART behavior
+

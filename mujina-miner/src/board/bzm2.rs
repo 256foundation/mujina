@@ -18,14 +18,17 @@ use crate::{
     },
     asic::{
         bzm2::{
-            Bzm2BringupPlan, Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2Pll, Bzm2Thread,
-            Bzm2ThreadConfig, Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController,
-            FileGpioPin, FilePowerRail, GpioResetLine, VoltageStackStep, control::Bzm2PowerRail,
+            Bzm2ClockController, Bzm2DiscoveredEngineMap, Bzm2Pll, Bzm2Thread, Bzm2ThreadConfig,
+            Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController,
         },
         hash_thread::{
             HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
             HashThreadStatus, HashThreadTelemetryUpdate,
         },
+    },
+    board::power::{
+        FileGpioPin, FilePowerRail, GpioResetLine, PowerRail, VoltageStackBringupPlan,
+        VoltageStackStep,
     },
     tracing::prelude::*,
     transport::{SerialControl, SerialStream},
@@ -215,7 +218,7 @@ pub struct Bzm2BringupConfig {
     pub rail_temperature: Vec<SensorSpec>,
     pub reset_path: Option<String>,
     pub reset_active_low: bool,
-    pub plan: Bzm2BringupPlan,
+    pub plan: VoltageStackBringupPlan,
 }
 
 impl Default for Bzm2BringupConfig {
@@ -234,7 +237,7 @@ impl Default for Bzm2BringupConfig {
             rail_temperature: Vec::new(),
             reset_path: None,
             reset_active_low: true,
-            plan: Bzm2BringupPlan {
+            plan: VoltageStackBringupPlan {
                 pre_power_delay: Duration::from_millis(DEFAULT_BRINGUP_PRE_POWER_MS),
                 post_power_delay: Duration::from_millis(DEFAULT_BRINGUP_POST_POWER_MS),
                 release_reset_delay: Duration::from_millis(DEFAULT_BRINGUP_RELEASE_RESET_MS),
@@ -297,7 +300,7 @@ impl Bzm2BringupConfig {
             || !rail_set_paths.is_empty()
             || reset_path.is_some();
 
-        let mut plan = Bzm2BringupPlan {
+        let mut plan = VoltageStackBringupPlan {
             assert_reset_before_power: env_flag_default_any(
                 &["MUJINA_BZM2_ASSERT_RESET_BEFORE_POWER"],
                 true,
@@ -3362,7 +3365,7 @@ mod tests {
                 rail_temperature: Vec::new(),
                 reset_path: Some(reset_path.to_string_lossy().into_owned()),
                 reset_active_low: true,
-                plan: Bzm2BringupPlan {
+                plan: VoltageStackBringupPlan {
                     pre_power_delay: Duration::ZERO,
                     post_power_delay: Duration::ZERO,
                     release_reset_delay: Duration::ZERO,
