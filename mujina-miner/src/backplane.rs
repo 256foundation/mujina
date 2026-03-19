@@ -142,7 +142,7 @@ impl Backplane {
             Ok(threads) => {
                 info!(
                     board = %board_info.model,
-                    id = %board_id,
+                    serial = %board_id,
                     threads = threads.len(),
                     "Board started."
                 );
@@ -161,7 +161,7 @@ impl Backplane {
             Err(e) => {
                 error!(
                     board = %board_info.model,
-                    id = %board_id,
+                    serial = %board_id,
                     error = %e,
                     "Board failed to start."
                 );
@@ -279,18 +279,18 @@ impl Backplane {
             CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
                 if let Some(mut board) = self.boards.remove(&device_id) {
                     let model = board.board_info().model;
-                    debug!(board = %model, id = %device_id, "Shutting down CPU miner");
+                    debug!(board = %model, serial = %device_id, "Shutting down board");
 
                     match board.shutdown().await {
                         Ok(()) => {
-                            info!(board = %model, id = %device_id, "CPU miner disconnected");
+                            info!(board = %model, serial = %device_id, "Board disconnected");
                         }
                         Err(e) => {
                             error!(
                                 board = %model,
-                                id = %device_id,
+                                serial = %device_id,
                                 error = %e,
-                                "Failed to shutdown CPU miner"
+                                "Failed to shutdown board"
                             );
                         }
                     }
