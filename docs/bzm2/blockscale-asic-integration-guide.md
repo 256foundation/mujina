@@ -536,11 +536,10 @@ ASIC behavior discussed above:
 - DTS/VS telemetry
 - on-demand sensor query support
 - startup tuning and saved operating-point replay
-- silicon-validation CLI flows
+- board and API diagnostics for low-level validation
 
 Relevant follow-on documents:
 
 - [UART and TDM Reference](blockscale-uart-protocol-reference.md)
 - [BZM2 Port Note](bzm2-port.md)
-- [BZM2 UART Debug Guide](bzm2-uart-debug.md)
 - [BZM2 Tuning Planner](bzm2-pnp.md)

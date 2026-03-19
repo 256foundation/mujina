@@ -10,7 +10,6 @@ use anyhow::Result;
 pub mod cpu;
 pub mod serial;
 pub mod usb;
-pub mod virtual_device;
 
 // Re-export transport implementations
 pub use cpu::CpuDeviceInfo;
@@ -19,7 +18,6 @@ pub use serial::{
     SerialWriter,
 };
 pub use usb::{UsbDeviceInfo, UsbTransport};
-pub use virtual_device::VirtualDeviceInfo;
 
 /// Generic transport event that can represent different transport types.
 #[derive(Debug)]
@@ -29,9 +27,6 @@ pub enum TransportEvent {
 
     /// CPU miner virtual device event
     Cpu(cpu::TransportEvent),
-
-    /// Generic virtual device event
-    Virtual(virtual_device::TransportEvent),
 }
 
 /// Common trait for transport discovery (future enhancement).

@@ -64,11 +64,6 @@ path = "src/bin/cli.rs"
 [[bin]]
 name = "mujina-tui"
 path = "src/bin/tui.rs"
-
-
-[[bin]]
-name = "mujina-bzm2-debug"
-path = "src/bin/bzm2-debug.rs"
 [features]
 default = []
 skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environments
