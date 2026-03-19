@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
@@ -22,8 +23,8 @@ use crate::{
             Bzm2ThreadHandle, Bzm2ThreadRuntimeMetrics, Bzm2UartController,
         },
         hash_thread::{
-            HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-            HashThreadStatus, HashThreadTelemetryUpdate,
+            HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus,
+            HashThreadTelemetryUpdate,
         },
     },
     board::power::{
@@ -1832,7 +1833,7 @@ impl Board for Bzm2Board {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<(), BoardError> {
+    async fn shutdown(&mut self) -> AnyhowResult<()> {
         if let Some(tx) = self.monitor_shutdown.take() {
             let _ = tx.send(true);
         }
@@ -1861,7 +1862,7 @@ impl Board for Bzm2Board {
         Ok(())
     }
 
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
+    async fn create_hash_threads(&mut self) -> AnyhowResult<Vec<Box<dyn HashThread>>> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
         self.apply_bringup_sequence().await?;
@@ -1967,7 +1968,7 @@ impl HashThread for Bzm2ManagedThread {
     async fn update_task(
         &mut self,
         new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    ) -> AnyhowResult<Option<HashTask>> {
         let result = self.inner.update_task(new_task).await;
         self.publish_status(&self.inner.status());
         result
@@ -1976,13 +1977,13 @@ impl HashThread for Bzm2ManagedThread {
     async fn replace_task(
         &mut self,
         new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    ) -> AnyhowResult<Option<HashTask>> {
         let result = self.inner.replace_task(new_task).await;
         self.publish_status(&self.inner.status());
         result
     }
 
-    async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
+    async fn go_idle(&mut self) -> AnyhowResult<Option<HashTask>> {
         let result = self.inner.go_idle().await;
         self.publish_status(&self.inner.status());
         result
@@ -2934,9 +2935,9 @@ fn calibration_error(serial_path: &str, err: impl std::fmt::Display) -> BoardErr
 }
 
 async fn create_bzm2_board()
--> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+-> AnyhowResult<(Box<dyn Board + Send>, super::BoardRegistration)> {
     let config = Bzm2RuntimeConfig::from_env().ok_or_else(|| {
-        crate::error::Error::Config("BZM2 not configured (MUJINA_BZM2_SERIAL not set)".into())
+        anyhow::anyhow!("BZM2 not configured (MUJINA_BZM2_SERIAL not set)")
     })?;
 
     let serial = config.device_id();
