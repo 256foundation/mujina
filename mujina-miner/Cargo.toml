@@ -11,6 +11,8 @@ default-run = "mujina-minerd"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
 axum = { workspace = true }
 bitcoin = { workspace = true }
 bitflags = { workspace = true }
@@ -69,6 +71,7 @@ skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environ
 http = "1"
 http-body-util = "0.1"
 serial_test = "3.3.1"
+tempfile = "3"
 test-case = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = "0.5"
