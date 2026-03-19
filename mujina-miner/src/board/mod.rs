@@ -52,6 +52,37 @@ pub struct BoardInfo {
     pub serial_number: Option<String>,
 }
 
+/// Board-specific errors used for board command/query paths.
+#[derive(Debug)]
+pub enum BoardError {
+    /// Hardware initialization failed
+    InitializationFailed(String),
+    /// Communication error with board
+    Communication(std::io::Error),
+    /// GPIO or hardware control error
+    HardwareControl(String),
+}
+
+impl fmt::Display for BoardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BoardError::InitializationFailed(msg) => {
+                write!(f, "Board initialization failed: {}", msg)
+            }
+            BoardError::Communication(err) => write!(f, "Board communication error: {}", err),
+            BoardError::HardwareControl(msg) => write!(f, "Hardware control error: {}", msg),
+        }
+    }
+}
+
+impl Error for BoardError {}
+
+impl From<std::io::Error> for BoardError {
+    fn from(err: std::io::Error) -> Self {
+        BoardError::Communication(err)
+    }
+}
+
 /// Registration data returned by board factory functions.
 ///
 /// Bundles the channels needed for the rest of the system to communicate

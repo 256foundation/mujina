@@ -498,7 +498,7 @@ impl HashThread for Bzm2Thread {
     async fn update_task(
         &mut self,
         new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    ) -> anyhow::Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::UpdateTask {
@@ -510,12 +510,13 @@ impl HashThread for Bzm2Thread {
         response_rx
             .await
             .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
     async fn replace_task(
         &mut self,
         new_task: HashTask,
-    ) -> Result<Option<HashTask>, HashThreadError> {
+    ) -> anyhow::Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::ReplaceTask {
@@ -527,9 +528,10 @@ impl HashThread for Bzm2Thread {
         response_rx
             .await
             .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
-    async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
+    async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::GoIdle { response_tx })
@@ -538,6 +540,7 @@ impl HashThread for Bzm2Thread {
         response_rx
             .await
             .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
