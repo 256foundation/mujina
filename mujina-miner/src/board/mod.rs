@@ -1,12 +1,14 @@
 pub(crate) mod bitaxe;
+pub(crate) mod bzm2;
 pub mod cpu;
 pub(crate) mod emberone;
 pub mod pattern;
+pub mod power;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use std::{future::Future, pin::Pin};
-use tokio::sync::watch;
+use std::{error::Error, fmt, future::Future, pin::Pin};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
@@ -50,6 +52,37 @@ pub struct BoardInfo {
     pub serial_number: Option<String>,
 }
 
+/// Board-specific errors used for board command/query paths.
+#[derive(Debug)]
+pub enum BoardError {
+    /// Hardware initialization failed
+    InitializationFailed(String),
+    /// Communication error with board
+    Communication(std::io::Error),
+    /// GPIO or hardware control error
+    HardwareControl(String),
+}
+
+impl fmt::Display for BoardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BoardError::InitializationFailed(msg) => {
+                write!(f, "Board initialization failed: {}", msg)
+            }
+            BoardError::Communication(err) => write!(f, "Board communication error: {}", err),
+            BoardError::HardwareControl(msg) => write!(f, "Hardware control error: {}", msg),
+        }
+    }
+}
+
+impl Error for BoardError {}
+
+impl From<std::io::Error> for BoardError {
+    fn from(err: std::io::Error) -> Self {
+        BoardError::Communication(err)
+    }
+}
+
 /// Registration data returned by board factory functions.
 ///
 /// Bundles the channels needed for the rest of the system to communicate
@@ -58,6 +91,54 @@ pub struct BoardInfo {
 pub struct BoardRegistration {
     /// Watch receiver for the board's current state.
     pub state_rx: watch::Receiver<BoardState>,
+
+    /// Optional command sender for board-specific control and queries.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
+}
+
+/// Board-specific control and query commands exposed to higher layers.
+pub enum BoardCommand {
+    /// Query one BZM2 ASIC's internal DTS/VS telemetry through a live hash thread.
+    QueryBzm2DtsVs {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
+    QueryBzm2Noop {
+        thread_index: usize,
+        asic: u8,
+        reply: oneshot::Sender<Result<[u8; 3], BoardError>>,
+    },
+    QueryBzm2Loopback {
+        thread_index: usize,
+        asic: u8,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, BoardError>>,
+    },
+    ReadBzm2Register {
+        thread_index: usize,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+        reply: oneshot::Sender<Result<Vec<u8>, BoardError>>,
+    },
+    WriteBzm2Register {
+        thread_index: usize,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
+    DiscoverBzm2Engines {
+        thread_index: usize,
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout_ms: Option<u32>,
+        reply: oneshot::Sender<Result<(), BoardError>>,
+    },
 }
 
 /// Helper type for async board factory functions

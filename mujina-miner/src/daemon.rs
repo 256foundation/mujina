@@ -15,6 +15,7 @@ use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
+    board::bzm2::Bzm2RuntimeConfig,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -84,6 +85,16 @@ impl Daemon {
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx);
+        if let Some(config) = Bzm2RuntimeConfig::from_env() {
+            info!(
+                serials = config.serial_paths.len(),
+                baud = config.baud_rate,
+                "BZM2 board enabled from configured serial paths"
+            );
+            backplane
+                .attach_configured_board("bzm2", config.device_id())
+                .await?;
+        }
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {

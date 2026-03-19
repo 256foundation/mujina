@@ -16,6 +16,10 @@ designed to communicate with various Bitcoin mining hash boards via USB serial
 interfaces. Part of the larger Mujina OS project, an open source, Debian-based
 embedded Linux distribution optimized for Bitcoin mining hardware.
 
+This repository also includes an active Rust port of the Intel BZM2 mining
+stack. The goal of the port is to keep BZM2 support inside Mujina rather than
+reviving the original split `cgminer` plus `bzmd` process model.
+
 ## Features
 
 - **Heterogeneous Multi-Board Support**: Mix and match different hash board
@@ -34,17 +38,33 @@ embedded Linux distribution optimized for Bitcoin mining hardware.
 - **Accessible Development**: Start developing with minimal hardware; a laptop
   and a single [Bitaxe](mujina-miner/src/board/bitaxe_gamma.md) board is enough
   to contribute meaningfully
+- **BZM2 Port In Progress**: Native Rust BZM2 support with direct UART work
+  dispatch, result parsing, telemetry, API diagnostics, and startup tuning flows
 
 ## Supported Hardware
 
 Currently supported:
 - [**Bitaxe Gamma**](mujina-miner/src/board/bitaxe_gamma.md) with BM1370 ASIC
 
+Experimental support in this repository:
+- **BZM2 boards** via Mujina's native Rust BZM2 path
+  - [Satoshi Starter](https://github.com/Blockscale-Solutions/SatoshiStarter)
+  - [bitaxeBIRDS](https://github.com/bitaxeorg/bitaxeBIRDS)
+  - direct UART mining path
+  - PLL and DLL diagnostics
+  - DTS/VS telemetry through the API
+  - on-demand DTS/VS query support through the HTTP API
+  - board/API diagnostics for chain state, register access, and clock reporting
+
 Planned support:
 - **EmberOne** with BM1362 ASIC
-- **EmberOne** with Intel BZM2 ASICs
 - Antminer S19j Pro hash boards
 - Any and all ASIC mining hardware
+
+The BZM2 work is functional and test-covered, but still not presented as
+production-ready hardware support. The remaining gap is mostly board-specific
+bring-up and manufacturing/operations integration rather than the core UART
+ASIC path.
 
 ## Documentation
 
@@ -53,6 +73,20 @@ Planned support:
 - [Architecture Overview](docs/architecture.md) - System design and component
   interaction
 - [REST API](docs/api.md) - API contract, conventions, and endpoints
+- [BZM2 Port Note](docs/bzm2/bzm2-port.md) - Architecture, implemented behavior,
+  telemetry, and current scope boundaries for the BZM2 port
+- [BZM2 Tuning Planner](docs/bzm2/bzm2-pnp.md) - Tuning-planner behavior and current
+  calibration scope
+- [BZM2 Opcode Grounding](docs/bzm2/bzm2-opcode-grounding.md) - Source-grounded UART
+  opcode behavior and the current JTAG evidence boundary
+- [Blockscale ASIC Integration Guide](docs/bzm2/blockscale-asic-integration-guide.md) -
+  Generic hardware design guidance for building a custom solution around the
+  Blockscale / BZM2 ASIC
+- [Blockscale UART And TDM Reference](docs/bzm2/blockscale-uart-protocol-reference.md) -
+  ASIC-facing UART, TDM, opcode, and job-programming reference
+- [Blockscale Reference Roadmap](docs/bzm2/blockscale-reference-roadmap.md) -
+  Ordered implementation plan for closing the remaining bring-up, tuning, and
+  diagnostics gaps
 - [CPU Mining](docs/cpu-mining.md) - Run without hardware for development and
   testing
 - [Container Image](docs/container.md) - Build and run as a container
@@ -127,6 +161,25 @@ Without `MUJINA_POOL_URL`, the miner runs with a dummy job source that
 generates synthetic mining work, which is useful for testing hardware without a
 pool connection.
 
+### BZM2 Quick Start
+
+Enable the BZM2 path by pointing Mujina at one or more serial devices:
+
+```bash
+MUJINA_BZM2_SERIAL="/dev/ttyUSB0" \
+MUJINA_BZM2_BAUD="5000000" \
+MUJINA_BZM2_DTS_VS_GEN="2" \
+cargo run -p mujina-miner --bin mujina-minerd
+```
+
+Query refreshed ASIC telemetry over HTTP:
+
+```bash
+curl -X POST http://127.0.0.1:7785/api/v0/boards/bzm2-0/bzm2/dts-vs-query \
+  -H "Content-Type: application/json" \
+  -d '{"thread_index":0,"asic":2}'
+```
+
 ### API Server
 
 The REST API listens on `127.0.0.1:7785` by default. To listen
@@ -190,6 +243,18 @@ commands, PMBus/I2C power management, and fan control.
 See [tools/mujina-dissect/README.md](tools/mujina-dissect/README.md) for
 detailed usage and documentation.
 
+## Validation Status
+
+As of the current BZM2 porting work, the full Linux-side `mujina-miner` test
+suite passes in WSL with:
+
+- `327 passed`
+- `0 failed`
+- `5 ignored`
+
+That validation includes the BZM2-specific protocol, thread, board, telemetry,
+API, and debug-tooling coverage added in this repository.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 or later.
@@ -214,3 +279,7 @@ started.
   Bitcoin mining hashboard
 - [emberone-usbserial-fw](https://github.com/256foundation/emberone-usbserial-fw) -
   Firmware for EmberOne boards
+- [Satoshi Starter](https://github.com/Blockscale-Solutions/SatoshiStarter) -
+  BZM2-based open hardware carrier from Blockscale Solutions
+- [bitaxeBIRDS](https://github.com/bitaxeorg/bitaxeBIRDS) -
+  BZM2-based Bitaxe-family board design

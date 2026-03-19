@@ -14,5 +14,6 @@ pub mod scheduler;
 pub mod stratum_v1;
 pub mod tracing;
 pub mod transport;
+pub mod tuning;
 pub mod types;
 mod u256;

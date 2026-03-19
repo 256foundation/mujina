@@ -329,4 +329,81 @@ impl Backplane {
 
         Ok(())
     }
+
+    /// Attach a configured board directly without going through a synthetic transport.
+    pub async fn attach_configured_board(
+        &mut self,
+        device_type: &str,
+        device_id: String,
+    ) -> Result<()> {
+        let Some(descriptor) = self.virtual_registry.find(device_type) else {
+            error!(device_type = %device_type, "No configured board descriptor found");
+            return Ok(());
+        };
+
+        info!(
+            board = descriptor.name,
+            device_type = %device_type,
+            device_id = %device_id,
+            "Configured board attached."
+        );
+
+        let (mut board, registration) = match (descriptor.create_fn)().await {
+            Ok(result) => result,
+            Err(e) => {
+                error!(
+                    board = descriptor.name,
+                    device_type = %device_type,
+                    error = %e,
+                    "Failed to create configured board"
+                );
+                return Ok(());
+            }
+        };
+
+        let board_info = board.board_info();
+
+        if let Err(e) = self.board_reg_tx.send(registration).await {
+            error!(
+                board = %board_info.model,
+                error = %e,
+                "Failed to register board with API server"
+            );
+        }
+
+        match board.create_hash_threads().await {
+            Ok(threads) => {
+                let thread_count = threads.len();
+                self.boards.insert(device_id.clone(), board);
+
+                for thread in threads {
+                    if let Err(e) = self.scheduler_tx.send(thread).await {
+                        error!(
+                            board = %board_info.model,
+                            error = %e,
+                            "Failed to send thread to scheduler"
+                        );
+                        break;
+                    }
+                }
+
+                info!(
+                    board = %board_info.model,
+                    device_id = %device_id,
+                    threads = thread_count,
+                    "Configured board started."
+                );
+            }
+            Err(e) => {
+                error!(
+                    board = %board_info.model,
+                    device_id = %device_id,
+                    error = %e,
+                    "Configured board failed to start."
+                );
+            }
+        }
+
+        Ok(())
+    }
 }

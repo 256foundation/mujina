@@ -136,8 +136,13 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api_client::types::{BoardState, SourceState};
-    use crate::board::BoardRegistration;
+    use crate::api_client::types::{
+        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
+        Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
+        Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
+        Bzm2RegisterWriteResponse, EngineCoordinate, SourceState, TemperatureSensor,
+    };
+    use crate::board::{BoardCommand, BoardRegistration};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -158,7 +163,10 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { state_rx: rx });
+            registry.push(BoardRegistration {
+                state_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 
@@ -174,6 +182,23 @@ mod tests {
         let req = Request::builder()
             .uri(uri)
             .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        app: Router,
+        uri: &str,
+        body: &T,
+    ) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -270,6 +295,278 @@ mod tests {
         let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/boards/nonexistent").await;
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn bzm2_query_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2DtsVs {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                state_tx_for_command.send_modify(|state| {
+                    state.temperatures.push(TemperatureSensor {
+                        name: "ttyUSB0-asic-2-dts".into(),
+                        temperature_c: Some(64.5),
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/dts-vs-query",
+            &Bzm2DtsVsQueryRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.temperatures.iter().any(
+            |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
+        ));
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_diagnostic_endpoints_round_trip_payloads() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(4);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            while let Some(command) = board_cmd_rx.recv().await {
+                match command {
+                    BoardCommand::QueryBzm2Noop {
+                        thread_index,
+                        asic,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        let _ = reply.send(Ok(*b"BZ2"));
+                    }
+                    BoardCommand::QueryBzm2Loopback {
+                        thread_index,
+                        asic,
+                        payload,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(payload, vec![0x01, 0x02, 0xaa, 0xbb]);
+                        let _ = reply.send(Ok(payload));
+                    }
+                    BoardCommand::ReadBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(count, 4);
+                        let _ = reply.send(Ok(vec![0x11, 0x22, 0x33, 0x44]));
+                    }
+                    BoardCommand::WriteBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(value, vec![0xde, 0xad, 0xbe, 0xef]);
+                        let _ = reply.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/noop",
+            &Bzm2NoopRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let noop: Bzm2NoopResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(noop.payload_hex, "425a32");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/loopback",
+            &Bzm2LoopbackRequest {
+                thread_index: 0,
+                asic: 2,
+                payload_hex: "0102aabb".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let loopback: Bzm2LoopbackResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(loopback.payload_hex, "0102aabb");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let readback: Bzm2RegisterReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(readback.value_hex, "11223344");
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/register-write",
+            &Bzm2RegisterWriteRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                value_hex: "deadbeef".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let write_ack: Bzm2RegisterWriteResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(write_ack.bytes_written, 4);
+
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_engine_discovery_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::DiscoverBzm2Engines {
+                thread_index,
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout_ms,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                assert_eq!(tdm_prediv_raw, 0x0f);
+                assert_eq!(tdm_counter, 16);
+                assert_eq!(timeout_ms, Some(150));
+                state_tx_for_command.send_modify(|state| {
+                    state.asics.push(AsicState {
+                        id: 2,
+                        thread_index: Some(0),
+                        serial_path: Some("/dev/ttyUSB0".into()),
+                        discovered_engine_count: Some(236),
+                        missing_engines: vec![
+                            EngineCoordinate { row: 3, col: 7 },
+                            EngineCoordinate { row: 5, col: 11 },
+                        ],
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/discover-engines",
+            &Bzm2EngineDiscoveryRequest {
+                thread_index: 0,
+                asic: 2,
+                tdm_prediv_raw: 0x0f,
+                tdm_counter: 16,
+                timeout_ms: Some(150),
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.asics.iter().any(|asic| {
+            asic.id == 2
+                && asic.thread_index == Some(0)
+                && asic.discovered_engine_count == Some(236)
+                && asic.missing_engines
+                    == vec![
+                        EngineCoordinate { row: 3, col: 7 },
+                        EngineCoordinate { row: 5, col: 11 },
+                    ]
+        }));
+        drop(miner_tx);
+        drop(cmd_rx);
     }
 
     #[tokio::test]
