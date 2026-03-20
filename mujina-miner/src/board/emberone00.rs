@@ -106,3 +106,6 @@ mod tests {
         assert_eq!(board.board_info().serial_number.as_deref(), Some("S12345"),);
     }
 }
+
+#[cfg(test)]
+mod integration_tests;
