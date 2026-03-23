@@ -144,7 +144,6 @@ impl DummySource {
                 }
 
                 _ = self.shutdown.cancelled() => {
-                    info!("Dummy source shutting down");
                     break;
                 }
             }
