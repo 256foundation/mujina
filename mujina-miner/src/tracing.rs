@@ -3,9 +3,9 @@
 //! At startup, the program should call [`init`] to install a tracing subscriber
 //! (i.e., something that emits events to a log).
 //!
-//! The rest of program the can include `use tracing::prelude::*` for convenient
-//! access to the `trace!()`, `debug!()`, `info!()`, `warn!()`, and `error!()`
-//! macros.
+//! The rest of the program can include `use crate::tracing::prelude::*`
+//! for convenient access to the `trace!()`, `debug!()`, `info!()`,
+//! `warn!()`, and `error!()` macros.
 
 use std::fmt;
 use time::OffsetDateTime;

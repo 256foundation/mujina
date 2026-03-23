@@ -188,6 +188,23 @@ warn!(temp_c = %temp, threshold = %TEMP_WARN, "Chip temperature high");
 error!(error = %err, "Failed to initialize board");
 ```
 
+### Tracing Imports [L.prelude](#L.prelude)
+
+Import logging macros from the project's tracing prelude, not
+by naming individual macros:
+
+```rust
+// Good
+use crate::tracing::prelude::*;
+
+// Bad
+use tracing::{debug, info, warn};
+```
+
+The wildcard import avoids churn in the import list every time a
+logging level changes. Adding a `warn!()` call shouldn't require
+touching the imports.
+
 ### Trace vs Debug [L.trace-debug](#L.trace-debug)
 
 Choose between trace and debug based on granularity:
