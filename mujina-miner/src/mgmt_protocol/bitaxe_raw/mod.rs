@@ -184,17 +184,6 @@ impl Packet {
         }
     }
 
-    /// Write a GPIO pin value.
-    pub fn gpio_write(id: u8, pin: u8, value: bool) -> Self {
-        let data = vec![if value { 0x01 } else { 0x00 }];
-        Self::new(id, Page::GPIO, pin, data)
-    }
-
-    /// Read a GPIO pin value.
-    pub fn gpio_read(id: u8, pin: u8) -> Self {
-        Self::new(id, Page::GPIO, pin, vec![])
-    }
-
     /// Encode packet to bytes
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -412,31 +401,6 @@ impl Encoder<Packet> for ControlCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_gpio_packet_encoding() {
-        // Test GPIO write low
-        let packet = Packet::gpio_write(0x42, 0, false);
-        let encoded = packet.encode();
-
-        assert_eq!(encoded[0], 0x07); // length low byte
-        assert_eq!(encoded[1], 0x00); // length high byte
-        assert_eq!(encoded[2], 0x42); // id
-        assert_eq!(encoded[3], 0x00); // bus
-        assert_eq!(encoded[4], 0x06); // GPIO page
-        assert_eq!(encoded[5], 0x00); // command byte is pin 0
-        assert_eq!(encoded[6], 0x00); // data: low
-
-        // Test GPIO write high
-        let packet = Packet::gpio_write(0x42, 0, true);
-        let encoded = packet.encode();
-        assert_eq!(encoded[6], 0x01); // data: high
-
-        // Test GPIO pin 5
-        let packet = Packet::gpio_write(0x42, 5, true);
-        let encoded = packet.encode();
-        assert_eq!(encoded[5], 0x05); // command byte is pin 5
-    }
 
     #[test]
     fn v0_response_parsing() {

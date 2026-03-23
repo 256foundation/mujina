@@ -3,8 +3,8 @@
 use crate::tracing::prelude::*;
 use async_trait::async_trait;
 
-use super::Packet;
 use super::channel::ControlChannel;
+use super::{Packet, Page};
 use crate::hw_trait::gpio::{Gpio, GpioPin, PinMode, PinValue};
 use crate::hw_trait::{HwError, Result};
 
@@ -61,13 +61,14 @@ impl GpioPin for BitaxeRawGpioPin {
 
     async fn write(&mut self, value: PinValue) -> Result<()> {
         debug!(pin = self.number, value = ?value, "GPIO write");
-        let packet = Packet::gpio_write(0, self.number, value.into());
+        let data = vec![if bool::from(value) { 0x01 } else { 0x00 }];
+        let packet = Packet::new(0, Page::GPIO, self.number, data);
         self.channel.send_packet(packet).await?;
         Ok(())
     }
 
     async fn read(&mut self) -> Result<PinValue> {
-        let packet = Packet::gpio_read(0, self.number);
+        let packet = Packet::new(0, Page::GPIO, self.number, vec![]);
         let response = self.channel.send_packet(packet).await?;
 
         // Response should contain one byte
@@ -85,5 +86,35 @@ impl GpioPin for BitaxeRawGpioPin {
         };
         debug!(pin = self.number, value = ?value, "GPIO read");
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpio_write_packet_encoding() {
+        // Write low
+        let packet = Packet::new(0x42, Page::GPIO, 0, vec![0x00]);
+        let encoded = packet.encode();
+
+        assert_eq!(encoded[0], 0x07); // length low byte
+        assert_eq!(encoded[1], 0x00); // length high byte
+        assert_eq!(encoded[2], 0x42); // id
+        assert_eq!(encoded[3], 0x00); // bus
+        assert_eq!(encoded[4], 0x06); // GPIO page
+        assert_eq!(encoded[5], 0x00); // command byte is pin 0
+        assert_eq!(encoded[6], 0x00); // data: low
+
+        // Write high
+        let packet = Packet::new(0x42, Page::GPIO, 0, vec![0x01]);
+        let encoded = packet.encode();
+        assert_eq!(encoded[6], 0x01); // data: high
+
+        // Different pin
+        let packet = Packet::new(0x42, Page::GPIO, 5, vec![0x01]);
+        let encoded = packet.encode();
+        assert_eq!(encoded[5], 0x05); // command byte is pin 5
     }
 }
