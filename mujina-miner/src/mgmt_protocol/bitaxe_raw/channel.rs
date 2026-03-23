@@ -94,4 +94,17 @@ impl ControlChannel {
 
         Ok(response)
     }
+
+    /// Send a packet without waiting for a response.
+    ///
+    /// Used for commands where the remote side will not (or cannot)
+    /// reply, such as a reboot that resets the device immediately.
+    pub async fn send_packet_no_reply(&self, mut packet: Packet) -> io::Result<()> {
+        let mut inner = self.inner.lock().await;
+
+        packet.id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+
+        inner.writer.send(packet).await
+    }
 }

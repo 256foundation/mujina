@@ -18,21 +18,19 @@
 //! [Length:2 LE] [ID:1] [Bus:1] [Page:1] [Command:1] [Data:N]
 //! ```
 //!
-//! Length = total packet size (all fields including length itself).
+//! Length is the total packet size including all fields. ID is an
+//! auto-assigned sequence number echoed in the response for
+//! correlation. Bus is always `0x00` in current firmware. Page
+//! selects the peripheral subsystem (see [`Page`]). Command and
+//! Data are page-specific; see the submodules for details.
 //!
-//! ## Pages
-//!
-//! - `0x05` - I2C operations (peripheral communication)
-//! - `0x06` - GPIO operations (ASIC reset, status pins)
-//! - `0x07` - ADC operations (voltage monitoring)
-//! - `0x08` - LED operations (SK6812 RGB)
-//!
-//! The bus field is always `0x00` in current firmware.
+//! See [`Packet`] for the programmatic representation.
 
 pub mod channel;
 pub mod gpio;
 pub mod i2c;
 pub mod led;
+pub mod system;
 
 use crate::tracing::prelude::*;
 use bytes::{BufMut, BytesMut};
@@ -105,6 +103,8 @@ pub enum Page {
     ADC = 0x07,
     /// LED operations (SK6812 RGB)
     LED = 0x08,
+    /// System operations (reboot)
+    System = 0x09,
 }
 
 /// I2C commands
