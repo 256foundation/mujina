@@ -18,7 +18,7 @@ use crate::{
     asic::hash_thread::HashThread,
     mgmt_protocol::{
         ControlChannel,
-        bitaxe_raw::{ResponseFormat, led::BitaxeRawLed},
+        bitaxe_raw::{ResponseFormat, led::BitaxeRawLed, system},
     },
     peripheral::led::{CalibratedLed, ColorProfile, Status, StatusLed},
     transport::UsbDeviceInfo,
@@ -122,6 +122,7 @@ impl Board for EmberOne00 {
 
     async fn shutdown(&mut self) -> Result<()> {
         self.status_led.off().await;
+        let _ = system::reboot(&self.channel).await;
         Ok(())
     }
 
