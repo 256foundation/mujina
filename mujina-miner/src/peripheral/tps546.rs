@@ -5,9 +5,9 @@
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/tps546d24a.pdf>
 
+use crate::tracing::prelude::*;
 use anyhow::{Result, bail};
 use thiserror::Error;
-use tracing::{debug, error, trace, warn};
 
 use super::pmbus::{self, PmbusCommand, StatusDecoder, VoutMode, linear11};
 use crate::hw_trait::I2c;

@@ -8,7 +8,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{Level, info, warn};
+use tracing::Level;
+
+use crate::tracing::prelude::*;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 

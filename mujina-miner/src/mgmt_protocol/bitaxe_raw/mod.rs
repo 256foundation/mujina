@@ -52,10 +52,10 @@ pub mod channel;
 pub mod gpio;
 pub mod i2c;
 
+use crate::tracing::prelude::*;
 use bytes::{BufMut, BytesMut};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::trace;
 
 /// Wrapper for formatting byte slices as space-separated hex.
 struct HexBytes<'a>(&'a [u8]);

@@ -1,7 +1,7 @@
 //! GPIO implementation using bitaxe-raw control protocol.
 
+use crate::tracing::prelude::*;
 use async_trait::async_trait;
-use tracing::debug;
 
 use super::Packet;
 use super::channel::ControlChannel;

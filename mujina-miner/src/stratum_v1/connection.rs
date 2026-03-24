@@ -9,10 +9,10 @@ use async_trait::async_trait;
 
 use super::error::{StratumError, StratumResult};
 use super::messages::JsonRpcMessage;
+use crate::tracing::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tracing::{debug, trace};
 
 /// Message-level I/O for Stratum protocol.
 ///

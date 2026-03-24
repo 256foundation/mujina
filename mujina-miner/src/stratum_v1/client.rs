@@ -8,9 +8,9 @@ use std::time::Duration;
 use super::connection::{Connection, Transport};
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
+use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
 
 /// Pool connection configuration.
 #[derive(Debug, Clone)]
@@ -655,8 +655,6 @@ impl StratumV1Client {
         mut self,
         mut conn: impl Transport,
     ) -> StratumResult<()> {
-        use tracing::{debug, info, warn};
-
         // Configure version rolling (before subscribe)
         let authorized_mask = self.configure_version_rolling(&mut conn).await?;
 

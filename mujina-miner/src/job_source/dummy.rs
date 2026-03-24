@@ -6,12 +6,12 @@
 //! probability of finding the real block hash quickly, making it an excellent test
 //! of the complete mining stack.
 
+use crate::tracing::prelude::*;
 use anyhow::Result;
 use bitcoin::block::Version;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
 
 use crate::types::{HashRate, ShareRate};
 

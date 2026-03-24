@@ -19,9 +19,9 @@
 //! be achieved because the scheduler's internal per-thread share filter
 //! caps the rate to prevent flooding.
 
+use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
 
 use super::{JobTemplate, SourceCommand, SourceEvent};
 use crate::types::{Difficulty, HashRate, ShareRate};
