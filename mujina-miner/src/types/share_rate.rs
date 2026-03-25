@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use bitcoin::Target;
 
-use super::HashRate;
+use super::{Difficulty, HashRate};
 use crate::u256::U256;
 
 /// Share submission rate (shares per unit time).
@@ -83,6 +83,14 @@ impl ShareRate {
             Target::from(U256::MAX / hashes_per_share)
         }
     }
+
+    /// Compute the difficulty needed to achieve this share rate at
+    /// the given hashrate.
+    ///
+    /// Convenience for `Difficulty::from_target(self.to_target(..))`.
+    pub fn to_difficulty(&self, hashrate: HashRate) -> Difficulty {
+        Difficulty::from_target(self.to_target(hashrate))
+    }
 }
 
 impl std::fmt::Display for ShareRate {
@@ -143,5 +151,16 @@ mod tests {
         // < 1 share/min: display as shares/sec
         assert_eq!(ShareRate::per_second(0.01).to_string(), "0.010 shares/sec");
         assert_eq!(ShareRate::per_second(0.001).to_string(), "0.001 shares/sec");
+    }
+
+    #[test]
+    fn to_difficulty_matches_to_target() {
+        let rate = ShareRate::per_second(1.0);
+        let hashrate = HashRate::from_terahashes(1.0);
+
+        let via_target = Difficulty::from_target(rate.to_target(hashrate));
+        let direct = rate.to_difficulty(hashrate);
+
+        assert_eq!(via_target.as_f64(), direct.as_f64());
     }
 }
