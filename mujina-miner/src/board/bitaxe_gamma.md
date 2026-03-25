@@ -32,7 +32,8 @@ custom kernel drivers.
 
 ## Hardware Components
 
-- **BM1370 ASIC**: Single chip capable of approximately 640 GH/s
+- **BM1370 ASIC**: Single chip capable of approximately 1 TH/s at stock
+  settings (525 MHz, 1.15V)
 - **TPS546D24A**: PMBus-compatible power management IC for core voltage control
 - **EMC2101**: PWM fan controller with integrated temperature monitoring
 

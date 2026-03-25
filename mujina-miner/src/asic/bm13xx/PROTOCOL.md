@@ -34,7 +34,7 @@ Different chips in the BM13xx family have varying core architectures:
 
 - **BM1362**: Core count unknown (used in Antminer S19 J Pro)
   - Chip ID: `[0x13, 0x62]`
-- **BM1370**: 80 main cores x 16 sub-cores = 1,280 total hashing units
+- **BM1370**: 128 main cores x 16 sub-cores = 2,048 total hashing units
   - Chip ID: `[0x13, 0x70]`
 
 The core architecture affects how nonces are reported and job IDs are encoded.
@@ -317,9 +317,9 @@ The encoding allows ASICs to:
 
 **Field Encoding by Chip Type:**
 
-#### BM1370 (80 cores x 16 sub-cores = 1,280 units):
+#### BM1370 (128 cores x 16 sub-cores = 2,048 units):
 - **Nonce**: 32-bit nonce value (little-endian)
-  - Bits 31-25: Main core ID (7 bits, values 0-79)
+  - Bits 31-25: Main core ID (7 bits, values 0-127)
   - Bits 24-0: Actual nonce value
 - **Midstate_Num**: Chip/core identifier (uncertain - may encode chip ID in 
 multi-chip chains)
@@ -673,10 +673,10 @@ The 32-bit nonce space (4.3 billion values) is automatically divided:
    - Core ID encoded in upper nonce bits (typically bits 24-31)
    - Each core searches ~33.5 million nonces (4.3B / 128 cores)
 
-3. **Example**: BM1370 with 80 cores x 16 sub-cores
-   - Bits 31-25: Main core ID (80 cores)
+3. **Example**: BM1370 with 128 cores x 16 sub-cores
+   - Bits 31-25: Main core ID (128 cores)
    - Bits 24-0: Actual nonce value searched
-   - Total: 1,280 parallel searches per chip
+   - Total: 2,048 parallel searches per chip
 
 #### NONCE_RANGE Register Configuration
 
@@ -723,8 +723,8 @@ Consider a 4-chip BM1370 chain mining a block:
    - Chip 1: Searches nonces where certain bits = 0x40
    - Chip 2: Searches nonces where certain bits = 0x80
    - Chip 3: Searches nonces where certain bits = 0xC0
-4. **Total parallel operations**: 4 chips x 1,280 cores = 5,120 simultaneous
-searches
+4. **Total parallel operations**: 4 chips x ~2,040 cores = ~8,160
+simultaneous searches
 
 #### Multiple Hash Board Distribution
 When a mining system has multiple hash boards, the software MUST prevent 
@@ -855,5 +855,5 @@ space partitioning:
 | Chip | Chip ID | Cores | Sub-cores | Job ID Bits | Used In |
 |------|---------|-------|-----------|-------------|----------|
 | BM1362 | 0x1362 | Unknown | Unknown | Unknown | Antminer S19 J Pro |
-| BM1370 | 0x1370 | 80 | 16 | 4+4 | Bitaxe Gamma, S21 Pro |
+| BM1370 | 0x1370 | 128 | ~16 | 4+4 | Bitaxe Gamma, S21 Pro |
 
