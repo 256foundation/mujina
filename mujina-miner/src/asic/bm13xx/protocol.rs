@@ -277,74 +277,6 @@ impl From<NonceRangeConfig> for [u8; 4] {
     }
 }
 
-/// ASIC hashrate in hashes per second
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Hashrate {
-    hps: f64, // Hashrate in hashes per second
-}
-
-impl Hashrate {
-    /// Create hashrate from gibihashes per second (GiH/s = 2^30 H/s)
-    ///
-    /// # Arguments
-    /// * `n` - Number of gibihashes/sec (any value accepted)
-    ///
-    /// # Example
-    /// ```
-    /// use mujina_miner::asic::bm13xx::protocol::Hashrate;
-    /// let hr = Hashrate::gibihashes_per_sec(500.0); // 500 GiH/s
-    /// ```
-    pub fn gibihashes_per_sec(n: f64) -> Self {
-        Self {
-            hps: n * 2f64.powi(30),
-        }
-    }
-
-    /// Create hashrate from tebihashes per second (TiH/s = 2^40 H/s)
-    ///
-    /// # Arguments
-    /// * `n` - Number of tebihashes/sec (any value accepted)
-    ///
-    /// # Example
-    /// ```
-    /// use mujina_miner::asic::bm13xx::protocol::Hashrate;
-    /// let hr = Hashrate::tebihashes_per_sec(1.0); // 1 TiH/s
-    /// ```
-    pub fn tebihashes_per_sec(n: f64) -> Self {
-        Self {
-            hps: n * 2f64.powi(40),
-        }
-    }
-
-    /// Get log2 of the hashrate (for internal calculations)
-    pub fn log2(&self) -> f64 {
-        self.hps.log2()
-    }
-}
-
-/// Desired nonce reporting rate
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReportingRate {
-    nonces_per_sec: f64,
-}
-
-impl ReportingRate {
-    /// Create reporting rate from nonces per second
-    ///
-    /// # Example
-    /// ```
-    /// use mujina_miner::asic::bm13xx::protocol::ReportingRate;
-    /// let rate = ReportingRate::nonces_per_sec(1.0); // 1 nonce/sec
-    /// ```
-    pub const fn nonces_per_sec(n: f64) -> Self {
-        Self { nonces_per_sec: n }
-    }
-
-    pub const fn nonces_per_sec_value(&self) -> f64 {
-        self.nonces_per_sec
-    }
-}
-
 /// ASIC difficulty as a power-of-2 exponent.
 ///
 /// BM13xx chips filter nonces using bitmask comparison (`hash &
@@ -383,47 +315,6 @@ impl fmt::Display for Log2Difficulty {
     }
 }
 
-/// Reporting interval: report 1 nonce per 2^exponent hashes
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReportingInterval {
-    exponent: u8, // N in "report 1 nonce per 2^N hashes"
-}
-
-impl ReportingInterval {
-    const fn from_exponent(exponent: u8) -> Self {
-        assert!(exponent >= 32 && exponent <= 56, "Exponent must be 32-56");
-        Self { exponent }
-    }
-
-    /// Calculate reporting interval from hashrate and desired reporting rate
-    ///
-    /// The result is rounded to the nearest power-of-2 interval to match
-    /// hardware constraints.
-    ///
-    /// # Example
-    /// ```
-    /// use mujina_miner::asic::bm13xx::protocol::{Hashrate, ReportingRate, ReportingInterval};
-    /// let interval = ReportingInterval::from_rate(
-    ///     Hashrate::gibihashes_per_sec(500.0),
-    ///     ReportingRate::nonces_per_sec(1.0)
-    /// );
-    /// ```
-    pub fn from_rate(hashrate: Hashrate, rate: ReportingRate) -> Self {
-        let total_bits = (hashrate.log2() - rate.nonces_per_sec_value().log2()).ceil() as u8;
-        Self::from_exponent(total_bits.clamp(32, 56))
-    }
-
-    pub const fn exponent(&self) -> u8 {
-        self.exponent
-    }
-}
-
-impl std::fmt::Display for ReportingInterval {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "2^{}", self.exponent)
-    }
-}
-
 /// Ticket mask controlling ASIC nonce reporting
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TicketMask {
@@ -435,20 +326,14 @@ pub struct TicketMask {
 }
 
 impl TicketMask {
-    /// Create ticket mask from reporting interval
+    /// Create ticket mask from an ASIC difficulty.
     ///
-    /// # Example
-    /// ```
-    /// use mujina_miner::asic::bm13xx::protocol::{Hashrate, ReportingRate, ReportingInterval, TicketMask};
-    /// let interval = ReportingInterval::from_rate(
-    ///     Hashrate::gibihashes_per_sec(512.0),
-    ///     ReportingRate::nonces_per_sec(1.0)
-    /// );
-    /// let mask = TicketMask::new(interval);
-    /// ```
-    pub const fn new(interval: ReportingInterval) -> Self {
+    /// The [`Log2Difficulty`] exponent maps directly to the number
+    /// of extra zero bits the chip requires beyond its hardwired
+    /// difficulty-1 gate.
+    pub const fn new(difficulty: Log2Difficulty) -> Self {
         Self {
-            zero_bits: interval.exponent.saturating_sub(32),
+            zero_bits: difficulty.exponent(),
         }
     }
 
@@ -1697,16 +1582,13 @@ mod command_tests {
     #[test]
     fn write_ticket_mask_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 14 00 00 00 FF 08
-        // This is 8 zero_bits (40 total bits, i.e., 2^40 hashes per nonce)
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(1.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
+        // Difficulty 256 = 8 zero_bits
+        let log2_diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
         assert_frame_eq(
             Command::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
-                register: Register::TicketMask(TicketMask::new(interval)),
+                register: Register::TicketMask(TicketMask::new(log2_diff)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x14, 0x00, 0x00, 0x00, 0xff, 0x08,
@@ -2492,152 +2374,56 @@ mod log2_difficulty_tests {
 #[cfg(test)]
 mod ticket_mask_tests {
     use super::*;
+    use crate::types::Difficulty;
 
     #[test]
-    fn test_hashrate_gibihashes() {
-        let hr = Hashrate::gibihashes_per_sec(512.0);
-        // 512 GiH/s = 2^39 H/s (2^9 * 2^30)
-        assert_eq!(hr.log2().round() as u8, 39);
-
-        let hr = Hashrate::gibihashes_per_sec(1.0);
-        // 1 GiH/s = 2^30 H/s
-        assert_eq!(hr.log2().round() as u8, 30);
-
-        let hr = Hashrate::gibihashes_per_sec(1024.0);
-        // 1024 GiH/s = 2^40 H/s (2^10 * 2^30)
-        assert_eq!(hr.log2().round() as u8, 40);
-
-        // Test non-power-of-2 value
-        let hr = Hashrate::gibihashes_per_sec(500.0);
-        // 500 GiH/s ~= 2^38.9 H/s, rounds to 39
-        assert_eq!(hr.log2().round() as u8, 39);
-    }
-
-    #[test]
-    fn test_hashrate_tebihashes() {
-        let hr = Hashrate::tebihashes_per_sec(1.0);
-        // 1 TiH/s = 2^40 H/s
-        assert_eq!(hr.log2().round() as u8, 40);
-
-        let hr = Hashrate::tebihashes_per_sec(8.0);
-        // 8 TiH/s = 2^43 H/s (2^3 * 2^40)
-        assert_eq!(hr.log2().round() as u8, 43);
-    }
-
-    #[test]
-    fn test_reporting_interval_from_rate() {
-        // 512 GiH/s (2^39), want 1 nonce/sec (2^0)
-        // Interval = 2^39 / 2^0 = 2^39
-        let interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(512.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 39);
-
-        // 1 TiH/s (2^40), want 1 nonce/sec
-        // Interval = 2^40 / 2^0 = 2^40
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(1.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 40);
-
-        // 512 GiH/s (2^39), want 2 nonces/sec (2^1)
-        // Interval = 2^39 / 2^1 = 2^38
-        let interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(512.0),
-            ReportingRate::nonces_per_sec(2.0),
-        );
-        assert_eq!(interval.exponent(), 38);
-
-        // Non-power-of-2: 500 GiH/s, want 1 nonce/sec
-        // 500 GiH/s ~= 2^38.9, rounds to 2^39
-        let interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(500.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 39);
-    }
-
-    #[test]
-    fn test_reporting_interval_display() {
-        let interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(512.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(format!("{}", interval), "2^39");
-    }
-
-    #[test]
-    fn test_ticket_mask_wire_encoding() {
-        // Test case 1: 40 bits total (8 zero_bits)
-        // Should produce [00, 00, 00, FF]
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(1.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 40);
-        let mask = TicketMask::new(interval);
-        let bytes = mask.to_wire_bytes();
+    fn wire_encoding_difficulty_256() {
+        // 8 zero_bits -> mask 0xFF -> [00, 00, 00, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+    }
 
-        // Test case 2: 42 bits total (10 zero_bits)
-        // Should produce [00, 00, C0, FF]
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(4.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 42);
-        let mask = TicketMask::new(interval);
-        let bytes = mask.to_wire_bytes();
+    #[test]
+    fn wire_encoding_difficulty_1024() {
+        // 10 zero_bits -> mask 0x3FF -> [00, 00, C0, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1024_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0xC0, 0xFF]);
+    }
 
-        // Test case 3: 48 bits total (16 zero_bits)
-        // Should produce [00, 00, FF, FF]
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(256.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 48);
-        let mask = TicketMask::new(interval);
-        let bytes = mask.to_wire_bytes();
+    #[test]
+    fn wire_encoding_difficulty_65536() {
+        // 16 zero_bits -> mask 0xFFFF -> [00, 00, FF, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(65536_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0xFF, 0xFF]);
     }
 
     #[test]
-    fn test_ticket_mask_zero_bits() {
-        // 32 bits total = 0 zero_bits
-        // Should produce [00, 00, 00, 00]
-        let interval = ReportingInterval::from_rate(
-            Hashrate::gibihashes_per_sec(4.0), // 2^32
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        assert_eq!(interval.exponent(), 32);
-        let mask = TicketMask::new(interval);
-        let bytes = mask.to_wire_bytes();
+    fn wire_encoding_difficulty_1() {
+        // 0 zero_bits -> [00, 00, 00, 00]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]
-    fn test_reverse_bits() {
+    fn into_bytes_matches_to_wire_bytes() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let mask = TicketMask::new(diff);
+        let bytes: [u8; 4] = mask.into();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn reverse_bits_examples() {
         assert_eq!(reverse_bits(0x00), 0x00);
         assert_eq!(reverse_bits(0xFF), 0xFF);
         assert_eq!(reverse_bits(0x01), 0x80);
         assert_eq!(reverse_bits(0x80), 0x01);
         assert_eq!(reverse_bits(0x03), 0xC0);
         assert_eq!(reverse_bits(0x0F), 0xF0);
-    }
-
-    #[test]
-    fn test_ticket_mask_from_trait() {
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(1.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        let mask = TicketMask::new(interval);
-
-        let bytes: [u8; 4] = mask.into();
-        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
     }
 }
 
@@ -2752,13 +2538,9 @@ impl BM13xxProtocol {
             raw_value: CORE_REG_INIT_2,
         }));
 
-        // Step 7: Set ticket mask (difficulty)
-        // Use 2^40 reporting interval (8 zero_bits)
-        let interval = ReportingInterval::from_rate(
-            Hashrate::tebihashes_per_sec(1.0),
-            ReportingRate::nonces_per_sec(1.0),
-        );
-        commands.push(self.broadcast_write(Register::TicketMask(TicketMask::new(interval))));
+        // Step 7: Set ticket mask (difficulty 256 = ~1 nonce/sec at 1 TH/s)
+        let log2_diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        commands.push(self.broadcast_write(Register::TicketMask(TicketMask::new(log2_diff))));
 
         // Step 8: Configure IO driver strength on all chips
         commands.push(self.broadcast_write(Register::IoDriverStrength(IoDriverStrength::normal())));

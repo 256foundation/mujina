@@ -16,14 +16,14 @@ use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
-use super::protocol;
+use super::protocol::{self, Log2Difficulty, TicketMask};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
         HashThreadStatus, Share, ThreadRemovalSignal,
     },
     tracing::prelude::*,
-    types::{Difficulty, HashRate},
+    types::{Difficulty, HashRate, ShareRate},
 };
 
 /// Tracks tasks sent to chip hardware, indexed by chip_job_id.
@@ -333,14 +333,11 @@ where
     )
     .await?;
 
-    // Ticket mask, IO strength
-    // Target: ~1 nonce per second at 1 TH/s (1000 GiH/s = 1.074 TH/s)
-    use protocol::{Hashrate, ReportingInterval, ReportingRate, TicketMask};
-    let reporting_interval = ReportingInterval::from_rate(
-        Hashrate::gibihashes_per_sec(1000.0),
-        ReportingRate::nonces_per_sec(1.0),
+    // Ticket mask: ~1 nonce/sec at 1 TH/s
+    let log2_diff = Log2Difficulty::from_difficulty(
+        ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
     );
-    let ticket_mask = TicketMask::new(reporting_interval);
+    let ticket_mask = TicketMask::new(log2_diff);
 
     send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
     send_reg(
