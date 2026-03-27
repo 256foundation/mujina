@@ -31,6 +31,9 @@ pub mod gpio;
 pub mod i2c;
 pub mod led;
 pub mod system;
+mod version;
+
+pub use version::DeviceVersion;
 
 use crate::tracing::prelude::*;
 use bytes::{BufMut, BytesMut};
