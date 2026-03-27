@@ -26,6 +26,7 @@ use crate::{
     },
     peripheral::{
         led::{CalibratedLed, ColorProfile, Status, StatusLed},
+        tmp451::Tmp451,
         tmp1075::Tmp1075,
     },
     transport::UsbDeviceInfo,
@@ -50,6 +51,7 @@ inventory::submit! {
 /// I2C device addresses on the emberOne/00 board.
 mod i2c_addr {
     pub const TMP1075_LEFT: u8 = 0x4A;
+    pub const TMP451_RIGHT: u8 = 0x49;
 }
 
 /// Select response format based on firmware version.
@@ -101,6 +103,21 @@ async fn create_from_usb(
         .await
         .context("TMP1075 (left) init failed")?;
 
+    let mut temp_right = Tmp451::new(i2c.clone(), i2c_addr::TMP451_RIGHT);
+    temp_right
+        .init()
+        .await
+        .context("TMP451 (right) init failed")?;
+    // The remote diode reads high compared to the board sensors
+    // at ambient. This offset brings the reading in line at room
+    // temperature. Revisit once the ASICs are running to
+    // distinguish constant offset from ideality (n-factor) error.
+    const REMOTE_OFFSET_C: i8 = -7;
+    temp_right
+        .set_remote_offset(REMOTE_OFFSET_C)
+        .await
+        .context("TMP451 remote offset failed")?;
+
     let serial = device.serial_number.clone();
     let board_name = format!("emberone00-{}", serial.as_deref().unwrap_or("unknown"));
     let initial_telemetry = BoardTelemetry {
@@ -111,7 +128,7 @@ async fn create_from_usb(
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
 
-    let monitor_handle = spawn_monitor(temp_left, telemetry_tx);
+    let monitor_handle = spawn_monitor(temp_left, temp_right, telemetry_tx);
 
     let board = EmberOne00 {
         device_info: device,
@@ -127,6 +144,7 @@ async fn create_from_usb(
 /// Spawn a task that periodically reads sensors and publishes telemetry.
 fn spawn_monitor(
     mut temp_left: Tmp1075<BitaxeRawI2c>,
+    mut temp_right: Tmp451<BitaxeRawI2c>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -148,11 +166,40 @@ fn spawn_monitor(
                 }
             };
 
+            let right_c = match temp_right.read_local().await {
+                Ok(reading) => Some(reading.as_degrees_c()),
+                Err(e) => {
+                    warn!("TMP451 (right) local read failed: {}", e);
+                    None
+                }
+            };
+
+            // TODO: attribute to the chip's hash thread once implemented
+            let chip0_c = match temp_right.read_remote().await {
+                Ok(reading) => Some(reading.as_degrees_c()),
+                Err(e) => {
+                    if !matches!(e, crate::peripheral::tmp451::Error::RemoteDiodeOpen) {
+                        warn!("TMP451 remote read failed: {}", e);
+                    }
+                    None
+                }
+            };
+
             telemetry_tx.send_modify(|t| {
-                t.temperatures = vec![TemperatureSensor {
-                    name: "pcb-left".into(),
-                    temperature_c: left_c,
-                }];
+                t.temperatures = vec![
+                    TemperatureSensor {
+                        name: "pcb-left".into(),
+                        temperature_c: left_c,
+                    },
+                    TemperatureSensor {
+                        name: "pcb-right".into(),
+                        temperature_c: right_c,
+                    },
+                    TemperatureSensor {
+                        name: "chip-0".into(),
+                        temperature_c: chip0_c,
+                    },
+                ];
             });
         }
     })
