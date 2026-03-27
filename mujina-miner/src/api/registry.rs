@@ -1,5 +1,8 @@
 //! Dynamic board registration tracking.
 
+use tokio::sync::mpsc;
+
+use crate::api::commands::BoardCommand;
 use crate::api_client::types::BoardTelemetry;
 use crate::board::BoardRegistration;
 
@@ -35,6 +38,25 @@ impl BoardRegistry {
             .map(|reg| reg.telemetry_rx.borrow().clone())
             .collect()
     }
+
+    /// Return the command sender for a connected board by name, or `None` if
+    /// the board is not found or does not support runtime commands.
+    pub fn find_cmd_tx(&self, name: &str) -> Option<mpsc::Sender<BoardCommand>> {
+        self.boards
+            .iter()
+            .find(|reg| {
+                reg.telemetry_rx.has_changed().is_ok() && reg.telemetry_rx.borrow().name == name
+            })
+            .and_then(|reg| reg.cmd_tx.clone())
+    }
+
+    /// Return `true` if a connected board with the given name exists (regardless
+    /// of whether it supports commands).
+    pub fn contains(&self, name: &str) -> bool {
+        self.boards.iter().any(|reg| {
+            reg.telemetry_rx.has_changed().is_ok() && reg.telemetry_rx.borrow().name == name
+        })
+    }
 }
 
 #[cfg(test)]
@@ -53,7 +75,7 @@ mod tests {
             ..Default::default()
         };
         let (tx, rx) = watch::channel(telemetry);
-        (tx, BoardRegistration { telemetry_rx: rx })
+        (tx, BoardRegistration { telemetry_rx: rx, cmd_tx: None })
     }
 
     #[test]

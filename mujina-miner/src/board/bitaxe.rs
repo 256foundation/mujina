@@ -16,6 +16,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::{
+    api::commands::BoardCommand,
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
@@ -146,6 +147,9 @@ pub struct BitaxeBoard {
     /// Channel for publishing board telemetry to the API server.
     /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
     telemetry_tx: Option<watch::Sender<BoardTelemetry>>,
+    /// Command receiver from the API layer.
+    /// Taken by `spawn_stats_monitor` so the monitoring loop can handle commands.
+    cmd_rx: Option<tokio::sync::mpsc::Receiver<BoardCommand>>,
 }
 
 impl BitaxeBoard {
@@ -177,6 +181,7 @@ impl BitaxeBoard {
         data_path: &str,
         serial_number: Option<String>,
         telemetry_tx: watch::Sender<BoardTelemetry>,
+        cmd_rx: tokio::sync::mpsc::Receiver<BoardCommand>,
     ) -> Result<Self> {
         // Bitaxe runs original bitaxe-raw firmware (v0 response format)
         let control_channel = ControlChannel::new(control, ResponseFormat::V0);
@@ -204,6 +209,7 @@ impl BitaxeBoard {
             stats_task_handle: None,
             serial_number,
             telemetry_tx: Some(telemetry_tx),
+            cmd_rx: Some(cmd_rx),
         })
     }
 
@@ -704,6 +710,12 @@ impl BitaxeBoard {
             .take()
             .expect("telemetry_tx must be present when spawning stats monitor");
 
+        // Take the command receiver so this task handles API commands
+        let mut cmd_rx = self
+            .cmd_rx
+            .take()
+            .expect("cmd_rx must be present when spawning stats monitor");
+
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(5);
             let mut interval = tokio::time::interval(STATS_INTERVAL);
@@ -719,108 +731,134 @@ impl BitaxeBoard {
             interval.tick().await;
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // -- Read sensor values --
 
-                // -- Read sensor values --
+                        let asic_temp = fan_ctrl.get_external_temperature().await.ok();
+                        let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
+                        let fan_rpm = fan_ctrl.get_rpm().await.ok();
 
-                let asic_temp = fan_ctrl.get_external_temperature().await.ok();
-                let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
-                let fan_rpm = fan_ctrl.get_rpm().await.ok();
+                        let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
+                            let mut reg = regulator.lock().await;
+                            (
+                                reg.get_vin().await.ok(),
+                                reg.get_vout().await.ok(),
+                                reg.get_iout().await.ok(),
+                                reg.get_power().await.ok(),
+                                reg.get_temperature().await.ok(),
+                            )
+                        };
 
-                let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
-                    let mut reg = regulator.lock().await;
-                    (
-                        reg.get_vin().await.ok(),
-                        reg.get_vout().await.ok(),
-                        reg.get_iout().await.ok(),
-                        reg.get_power().await.ok(),
-                        reg.get_temperature().await.ok(),
-                    )
-                };
-
-                if let Some(mv) = vout_mv {
-                    let volts = mv as f32 / 1000.0;
-                    if volts < 1.0 {
-                        warn!("Core voltage low: {:.3}V", volts);
-                    }
-                }
-
-                // Check power status -- critical faults will return error
-                {
-                    let mut reg = regulator.lock().await;
-                    if let Err(e) = reg.check_status().await {
-                        error!("CRITICAL: Power controller fault detected: {}", e);
-
-                        warn!("Attempting to clear power controller faults...");
-                        if let Err(clear_err) = reg.clear_faults().await {
-                            error!("Failed to clear faults: {}", clear_err);
+                        if let Some(mv) = vout_mv {
+                            let volts = mv as f32 / 1000.0;
+                            if volts < 1.0 {
+                                warn!("Core voltage low: {:.3}V", volts);
+                            }
                         }
 
-                        continue;
+                        // Check power status -- critical faults will return error
+                        {
+                            let mut reg = regulator.lock().await;
+                            if let Err(e) = reg.check_status().await {
+                                error!("CRITICAL: Power controller fault detected: {}", e);
+
+                                warn!("Attempting to clear power controller faults...");
+                                if let Err(clear_err) = reg.clear_faults().await {
+                                    error!("Failed to clear faults: {}", clear_err);
+                                }
+
+                                continue;
+                            }
+                        }
+
+                        // -- Publish BoardTelemetry --
+
+                        let _ = telemetry_tx.send(BoardTelemetry {
+                            name: board_name.clone(),
+                            model: board_model.clone(),
+                            serial: board_serial.clone(),
+                            fans: vec![Fan {
+                                name: "fan".into(),
+                                rpm: fan_rpm,
+                                percent: fan_percent,
+                                target_percent: None,
+                            }],
+                            temperatures: vec![
+                                TemperatureSensor {
+                                    name: "asic".into(),
+                                    temperature_c: asic_temp,
+                                },
+                                TemperatureSensor {
+                                    name: "vr".into(),
+                                    temperature_c: vr_temp.map(|t| t as f32),
+                                },
+                            ],
+                            powers: vec![
+                                PowerMeasurement {
+                                    name: "input".into(),
+                                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                                    current_a: None,
+                                    power_w: None,
+                                },
+                                PowerMeasurement {
+                                    name: "core".into(),
+                                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                                    current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
+                                    power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                                },
+                            ],
+                            threads: Vec::new(),
+                        });
+
+                        // -- Log summary (throttled) --
+
+                        if last_log.elapsed() >= LOG_INTERVAL {
+                            last_log = tokio::time::Instant::now();
+                            info!(
+                                board = %board_model,
+                                serial = ?board_serial,
+                                asic_temp_c = ?asic_temp,
+                                fan_percent = ?fan_percent,
+                                fan_rpm = ?fan_rpm,
+                                vr_temp_c = ?vr_temp,
+                                power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
+                                current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
+                                vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
+                                vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
+                                "Board status."
+                            );
+                        }
                     }
-                }
 
-                // -- Publish BoardTelemetry --
-
-                let _ = telemetry_tx.send(BoardTelemetry {
-                    name: board_name.clone(),
-                    model: board_model.clone(),
-                    serial: board_serial.clone(),
-                    fans: vec![Fan {
-                        name: "fan".into(),
-                        rpm: fan_rpm,
-                        percent: fan_percent,
-                        target_percent: None,
-                    }],
-                    temperatures: vec![
-                        TemperatureSensor {
-                            name: "asic".into(),
-                            temperature_c: asic_temp,
-                        },
-                        TemperatureSensor {
-                            name: "vr".into(),
-                            temperature_c: vr_temp.map(|t| t as f32),
-                        },
-                    ],
-                    powers: vec![
-                        PowerMeasurement {
-                            name: "input".into(),
-                            voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
-                            current_a: None,
-                            power_w: None,
-                        },
-                        PowerMeasurement {
-                            name: "core".into(),
-                            voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
-                            current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
-                            power_w: power_mw.map(|mw| mw as f32 / 1000.0),
-                        },
-                    ],
-                    threads: Vec::new(),
-                });
-
-                // -- Log summary (throttled) --
-
-                if last_log.elapsed() >= LOG_INTERVAL {
-                    last_log = tokio::time::Instant::now();
-                    info!(
-                        board = %board_model,
-                        serial = ?board_serial,
-                        asic_temp_c = ?asic_temp,
-                        fan_percent = ?fan_percent,
-                        fan_rpm = ?fan_rpm,
-                        vr_temp_c = ?vr_temp,
-                        power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
-                        current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
-                        vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
-                        vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
-                        "Board status."
-                    );
+                    Some(cmd) = cmd_rx.recv() => {
+                        handle_board_command(cmd, &regulator).await;
+                    }
                 }
             }
         });
 
         self.stats_task_handle = Some(handle);
+    }
+}
+
+/// Handle a single board command received from the API layer.
+async fn handle_board_command(
+    cmd: BoardCommand,
+    regulator: &Arc<Mutex<crate::peripheral::tps546::Tps546<crate::mgmt_protocol::bitaxe_raw::i2c::BitaxeRawI2c>>>,
+) {
+    match cmd {
+        BoardCommand::SetVoltage { domain, voltage_v, reply } => {
+            if domain != "core" {
+                let _ = reply.send(Err(anyhow::anyhow!("unknown power domain: {}", domain)));
+                return;
+            }
+            let result = regulator.lock().await.set_vout(voltage_v).await;
+            let _ = reply.send(result);
+        }
+        BoardCommand::SetFanTarget { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!("fan target control not yet implemented")));
+        }
     }
 }
 
@@ -961,12 +999,16 @@ async fn create_from_usb(
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
+    // Create command channel for API-to-board control
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<crate::api::commands::BoardCommand>(16);
+
     // Create the board with the control port and data port path
     let mut board = BitaxeBoard::new(
         control_port,
         &serial_ports[1],
         device.serial_number.clone(),
         telemetry_tx,
+        cmd_rx,
     )
     .context("failed to create board")?;
 
@@ -981,7 +1023,10 @@ async fn create_from_usb(
         board.chip_count()
     );
 
-    let registration = super::BoardRegistration { telemetry_rx };
+    let registration = super::BoardRegistration {
+        telemetry_rx,
+        cmd_tx: Some(cmd_tx),
+    };
     Ok((Box::new(board), registration))
 }
 

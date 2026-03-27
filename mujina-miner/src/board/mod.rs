@@ -6,10 +6,13 @@ pub mod pattern;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::{future::Future, pin::Pin};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api::commands::BoardCommand,
+    api_client::types::BoardTelemetry,
+    asic::hash_thread::HashThread,
+    transport::UsbDeviceInfo,
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -58,6 +61,10 @@ pub struct BoardInfo {
 pub struct BoardRegistration {
     /// Watch receiver for the board's telemetry.
     pub telemetry_rx: watch::Receiver<BoardTelemetry>,
+    /// Sender for dispatching commands to this board.
+    ///
+    /// `None` for boards that do not support runtime commands (e.g. CPU miner).
+    pub cmd_tx: Option<mpsc::Sender<BoardCommand>>,
 }
 
 /// Helper type for async board factory functions
