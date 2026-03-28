@@ -85,6 +85,18 @@ mod tests {
 }
 ```
 
+### Module Layout [S.modlayout](#S.modlayout)
+
+Choose between the two module-with-submodules layouts based on
+where the real code lives:
+
+- **`foo/mod.rs`** -- when the root file is mostly re-exports and
+  wiring. The directory *is* the module (e.g., `peripheral/mod.rs`
+  declaring driver submodules).
+- **`foo.rs` + `foo/`** (2024 edition style) -- when the root file
+  has substantial code and submodules are supporting detail (e.g.,
+  `temperature.rs` with a `temperature/conversions.rs` submodule).
+
 ### Lint Attributes [S.expect](#S.expect)
 
 Use `#[expect(...)]` instead of `#[allow(...)]` for intentional lint suppressions.
