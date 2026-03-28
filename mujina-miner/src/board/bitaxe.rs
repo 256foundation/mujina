@@ -40,6 +40,7 @@ use crate::{
     },
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
+    types::Temperature,
 };
 
 use super::{
@@ -775,11 +776,11 @@ impl BitaxeBoard {
                     temperatures: vec![
                         TemperatureSensor {
                             name: "asic".into(),
-                            temperature_c: asic_temp,
+                            temperature: asic_temp.map(Temperature::from_celsius),
                         },
                         TemperatureSensor {
                             name: "vr".into(),
-                            temperature_c: vr_temp.map(|t| t as f32),
+                            temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
                         },
                     ],
                     powers: vec![

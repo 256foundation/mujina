@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::types::Temperature;
+
 /// Full miner telemetry snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerTelemetry {
@@ -49,7 +51,9 @@ pub struct Fan {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct TemperatureSensor {
     pub name: String,
-    pub temperature_c: Option<f32>,
+    #[serde(rename = "temperature_c")]
+    #[schema(value_type = Option<f32>)]
+    pub temperature: Option<Temperature>,
 }
 
 /// Voltage, current, and power from a single measurement point.

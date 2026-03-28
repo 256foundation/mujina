@@ -189,16 +189,16 @@ fn spawn_monitor(
                 _ = ticker.tick() => {}
             }
 
-            let left_c = match temp_left.read().await {
-                Ok(reading) => Some(reading.as_degrees_c()),
+            let t_left = match temp_left.read().await {
+                Ok(reading) => Some(reading.into()),
                 Err(e) => {
                     warn!("TMP1075 (left) read failed: {}", e);
                     None
                 }
             };
 
-            let right_c = match temp_right.read_local().await {
-                Ok(reading) => Some(reading.as_degrees_c()),
+            let t_right = match temp_right.read_local().await {
+                Ok(reading) => Some(reading.into()),
                 Err(e) => {
                     warn!("TMP451 (right) local read failed: {}", e);
                     None
@@ -206,8 +206,8 @@ fn spawn_monitor(
             };
 
             // TODO: attribute to the chip's hash thread once implemented
-            let chip0_c = match temp_right.read_remote().await {
-                Ok(reading) => Some(reading.as_degrees_c()),
+            let t_chip0 = match temp_right.read_remote().await {
+                Ok(reading) => Some(reading.into()),
                 Err(e) => {
                     if !matches!(e, crate::peripheral::tmp451::Error::RemoteDiodeOpen) {
                         warn!("TMP451 remote read failed: {}", e);
@@ -220,15 +220,15 @@ fn spawn_monitor(
                 t.temperatures = vec![
                     TemperatureSensor {
                         name: "pcb-left".into(),
-                        temperature_c: left_c,
+                        temperature: t_left,
                     },
                     TemperatureSensor {
                         name: "pcb-right".into(),
-                        temperature_c: right_c,
+                        temperature: t_right,
                     },
                     TemperatureSensor {
                         name: "chip-0".into(),
-                        temperature_c: chip0_c,
+                        temperature: t_chip0,
                     },
                 ];
             });
