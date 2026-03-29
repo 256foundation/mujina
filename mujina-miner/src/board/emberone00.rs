@@ -273,5 +273,5 @@ impl Board for EmberOne00 {
 #[cfg(test)]
 mod tests {}
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod integration_tests;
