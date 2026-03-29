@@ -931,10 +931,7 @@ async fn create_from_usb(
 ) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     use tokio_serial::SerialPortBuilderExt;
 
-    let serial_ports = device
-        .get_serial_ports(2)
-        .await
-        .context("Bitaxe Gamma has 2 serial ports")?;
+    let serial_ports = device.get_serial_ports(2).await?;
 
     debug!(
         serial = ?device.serial_number,

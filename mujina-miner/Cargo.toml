@@ -20,6 +20,7 @@ crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
+nusb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strum = { workspace = true }
@@ -45,7 +46,6 @@ num-traits = { workspace = true }
 ruint = "1.17.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-udev = { workspace = true }
 tracing-journald = { workspace = true }
 udev = { workspace = true }
 

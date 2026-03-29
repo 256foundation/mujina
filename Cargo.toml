@@ -21,6 +21,7 @@ crc_all = "0.2"
 futures = "0.3"
 hex = "0.4"
 inventory = "0.3"
+nusb = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 strum = { version = "0.27", features = ["derive"] }
@@ -42,7 +43,6 @@ regex = "1.10"
 reqwest = { version = "0.12", features = ["json"] }
 rustix = { version = "0.38", features = ["fs", "termios"] }
 slotmap = "1.0"
-tokio-udev = "0.10"
 udev = "0.9"
 utoipa = "5.4"
 utoipa-axum = "0.2"
