@@ -363,8 +363,10 @@ impl<I: I2c> Emc2101<I> {
     /// Read TACH count (fan speed measurement)
     /// Returns raw TACH count - convert to RPM based on fan specs
     pub async fn get_tach_count(&mut self) -> Result<u16> {
-        let high = self.read_register(regs::TACH_HIGH).await?;
+        // Read low byte first: this latches the high byte so the
+        // pair is from the same measurement cycle.
         let low = self.read_register(regs::TACH_LOW).await?;
+        let high = self.read_register(regs::TACH_HIGH).await?;
 
         let count = ((high as u16) << 8) | (low as u16);
         trace!(
