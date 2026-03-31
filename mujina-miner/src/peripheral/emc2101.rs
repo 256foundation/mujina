@@ -271,21 +271,26 @@ impl<I: I2c> Emc2101<I> {
             )));
         }
 
-        // Valid product IDs for EMC2101
-        const PRODUCT_ID_EMC2101_1: u8 = 0x16;
-        const PRODUCT_ID_EMC2101_2: u8 = 0x28;
-        if product_id != PRODUCT_ID_EMC2101_1 && product_id != PRODUCT_ID_EMC2101_2 {
-            return Err(HwError::InvalidParameter(format!(
-                "Wrong product ID: 0x{:02X}, expected 0x{:02X} or 0x{:02X}",
-                product_id, PRODUCT_ID_EMC2101_1, PRODUCT_ID_EMC2101_2
-            )));
-        }
+        const PRODUCT_ID_EMC2101: u8 = 0x16;
+        const PRODUCT_ID_EMC2101_R: u8 = 0x28;
+
+        let variant = match product_id {
+            PRODUCT_ID_EMC2101 => "EMC2101",
+            PRODUCT_ID_EMC2101_R => "EMC2101-R",
+            _ => {
+                return Err(HwError::InvalidParameter(format!(
+                    "Wrong product ID: 0x{:02X}, expected 0x{:02X} (EMC2101) \
+                     or 0x{:02X} (EMC2101-R)",
+                    product_id, PRODUCT_ID_EMC2101, PRODUCT_ID_EMC2101_R
+                )));
+            }
+        };
 
         debug!(
+            variant,
             mfg_id = format!("{:#04x}", mfg_id),
-            product_id = format!("{:#04x}", product_id),
             revision = format!("{:#04x}", revision),
-            "Detected EMC2101 variant"
+            "Detected fan controller"
         );
 
         // Read current CONFIG register to preserve other bits
