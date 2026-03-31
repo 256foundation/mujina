@@ -72,7 +72,10 @@ mod journald {
         }
 
         if let Ok(layer) = tracing_journald::layer() {
-            tracing_subscriber::registry().with(layer).init();
+            tracing_subscriber::registry()
+                .with(super::build_env_filter())
+                .with(layer)
+                .init();
             true
         } else {
             error!("Failed to initialize journald logging, using stdout.");
