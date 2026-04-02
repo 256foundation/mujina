@@ -162,7 +162,8 @@ RUST_LOG=mujina_miner=debug cargo run
 RUST_LOG=mujina_miner=trace cargo run
 ```
 
-Target specific modules for focused debugging:
+Global trace is verbose. Target specific modules to focus on what
+you're debugging:
 
 ```bash
 # Trace just the Stratum v1 client
