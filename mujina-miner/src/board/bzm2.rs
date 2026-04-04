@@ -2801,10 +2801,12 @@ fn reconcile_saved_operating_point_status(
         .unwrap_or_else(|e| e.into_inner());
 
     let desired = if tuning_state.retune_pending == Some(true) {
-        Some((
-            Bzm2SavedOperatingPointStatus::Invalidated,
-            tuning_state.retune_reasons.clone(),
-        ))
+        guard.saved_operating_point.as_ref().map(|_| {
+            (
+                Bzm2SavedOperatingPointStatus::Pending,
+                tuning_state.retune_reasons.clone(),
+            )
+        })
     } else if guard.saved_operating_point.is_some() {
         Some((Bzm2SavedOperatingPointStatus::Validated, Vec::new()))
     } else {
@@ -2838,14 +2840,11 @@ fn reconcile_saved_operating_point_status(
             }
             guard.saved_operating_point_status = Some(status);
             guard.saved_operating_point_reasons = reasons.clone();
-            if status == Bzm2SavedOperatingPointStatus::Invalidated {
-                guard.saved_operating_point = None;
-            }
         }
 
         tuning_state.saved_operating_point_status = Some(status);
         tuning_state.saved_operating_point_reasons = reasons;
-        if status == Bzm2SavedOperatingPointStatus::Invalidated {
+        if tuning_state.retune_pending == Some(true) {
             tuning_state.reuse_saved_operating_point = Some(false);
         }
     } else {
@@ -4625,21 +4624,22 @@ mod tests {
         );
         assert_eq!(
             tuning.saved_operating_point_status,
-            Some(Bzm2SavedOperatingPointStatus::Invalidated)
+            Some(Bzm2SavedOperatingPointStatus::Pending)
         );
         assert_eq!(
             tuning.saved_operating_point_reasons,
             vec!["throughput regression"]
         );
+        assert_eq!(tuning.reuse_saved_operating_point, Some(false));
 
         let applied = applied_state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        assert!(applied.saved_operating_point.is_none());
+        assert!(applied.saved_operating_point.is_some());
         assert_eq!(
             applied.saved_operating_point_status,
-            Some(Bzm2SavedOperatingPointStatus::Invalidated)
+            Some(Bzm2SavedOperatingPointStatus::Pending)
         );
 
         let stored = load_saved_operating_point_profile(Some(&profile_path))
@@ -4647,7 +4647,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored.persisted.unwrap().saved_operating_point_status,
-            Bzm2SavedOperatingPointStatus::Invalidated
+            Bzm2SavedOperatingPointStatus::Pending
         );
 
         let _ = fs::remove_file(profile_path);
