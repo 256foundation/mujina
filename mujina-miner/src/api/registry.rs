@@ -1,7 +1,7 @@
 //! Dynamic board registration tracking.
 
 use crate::api_client::types::BoardTelemetry;
-use crate::board::BoardRegistration;
+use tokio::sync::watch;
 
 /// Dynamic collection of board registrations.
 ///
@@ -37,12 +37,16 @@ impl BoardRegistry {
     }
 }
 
+/// A board's registration with the API server.
+pub struct BoardRegistration {
+    pub telemetry_rx: watch::Receiver<BoardTelemetry>,
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::watch;
 
     use super::*;
-    use crate::board::BoardRegistration;
 
     /// Create a board registration with the given name, returning the
     /// state sender so the test can update or drop it.

@@ -6,8 +6,7 @@
 use std::time::Duration;
 
 use crate::tracing::prelude::*;
-use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
+use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -15,12 +14,11 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Board, BoardDescriptor, BoardInfo,
+    BackplaneConnector, BoardDescriptor, BoardInfo,
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
     api_client::types::{BoardTelemetry, TemperatureSensor},
-    asic::hash_thread::HashThread,
     hw_trait::gpio::{Gpio, GpioPin, PinValue},
     mgmt_protocol::{
         ControlChannel,
@@ -83,9 +81,7 @@ fn response_format(version: &DeviceVersion) -> ResponseFormat {
     }
 }
 
-async fn create_from_usb(
-    device: UsbDeviceInfo,
-) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let serial_ports = device.get_serial_ports(2).await?;
 
     debug!(
@@ -136,12 +132,20 @@ async fn create_from_usb(
         .await
         .context("TMP451 remote offset failed")?;
 
-    let serial = device.serial_number.clone();
-    let board_name = format!("emberone00-{}", serial.as_deref().unwrap_or("unknown"));
+    let info = BoardInfo {
+        model: "emberOne/00".to_string(),
+        firmware_version: None,
+        serial_number: device.serial_number.clone(),
+    };
+
+    let board_name = format!(
+        "emberone00-{}",
+        info.serial_number.as_deref().unwrap_or("unknown")
+    );
     let initial_telemetry = BoardTelemetry {
-        name: board_name.clone(),
-        model: "emberOne/00".into(),
-        serial,
+        name: board_name,
+        model: info.model.clone(),
+        serial: info.serial_number.clone(),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_telemetry);
@@ -149,8 +153,7 @@ async fn create_from_usb(
     let cancel = CancellationToken::new();
     let monitor_task = spawn_monitor(temp_left, temp_right, telemetry_tx, cancel.clone());
 
-    let board = EmberOne00 {
-        device_info: device,
+    let mut board = EmberOne00 {
         control,
         vddio_en,
         status_led,
@@ -158,8 +161,18 @@ async fn create_from_usb(
         monitor_task,
     };
 
-    let registration = super::BoardRegistration { telemetry_rx };
-    Ok((Box::new(board), registration))
+    let shutdown = Box::pin(async move {
+        board.shutdown().await;
+    });
+
+    warn!("emberOne/00 hash threads not yet implemented");
+
+    Ok(BackplaneConnector {
+        info,
+        threads: Vec::new(),
+        telemetry_rx,
+        shutdown: Some(shutdown),
+    })
 }
 
 /// Spawn a task that periodically reads sensors and publishes telemetry.
@@ -230,9 +243,11 @@ fn spawn_monitor(
     })
 }
 
-/// emberOne/00 hash board
-pub struct EmberOne00 {
-    device_info: UsbDeviceInfo,
+/// emberOne/00 hash board state.
+///
+/// Holds hardware handles needed for the board's lifetime.
+/// Moved into the shutdown future by the factory function.
+struct EmberOne00 {
     control: ControlChannel,
     vddio_en: BitaxeRawGpioPin,
     status_led: StatusLed,
@@ -240,27 +255,13 @@ pub struct EmberOne00 {
     monitor_task: JoinHandle<()>,
 }
 
-#[async_trait]
-impl Board for EmberOne00 {
-    fn board_info(&self) -> BoardInfo {
-        BoardInfo {
-            model: "emberOne/00".to_string(),
-            firmware_version: None,
-            serial_number: self.device_info.serial_number.clone(),
-        }
-    }
-
-    async fn shutdown(&mut self) -> Result<()> {
+impl EmberOne00 {
+    async fn shutdown(&mut self) {
         self.monitor_cancel.cancel();
         let _ = (&mut self.monitor_task).await;
         let _ = self.vddio_en.write(PinValue::Low).await;
         self.status_led.off().await;
         let _ = system::reboot(&self.control).await;
-        Ok(())
-    }
-
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
-        bail!("emberOne/00 hash threads not yet implemented")
     }
 }
 

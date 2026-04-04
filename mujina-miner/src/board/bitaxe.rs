@@ -12,6 +12,7 @@ use tokio::{
     sync::{Mutex, watch},
     time,
 };
+use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -39,12 +40,15 @@ use crate::{
         tps546::{Tps546, Tps546Config},
     },
     tracing::prelude::*,
-    transport::serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
+    transport::{
+        UsbDeviceInfo,
+        serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
+    },
     types::Temperature,
 };
 
 use super::{
-    Board, BoardInfo,
+    BackplaneConnector, BoardInfo,
     pattern::{Match, StringMatch},
 };
 
@@ -825,8 +829,7 @@ impl BitaxeBoard {
     }
 }
 
-#[async_trait]
-impl Board for BitaxeBoard {
+impl BitaxeBoard {
     fn board_info(&self) -> BoardInfo {
         BoardInfo {
             model: "Bitaxe Gamma".to_string(),
@@ -835,19 +838,20 @@ impl Board for BitaxeBoard {
         }
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&mut self) {
         // Signal hash threads to shut down gracefully
         if let Some(ref tx) = self.thread_shutdown {
             if let Err(e) = tx.send(ThreadRemovalSignal::Shutdown) {
                 warn!("Failed to send shutdown signal to threads: {}", e);
             } else {
-                debug!("Sent shutdown signal to hash threads");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
 
         // Hold chips in reset
-        self.hold_in_reset().await?;
+        if let Err(e) = self.hold_in_reset().await {
+            warn!("Failed to hold chips in reset: {}", e);
+        }
 
         // Turn off core voltage
         if let Some(ref regulator) = self.regulator {
@@ -869,11 +873,9 @@ impl Board for BitaxeBoard {
         if let Some(handle) = self.stats_task_handle.take() {
             handle.abort();
         }
-
-        Ok(())
     }
 
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
+    fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
         // Create removal signal channel (starts as Running)
         let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
 
@@ -925,12 +927,8 @@ impl Board for BitaxeBoard {
     }
 }
 
-// Factory function to create a Bitaxe board from USB device info
-async fn create_from_usb(
-    device: crate::transport::UsbDeviceInfo,
-) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    use tokio_serial::SerialPortBuilderExt;
-
+/// Create a Bitaxe board from USB device info.
+async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let serial_ports = device.get_serial_ports(2).await?;
 
     debug!(
@@ -953,7 +951,6 @@ async fn create_from_usb(
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
-    // Create the board with the control port and data port path
     let mut board = BitaxeBoard::new(
         control_port,
         &serial_ports[1],
@@ -962,19 +959,29 @@ async fn create_from_usb(
     )
     .context("failed to create board")?;
 
-    // Initialize the board (reset, discover chips, start event monitoring)
     board
         .initialize()
         .await
         .context("failed to initialize board")?;
 
-    debug!(
-        "Bitaxe board initialized successfully with {} chips",
-        board.chip_count()
-    );
+    let threads = board
+        .create_hash_threads()
+        .context("failed to create hash threads")?;
 
-    let registration = super::BoardRegistration { telemetry_rx };
-    Ok((Box::new(board), registration))
+    let info = board.board_info();
+
+    debug!("Bitaxe board initialized with {} chips", board.chip_count());
+
+    let shutdown = Box::pin(async move {
+        board.shutdown().await;
+    });
+
+    Ok(BackplaneConnector {
+        info,
+        threads,
+        telemetry_rx,
+        shutdown: Some(shutdown),
+    })
 }
 
 // Register this board type with the inventory system

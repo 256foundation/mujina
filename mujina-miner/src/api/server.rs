@@ -14,9 +14,12 @@ use crate::tracing::prelude::*;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
-use super::{commands::SchedulerCommand, registry::BoardRegistry, v0};
+use super::{
+    commands::SchedulerCommand,
+    registry::{BoardRegistration, BoardRegistry},
+    v0,
+};
 use crate::api_client::types::MinerTelemetry;
-use crate::board::BoardRegistration;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -138,8 +141,8 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
+    use crate::api::registry::BoardRegistration;
     use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
-    use crate::board::BoardRegistration;
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
