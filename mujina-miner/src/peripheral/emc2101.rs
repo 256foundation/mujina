@@ -342,6 +342,15 @@ impl<I: I2c> Emc2101<I> {
         const FRACTION_SHIFT: u8 = 5;
         let raw = ((high as u16) << FRACTION_BITS) | ((low as u16) >> FRACTION_SHIFT);
 
+        // Diode fault detection (datasheet section 6.5)
+        const FAULT_OPEN_CIRCUIT: u16 = 0x3F8;
+        const FAULT_SHORT: u16 = 0x3FF;
+        match raw {
+            FAULT_OPEN_CIRCUIT => return Err(HwError::Other("external diode open circuit".into())),
+            FAULT_SHORT => return Err(HwError::Other("external diode short".into())),
+            _ => {}
+        }
+
         // Convert to Celsius
         const RESOLUTION: f32 = 0.125; // degC per LSB
         const SIGN_BIT: u16 = 0x400; // 11-bit sign bit
