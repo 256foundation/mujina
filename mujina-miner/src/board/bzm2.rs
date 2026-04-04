@@ -56,6 +56,7 @@ const DEFAULT_CALIBRATION_SITE_TEMP_C: f32 = 20.0;
 const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
 const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
+const DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ: f32 = 800.0;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
@@ -1629,7 +1630,7 @@ impl Bzm2Board {
                         .filter_map(|asic_id| profile.saved_state.per_asic_pll_mhz.get(&asic_id))
                         .map(|frequencies| frequencies[pll_index]),
                 )
-                .unwrap_or(DEFAULT_CALIBRATION_SITE_TEMP_C)
+                .unwrap_or(DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ)
             });
             self.apply_bus_frequency_map(
                 bus,
@@ -1965,19 +1966,13 @@ impl HashThread for Bzm2ManagedThread {
         self.inner.capabilities()
     }
 
-    async fn update_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> AnyhowResult<Option<HashTask>> {
+    async fn update_task(&mut self, new_task: HashTask) -> AnyhowResult<Option<HashTask>> {
         let result = self.inner.update_task(new_task).await;
         self.publish_status(&self.inner.status());
         result
     }
 
-    async fn replace_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> AnyhowResult<Option<HashTask>> {
+    async fn replace_task(&mut self, new_task: HashTask) -> AnyhowResult<Option<HashTask>> {
         let result = self.inner.replace_task(new_task).await;
         self.publish_status(&self.inner.status());
         result
@@ -2934,11 +2929,9 @@ fn calibration_error(serial_path: &str, err: impl std::fmt::Display) -> BoardErr
     ))
 }
 
-async fn create_bzm2_board()
--> AnyhowResult<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let config = Bzm2RuntimeConfig::from_env().ok_or_else(|| {
-        anyhow::anyhow!("BZM2 not configured (MUJINA_BZM2_SERIAL not set)")
-    })?;
+async fn create_bzm2_board() -> AnyhowResult<(Box<dyn Board + Send>, super::BoardRegistration)> {
+    let config = Bzm2RuntimeConfig::from_env()
+        .ok_or_else(|| anyhow::anyhow!("BZM2 not configured (MUJINA_BZM2_SERIAL not set)"))?;
 
     let serial = config.device_id();
     let initial_state = BoardState {

@@ -13,12 +13,14 @@ pub const BROADCAST_ASIC: u8 = 0xff;
 pub const TARGET_BYTE: u8 = 0x08;
 
 pub const ENGINE_REG_TARGET: u8 = 0x44;
+pub const ENGINE_REG_START_NONCE: u8 = 0x3c;
 pub const ENGINE_REG_TIMESTAMP_COUNT: u8 = 0x48;
 pub const ENGINE_REG_ZEROS_TO_FIND: u8 = 0x49;
 pub const ENGINE_REG_END_NONCE: u8 = 0x40;
 
 pub const DEFAULT_TIMESTAMP_COUNT: u8 = 60;
 pub const DEFAULT_NONCE_GAP: u32 = 0x28;
+pub const DEFAULT_BOARD_END_NONCE: u32 = 0xffff_ffff;
 pub const LOGICAL_ENGINE_ROWS: u8 = 20;
 pub const LOGICAL_ENGINE_COLS: u8 = 12;
 

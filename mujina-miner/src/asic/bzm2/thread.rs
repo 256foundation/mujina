@@ -24,11 +24,12 @@ use super::clock::{
     Bzm2ClockDebugReport, Bzm2Dll, Bzm2DllStatus, Bzm2Pll, Bzm2PllStatus, fincon_is_valid,
 };
 use super::protocol::{
-    self, BROADCAST_ASIC, Bzm2EngineLayout, DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT,
-    DtsVsGeneration, ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND,
-    OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP, OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame,
-    TdmFrameParser, encode_loopback, encode_noop, encode_read_register, encode_write_job,
-    encode_write_register, leading_zero_threshold, logical_engine_address,
+    self, BROADCAST_ASIC, Bzm2EngineLayout, DEFAULT_BOARD_END_NONCE, DEFAULT_NONCE_GAP,
+    DEFAULT_TIMESTAMP_COUNT, DtsVsGeneration, ENGINE_REG_END_NONCE, ENGINE_REG_START_NONCE,
+    ENGINE_REG_TARGET, ENGINE_REG_TIMESTAMP_COUNT, ENGINE_REG_ZEROS_TO_FIND, OPCODE_UART_LOOPBACK,
+    OPCODE_UART_NOOP, OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame, TdmFrameParser,
+    encode_loopback, encode_noop, encode_read_register, encode_write_job, encode_write_register,
+    leading_zero_threshold, logical_engine_address,
 };
 use super::uart::{
     Bzm2DiscoveredEngineMap, Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT,
@@ -64,6 +65,7 @@ const RUNTIME_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5 * 60);
 // Legacy source treats rows 0-9 as the bottom stack (PLL0) and rows 10-19 as
 // the top stack (PLL1).
 const PLL_STACK_SPLIT_ROW: u8 = 10;
+const TIMESTAMP_COUNT_AUTO_CLOCK_UNGATE: u8 = 0x80;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Bzm2PllRuntimeMetrics {
@@ -495,10 +497,7 @@ impl HashThread for Bzm2Thread {
         &self.capabilities
     }
 
-    async fn update_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> anyhow::Result<Option<HashTask>> {
+    async fn update_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::UpdateTask {
@@ -513,10 +512,7 @@ impl HashThread for Bzm2Thread {
             .map_err(Into::into)
     }
 
-    async fn replace_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> anyhow::Result<Option<HashTask>> {
+    async fn replace_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::ReplaceTask {
@@ -1283,8 +1279,10 @@ async fn dispatch_task_to_board(
     });
     let merkle_root_residue = u32::from_le_bytes(header_bytes[64..68].try_into().unwrap());
     let lead_zeros = leading_zero_threshold(task.share_target).saturating_sub(32);
-    let timestamp_count = config.timestamp_count;
+    let timestamp_count = config.timestamp_count | TIMESTAMP_COUNT_AUTO_CLOCK_UNGATE;
     let bits = task.template.bits.to_consensus();
+    let start_nonce = 0u32;
+    let end_nonce = DEFAULT_BOARD_END_NONCE;
 
     for &(row, col) in engine_layout.active_coordinates() {
         let engine_address = logical_engine_address(row, col);
@@ -1325,6 +1323,30 @@ async fn dispatch_task_to_board(
             .await
             .map_err(|err| {
                 HashThreadError::WorkAssignmentFailed(format!("Failed to write target bits: {err}"))
+            })?;
+
+        writer
+            .write_all(&encode_write_register(
+                BROADCAST_ASIC,
+                engine_address,
+                ENGINE_REG_START_NONCE,
+                &start_nonce.to_le_bytes(),
+            ))
+            .await
+            .map_err(|err| {
+                HashThreadError::WorkAssignmentFailed(format!("Failed to write start nonce: {err}"))
+            })?;
+
+        writer
+            .write_all(&encode_write_register(
+                BROADCAST_ASIC,
+                engine_address,
+                ENGINE_REG_END_NONCE,
+                &end_nonce.to_le_bytes(),
+            ))
+            .await
+            .map_err(|err| {
+                HashThreadError::WorkAssignmentFailed(format!("Failed to write end nonce: {err}"))
             })?;
 
         let seq_start = (base_sequence % 2) * 4;
@@ -1687,7 +1709,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected_bytes_per_engine = 8 + 8 + 11 + (48 * 4);
+        let expected_bytes_per_engine = 8 + 8 + 11 + 11 + 11 + (48 * 4);
         let expected_total = expected_bytes_per_engine * engine_coords.len();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
         let mut buf = vec![0u8; 512];
@@ -1711,8 +1733,37 @@ mod tests {
         assert_eq!(bytes.len(), expected_total);
         assert_eq!(engine_dispatches.len(), engine_coords.len());
 
-        let first_packet_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-        assert_eq!(first_packet_len, 8);
+        let packet_lengths = bytes
+            .chunks_exact(expected_bytes_per_engine)
+            .map(|chunk| {
+                [
+                    u16::from_le_bytes([chunk[0], chunk[1]]) as usize,
+                    u16::from_le_bytes([chunk[8], chunk[9]]) as usize,
+                    u16::from_le_bytes([chunk[16], chunk[17]]) as usize,
+                    u16::from_le_bytes([chunk[27], chunk[28]]) as usize,
+                    u16::from_le_bytes([chunk[38], chunk[39]]) as usize,
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            packet_lengths
+                .iter()
+                .all(|lens| *lens == [8, 8, 11, 11, 11])
+        );
+
+        for chunk in bytes.chunks_exact(expected_bytes_per_engine) {
+            assert_eq!(
+                chunk[7],
+                leading_zero_threshold(task.share_target).saturating_sub(32)
+            );
+            assert_eq!(chunk[15], 0x80 | DEFAULT_TIMESTAMP_COUNT);
+            assert_eq!(
+                &chunk[23..27],
+                &task.template.bits.to_consensus().to_le_bytes()
+            );
+            assert_eq!(&chunk[34..38], &0u32.to_le_bytes());
+            assert_eq!(&chunk[45..49], &DEFAULT_BOARD_END_NONCE.to_le_bytes());
+        }
 
         let last_packet_start = bytes.len() - 48;
         assert_eq!(
@@ -2059,7 +2110,8 @@ mod tests {
         let mut buf = vec![0u8; 512];
         let mut bytes = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-        while bytes.len() < (8 + 8 + 11 + (48 * 4)) * engine_layout.active_engine_count() {
+        let expected_bytes_per_engine = 8 + 8 + 11 + 11 + 11 + (48 * 4);
+        while bytes.len() < expected_bytes_per_engine * engine_layout.active_engine_count() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let n = tokio::time::timeout(remaining, reader.read(&mut buf))
                 .await
@@ -2071,15 +2123,16 @@ mod tests {
             bytes.extend_from_slice(&buf[..n]);
         }
 
-        let first_engine = logical_engine_address(0, 0).to_be_bytes();
-        let second_engine = logical_engine_address(19, 10).to_be_bytes();
-        assert!(bytes.windows(2).any(|window| window == first_engine));
-        assert!(bytes.windows(2).any(|window| window == second_engine));
-        assert!(
-            !bytes
-                .windows(2)
-                .any(|window| window == logical_engine_address(0, 1).to_be_bytes())
-        );
+        let first_engine = logical_engine_address(0, 0);
+        let second_engine = logical_engine_address(19, 10);
+        let touched_engines = bytes
+            .chunks_exact(expected_bytes_per_engine)
+            .map(|chunk| u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]))
+            .map(|header| ((header >> 8) & 0x0fff) as u16)
+            .collect::<Vec<_>>();
+        assert!(touched_engines.contains(&first_engine));
+        assert!(touched_engines.contains(&second_engine));
+        assert!(!touched_engines.contains(&logical_engine_address(0, 1)));
         assert_eq!(engine_dispatches.len(), 2);
         assert!(engine_dispatches.contains_key(&0));
         assert!(engine_dispatches.contains_key(&1));
