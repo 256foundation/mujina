@@ -84,6 +84,7 @@ inventory::submit! {
         pattern: BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("256F")),
             product: Match::Specific(StringMatch::Exact("EmberOne00")),
             serial_pattern: Match::Any,
@@ -99,14 +100,15 @@ mod tests {
 
     #[test]
     fn test_board_creation() {
-        let device = UsbDeviceInfo::new_for_test(
-            0xc0de,
-            0xcafe,
-            Some("TEST001".to_string()),
-            Some("EmberOne".to_string()),
-            Some("Mining Board".to_string()),
-            "/sys/devices/test".to_string(),
-        );
+        let device = UsbDeviceInfo {
+            vid: 0xc0de,
+            pid: 0xcafe,
+            bcd_device: 0x0100,
+            serial_number: Some("TEST001".to_string()),
+            manufacturer: Some("EmberOne".to_string()),
+            product: Some("Mining Board".to_string()),
+            device_path: "/sys/devices/test".to_string(),
+        };
 
         let (state_tx, _state_rx) = watch::channel(BoardState {
             name: format!(

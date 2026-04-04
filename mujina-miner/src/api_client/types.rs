@@ -20,6 +20,8 @@ pub struct MinerState {
     pub sources: Vec<SourceState>,
 }
 
+pub type MinerTelemetry = MinerState;
+
 /// Board status.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct BoardState {
@@ -36,6 +38,8 @@ pub struct BoardState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bzm2_tuning: Option<Bzm2TuningState>,
 }
+
+pub type BoardTelemetry = BoardState;
 
 /// Fan status.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -282,3 +286,5 @@ pub struct SourceState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub difficulty: Option<f64>,
 }
+
+pub type SourceTelemetry = SourceState;

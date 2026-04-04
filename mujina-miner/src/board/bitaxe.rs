@@ -29,6 +29,7 @@ use crate::{
     mgmt_protocol::{
         ControlChannel,
         bitaxe_raw::{
+            ResponseFormat,
             gpio::{BitaxeRawGpioController, BitaxeRawGpioPin},
             i2c::BitaxeRawI2c,
         },
@@ -178,7 +179,7 @@ impl BitaxeBoard {
         state_tx: watch::Sender<BoardState>,
     ) -> Result<Self> {
         // Create control channel and I2C controller
-        let control_channel = ControlChannel::new(control);
+        let control_channel = ControlChannel::new(control, ResponseFormat::V0);
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Create SerialStream for data channel at initial baud rate
@@ -932,7 +933,7 @@ async fn create_from_usb(
     use tokio_serial::SerialPortBuilderExt;
 
     // Get serial ports
-    let serial_ports = device.serial_ports()?;
+    let serial_ports = device.get_serial_ports(2).await?;
 
     // Bitaxe Gamma requires exactly 2 serial ports
     if serial_ports.len() != 2 {
@@ -995,6 +996,7 @@ inventory::submit! {
         pattern: crate::board::pattern::BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
             product: Match::Specific(StringMatch::Exact("Bitaxe")),
             serial_pattern: Match::Any,
