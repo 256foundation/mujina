@@ -48,6 +48,39 @@ The biggest missing pieces are:
 2. closed-loop calibration and retune
 3. board/API diagnostics parity with the CLI
 
+## Generic Breakout Targets
+
+The long-term goal is not just a strong BZM2 port, but a reusable mining-board
+reference architecture inside Mujina.
+
+These pieces should remain shaped so they can become general-purpose facilities:
+
+- `board::power`
+  - rail sequencing
+  - reset-line orchestration
+  - reusable rail telemetry adapters
+- `asic::hash_thread`
+  - thread telemetry events
+  - idle-only diagnostics gatekeeping
+  - generic scheduler-facing lifecycle hooks
+- `tuning`
+  - board-independent tuning inputs and outputs
+  - reusable search-space generation
+  - reusable replay / pending / validated operating-point states
+- board command plumbing
+  - generic board-side diagnostics RPC pattern
+  - per-board command enums only for truly ASIC-specific operations
+- protocol documentation pattern
+  - keep wire-level references vendor-specific
+  - keep planning, telemetry, and power-control descriptions reusable
+
+The pieces that should stay BZM2-specific are:
+
+- UART opcode packing and TDM parsing
+- BZM2 engine topology model
+- BZM2 PLL/DLL register programming
+- BZM2 DTS/VS payload decoding
+
 ## Phase 1: Discoverable Bring-Up
 
 Objective:
@@ -330,4 +363,3 @@ Reason:
 - enumeration removes a major assumption from the current board runtime
 - it is ASIC-generic
 - it is directly grounded in documented and legacy UART behavior
-

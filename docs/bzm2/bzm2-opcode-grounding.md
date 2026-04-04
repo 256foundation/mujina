@@ -1,17 +1,17 @@
-# BZM2 Opcode And JTAG Grounding
+# BZM2 Opcode And Interface Grounding
 
 ## Scope
 
 This note captures only behavior that is grounded in material included in this repository:
 
-- legacy UART implementation in [uart.h](../bzm2_cgminer/feeds/mining_src/bzmd/uart.h) and [uart.c](../bzm2_cgminer/feeds/mining_src/bzmd/uart.c)
-- legacy exercised behavior in [test.c](../bzm2_cgminer/feeds/mining_src/bzmd/tests/test.c)
+- repository-visible historical UART implementation behavior
+- repository-visible historical exercised UART behavior
 
 Anything not evidenced there is intentionally excluded from the Mujina port.
 
 ## What The Legacy Source Proved
 
-The legacy `bzmd` source gives a concrete UART wire contract for these opcodes:
+The historical shipped C implementation gives a concrete UART wire contract for these opcodes:
 
 - `WRITEJOB`
 - `READRESULT`
@@ -22,7 +22,7 @@ The legacy `bzmd` source gives a concrete UART wire contract for these opcodes:
 - `LOOPBACK`
 - `NOOP`
 
-Grounded request/response behavior from [uart.c](../bzm2_cgminer/feeds/mining_src/bzmd/uart.c):
+Grounded request/response behavior from the repository-visible historical UART implementation:
 
 - `WRITEREG`: request is `len(2 LE) + header(4 BE) + count_minus_one + payload`
 - `MULTICAST_WRITE`: same framing as `WRITEREG`, but opcode `0x4`
@@ -32,7 +32,7 @@ Grounded request/response behavior from [uart.c](../bzm2_cgminer/feeds/mining_sr
 - `LOOPBACK`: request is `len + header + count_minus_one + payload`; response echoes `asic + opcode + payload`
 - `DTS_VS`: in TDM mode, payload is 4 bytes for gen1 and 8 bytes for gen2
 
-Grounded concurrency and parser behavior from [uart.h](../bzm2_cgminer/feeds/mining_src/bzmd/uart.h), [uart.c](../bzm2_cgminer/feeds/mining_src/bzmd/uart.c), and [test.c](../bzm2_cgminer/feeds/mining_src/bzmd/tests/test.c):
+Grounded concurrency and parser behavior from the repository-visible historical implementation and tests:
 
 - TDM parsing is byte-stream oriented and must resynchronize after unknown prefixes
 - TDM `READREG` response size is caller-driven and tracked per ASIC
@@ -61,5 +61,5 @@ Not implemented from the docs side:
 
 Reason:
 
-- the available source in this workspace proves the UART mining/control path
+- the repository-visible implementation proves the UART mining/control path
 - the repository-visible sources do not provide enough packet-level JTAG detail to implement anything defensible

@@ -1,6 +1,6 @@
-# BZM2 PnP Calibration In Mujina
+# BZM2 Tuning Calibration In Mujina
 
-This note captures the current BZM2 PnP state in Mujina, what the legacy `bzmd` implementation did, and what is now implemented in the Rust port.
+This note captures the current BZM2 tuning state in Mujina, what the historical C implementation did, and what is now implemented in the Rust port.
 
 ## Current Gap
 
@@ -22,7 +22,7 @@ What it did not have was a native Mujina tuning planner for BZM2:
 - domain-aware planning for hardware with multiple voltage domains
 - per-ASIC or per-stack frequency fine-tuning around a target pass-rate window
 
-## Legacy `pnp.c` Behavior
+## Historical C Tuning Behavior
 
 The original C implementation mixed:
 

@@ -2,12 +2,12 @@
 
 ## Architecture
 
-This port keeps BZM2 support inside Mujina rather than reviving the original split `cgminer` + `bzmd` process model.
+This port keeps BZM2 support inside Mujina rather than depending on an external split-process design.
 
-The legacy split looked like this:
+The earlier implementation split responsibilities across separate components:
 
-- `cgminer` handled scheduling, pool interaction, and IPC to `bzmd`
-- `bzmd` owned UART transport, job fanout, result validation, and board-management glue
+- one component handled scheduling and pool interaction
+- one component owned UART transport, job fanout, result validation, and board-management glue
 
 In Mujina, those responsibilities map cleanly onto existing abstractions:
 
@@ -194,7 +194,7 @@ Example JSON fragment:
 Notes:
 
 - these ASIC-originated entries are merged into board state and do not replace host-file telemetry
-- Celsius and voltage scaling follow the legacy `bzmd` DTS/VS conversion formulas
+- Celsius and voltage scaling follow the historical DTS/VS conversion formulas preserved in the repository-visible implementation
 - Gen1 currently exposes voltage through this path, but not a Celsius temperature reading
 
 ## On-Demand ASIC Sensor Queries
@@ -319,7 +319,7 @@ configuration alone.
 
 ## Design Boundary
 
-The legacy `bzmd` board-power path mixes three different concerns:
+The historical board-power path mixed three different concerns:
 
 - genuinely reusable sequencing concepts
 - generic peripheral protocols like PMBus/I2C regulators and reset GPIOs
@@ -365,4 +365,3 @@ This port currently implements the opcode surface that is evidenced in the legac
 See also:
 
 - [bzm2-opcode-grounding.md](bzm2-opcode-grounding.md) for the source-grounded opcode matrix and the current JTAG evidence boundary
-

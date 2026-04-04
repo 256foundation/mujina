@@ -17,8 +17,9 @@ interfaces. Part of the larger Mujina OS project, an open source, Debian-based
 embedded Linux distribution optimized for Bitcoin mining hardware.
 
 This repository also includes an active Rust port of the Intel BZM2 mining
-stack. The goal of the port is to keep BZM2 support inside Mujina rather than
-reviving the original split `cgminer` plus `bzmd` process model.
+stack. The goal of the port is to keep BZM2 support inside Mujina as a native
+board and ASIC implementation rather than depending on an external companion
+process model.
 
 ## Features
 

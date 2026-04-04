@@ -43,7 +43,7 @@ pub enum Bzm2PerformanceMode {
 }
 
 impl Bzm2PerformanceMode {
-    fn pass_rate_range(self) -> f32 {
+    fn acceptance_band(self) -> f32 {
         match self {
             Self::MaxThroughput => ACCEPT_RATIO_BAND_MAX_THROUGHPUT,
             Self::Standard => ACCEPT_RATIO_BAND_STANDARD,
@@ -464,8 +464,8 @@ impl Bzm2CalibrationPlanner {
                         for (pll_index, pass_rate) in measurement.pll_pass_rates.iter().enumerate()
                         {
                             if let Some(pass_rate) = pass_rate {
-                                let low = target.pass_rate - input.target_mode.pass_rate_range();
-                                let high = target.pass_rate + input.target_mode.pass_rate_range();
+                                let low = target.pass_rate - input.target_mode.acceptance_band();
+                                let high = target.pass_rate + input.target_mode.acceptance_band();
                                 if *pass_rate < low {
                                     pll_frequencies[pll_index] =
                                         clamp_frequency(pll_frequencies[pll_index] - CALI_FREQ_MHZ);
@@ -487,7 +487,7 @@ impl Bzm2CalibrationPlanner {
                             }
                         }
                     } else if let Some(pass_rate) = measurement.average_pass_rate {
-                        if pass_rate < target.pass_rate - input.target_mode.pass_rate_range() {
+                        if pass_rate < target.pass_rate - input.target_mode.acceptance_band() {
                             pll_frequencies =
                                 [clamp_frequency(domain_frequency - CALI_FREQ_MHZ); 2];
                             asic_notes.push(format!(
