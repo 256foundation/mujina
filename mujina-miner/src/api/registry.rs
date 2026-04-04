@@ -1,7 +1,9 @@
 //! Dynamic board registration tracking.
 
-use crate::api_client::types::BoardTelemetry;
-use crate::board::BoardRegistration;
+use tokio::sync::mpsc;
+
+use crate::api_client::types::BoardState;
+use crate::board::{BoardCommand, BoardRegistration};
 
 /// Dynamic collection of board registrations.
 ///
@@ -23,37 +25,64 @@ impl BoardRegistry {
         self.boards.push(reg);
     }
 
+    fn prune_disconnected(&mut self) {
+        self.boards.retain(|reg| reg.state_rx.has_changed().is_ok());
+    }
+
     /// Snapshot all connected boards.
     ///
     /// Removes boards whose sender has been dropped (board disconnected)
     /// and returns the current state of each.
-    pub fn boards(&mut self) -> Vec<BoardTelemetry> {
-        self.boards
-            .retain(|reg| reg.telemetry_rx.has_changed().is_ok());
+    pub fn boards(&mut self) -> Vec<BoardState> {
+        self.prune_disconnected();
         self.boards
             .iter()
-            .map(|reg| reg.telemetry_rx.borrow().clone())
+            .map(|reg| reg.state_rx.borrow().clone())
             .collect()
+    }
+
+    /// Snapshot one connected board by name.
+    pub fn board(&mut self, name: &str) -> Option<BoardState> {
+        self.prune_disconnected();
+        self.boards
+            .iter()
+            .find(|reg| reg.state_rx.borrow().name == name)
+            .map(|reg| reg.state_rx.borrow().clone())
+    }
+
+    /// Clone a board command sender by board name if available.
+    pub fn command_tx(&mut self, name: &str) -> Option<mpsc::Sender<BoardCommand>> {
+        self.prune_disconnected();
+        self.boards
+            .iter()
+            .find(|reg| reg.state_rx.borrow().name == name)
+            .and_then(|reg| reg.command_tx.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
     use crate::board::BoardRegistration;
 
     /// Create a board registration with the given name, returning the
     /// state sender so the test can update or drop it.
-    fn make_board(name: &str) -> (watch::Sender<BoardTelemetry>, BoardRegistration) {
-        let telemetry = BoardTelemetry {
+    fn make_board(name: &str) -> (watch::Sender<BoardState>, BoardRegistration) {
+        let state = BoardState {
             name: name.into(),
             model: "Test".into(),
             ..Default::default()
         };
-        let (tx, rx) = watch::channel(telemetry);
-        (tx, BoardRegistration { telemetry_rx: rx })
+        let (tx, rx) = watch::channel(state);
+        (
+            tx,
+            BoardRegistration {
+                state_rx: rx,
+                command_tx: None,
+            },
+        )
     }
 
     #[test]
@@ -80,16 +109,13 @@ mod tests {
         registry.push(reg_a);
         registry.push(reg_b);
 
-        // Both present initially
         assert_eq!(registry.boards().len(), 2);
 
-        // Drop the sender for board B -- simulates board disconnect
         drop(drop_me);
         let boards = registry.boards();
         assert_eq!(boards.len(), 1);
         assert_eq!(boards[0].name, "stays");
 
-        // Sender A still alive
         drop(keep);
     }
 
@@ -104,5 +130,23 @@ mod tests {
 
         tx.send_modify(|s| s.model = "Updated".into());
         assert_eq!(registry.boards()[0].model, "Updated");
+    }
+
+    #[test]
+    fn returns_command_sender_for_named_board() {
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "board-a".into(),
+            model: "Test".into(),
+            ..Default::default()
+        });
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(command_tx.clone()),
+        });
+
+        let cloned = registry.command_tx("board-a");
+        assert!(cloned.is_some());
     }
 }
