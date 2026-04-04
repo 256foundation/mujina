@@ -8,14 +8,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::Level;
-
-use crate::tracing::prelude::*;
+use tracing::{Level, info, warn};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::{commands::SchedulerCommand, registry::BoardRegistry, v0};
-use crate::api_client::types::MinerTelemetry;
+use crate::api_client::types::MinerState;
 use crate::board::BoardRegistration;
 
 /// API server configuration.
@@ -28,22 +26,22 @@ pub struct ApiConfig {
 /// Shared application state available to all handlers.
 #[derive(Clone)]
 pub(crate) struct SharedState {
-    pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
+    pub miner_state_rx: watch::Receiver<MinerState>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
 }
 
 impl SharedState {
-    /// Build a complete MinerTelemetry by combining scheduler data with board
+    /// Build a complete MinerState by combining scheduler data with board
     /// snapshots from the registry.
-    pub fn miner_telemetry(&self) -> MinerTelemetry {
-        let mut telemetry = self.miner_telemetry_rx.borrow().clone();
-        telemetry.boards = self
+    pub fn miner_state(&self) -> MinerState {
+        let mut state = self.miner_state_rx.borrow().clone();
+        state.boards = self
             .board_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .boards();
-        telemetry
+        state
     }
 }
 
@@ -59,7 +57,7 @@ impl SharedState {
 pub async fn serve(
     config: ApiConfig,
     shutdown: CancellationToken,
-    miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
+    miner_state_rx: watch::Receiver<MinerState>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
 ) -> Result<()> {
@@ -76,7 +74,7 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    let app = build_router(miner_state_rx, board_registry, scheduler_cmd_tx);
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -104,12 +102,12 @@ pub async fn serve(
 
 /// Build the application router with all API routes.
 pub(crate) fn build_router(
-    miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
+    miner_state_rx: watch::Receiver<MinerState>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
 ) -> Router {
     let state = SharedState {
-        miner_telemetry_rx,
+        miner_state_rx,
         board_registry,
         scheduler_cmd_tx,
     };
@@ -138,24 +136,26 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
-    use crate::board::BoardRegistration;
+    use crate::api_client::types::{
+        AsicState, BoardState, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
+        Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
+        Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
+        Bzm2RegisterWriteResponse, EngineCoordinate, SourceState, TemperatureSensor,
+    };
+    use crate::board::{BoardCommand, BoardRegistration};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
         router: Router,
         /// Keep alive to prevent board watch channels from closing.
-        _board_senders: Vec<watch::Sender<BoardTelemetry>>,
-        /// Publish updated miner telemetry (e.g. after handling a command).
-        _miner_tx: watch::Sender<MinerTelemetry>,
+        _board_senders: Vec<watch::Sender<BoardState>>,
+        /// Publish updated miner state (e.g. after handling a command).
+        _miner_tx: watch::Sender<MinerState>,
         /// Receives commands sent by PATCH handlers.
         _cmd_rx: mpsc::Receiver<SchedulerCommand>,
     }
 
-    fn build_test_router(
-        miner_state: MinerTelemetry,
-        board_states: Vec<BoardTelemetry>,
-    ) -> TestFixtures {
+    fn build_test_router(miner_state: MinerState, board_states: Vec<BoardState>) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
 
@@ -163,7 +163,10 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
+            registry.push(BoardRegistration {
+                state_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 
@@ -186,9 +189,26 @@ mod tests {
         (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
+    async fn post_json<T: serde::Serialize>(
+        app: Router,
+        uri: &str,
+        body: &T,
+    ) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
     #[tokio::test]
     async fn health_returns_ok() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, body) = get(fixtures.router.clone(), "/api/v0/health").await;
         assert_eq!(status, 200);
         assert_eq!(body, "OK");
@@ -196,18 +216,18 @@ mod tests {
 
     #[tokio::test]
     async fn miner_includes_boards_and_sources() {
-        let miner_state = MinerTelemetry {
+        let miner_state = MinerState {
             uptime_secs: 42,
             hashrate: 1_000_000,
             shares_submitted: 5,
-            sources: vec![SourceTelemetry {
+            sources: vec![SourceState {
                 name: "pool".into(),
                 url: Some("stratum+tcp://localhost:3333".into()),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        let board = BoardTelemetry {
+        let board = BoardState {
             name: "test-board".into(),
             model: "TestModel".into(),
             ..Default::default()
@@ -217,7 +237,7 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/miner").await;
         assert_eq!(status, 200);
 
-        let state: MinerTelemetry = serde_json::from_str(&body).unwrap();
+        let state: MinerState = serde_json::from_str(&body).unwrap();
         assert_eq!(state.uptime_secs, 42);
         assert_eq!(state.hashrate, 1_000_000);
         assert_eq!(state.shares_submitted, 5);
@@ -230,23 +250,23 @@ mod tests {
     #[tokio::test]
     async fn boards_returns_list() {
         let boards = vec![
-            BoardTelemetry {
+            BoardState {
                 name: "board-a".into(),
                 model: "A".into(),
                 ..Default::default()
             },
-            BoardTelemetry {
+            BoardState {
                 name: "board-b".into(),
                 model: "B".into(),
                 ..Default::default()
             },
         ];
-        let fixtures = build_test_router(MinerTelemetry::default(), boards);
+        let fixtures = build_test_router(MinerState::default(), boards);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards").await;
         assert_eq!(status, 200);
 
-        let boards: Vec<BoardTelemetry> = serde_json::from_str(&body).unwrap();
+        let boards: Vec<BoardState> = serde_json::from_str(&body).unwrap();
         assert_eq!(boards.len(), 2);
         assert_eq!(boards[0].name, "board-a");
         assert_eq!(boards[1].name, "board-b");
@@ -254,39 +274,311 @@ mod tests {
 
     #[tokio::test]
     async fn board_by_name_returns_match() {
-        let board = BoardTelemetry {
+        let board = BoardState {
             name: "bitaxe-abc123".into(),
             model: "Bitaxe".into(),
             serial: Some("abc123".into()),
             ..Default::default()
         };
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![board]);
+        let fixtures = build_test_router(MinerState::default(), vec![board]);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards/bitaxe-abc123").await;
         assert_eq!(status, 200);
 
-        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
+        let board: BoardState = serde_json::from_str(&body).unwrap();
         assert_eq!(board.name, "bitaxe-abc123");
         assert_eq!(board.serial, Some("abc123".into()));
     }
 
     #[tokio::test]
     async fn board_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/boards/nonexistent").await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
+    async fn bzm2_query_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2DtsVs {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                state_tx_for_command.send_modify(|state| {
+                    state.temperatures.push(TemperatureSensor {
+                        name: "ttyUSB0-asic-2-dts".into(),
+                        temperature_c: Some(64.5),
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/dts-vs-query",
+            &Bzm2DtsVsQueryRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.temperatures.iter().any(
+            |sensor| sensor.name == "ttyUSB0-asic-2-dts" && sensor.temperature_c == Some(64.5)
+        ));
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_diagnostic_endpoints_round_trip_payloads() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (_state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(4);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            while let Some(command) = board_cmd_rx.recv().await {
+                match command {
+                    BoardCommand::QueryBzm2Noop {
+                        thread_index,
+                        asic,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        let _ = reply.send(Ok(*b"BZ2"));
+                    }
+                    BoardCommand::QueryBzm2Loopback {
+                        thread_index,
+                        asic,
+                        payload,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(payload, vec![0x01, 0x02, 0xaa, 0xbb]);
+                        let _ = reply.send(Ok(payload));
+                    }
+                    BoardCommand::ReadBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(count, 4);
+                        let _ = reply.send(Ok(vec![0x11, 0x22, 0x33, 0x44]));
+                    }
+                    BoardCommand::WriteBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(value, vec![0xde, 0xad, 0xbe, 0xef]);
+                        let _ = reply.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/noop",
+            &Bzm2NoopRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let noop: Bzm2NoopResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(noop.payload_hex, "425a32");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/loopback",
+            &Bzm2LoopbackRequest {
+                thread_index: 0,
+                asic: 2,
+                payload_hex: "0102aabb".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let loopback: Bzm2LoopbackResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(loopback.payload_hex, "0102aabb");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let readback: Bzm2RegisterReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(readback.value_hex, "11223344");
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/register-write",
+            &Bzm2RegisterWriteRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                value_hex: "deadbeef".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let write_ack: Bzm2RegisterWriteResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(write_ack.bytes_written, 4);
+
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
+    async fn bzm2_engine_discovery_endpoint_returns_refreshed_board_state() {
+        let (miner_tx, miner_rx) = watch::channel(MinerState::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (state_tx, state_rx) = watch::channel(BoardState {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let state_tx_for_command = state_tx.clone();
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            state_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::DiscoverBzm2Engines {
+                thread_index,
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout_ms,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                assert_eq!(tdm_prediv_raw, 0x0f);
+                assert_eq!(tdm_counter, 16);
+                assert_eq!(timeout_ms, Some(150));
+                state_tx_for_command.send_modify(|state| {
+                    state.asics.push(AsicState {
+                        id: 2,
+                        thread_index: Some(0),
+                        serial_path: Some("/dev/ttyUSB0".into()),
+                        discovered_engine_count: Some(236),
+                        missing_engines: vec![
+                            EngineCoordinate { row: 3, col: 7 },
+                            EngineCoordinate { row: 5, col: 11 },
+                        ],
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "/api/v0/boards/bzm2-test/bzm2/discover-engines",
+            &Bzm2EngineDiscoveryRequest {
+                thread_index: 0,
+                asic: 2,
+                tdm_prediv_raw: 0x0f,
+                tdm_counter: 16,
+                timeout_ms: Some(150),
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardState = serde_json::from_str(&body).unwrap();
+        assert!(board.asics.iter().any(|asic| {
+            asic.id == 2
+                && asic.thread_index == Some(0)
+                && asic.discovered_engine_count == Some(236)
+                && asic.missing_engines
+                    == vec![
+                        EngineCoordinate { row: 3, col: 7 },
+                        EngineCoordinate { row: 5, col: 11 },
+                    ]
+        }));
+        drop(miner_tx);
+        drop(cmd_rx);
+    }
+
+    #[tokio::test]
     async fn sources_returns_list() {
-        let miner_state = MinerTelemetry {
+        let miner_state = MinerState {
             sources: vec![
-                SourceTelemetry {
+                SourceState {
                     name: "pool-a".into(),
                     url: Some("stratum+tcp://a:3333".into()),
                     ..Default::default()
                 },
-                SourceTelemetry {
+                SourceState {
                     name: "pool-b".into(),
                     url: None,
                     ..Default::default()
@@ -299,7 +591,7 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources").await;
         assert_eq!(status, 200);
 
-        let sources: Vec<SourceTelemetry> = serde_json::from_str(&body).unwrap();
+        let sources: Vec<SourceState> = serde_json::from_str(&body).unwrap();
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].name, "pool-a");
         assert_eq!(sources[0].url.as_deref(), Some("stratum+tcp://a:3333"));
@@ -309,8 +601,8 @@ mod tests {
 
     #[tokio::test]
     async fn source_by_name_returns_match() {
-        let miner_state = MinerTelemetry {
-            sources: vec![SourceTelemetry {
+        let miner_state = MinerState {
+            sources: vec![SourceState {
                 name: "my-pool".into(),
                 url: Some("stratum+tcp://pool:3333".into()),
                 ..Default::default()
@@ -322,22 +614,22 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/my-pool").await;
         assert_eq!(status, 200);
 
-        let source: SourceTelemetry = serde_json::from_str(&body).unwrap();
+        let source: SourceState = serde_json::from_str(&body).unwrap();
         assert_eq!(source.name, "my-pool");
         assert_eq!(source.url.as_deref(), Some("stratum+tcp://pool:3333"));
     }
 
     #[tokio::test]
     async fn source_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/sources/nonexistent").await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
     async fn source_difficulty_serializes_as_f64() {
-        let miner_state = MinerTelemetry {
-            sources: vec![SourceTelemetry {
+        let miner_state = MinerState {
+            sources: vec![SourceState {
                 name: "pool".into(),
                 difficulty: Some(2048.5),
                 ..Default::default()
@@ -349,13 +641,13 @@ mod tests {
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/pool").await;
         assert_eq!(status, 200);
 
-        let source: SourceTelemetry = serde_json::from_str(&body).unwrap();
+        let source: SourceState = serde_json::from_str(&body).unwrap();
         assert_eq!(source.difficulty, Some(2048.5));
     }
 
     #[tokio::test]
     async fn unknown_route_returns_404() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerState::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
     }

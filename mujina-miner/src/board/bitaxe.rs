@@ -16,7 +16,7 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use crate::{
-    api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
+    api_client::types::{BoardState, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
         bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
@@ -40,7 +40,6 @@ use crate::{
     },
     tracing::prelude::*,
     transport::serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
-    types::Temperature,
 };
 
 use super::{
@@ -144,9 +143,9 @@ pub struct BitaxeBoard {
     stats_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Serial number from USB device info
     serial_number: Option<String>,
-    /// Channel for publishing board telemetry to the API server.
+    /// Channel for publishing board state to the API server.
     /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
-    telemetry_tx: Option<watch::Sender<BoardTelemetry>>,
+    state_tx: Option<watch::Sender<BoardState>>,
 }
 
 impl BitaxeBoard {
@@ -177,9 +176,9 @@ impl BitaxeBoard {
         control: tokio_serial::SerialStream,
         data_path: &str,
         serial_number: Option<String>,
-        telemetry_tx: watch::Sender<BoardTelemetry>,
+        state_tx: watch::Sender<BoardState>,
     ) -> Result<Self> {
-        // Bitaxe runs original bitaxe-raw firmware (v0 response format)
+        // Create control channel and I2C controller
         let control_channel = ControlChannel::new(control, ResponseFormat::V0);
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
@@ -204,7 +203,7 @@ impl BitaxeBoard {
             thread_shutdown: None,
             stats_task_handle: None,
             serial_number,
-            telemetry_tx: Some(telemetry_tx),
+            state_tx: Some(state_tx),
         })
     }
 
@@ -700,10 +699,10 @@ impl BitaxeBoard {
         let board_serial = board_info.serial_number.clone();
 
         // Take the state sender so this task owns publishing
-        let telemetry_tx = self
-            .telemetry_tx
+        let state_tx = self
+            .state_tx
             .take()
-            .expect("telemetry_tx must be present when spawning stats monitor");
+            .expect("state_tx must be present when spawning stats monitor");
 
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(5);
@@ -761,9 +760,9 @@ impl BitaxeBoard {
                     }
                 }
 
-                // -- Publish BoardTelemetry --
+                // -- Publish BoardState --
 
-                let _ = telemetry_tx.send(BoardTelemetry {
+                let _ = state_tx.send(BoardState {
                     name: board_name.clone(),
                     model: board_model.clone(),
                     serial: board_serial.clone(),
@@ -776,11 +775,11 @@ impl BitaxeBoard {
                     temperatures: vec![
                         TemperatureSensor {
                             name: "asic".into(),
-                            temperature: asic_temp.map(Temperature::from_celsius),
+                            temperature_c: asic_temp,
                         },
                         TemperatureSensor {
                             name: "vr".into(),
-                            temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
+                            temperature_c: vr_temp.map(|t| t as f32),
                         },
                     ],
                     powers: vec![
@@ -798,6 +797,8 @@ impl BitaxeBoard {
                         },
                     ],
                     threads: Vec::new(),
+                    asics: Vec::new(),
+                    bzm2_tuning: None,
                 });
 
                 // -- Log summary (throttled) --
@@ -931,7 +932,16 @@ async fn create_from_usb(
 ) -> Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
     use tokio_serial::SerialPortBuilderExt;
 
+    // Get serial ports
     let serial_ports = device.get_serial_ports(2).await?;
+
+    // Bitaxe Gamma requires exactly 2 serial ports
+    if serial_ports.len() != 2 {
+        bail!(
+            "Bitaxe Gamma requires exactly 2 serial ports, found {}",
+            serial_ports.len()
+        );
+    }
 
     debug!(
         serial = ?device.serial_number,
@@ -943,22 +953,22 @@ async fn create_from_usb(
     // Open control port at 115200 baud
     let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
-    // Create watch channel for board telemetry, seeded with identity
+    // Create watch channel for board state, seeded with identity
     let serial = device.serial_number.clone();
-    let initial_state = BoardTelemetry {
+    let initial_state = BoardState {
         name: format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown")),
         model: "Bitaxe Gamma".into(),
         serial,
         ..Default::default()
     };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+    let (state_tx, state_rx) = watch::channel(initial_state);
 
     // Create the board with the control port and data port path
     let mut board = BitaxeBoard::new(
         control_port,
         &serial_ports[1],
         device.serial_number.clone(),
-        telemetry_tx,
+        state_tx,
     )
     .context("failed to create board")?;
 
@@ -973,7 +983,10 @@ async fn create_from_usb(
         board.chip_count()
     );
 
-    let registration = super::BoardRegistration { telemetry_rx };
+    let registration = super::BoardRegistration {
+        state_rx,
+        command_tx: None,
+    };
     Ok((Box::new(board), registration))
 }
 
