@@ -42,7 +42,7 @@ use crate::{
     tracing::prelude::*,
     transport::{
         UsbDeviceInfo,
-        serial::{SerialControl, SerialReader, SerialStream, SerialWriter},
+        serial::{SerialReader, SerialStream, SerialWriter},
     },
     types::Temperature,
 };
@@ -52,532 +52,241 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
-/// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
-struct BitaxeAsicEnable {
-    /// Reset pin (directly controls nRST on the BM1370)
-    nrst_pin: BitaxeRawGpioPin,
+// Register this board type with the inventory system
+inventory::submit! {
+    crate::board::BoardDescriptor {
+        pattern: crate::board::pattern::BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Any,
+            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
+            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            serial_pattern: Match::Any,
+        },
+        name: "Bitaxe Gamma",
+        create_fn: |device| Box::pin(create_from_usb(device)),
+    }
 }
 
-#[async_trait]
-impl crate::asic::hash_thread::AsicEnable for BitaxeAsicEnable {
-    async fn enable(&mut self) -> Result<()> {
-        // Release reset (nRST is active-low, so High = running)
-        self.nrst_pin
-            .write(PinValue::High)
+/// Create a Bitaxe board from USB device info.
+async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
+    let serial_ports = device.get_serial_ports(2).await?;
+
+    debug!(
+        serial = ?device.serial_number,
+        control = %serial_ports[0],
+        data = %serial_ports[1],
+        "Opening Bitaxe Gamma serial ports"
+    );
+
+    // Open control port, create management channel and I2C bus
+    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+    let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
+    let mut i2c = BitaxeRawI2c::new(control_channel.clone());
+
+    // Open data port for chip communication
+    let data_stream =
+        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+    let (data_reader, data_writer, _data_control) = data_stream.split();
+    let tracing_reader = TracingReader::new(data_reader, "Data");
+    let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
+    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
+
+    // Get reset pin
+    const ASIC_RESET_PIN: u8 = 0;
+    let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
+    let mut reset_pin = gpio_controller.pin(ASIC_RESET_PIN).await?;
+
+    // Hold ASIC in reset during power configuration
+    reset_pin.write(PinValue::Low).await?;
+
+    // Initialize peripherals
+    i2c.set_frequency(100_000).await?;
+
+    let fan_controller = init_fan_controller(i2c.clone()).await?;
+    let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
+
+    time::sleep(Duration::from_millis(500)).await;
+
+    // Release ASIC from reset for discovery
+    debug!("De-asserting ASIC nRST");
+    reset_pin.write(PinValue::High).await?;
+
+    time::sleep(Duration::from_millis(200)).await;
+
+    // Version mask and chip discovery
+    debug!("Sending version mask configuration (3 times)");
+    for i in 1..=3 {
+        trace!("Version mask send {}/3", i);
+        let version_cmd = Command::WriteRegister {
+            broadcast: true,
+            chip_address: 0x00,
+            register: bm13xx::protocol::Register::VersionMask(
+                bm13xx::protocol::VersionMask::full_rolling(),
+            ),
+        };
+        data_writer
+            .send(version_cmd)
             .await
-            .map_err(|e| anyhow!("failed to release reset: {}", e))
+            .context("failed to send config command")?;
+        time::sleep(Duration::from_millis(5)).await;
     }
 
-    async fn disable(&mut self) -> Result<()> {
-        // Assert reset (nRST is active-low, so Low = reset)
-        self.nrst_pin
-            .write(PinValue::Low)
-            .await
-            .map_err(|e| anyhow!("failed to assert reset: {}", e))
+    time::sleep(Duration::from_millis(10)).await;
+
+    let chip_infos = discover_chips(&mut data_reader, &mut data_writer).await?;
+
+    debug!(count = chip_infos.len(), "Discovered chips");
+
+    // Verify expected BM1370 chip
+    const EXPECTED_CHIP_ID: [u8; 2] = [0x13, 0x70];
+    if let Some(first_chip) = chip_infos.first()
+        && first_chip.chip_id != EXPECTED_CHIP_ID
+    {
+        bail!(
+            "wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
+            EXPECTED_CHIP_ID[0],
+            EXPECTED_CHIP_ID[1],
+            first_chip.chip_id[0],
+            first_chip.chip_id[1]
+        );
     }
+
+    // Put chip back in reset before handing off to hash thread
+    reset_pin.write(PinValue::Low).await?;
+
+    // Create hash thread
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
+
+    let thread_name = match &device.serial_number {
+        Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
+        None => "Bitaxe-Gamma".to_string(),
+    };
+
+    let asic_enable = BitaxeAsicEnable {
+        nrst_pin: reset_pin.clone(),
+    };
+    let peripherals = BoardPeripherals {
+        asic_enable: Some(Box::new(asic_enable)),
+        voltage_regulator: None,
+    };
+
+    let thread = BM13xxThread::new(
+        thread_name,
+        data_reader,
+        data_writer,
+        peripherals,
+        thread_shutdown_rx,
+    );
+    let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
+
+    debug!("Bitaxe board initialized with {} chips", chip_infos.len());
+
+    // Telemetry channel seeded with board identity
+    let serial = device.serial_number.clone();
+    let initial_state = BoardTelemetry {
+        name: format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown")),
+        model: "Bitaxe Gamma".into(),
+        serial,
+        ..Default::default()
+    };
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+
+    let info = BoardInfo {
+        model: "Bitaxe Gamma".to_string(),
+        firmware_version: Some("bitaxe-raw".to_string()),
+        serial_number: device.serial_number.clone(),
+    };
+
+    // Assemble internal state for the monitor and shutdown
+    let mut bitaxe = Bitaxe {
+        asic_nrst: reset_pin,
+        i2c,
+        fan_controller,
+        regulator,
+        thread_shutdown: thread_shutdown_tx,
+        stats_task_handle: None,
+        serial_number: device.serial_number,
+        telemetry_tx: Some(telemetry_tx),
+    };
+
+    bitaxe.spawn_stats_monitor();
+
+    let shutdown = Box::pin(async move {
+        bitaxe.shutdown().await;
+    });
+
+    Ok(BackplaneConnector {
+        info,
+        threads,
+        telemetry_rx,
+        shutdown: Some(shutdown),
+    })
 }
 
-/// A wrapper around AsyncRead that traces raw bytes as they're read
-struct TracingReader<R> {
-    inner: R,
-    name: &'static str,
-}
-
-impl<R: AsyncRead + Unpin> TracingReader<R> {
-    fn new(inner: R, name: &'static str) -> Self {
-        Self { inner, name }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before_len = buf.filled().len();
-
-        // Call the inner reader
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-
-        // Trace any bytes received
-        if let Poll::Ready(Ok(())) = &result {
-            let after_len = buf.filled().len();
-            if after_len > before_len {
-                let new_bytes = &buf.filled()[before_len..after_len];
-                trace!(
-                    "{} RX: {} bytes => {:02x?}",
-                    self.name,
-                    new_bytes.len(),
-                    new_bytes
-                );
-            }
-        }
-
-        result
-    }
-}
-
-/// Bitaxe Gamma hashboard abstraction.
+/// Internal state for the board monitor and shutdown sequence.
 ///
-/// The Bitaxe Gamma running bitaxe-raw firmware provides a control interface for managing the
-/// hashboard, including GPIO reset control and board initialization sequences.
-pub struct BitaxeBoard {
-    /// Control channel for board management
-    control_channel: ControlChannel,
-    /// ASIC reset (active low)
-    asic_nrst: Option<BitaxeRawGpioPin>,
-    /// I2C bus controller
+/// The factory moves this into a spawned task. It holds only what
+/// the stats monitor and graceful shutdown need.
+struct Bitaxe {
+    asic_nrst: BitaxeRawGpioPin,
     i2c: BitaxeRawI2c,
-    /// Fan controller (board-controlled only, not shared with thread)
     fan_controller: Option<Emc2101<BitaxeRawI2c>>,
-    /// Voltage regulator (shared with thread, cached state)
-    regulator: Option<Arc<Mutex<Tps546<BitaxeRawI2c>>>>,
-    /// Writer for sending commands to chips (transferred to hash thread)
-    data_writer: Option<FramedWrite<SerialWriter, bm13xx::FrameCodec>>,
-    /// Reader for receiving responses from chips (transferred to hash thread)
-    data_reader: Option<FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>>,
-    /// Control handle for data channel (for baud rate changes)
-    #[expect(dead_code, reason = "will be used when baud rate change is fixed")]
-    data_control: SerialControl,
-    /// Discovered chip information (passive record-keeping)
-    chip_infos: Vec<ChipInfo>,
-    /// Thread shutdown signal (board-to-thread implementation detail)
-    thread_shutdown: Option<watch::Sender<ThreadRemovalSignal>>,
-    /// Handle for the statistics task
+    regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
     stats_task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Serial number from USB device info
     serial_number: Option<String>,
-    /// Channel for publishing board telemetry to the API server.
     /// Taken by `spawn_stats_monitor` which publishes periodic snapshots.
     telemetry_tx: Option<watch::Sender<BoardTelemetry>>,
 }
 
-impl BitaxeBoard {
-    /// GPIO pin number for ASIC reset control (active low)
-    const ASIC_RESET_PIN: u8 = 0;
-
-    /// Bitaxe Gamma board configuration
-    /// The Gamma uses a BM1370 chip and runs at 1Mbps after initialization
-    #[expect(dead_code, reason = "will be used when baud rate change is fixed")]
-    const TARGET_BAUD_RATE: u32 = 1_000_000;
-    #[expect(dead_code, reason = "will be used when baud rate change is fixed")]
-    const CHIP_BAUD_REGISTER: bm13xx::protocol::BaudRate = bm13xx::protocol::BaudRate::Baud1M;
-    const EXPECTED_CHIP_ID: [u8; 2] = [0x13, 0x70]; // BM1370
-
-    /// Creates a new BitaxeBoard instance with the provided serial streams.
-    ///
-    /// # Arguments
-    /// * `control` - Serial stream for sending board control commands
-    /// * `data_path` - Path to the data serial port (e.g., "/dev/ttyACM1")
-    ///
-    /// # Returns
-    /// A new BitaxeBoard instance ready for hardware operations
-    ///
-    /// # Design Note
-    /// In the future, a DeviceManager will create boards when USB devices
-    /// are detected (by VID/PID) and pass already-opened serial streams.
-    pub fn new(
-        control: tokio_serial::SerialStream,
-        data_path: &str,
-        serial_number: Option<String>,
-        telemetry_tx: watch::Sender<BoardTelemetry>,
-    ) -> Result<Self> {
-        // Bitaxe runs original bitaxe-raw firmware (v0 response format)
-        let control_channel = ControlChannel::new(control, ResponseFormat::V0);
-        let i2c = BitaxeRawI2c::new(control_channel.clone());
-
-        // Create SerialStream for data channel at initial baud rate
-        let data_stream =
-            SerialStream::new(data_path, 115200).context("failed to open data port")?;
-        let (data_reader, data_writer, data_control) = data_stream.split();
-
-        // Wrap the data reader with tracing
-        let tracing_reader = TracingReader::new(data_reader, "Data");
-
-        Ok(BitaxeBoard {
-            control_channel,
-            asic_nrst: None,
-            i2c,
-            fan_controller: None,
-            regulator: None,
-            data_writer: Some(FramedWrite::new(data_writer, bm13xx::FrameCodec)),
-            data_reader: Some(FramedRead::new(tracing_reader, bm13xx::FrameCodec)),
-            data_control,
-            chip_infos: Vec::new(),
-            thread_shutdown: None,
-            stats_task_handle: None,
-            serial_number,
-            telemetry_tx: Some(telemetry_tx),
-        })
-    }
-
-    /// Performs a momentary reset of the mining chips via GPIO control.
-    ///
-    /// This function toggles the reset line low for 100ms, then high for 100ms
-    /// to properly reset all connected mining chips.
-    #[expect(dead_code, reason = "will be used for error recovery")]
-    pub async fn momentary_reset(&mut self) -> Result<()> {
-        const WAIT: Duration = Duration::from_millis(100);
-
-        // Assert reset
-        self.hold_in_reset().await?;
-        time::sleep(WAIT).await;
-
-        // De-assert reset
-        self.release_reset().await?;
-        time::sleep(WAIT).await;
-
-        Ok(())
-    }
-
-    /// Release the mining chips from reset state.
-    async fn release_reset(&mut self) -> Result<()> {
-        let reset_pin = self
-            .asic_nrst
-            .as_mut()
-            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
-
-        // Set reset high (inactive - active low signal)
-        debug!(
-            "De-asserting ASIC nRST (GPIO {} = high)",
-            Self::ASIC_RESET_PIN
-        );
-        reset_pin
-            .write(PinValue::High)
-            .await
-            .context("failed to de-assert reset")?;
-
-        Ok(())
-    }
-
-    /// Hold the mining chips in reset state.
-    ///
-    /// This function sets the reset line low and keeps it there,
-    /// effectively disabling all connected mining chips. This is used
-    /// during shutdown to ensure chips are in a safe, non-hashing state.
-    pub async fn hold_in_reset(&mut self) -> Result<()> {
-        let reset_pin = self
-            .asic_nrst
-            .as_mut()
-            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
-
-        // Hold reset low (active - active low signal)
-        reset_pin
-            .write(PinValue::Low)
-            .await
-            .context("failed to hold reset")?;
-
-        Ok(())
-    }
-
-    /// Send a configuration command to the chips.
-    ///
-    /// This is used during initialization to configure PLL, version rolling, etc.
-    pub async fn send_config_command(&mut self, command: Command) -> Result<()> {
-        self.data_writer
-            .as_mut()
-            .expect("data_writer should be available during initialization")
-            .send(command)
-            .await
-            .context("failed to send config command")
-    }
-
-    /// Send multiple configuration commands in sequence.
-    #[expect(dead_code, reason = "Will be used for batch configuration")]
-    pub async fn send_config_commands(&mut self, commands: Vec<Command>) -> Result<()> {
-        for command in commands {
-            self.send_config_command(command).await?;
-            // Small delay between commands to avoid overwhelming the chip
-            tokio::time::sleep(Duration::from_millis(10)).await;
+impl Bitaxe {
+    fn board_info(&self) -> BoardInfo {
+        BoardInfo {
+            model: "Bitaxe Gamma".to_string(),
+            firmware_version: Some("bitaxe-raw".to_string()),
+            serial_number: self.serial_number.clone(),
         }
-        Ok(())
     }
 
-    async fn discover_chips(&mut self) -> Result<()> {
-        // Get a mutable reference to the reader
-        let reader = self
-            .data_reader
-            .as_mut()
-            .ok_or_else(|| anyhow!("data reader already taken"))?;
+    async fn shutdown(&mut self) {
+        // Signal hash threads to shut down gracefully
+        if let Err(e) = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+            warn!("Failed to send shutdown signal to threads: {}", e);
+        } else {
+            time::sleep(Duration::from_millis(200)).await;
+        }
 
-        // Send a broadcast read to discover chips
-        let discover_cmd = BM13xxProtocol::discover_chips();
+        // Hold chips in reset
+        if let Err(e) = self.asic_nrst.write(PinValue::Low).await {
+            warn!("Failed to hold chips in reset: {}", e);
+        }
 
-        self.data_writer
-            .as_mut()
-            .expect("data_writer should be available during chip discovery")
-            .send(discover_cmd)
-            .await
-            .context("failed to send chip discovery command")?;
+        // Turn off core voltage
+        match self.regulator.lock().await.set_vout(0.0).await {
+            Ok(()) => debug!("Core voltage turned off"),
+            Err(e) => warn!("Failed to turn off core voltage: {}", e),
+        }
 
-        // Wait a bit for responses
-        let timeout = Duration::from_millis(500);
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        while tokio::time::Instant::now() < deadline {
-            tokio::select! {
-                response = reader.next() => {
-                    match response {
-                        Some(Ok(bm13xx::Response::ReadRegister {
-                            chip_address: _,
-                            register: bm13xx::Register::ChipId { chip_type, core_count, address }
-                        })) => {
-                            let chip_id = chip_type.id_bytes();
-                            debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
-                                         chip_type, chip_id[0], chip_id[1]);
-
-                            let chip_info = ChipInfo {
-                                chip_id,
-                                core_count: core_count.into(),
-                                address,
-                                supports_version_rolling: true, // BM1370 supports this
-                            };
-
-                            self.chip_infos.push(chip_info);
-                        }
-                        Some(Ok(_)) => {
-                            warn!("Unexpected response during chip discovery");
-                        }
-                        Some(Err(e)) => {
-                            error!("Error during chip discovery: {e}");
-                        }
-                        None => break,
-                    }
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    break;
-                }
+        // Reduce fan speed (no more heat generation)
+        if let Some(ref mut fan) = self.fan_controller {
+            let shutdown_speed = Percent::new_clamped(25);
+            if let Err(e) = fan.set_fan_speed(shutdown_speed).await {
+                warn!("Failed to set fan speed: {}", e);
             }
         }
 
-        if self.chip_infos.is_empty() {
-            bail!("no chips discovered");
+        // Cancel the statistics monitoring task
+        if let Some(handle) = self.stats_task_handle.take() {
+            handle.abort();
         }
-        Ok(())
-    }
-
-    /// Initialize the power controller
-    async fn init_power_controller(&mut self) -> Result<()> {
-        // Clone the I2C bus for the power controller
-        let power_i2c = self.i2c.clone();
-
-        // Bitaxe Gamma power configuration for TPS546D24A
-        let config = Tps546Config {
-            // Phase and frequency
-            phase: 0x00,
-            frequency_switch_khz: 650,
-
-            // Input voltage thresholds
-            vin_on: 4.8,
-            vin_off: 4.5,
-            vin_uv_warn_limit: 0.0, // Disabled due to TI bug
-            vin_ov_fault_limit: 6.5,
-            vin_ov_fault_response: 0xB7, // Immediate shutdown, 6 retries, 7xTON_RISE delay
-
-            // Output voltage configuration
-            vout_scale_loop: 0.25,
-            vout_min: 1.0,
-            vout_max: 2.0,
-            vout_command: 1.15, // BM1370 default voltage
-
-            // Output voltage protection (relative to vout_command)
-            vout_ov_fault_limit: 1.25, // 125% of VOUT_COMMAND
-            vout_ov_warn_limit: 1.16,  // 116% of VOUT_COMMAND
-            vout_margin_high: 1.10,    // 110% of VOUT_COMMAND
-            vout_margin_low: 0.90,     // 90% of VOUT_COMMAND
-            vout_uv_warn_limit: 0.90,  // 90% of VOUT_COMMAND
-            vout_uv_fault_limit: 0.75, // 75% of VOUT_COMMAND
-
-            // Output current protection
-            iout_oc_warn_limit: 25.0,
-            iout_oc_fault_limit: 30.0,
-            iout_oc_fault_response: 0xC0, // Shutdown immediately, no retries
-
-            // Temperature protection
-            ot_warn_limit: 105,      // degC
-            ot_fault_limit: 145,     // degC
-            ot_fault_response: 0xFF, // Infinite retries
-
-            // Timing configuration
-            ton_delay: 0,
-            ton_rise: 3,
-            ton_max_fault_limit: 0,
-            ton_max_fault_response: 0x3B, // 3 retries, 91ms delay
-            toff_delay: 0,
-            toff_fall: 0,
-
-            // Pin configuration
-            pin_detect_override: 0xFFFF,
-        };
-
-        let mut tps546 = Tps546::new(power_i2c, config);
-
-        // Initialize the TPS546
-        match tps546.init().await {
-            Ok(()) => {
-                // Delay before setting voltage
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                // Set initial output voltage, default for BM1370 from esp-miner
-                const DEFAULT_VOUT: f32 = 1.15;
-                match tps546.set_vout(DEFAULT_VOUT).await {
-                    Ok(()) => {
-                        debug!("Core voltage set to {DEFAULT_VOUT}V");
-
-                        // Wait for voltage to stabilize
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-                        // Verify voltage
-                        match tps546.get_vout().await {
-                            Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
-                            Err(e) => warn!("Failed to read core voltage: {}", e),
-                        }
-
-                        // Dump complete configuration for debugging
-                        if let Err(e) = tps546.dump_configuration().await {
-                            warn!("Failed to dump TPS546 configuration: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to set initial core voltage: {}", e);
-                        return Err(e).context("failed to set core voltage");
-                    }
-                }
-
-                self.regulator = Some(Arc::new(Mutex::new(tps546)));
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to initialize TPS546D24A power controller: {}", e);
-                Err(e).context("power controller init failed")
-            }
-        }
-    }
-
-    /// Initialize the fan controller
-    async fn init_fan_controller(&mut self) -> Result<()> {
-        // Clone the I2C bus for the fan controller
-        let fan_i2c = self.i2c.clone();
-        let mut fan = Emc2101::new(fan_i2c);
-
-        // Initialize the EMC2101
-        match fan.init().await {
-            Ok(()) => {
-                // Set fan to full speed until closed-loop control is implemented
-                match fan.set_fan_speed(Percent::FULL).await {
-                    Ok(()) => {
-                        debug!("Fan speed set to 100%");
-                    }
-                    Err(e) => {
-                        warn!("Failed to set fan speed: {}", e);
-                    }
-                }
-
-                self.fan_controller = Some(fan);
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to initialize EMC2101 fan controller: {}", e);
-                // Continue without fan control - not critical for operation
-                Ok(())
-            }
-        }
-    }
-
-    /// Initialize the board and discover connected chips.
-    ///
-    /// After initialization, the board is ready for `create_hash_threads()`.
-    pub async fn initialize(&mut self) -> Result<()> {
-        // Create GPIO controller and get reset pin handle
-        let mut gpio_controller = BitaxeRawGpioController::new(self.control_channel.clone());
-        let reset_pin = gpio_controller
-            .pin(Self::ASIC_RESET_PIN)
-            .await
-            .context("failed to get reset pin")?;
-        self.asic_nrst = Some(reset_pin);
-
-        // Phase 1: Hold ASIC in reset during power configuration
-        trace!("Holding ASIC in reset during power initialization");
-        self.hold_in_reset().await?;
-
-        // Phase 2: Initialize power controller while ASIC is in reset
-        self.i2c
-            .set_frequency(100_000)
-            .await
-            .context("failed to set I2C frequency")?;
-
-        self.init_fan_controller().await?;
-        self.init_power_controller().await?;
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Phase 3: Release ASIC from reset for discovery
-        debug!("Releasing ASIC from reset for discovery");
-        self.release_reset().await?;
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Phase 4: Version mask and chip discovery
-        debug!("Sending version mask configuration (3 times)");
-        for i in 1..=3 {
-            trace!("Version mask send {}/3", i);
-            let version_cmd = Command::WriteRegister {
-                broadcast: true,
-                chip_address: 0x00,
-                register: bm13xx::protocol::Register::VersionMask(
-                    bm13xx::protocol::VersionMask::full_rolling(),
-                ),
-            };
-            self.send_config_command(version_cmd).await?;
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        self.discover_chips().await?;
-
-        debug!(count = self.chip_infos.len(), "Discovered chips");
-
-        // Verify expected BM1370 chip was found
-        if let Some(first_chip) = self.chip_infos.first()
-            && first_chip.chip_id != Self::EXPECTED_CHIP_ID
-        {
-            bail!(
-                "wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-                Self::EXPECTED_CHIP_ID[0],
-                Self::EXPECTED_CHIP_ID[1],
-                first_chip.chip_id[0],
-                first_chip.chip_id[1]
-            );
-        }
-
-        // Put chip back in reset
-        self.hold_in_reset().await?;
-
-        // Spawn statistics monitoring task
-        self.spawn_stats_monitor();
-
-        Ok(())
-    }
-
-    /// Number of discovered chips on this board.
-    pub fn chip_count(&self) -> usize {
-        self.chip_infos.len()
     }
 
     /// Spawn a task to periodically log and publish board telemetry.
     fn spawn_stats_monitor(&mut self) {
-        // Clone data needed for the monitoring task
         let i2c = self.i2c.clone();
+        let regulator = self.regulator.clone();
 
-        // Clone the regulator Arc for stats monitoring
-        let regulator = self
-            .regulator
-            .clone()
-            .expect("Regulator must be initialized before spawning stats monitor");
-
-        // Capture board info for logging
         let board_info = self.board_info();
         let board_name = format!(
             "bitaxe-{}",
@@ -586,7 +295,6 @@ impl BitaxeBoard {
         let board_model = board_info.model.clone();
         let board_serial = board_info.serial_number.clone();
 
-        // Take the state sender so this task owns publishing
         let telemetry_tx = self
             .telemetry_tx
             .take()
@@ -594,22 +302,19 @@ impl BitaxeBoard {
 
         let handle = tokio::spawn(async move {
             const STATS_INTERVAL: Duration = Duration::from_secs(5);
-            let mut interval = tokio::time::interval(STATS_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut interval = time::interval(STATS_INTERVAL);
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
-            // Create fan controller for the stats task
             let mut fan_ctrl = Emc2101::new(i2c);
 
             const LOG_INTERVAL: Duration = Duration::from_secs(30);
-            let mut last_log = tokio::time::Instant::now();
+            let mut last_log = time::Instant::now();
 
             // Discard first tick (fires immediately, ADC readings may not be settled)
             interval.tick().await;
 
             loop {
                 interval.tick().await;
-
-                // -- Read sensor values --
 
                 let asic_temp = fan_ctrl.get_external_temperature().await.ok();
                 let fan_percent = fan_ctrl.get_fan_speed().await.ok().map(u8::from);
@@ -633,7 +338,6 @@ impl BitaxeBoard {
                     }
                 }
 
-                // Check power status -- critical faults will return error
                 {
                     let mut reg = regulator.lock().await;
                     if let Err(e) = reg.check_status().await {
@@ -647,8 +351,6 @@ impl BitaxeBoard {
                         continue;
                     }
                 }
-
-                // -- Publish BoardTelemetry --
 
                 let _ = telemetry_tx.send(BoardTelemetry {
                     name: board_name.clone(),
@@ -687,10 +389,8 @@ impl BitaxeBoard {
                     threads: Vec::new(),
                 });
 
-                // -- Log summary (throttled) --
-
                 if last_log.elapsed() >= LOG_INTERVAL {
-                    last_log = tokio::time::Instant::now();
+                    last_log = time::Instant::now();
                     info!(
                         board = %board_model,
                         serial = ?board_serial,
@@ -712,173 +412,207 @@ impl BitaxeBoard {
     }
 }
 
-impl BitaxeBoard {
-    fn board_info(&self) -> BoardInfo {
-        BoardInfo {
-            model: "Bitaxe Gamma".to_string(),
-            firmware_version: Some("bitaxe-raw".to_string()),
-            serial_number: self.serial_number.clone(),
-        }
-    }
+async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Option<Emc2101<BitaxeRawI2c>>> {
+    let mut fan = Emc2101::new(i2c);
 
-    async fn shutdown(&mut self) {
-        // Signal hash threads to shut down gracefully
-        if let Some(ref tx) = self.thread_shutdown {
-            if let Err(e) = tx.send(ThreadRemovalSignal::Shutdown) {
-                warn!("Failed to send shutdown signal to threads: {}", e);
-            } else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+    match fan.init().await {
+        Ok(()) => {
+            match fan.set_fan_speed(Percent::FULL).await {
+                Ok(()) => debug!("Fan speed set to 100%"),
+                Err(e) => warn!("Failed to set fan speed: {}", e),
             }
+            Ok(Some(fan))
         }
-
-        // Hold chips in reset
-        if let Err(e) = self.hold_in_reset().await {
-            warn!("Failed to hold chips in reset: {}", e);
+        Err(e) => {
+            warn!("Failed to initialize EMC2101 fan controller: {}", e);
+            Ok(None)
         }
-
-        // Turn off core voltage
-        if let Some(ref regulator) = self.regulator {
-            match regulator.lock().await.set_vout(0.0).await {
-                Ok(()) => debug!("Core voltage turned off"),
-                Err(e) => warn!("Failed to turn off core voltage: {}", e),
-            }
-        }
-
-        // Reduce fan speed (no more heat generation)
-        if let Some(ref mut fan) = self.fan_controller {
-            let shutdown_speed = Percent::new_clamped(25);
-            if let Err(e) = fan.set_fan_speed(shutdown_speed).await {
-                warn!("Failed to set fan speed: {}", e);
-            }
-        }
-
-        // Cancel the statistics monitoring task
-        if let Some(handle) = self.stats_task_handle.take() {
-            handle.abort();
-        }
-    }
-
-    fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>> {
-        // Create removal signal channel (starts as Running)
-        let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
-
-        // Store removal signal sender for later shutdown
-        self.thread_shutdown = Some(removal_tx);
-
-        // Take ownership of serial I/O streams
-        let data_reader = self
-            .data_reader
-            .take()
-            .ok_or_else(|| anyhow!("no data reader available"))?;
-
-        let data_writer = self
-            .data_writer
-            .take()
-            .ok_or_else(|| anyhow!("no data writer available"))?;
-
-        // Create ASIC enable adapter (wraps GPIO pin)
-        let nrst_pin = self
-            .asic_nrst
-            .clone()
-            .ok_or_else(|| anyhow!("reset pin not initialized"))?;
-        let asic_enable = BitaxeAsicEnable { nrst_pin };
-
-        // Bundle peripherals for thread
-        let peripherals = BoardPeripherals {
-            asic_enable: Some(Box::new(asic_enable)),
-            voltage_regulator: None, // Not used by hash thread yet
-        };
-
-        // Build thread name from board model and serial
-        let thread_name = match &self.serial_number {
-            Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
-            None => "Bitaxe-Gamma".to_string(),
-        };
-
-        // Create BM13xxThread with streams and peripherals
-        let thread = BM13xxThread::new(
-            thread_name,
-            data_reader,
-            data_writer,
-            peripherals,
-            removal_rx,
-        );
-
-        debug!("Created BM13xx hash thread from BitaxeBoard");
-
-        Ok(vec![Box::new(thread)])
     }
 }
 
-/// Create a Bitaxe board from USB device info.
-async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
-    let serial_ports = device.get_serial_ports(2).await?;
+async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>> {
+    let config = Tps546Config {
+        phase: 0x00,
+        frequency_switch_khz: 650,
 
-    debug!(
-        serial = ?device.serial_number,
-        control = %serial_ports[0],
-        data = %serial_ports[1],
-        "Opening Bitaxe Gamma serial ports"
-    );
+        vin_on: 4.8,
+        vin_off: 4.5,
+        vin_uv_warn_limit: 0.0, // Disabled due to TI bug
+        vin_ov_fault_limit: 6.5,
+        vin_ov_fault_response: 0xB7,
 
-    // Open control port at 115200 baud
-    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+        vout_scale_loop: 0.25,
+        vout_min: 1.0,
+        vout_max: 2.0,
+        vout_command: 1.15,
 
-    // Create watch channel for board telemetry, seeded with identity
-    let serial = device.serial_number.clone();
-    let initial_state = BoardTelemetry {
-        name: format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown")),
-        model: "Bitaxe Gamma".into(),
-        serial,
-        ..Default::default()
+        vout_ov_fault_limit: 1.25,
+        vout_ov_warn_limit: 1.16,
+        vout_margin_high: 1.10,
+        vout_margin_low: 0.90,
+        vout_uv_warn_limit: 0.90,
+        vout_uv_fault_limit: 0.75,
+
+        iout_oc_warn_limit: 25.0,
+        iout_oc_fault_limit: 30.0,
+        iout_oc_fault_response: 0xC0,
+
+        ot_warn_limit: 105,
+        ot_fault_limit: 145,
+        ot_fault_response: 0xFF,
+
+        ton_delay: 0,
+        ton_rise: 3,
+        ton_max_fault_limit: 0,
+        ton_max_fault_response: 0x3B,
+        toff_delay: 0,
+        toff_fall: 0,
+
+        pin_detect_override: 0xFFFF,
     };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
-    let mut board = BitaxeBoard::new(
-        control_port,
-        &serial_ports[1],
-        device.serial_number.clone(),
-        telemetry_tx,
-    )
-    .context("failed to create board")?;
+    let mut tps546 = Tps546::new(i2c, config);
 
-    board
-        .initialize()
+    tps546
+        .init()
         .await
-        .context("failed to initialize board")?;
+        .context("power controller init failed")?;
 
-    let threads = board
-        .create_hash_threads()
-        .context("failed to create hash threads")?;
+    time::sleep(Duration::from_millis(100)).await;
 
-    let info = board.board_info();
+    const DEFAULT_VOUT: f32 = 1.15;
+    tps546
+        .set_vout(DEFAULT_VOUT)
+        .await
+        .context("failed to set core voltage")?;
+    debug!("Core voltage set to {DEFAULT_VOUT}V");
 
-    debug!("Bitaxe board initialized with {} chips", board.chip_count());
+    time::sleep(Duration::from_millis(500)).await;
 
-    let shutdown = Box::pin(async move {
-        board.shutdown().await;
-    });
+    match tps546.get_vout().await {
+        Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
+        Err(e) => warn!("Failed to read core voltage: {}", e),
+    }
 
-    Ok(BackplaneConnector {
-        info,
-        threads,
-        telemetry_rx,
-        shutdown: Some(shutdown),
-    })
+    if let Err(e) = tps546.dump_configuration().await {
+        warn!("Failed to dump TPS546 configuration: {}", e);
+    }
+
+    Ok(tps546)
 }
 
-// Register this board type with the inventory system
-inventory::submit! {
-    crate::board::BoardDescriptor {
-        pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
-            bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe")),
-            serial_pattern: Match::Any,
-        },
-        name: "Bitaxe Gamma",
-        create_fn: |device| Box::pin(create_from_usb(device)),
+async fn discover_chips(
+    reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
+    writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
+) -> Result<Vec<ChipInfo>> {
+    let discover_cmd = BM13xxProtocol::discover_chips();
+
+    writer
+        .send(discover_cmd)
+        .await
+        .context("failed to send chip discovery command")?;
+
+    let mut chip_infos = Vec::new();
+    let timeout = Duration::from_millis(500);
+    let deadline = time::Instant::now() + timeout;
+
+    while time::Instant::now() < deadline {
+        tokio::select! {
+            response = reader.next() => {
+                match response {
+                    Some(Ok(bm13xx::Response::ReadRegister {
+                        chip_address: _,
+                        register: bm13xx::Register::ChipId { chip_type, core_count, address }
+                    })) => {
+                        let chip_id = chip_type.id_bytes();
+                        debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
+                                     chip_type, chip_id[0], chip_id[1]);
+
+                        chip_infos.push(ChipInfo {
+                            chip_id,
+                            core_count: core_count.into(),
+                            address,
+                            supports_version_rolling: true,
+                        });
+                    }
+                    Some(Ok(_)) => {
+                        warn!("Unexpected response during chip discovery");
+                    }
+                    Some(Err(e)) => {
+                        error!("Error during chip discovery: {e}");
+                    }
+                    None => break,
+                }
+            }
+            _ = time::sleep_until(deadline) => {
+                break;
+            }
+        }
+    }
+
+    if chip_infos.is_empty() {
+        bail!("no chips discovered");
+    }
+    Ok(chip_infos)
+}
+
+/// Adapter implementing `AsicEnable` for Bitaxe's GPIO-based reset control.
+struct BitaxeAsicEnable {
+    nrst_pin: BitaxeRawGpioPin,
+}
+
+#[async_trait]
+impl crate::asic::hash_thread::AsicEnable for BitaxeAsicEnable {
+    async fn enable(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::High)
+            .await
+            .map_err(|e| anyhow!("failed to release reset: {}", e))
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::Low)
+            .await
+            .map_err(|e| anyhow!("failed to assert reset: {}", e))
+    }
+}
+
+/// A wrapper around AsyncRead that traces raw bytes as they're read.
+struct TracingReader<R> {
+    inner: R,
+    name: &'static str,
+}
+
+impl<R: AsyncRead + Unpin> TracingReader<R> {
+    fn new(inner: R, name: &'static str) -> Self {
+        Self { inner, name }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before_len = buf.filled().len();
+
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+
+        if let Poll::Ready(Ok(())) = &result {
+            let after_len = buf.filled().len();
+            if after_len > before_len {
+                let new_bytes = &buf.filled()[before_len..after_len];
+                trace!(
+                    "{} RX: {} bytes => {:02x?}",
+                    self.name,
+                    new_bytes.len(),
+                    new_bytes
+                );
+            }
+        }
+
+        result
     }
 }
