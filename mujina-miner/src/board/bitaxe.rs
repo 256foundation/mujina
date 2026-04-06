@@ -194,37 +194,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
-        fans: vec![Fan {
-            name: "fan".into(),
-            rpm: None,
-            percent: None,
-            target_percent: None,
-        }],
-        temperatures: vec![
-            TemperatureSensor {
-                name: "asic".into(),
-                temperature: None,
-            },
-            TemperatureSensor {
-                name: "vr".into(),
-                temperature: None,
-            },
-        ],
-        powers: vec![
-            PowerMeasurement {
-                name: "input".into(),
-                voltage_v: None,
-                current_a: None,
-                power_w: None,
-            },
-            PowerMeasurement {
-                name: "core".into(),
-                voltage_v: None,
-                current_a: None,
-                power_w: None,
-            },
-        ],
-        threads: Vec::new(), // TODO: populate from hash thread telemetry
+        ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
@@ -239,8 +209,10 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         emc2101,
         regulator,
         thread_shutdown: thread_shutdown_tx,
+        board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
+        bad_thermal_count: 0,
         asic_enable: asic_enable_monitor,
     };
 
@@ -267,8 +239,12 @@ struct Bitaxe {
     emc2101: Emc2101<BitaxeRawI2c>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+    board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
+    /// Consecutive bad thermal readings (I2C error, out-of-range, or
+    /// above emergency threshold). Triggers emergency shutdown.
+    bad_thermal_count: u32,
     asic_enable: BitaxeAsicEnable,
 }
 
@@ -285,19 +261,44 @@ impl Bitaxe {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.monitor_tick(&telemetry_tx, &mut last_log).await;
+                    if self.monitor_tick(&telemetry_tx, &mut last_log).await.is_err() {
+                        self.shutdown().await;
+                        return;
+                    }
                 }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
+                    if let Err(e) = self.emc2101.set_fan_speed(Percent::new_clamped(25)).await {
+                        warn!("Failed to reduce fan speed: {}", e);
+                    }
                     return;
                 }
             }
         }
     }
 
-    async fn monitor_tick(&mut self, tx: &watch::Sender<BoardTelemetry>, last_log: &mut Instant) {
+    /// Run one monitoring cycle. Returns `Err` on thermal emergency.
+    ///
+    /// Reads all sensors, classifies the temperature reading, publishes
+    /// telemetry, and logs a periodic summary.
+    ///
+    /// Temperature readings fall into four categories:
+    /// - I2C errors or diode faults: no temperature available.
+    /// - Out of plausible range (outside 0..120 C): implausible,
+    ///   treated as a bad reading.
+    /// - Above the emergency threshold: valid but dangerous.
+    /// - Normal: valid and safe, resets the bad-reading counter.
+    ///
+    /// Any category except normal increments a consecutive
+    /// bad-reading counter. After BAD_READING_LIMIT consecutive
+    /// bad readings, the board shuts down.
+    async fn monitor_tick(
+        &mut self,
+        tx: &watch::Sender<BoardTelemetry>,
+        last_log: &mut Instant,
+    ) -> Result<(), ()> {
         // Read all sensors in one pass
-        let raw_temp = self.emc2101.get_external_temperature().await.ok();
+        let raw_temp = self.emc2101.get_external_temperature().await;
         let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
         let fan_rpm = self.emc2101.get_rpm().await.ok();
 
@@ -320,6 +321,10 @@ impl Bitaxe {
             )
         };
 
+        const EXPECTED_MIN_C: f32 = 0.0;
+        const EXPECTED_MAX_C: f32 = 120.0;
+        const EMERGENCY_TEMP_C: f32 = 80.0;
+        const BAD_READING_LIMIT: u32 = 3;
         // The EMC2101 measures temperature via a diode on the ASIC
         // die. When the ASIC comes out of reset, the resulting
         // electrical transient corrupts the first few ADC conversions.
@@ -329,18 +334,86 @@ impl Bitaxe {
             .asic_enable
             .enabled_since()
             .is_some_and(|since| since.elapsed() >= DIODE_SETTLE);
-        let asic_temp = if diode_ready { raw_temp } else { None };
+        let asic_temp = if diode_ready {
+            match raw_temp {
+                Ok(t) if !(EXPECTED_MIN_C..=EXPECTED_MAX_C).contains(&t) => {
+                    self.bad_thermal_count += 1;
+                    trace!(temp_c = t, "Discarding out-of-range temperature reading");
+                    None
+                }
+                Ok(t) if t >= EMERGENCY_TEMP_C => {
+                    self.bad_thermal_count += 1;
+                    warn!(
+                        temp_c = t,
+                        consecutive = self.bad_thermal_count,
+                        "Temperature above emergency threshold"
+                    );
+                    Some(t)
+                }
+                Ok(t) => {
+                    self.bad_thermal_count = 0;
+                    Some(t)
+                }
+                Err(e) => {
+                    self.bad_thermal_count += 1;
+                    warn!("Temperature read failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            self.bad_thermal_count = 0;
+            None
+        };
 
-        // Update telemetry with current readings
-        tx.send_modify(|t| {
-            t.fans[0].rpm = fan_rpm;
-            t.fans[0].percent = fan_percent;
-            t.temperatures[0].temperature = asic_temp.map(Temperature::from_celsius);
-            t.temperatures[1].temperature = vr_temp.map(|t| Temperature::from_celsius(t as f32));
-            t.powers[0].voltage_v = vin_mv.map(|mv| mv as f32 / 1000.0);
-            t.powers[1].voltage_v = vout_mv.map(|mv| mv as f32 / 1000.0);
-            t.powers[1].current_a = iout_ma.map(|ma| ma as f32 / 1000.0);
-            t.powers[1].power_w = power_mw.map(|mw| mw as f32 / 1000.0);
+        // Without reliable temperature readings we cannot operate
+        // safely. Shut down the board.
+        if self.bad_thermal_count >= BAD_READING_LIMIT {
+            error!(
+                consecutive = self.bad_thermal_count,
+                "THERMAL EMERGENCY: shutting down board"
+            );
+            if let Err(e) = self.emc2101.set_fan_speed(Percent::FULL).await {
+                error!("Failed to set fan speed: {}", e);
+            }
+            return Err(());
+        }
+
+        // Publish telemetry
+        let _ = tx.send(BoardTelemetry {
+            name: self.board_name.clone(),
+            model: self.board_model.into(),
+            serial: self.board_serial.clone(),
+            fans: vec![Fan {
+                name: "fan".into(),
+                rpm: fan_rpm,
+                percent: fan_percent,
+                target_percent: None,
+            }],
+            temperatures: vec![
+                TemperatureSensor {
+                    name: "asic".into(),
+                    temperature: asic_temp.map(Temperature::from_celsius),
+                },
+                TemperatureSensor {
+                    name: "vr".into(),
+                    temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
+                },
+            ],
+            powers: vec![
+                PowerMeasurement {
+                    name: "input".into(),
+                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                    current_a: None,
+                    power_w: None,
+                },
+                PowerMeasurement {
+                    name: "core".into(),
+                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                    current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
+                    power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                },
+            ],
+            threads: Vec::new(), // TODO: populate from hash thread telemetry
         });
 
         // Periodic log
@@ -361,6 +434,8 @@ impl Bitaxe {
                 "Board status"
             );
         }
+
+        Ok(())
     }
 
     async fn shutdown(&mut self) {
@@ -377,11 +452,6 @@ impl Bitaxe {
         match self.regulator.lock().await.set_vout(0.0).await {
             Ok(()) => debug!("Core voltage turned off"),
             Err(e) => warn!("Failed to turn off core voltage: {}", e),
-        }
-
-        let shutdown_speed = Percent::new_clamped(25);
-        if let Err(e) = self.emc2101.set_fan_speed(shutdown_speed).await {
-            warn!("Failed to set fan speed: {}", e);
         }
     }
 }
