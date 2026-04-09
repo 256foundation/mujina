@@ -55,6 +55,9 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
+mod fan_controller;
+use fan_controller::{FanController, FanControllerConfig};
+
 // Register this board type with the inventory system
 inventory::submit! {
     crate::board::BoardDescriptor {
@@ -214,6 +217,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_serial: serial,
         bad_thermal_count: 0,
         asic_enable: asic_enable_monitor,
+        fan_controller: FanController::new(FanControllerConfig::default()),
     };
 
     let cancel = CancellationToken::new();
@@ -246,6 +250,8 @@ struct Bitaxe {
     /// above emergency threshold). Triggers emergency shutdown.
     bad_thermal_count: u32,
     asic_enable: BitaxeAsicEnable,
+    /// PI fan speed controller.
+    fan_controller: FanController,
 }
 
 impl Bitaxe {
@@ -376,6 +382,15 @@ impl Bitaxe {
                 error!("Failed to set fan speed: {}", e);
             }
             return Err(());
+        }
+
+        if let Some(temp_c) = asic_temp {
+            let speed = self
+                .fan_controller
+                .update_speed(temp_c, Duration::from_secs(2));
+            if let Err(e) = self.emc2101.set_fan_speed(speed).await {
+                warn!("Failed to set fan speed: {}", e);
+            }
         }
 
         // Publish telemetry
