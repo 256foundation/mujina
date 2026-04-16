@@ -245,7 +245,7 @@ impl Backplane {
                 );
 
                 // Create the board using the descriptor's factory function
-                let (mut board, registration) = match (descriptor.create_fn)().await {
+                let (mut board, registration) = match (descriptor.create_fn)(device_info.clone()).await {
                     Ok(result) => result,
                     Err(e) => {
                         error!(

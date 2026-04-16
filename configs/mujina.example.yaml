@@ -52,6 +52,13 @@ pool:
   # Worker password. Most pools accept "x".
   password: "x"
 
+  # Target share rate in shares per minute for the forced-rate wrapper.
+  # When set, overrides the pool's share target so a CPU miner finds shares
+  # at this rate regardless of pool difficulty. Useful for testing share
+  # submission flow without waiting days for a real share.
+  # Null disables the wrapper (normal pool difficulty applies).
+  forced_rate: ~
+
 
 # ------------------------------------------------------------
 # backplane — board discovery and lifecycle management

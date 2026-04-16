@@ -13,23 +13,27 @@ Use cases:
 
 ## Enabling CPU Mining
 
-Set `MUJINA_CPUMINER_THREADS` to enable CPU mining. The value specifies how
-many parallel hashing threads to run:
+Set `boards.cpu_miner.enabled = true` and `boards.cpu_miner.threads` in your
+config file, or use env vars:
 
 ```bash
-MUJINA_CPUMINER_THREADS=2 cargo run
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=2 \
+cargo run
 ```
 
-Without this variable, the miner only looks for USB-connected ASIC hardware.
+Without CPU mining enabled, the miner only looks for USB-connected ASIC
+hardware.
 
-When running CPU-only, also set `MUJINA_USB_DISABLE=1` to skip USB device
-discovery. This ignores any real mining boards you might have connected---they
-run at vastly different hashrates and would complicate testing. It also avoids
-USB-related noise on cloud systems:
+When running CPU-only, also set `backplane.usb_enabled = false` to skip USB
+device discovery. This ignores any real mining boards you might have
+connected---they run at vastly different hashrates and would complicate
+testing. It also avoids USB-related noise on cloud systems:
 
 ```bash
-MUJINA_CPUMINER_THREADS=2 \
-MUJINA_USB_DISABLE=1 \
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=2 \
+MUJINA__BACKPLANE__USB_ENABLED=false \
 cargo run
 ```
 
@@ -39,7 +43,7 @@ By default, each mining thread hashes for 50ms then sleeps for 50ms---a 50%
 duty cycle. This prevents CPU mining from starving other processes and avoids
 tripping CPU usage limits on cloud instances.
 
-Adjust with `MUJINA_CPUMINER_DUTY`:
+Adjust with `boards.cpu_miner.duty_percent` (or `MUJINA__BOARDS__CPU_MINER__DUTY_PERCENT`):
 
 - `100` --- Full speed, no throttling
 - `50` --- Hash half the time, sleep half (default)
@@ -52,19 +56,20 @@ hashrate.
 
 Pools set share difficulty for ASIC-speed miners. A CPU running at MH/s instead
 of TH/s would wait days or weeks to find a share at typical pool difficulty. To
-test the share submission flow, use `MUJINA_POOL_FORCED_RATE` to artificially
+test the share submission flow, use `pool.forced_rate` (or `MUJINA__POOL__FORCED_RATE`) to artificially
 lower the target:
 
 ```bash
-MUJINA_CPUMINER_THREADS=2 \
-MUJINA_USB_DISABLE=1 \
-MUJINA_POOL_FORCED_RATE=6 \
-MUJINA_POOL_URL="stratum+tcp://pool.example.com:3333" \
-MUJINA_POOL_USER="your-address.worker" \
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=2 \
+MUJINA__BACKPLANE__USB_ENABLED=false \
+MUJINA__POOL__FORCED_RATE=6 \
+MUJINA__POOL__URL="stratum+tcp://pool.example.com:3333" \
+MUJINA__POOL__USER="your-address.worker" \
 cargo run
 ```
 
-The value is target shares per minute. With `MUJINA_POOL_FORCED_RATE=6`, the
+The value is target shares per minute. With `MUJINA__POOL__FORCED_RATE=6`, the
 miner targets one share every 10 seconds.
 
 The forced rate wrapper intercepts jobs from the pool and replaces the share
@@ -82,12 +87,13 @@ caps the per-thread rate to prevent flooding.
 
 ## Running Without a Pool
 
-Without `MUJINA_POOL_URL`, the miner uses a dummy job source that generates
+Without `pool.url` set, the miner uses a dummy job source that generates
 synthetic work:
 
 ```bash
-MUJINA_CPUMINER_THREADS=2 \
-MUJINA_USB_DISABLE=1 \
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=2 \
+MUJINA__BACKPLANE__USB_ENABLED=false \
 RUST_LOG=mujina_miner=debug \
 cargo run
 ```
@@ -104,7 +110,8 @@ For deploying to cloud infrastructure or container orchestration platforms, see
 
 | Variable | Description |
 |----------|-------------|
-| `MUJINA_CPUMINER_THREADS` | Number of mining threads; presence enables CPU mining |
-| `MUJINA_CPUMINER_DUTY` | Duty cycle percentage, 1-100 (default: 50) |
-| `MUJINA_USB_DISABLE` | Set to `1` to skip USB device discovery |
-| `MUJINA_POOL_FORCED_RATE` | Target share rate in shares/min |
+| `MUJINA__BOARDS__CPU_MINER__ENABLED` | Set to `true` to enable CPU mining |
+| `MUJINA__BOARDS__CPU_MINER__THREADS` | Number of mining threads |
+| `MUJINA__BOARDS__CPU_MINER__DUTY_PERCENT` | Duty cycle percentage, 1-100 (default: 50) |
+| `MUJINA__BACKPLANE__USB_ENABLED` | Set to `false` to skip USB device discovery |
+| `MUJINA__POOL__FORCED_RATE` | Target share rate in shares/min |

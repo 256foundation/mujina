@@ -8,7 +8,9 @@ use std::{error::Error, fmt, future::Future, pin::Pin};
 use tokio::sync::watch;
 
 use crate::{
-    api_client::types::BoardState, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardState,
+    asic::hash_thread::HashThread,
+    transport::{UsbDeviceInfo, cpu::CpuDeviceInfo},
 };
 
 /// Represents a mining board containing one or more ASIC chips.
@@ -143,11 +145,11 @@ inventory::collect!(BoardDescriptor);
 /// Factory function signature for creating a virtual board.
 ///
 /// Same contract as [`BoardFactoryFn`] (create watch channel, seed with
-/// identity, return [`BoardRegistration`]), but virtual boards don't
-/// receive USB device info---they're configured via environment
-/// variables or other means.
-pub type VirtualBoardFactoryFn =
-    fn() -> BoxFuture<'static, crate::error::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
+/// identity, return [`BoardRegistration`]), but virtual boards receive their
+/// configuration via [`CpuDeviceInfo`] rather than USB device info.
+pub type VirtualBoardFactoryFn = fn(
+    CpuDeviceInfo,
+) -> BoxFuture<'static, crate::error::Result<(Box<dyn Board + Send>, BoardRegistration)>>;
 
 /// Descriptor for virtual boards (CPU miner, test boards, etc.).
 ///

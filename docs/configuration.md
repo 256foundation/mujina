@@ -6,6 +6,7 @@ This document describes the configuration system for `mujina-minerd`.
 - [2. Config Files](#2-config-files)
   - [2.1. Default location](#21-default-location)
   - [2.2. User-specified location](#22-user-specified-location)
+  - [2.3. Bootstrap variables](#23-bootstrap-variables)
 - [3. Environment Variables](#3-environment-variables)
   - [3.1. Migration from Legacy Environment Variables](#31-migration-from-legacy-environment-variables)
 - [4. CLI Flags](#4-cli-flags)
@@ -39,6 +40,9 @@ will start with sensible defaults (dummy job source, API on localhost).
 This is the standard system-wide config file, suitable for installation by a
 package manager or system administrator.
 
+> [!NOTE]
+> This path can be overridden via `MUJINA_DEFAULT_CONFIG_PATH`.
+
 ### 2.2. User-specified location
 
 Set `MUJINA_CONFIG_FILE_PATH` to an absolute path to load a second config file
@@ -53,6 +57,21 @@ Keys present in the user-specified file take precedence over the same keys in
 default file, then to hard-coded defaults.
 
 An example config file is provided at `configs/mujina.example.yaml`.
+
+### 2.3. Bootstrap variables
+
+`MUJINA_CONFIG_FILE_PATH` and `MUJINA_DEFAULT_CONFIG_PATH` use single
+underscores and are **not** part of the `MUJINA__*` config-key system. They are
+bootstrap variables read by the loader before the config system is constructed,
+so the double-underscore naming convention does not apply to them.
+
+`MUJINA_DEFAULT_CONFIG_PATH` overrides the default system config path
+(`/etc/mujina/mujina.yaml`). It is primarily intended for testing, where
+writing to `/etc` requires root access:
+
+```sh
+MUJINA_DEFAULT_CONFIG_PATH=/tmp/mujina-test.yaml mujina-minerd
+```
 
 ## 3. Environment Variables
 
@@ -108,6 +127,7 @@ These are superseded by the unified config system:
 | `MUJINA_POOL_URL` | `pool.url` | `MUJINA__POOL__URL` |
 | `MUJINA_POOL_USER` | `pool.user` | `MUJINA__POOL__USER` |
 | `MUJINA_POOL_PASS` | `pool.password` | `MUJINA__POOL__PASSWORD` |
+| `MUJINA_POOL_FORCED_RATE` | `pool.forced_rate` | `MUJINA__POOL__FORCED_RATE` |
 | `MUJINA_API_LISTEN` | `api.listen` | `MUJINA__API__LISTEN` |
 | `MUJINA_USB_DISABLE` | `backplane.usb_enabled` | `MUJINA__BACKPLANE__USB_ENABLED` |
 | `MUJINA_CPUMINER_THREADS` | `boards.cpu_miner.threads` | `MUJINA__BOARDS__CPU_MINER__THREADS` |

@@ -11,6 +11,7 @@ use crate::{
     api_client::types::BoardState,
     asic::hash_thread::HashThread,
     cpu_miner::{CpuHashThread, CpuMinerConfig},
+    transport::cpu::CpuDeviceInfo,
 };
 
 /// CPU mining board.
@@ -80,11 +81,13 @@ impl Board for CpuBoard {
 // ---------------------------------------------------------------------------
 
 /// Factory function for creating CpuBoard instances.
-async fn create_cpu_board()
--> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let config = CpuMinerConfig::from_env().ok_or_else(|| {
-        crate::error::Error::Config("CPU miner not configured (MUJINA_CPU_MINER not set)".into())
-    })?;
+async fn create_cpu_board(
+    device_info: CpuDeviceInfo,
+) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
+    let config = CpuMinerConfig {
+        thread_count: device_info.thread_count,
+        duty_percent: device_info.duty_percent,
+    };
 
     let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
     let initial_state = BoardState {
@@ -104,6 +107,6 @@ inventory::submit! {
     VirtualBoardDescriptor {
         device_type: "cpu_miner",
         name: "CPU Miner",
-        create_fn: || Box::pin(create_cpu_board()),
+        create_fn: |info| Box::pin(create_cpu_board(info)),
     }
 }

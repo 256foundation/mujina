@@ -126,7 +126,9 @@ impl Daemon {
             };
 
             // Optionally wrap with ForcedRateSource for testing
-            if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
+            if let Some(forced_rate_config) = config.pool.forced_rate.map(|rate| ForcedRateConfig {
+                target_rate: crate::types::ShareRate::per_minute(rate),
+            }) {
                 info!(
                     rate = %forced_rate_config.target_rate,
                     "Forced share rate wrapper enabled"

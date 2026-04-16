@@ -6,10 +6,11 @@
 //!
 //! # Usage
 //!
-//! Set `MUJINA_POOL_FORCED_RATE=18` to enable the wrapper targeting 18
-//! shares per minute (~3.33 seconds between shares). The wrapper intercepts
-//! job templates from the inner source and replaces their share_target with
-//! one computed to achieve the target rate at the current hashrate.
+//! Set `pool.forced_rate = 18` (or `MUJINA__POOL__FORCED_RATE=18`) to enable
+//! the wrapper targeting 18 shares per minute (~3.33 seconds between shares).
+//! The wrapper intercepts job templates from the inner source and replaces
+//! their share_target with one computed to achieve the target rate at the
+//! current hashrate.
 //!
 //! Shares are forwarded to the inner source regardless of whether they meet
 //! the pool's actual difficulty. The pool may accept (if configured with low
@@ -21,7 +22,7 @@
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use super::{JobTemplate, SourceCommand, SourceEvent};
 use crate::types::{Difficulty, HashRate, ShareRate, target_for_share_rate};
@@ -32,35 +33,6 @@ pub struct ForcedRateConfig {
     pub target_rate: ShareRate,
 }
 
-impl ForcedRateConfig {
-    /// Parse from environment variables.
-    ///
-    /// Returns `Some` if `MUJINA_POOL_FORCED_RATE` is set. The value specifies
-    /// the target rate in shares per minute; defaults to 18 if unparseable.
-    pub fn from_env() -> Option<Self> {
-        let val = std::env::var("MUJINA_POOL_FORCED_RATE").ok()?;
-        let shares_per_min: f64 = match val.parse::<f64>() {
-            Ok(v) if v.is_finite() && v > 0.0 => v,
-            Ok(v) => {
-                warn!(
-                    value = v,
-                    "MUJINA_POOL_FORCED_RATE must be finite and positive, using default 18"
-                );
-                18.0
-            }
-            Err(_) => {
-                warn!(
-                    value = %val,
-                    "Invalid MUJINA_POOL_FORCED_RATE, using default 18"
-                );
-                18.0
-            }
-        };
-        Some(Self {
-            target_rate: ShareRate::per_minute(shares_per_min),
-        })
-    }
-}
 
 /// Wrapper that overrides share_target to force a specific share rate.
 ///

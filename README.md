@@ -106,26 +106,24 @@ cargo test
 
 ## Running
 
-At this point in development, configuration is done via environment variables.
-Once configuration storage and API functionality are more complete, persistent
-configuration will be available through the REST API and CLI tools.
+Configuration is managed through a YAML config file, environment variables, or
+CLI flags. See [Configuration](docs/configuration.md) for the full reference.
 
 ### Pool Configuration
 
 Connect to a Stratum v1 mining pool:
 
 ```bash
-MUJINA_POOL_URL="stratum+tcp://localhost:3333" \
-MUJINA_POOL_USER="bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina" \
-MUJINA_POOL_PASS="custom-password" \
+MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
+MUJINA__POOL__USER="bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina" \
+MUJINA__POOL__PASSWORD="custom-password" \
 cargo run
 ```
 
 The password defaults to "x" if not specified.
 
-Without `MUJINA_POOL_URL`, the miner runs with a dummy job source that
-generates synthetic mining work, which is useful for testing hardware without a
-pool connection.
+Without `pool.url` set, the miner runs with a dummy job source that generates
+synthetic mining work, useful for testing hardware without a pool connection.
 
 ### API Server
 
@@ -133,7 +131,7 @@ The REST API listens on `127.0.0.1:7785` by default. To listen
 on all interfaces:
 
 ```bash
-MUJINA_API_LISTEN="0.0.0.0" cargo run
+MUJINA__API__LISTEN="0.0.0.0" cargo run
 ```
 
 See [REST API](docs/api.md) for endpoints and details.
@@ -176,8 +174,8 @@ Combine pool configuration with logging as needed:
 
 ```bash
 RUST_LOG=mujina_miner=debug \
-MUJINA_POOL_URL="stratum+tcp://localhost:3333" \
-MUJINA_POOL_USER="your-address.worker" \
+MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
+MUJINA__POOL__USER="your-address.worker" \
 cargo run
 ```
 

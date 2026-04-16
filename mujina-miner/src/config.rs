@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use config::{Environment, File, FileFormat};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/mujina/mujina.yaml";
 const DEFAULT_CONFIG_PATH_ENV_VAR: &str = "MUJINA_DEFAULT_CONFIG_PATH";
@@ -103,6 +104,11 @@ pub struct PoolConfig {
     pub url: Option<String>,
     pub user: String,
     pub password: String,
+    /// Target share rate in shares per minute for the forced-rate wrapper.
+    /// When set, overrides the pool's share target to achieve this rate.
+    /// Intended for CPU mining tests against pools that set difficulty too
+    /// high for software hashers. `None` disables the wrapper.
+    pub forced_rate: Option<f64>,
 }
 
 impl Default for PoolConfig {
@@ -111,6 +117,7 @@ impl Default for PoolConfig {
             url: None,
             user: "mujina-testing".to_string(),
             password: "x".to_string(),
+            forced_rate: None,
         }
     }
 }
@@ -214,6 +221,58 @@ impl Config {
     /// `cli_config_path` corresponds to the `--config` CLI flag and takes
     /// precedence over `MUJINA_CONFIG_FILE_PATH`.
     pub fn load_with(cli_config_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        // Detect misuse of bootstrap variables before the config system is
+        // constructed. Neither `config` nor `default` are valid config
+        // sections — the likely mistakes are:
+        //   MUJINA__CONFIG__FILE__PATH  instead of  MUJINA_CONFIG_FILE_PATH
+        //   MUJINA__DEFAULT__CONFIG__PATH  instead of  MUJINA_DEFAULT_CONFIG_PATH
+        let bad_vars: Vec<String> = std::env::vars()
+            .filter(|(k, _)| {
+                let u = k.to_uppercase();
+                u.starts_with("MUJINA__CONFIG") || u.starts_with("MUJINA__DEFAULT")
+            })
+            .map(|(k, _)| k)
+            .collect();
+        if !bad_vars.is_empty() {
+            anyhow::bail!(
+                "Invalid environment variable(s): {}\n\n\
+                 These are not config sections. Did you mean one of the \
+                 bootstrap variables `MUJINA_CONFIG_FILE_PATH` or \
+                 `MUJINA_DEFAULT_CONFIG_PATH` (single underscores)?",
+                bad_vars.join(", ")
+            );
+        }
+
+        // Log config file sources so startup problems are easy to diagnose.
+        {
+            let default_path = default_config_path();
+            let default_exists = std::path::Path::new(&default_path).exists();
+            debug!(
+                path = %default_path,
+                exists = default_exists,
+                env_var = std::env::var(DEFAULT_CONFIG_PATH_ENV_VAR).ok().as_deref().unwrap_or("(not set)"),
+                "Default config file (MUJINA_DEFAULT_CONFIG_PATH)"
+            );
+
+            let user_path = cli_config_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| std::env::var(CONFIG_FILE_ENV_VAR).ok());
+            match &user_path {
+                Some(path) => {
+                    let exists = std::path::Path::new(path).exists();
+                    debug!(
+                        path = %path,
+                        exists = exists,
+                        "User config file (MUJINA_CONFIG_FILE_PATH)"
+                    );
+                }
+                None => {
+                    debug!("User config file (MUJINA_CONFIG_FILE_PATH): not set");
+                }
+            }
+        }
+
         let mut builder = config::Config::builder()
             // Layer 4 (lowest): default system config file
             .add_source(
