@@ -1,12 +1,24 @@
 //! Hashrate measurement type.
+//!
+//! Represents a per-miner hashrate in hashes per second, stored as
+//! u64. This covers up to ~18.4 EH/s, which is well beyond any
+//! single miner's capability. Not intended for representing
+//! aggregate network hashrate.
+//!
+//! Arithmetic follows Rust's default overflow behavior: panics in
+//! debug builds, wraps in release builds.
 
 use std::iter::Sum;
 use std::ops::Add;
 use std::time::Duration;
 
-/// Hashrate measurement.
+/// Per-miner hashrate in hashes per second.
+///
+/// Stored as u64, covering up to ~18.4 EH/s. Constructors from
+/// f64 (e.g., `from_terahashes`) saturate to `u64::MAX` for
+/// out-of-range values.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct HashRate(pub u64); // hashes per second
+pub struct HashRate(pub u64);
 
 impl HashRate {
     /// Create from megahashes per second
@@ -45,8 +57,13 @@ impl HashRate {
     }
 
     /// Expected number of hashes in the given duration.
-    pub fn hashes_in(&self, duration: Duration) -> u128 {
-        self.0 as u128 * duration.as_nanos() / 1_000_000_000
+    ///
+    /// Returns a fractional count because this is a statistical
+    /// expectation (e.g., 0.5 hashes in 100 ms at 5 H/s). Exact for
+    /// hashrates up to ~9 PH/s (2^53 H/s); above that, rounding
+    /// errors are bounded by ~10^-16 relative.
+    pub fn hashes_in(&self, duration: Duration) -> f64 {
+        self.0 as f64 * duration.as_secs_f64()
     }
 
     /// Format as human-readable string with appropriate units

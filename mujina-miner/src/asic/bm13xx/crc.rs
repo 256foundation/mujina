@@ -1,10 +1,4 @@
 //! CRC validation utilities for BM13xx protocol frames.
-//!
-//! TODO: Remove redundancy between protocol decoder and dissector CRC usage
-//! - Both protocol.rs and dissect.rs implement similar CRC validation logic
-//! - Consider extracting frame validation helpers to reduce duplication
-//! - Unify CRC16 big-endian handling across different code paths
-//! - Add comprehensive unit tests using known good/bad frames from captures
 
 use crc_all::CrcAlgo;
 

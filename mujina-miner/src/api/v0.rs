@@ -15,7 +15,9 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
-use crate::api_client::types::{BoardState, MinerPatchRequest, MinerState, SourceState};
+use crate::api_client::types::{
+    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+};
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
@@ -47,11 +49,11 @@ async fn health() -> &'static str {
     path = "/miner",
     tag = "miner",
     responses(
-        (status = OK, description = "Current miner state", body = MinerState),
+        (status = OK, description = "Current miner telemetry", body = MinerTelemetry),
     ),
 )]
-async fn get_miner(State(state): State<SharedState>) -> Json<MinerState> {
-    Json(state.miner_state())
+async fn get_miner(State(state): State<SharedState>) -> Json<MinerTelemetry> {
+    Json(state.miner_telemetry())
 }
 
 /// Apply partial updates to the miner configuration.
@@ -61,14 +63,14 @@ async fn get_miner(State(state): State<SharedState>) -> Json<MinerState> {
     tag = "miner",
     request_body = MinerPatchRequest,
     responses(
-        (status = OK, description = "Updated miner state", body = MinerState),
+        (status = OK, description = "Updated miner telemetry", body = MinerTelemetry),
         (status = INTERNAL_SERVER_ERROR, description = "Command channel error"),
     ),
 )]
 async fn patch_miner(
     State(state): State<SharedState>,
     Json(req): Json<MinerPatchRequest>,
-) -> Result<Json<MinerState>, StatusCode> {
+) -> Result<Json<MinerTelemetry>, StatusCode> {
     if let Some(paused) = req.paused {
         let (tx, rx) = oneshot::channel();
         let cmd = if paused {
@@ -87,7 +89,7 @@ async fn patch_miner(
         };
     }
 
-    Ok(Json(state.miner_state()))
+    Ok(Json(state.miner_telemetry()))
 }
 
 /// Return all connected boards.
@@ -96,10 +98,10 @@ async fn patch_miner(
     path = "/boards",
     tag = "boards",
     responses(
-        (status = OK, description = "List of connected boards", body = Vec<BoardState>),
+        (status = OK, description = "List of connected boards", body = Vec<BoardTelemetry>),
     ),
 )]
-async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardState>> {
+async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardTelemetry>> {
     Json(
         state
             .board_registry
@@ -118,14 +120,14 @@ async fn get_boards(State(state): State<SharedState>) -> Json<Vec<BoardState>> {
         ("name" = String, Path, description = "Board name"),
     ),
     responses(
-        (status = OK, description = "Board details", body = BoardState),
+        (status = OK, description = "Board details", body = BoardTelemetry),
         (status = NOT_FOUND, description = "Board not found"),
     ),
 )]
 async fn get_board(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<BoardState>, StatusCode> {
+) -> Result<Json<BoardTelemetry>, StatusCode> {
     state
         .board_registry
         .lock()
@@ -143,11 +145,11 @@ async fn get_board(
     path = "/sources",
     tag = "sources",
     responses(
-        (status = OK, description = "List of job sources", body = Vec<SourceState>),
+        (status = OK, description = "List of job sources", body = Vec<SourceTelemetry>),
     ),
 )]
-async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceState>> {
-    Json(state.miner_state().sources)
+async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceTelemetry>> {
+    Json(state.miner_telemetry_rx.borrow().sources.clone())
 }
 
 /// Return a single source by name, or 404 if not found.
@@ -159,19 +161,21 @@ async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceState>>
         ("name" = String, Path, description = "Source name"),
     ),
     responses(
-        (status = OK, description = "Source details", body = SourceState),
+        (status = OK, description = "Source details", body = SourceTelemetry),
         (status = NOT_FOUND, description = "Source not found"),
     ),
 )]
 async fn get_source(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<SourceState>, StatusCode> {
+) -> Result<Json<SourceTelemetry>, StatusCode> {
     state
-        .miner_state()
+        .miner_telemetry_rx
+        .borrow()
         .sources
-        .into_iter()
+        .iter()
         .find(|s| s.name == name)
+        .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }

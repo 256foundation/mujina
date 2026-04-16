@@ -20,12 +20,12 @@
 //! be achieved because the scheduler's internal per-thread share filter
 //! caps the rate to prevent flooding.
 
+use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
 
 use super::{JobTemplate, SourceCommand, SourceEvent};
-use crate::types::{Difficulty, HashRate, ShareRate, target_for_share_rate};
+use crate::types::{Difficulty, HashRate, ShareRate};
 
 /// Configuration for forced share rate wrapper.
 pub struct ForcedRateConfig {
@@ -96,7 +96,7 @@ impl ForcedRateSource {
             return job;
         }
 
-        let target = target_for_share_rate(self.target_rate, self.hashrate);
+        let target = self.target_rate.to_target(self.hashrate);
 
         trace!(
             job_id = %job.id,
@@ -160,7 +160,6 @@ impl ForcedRateSource {
 mod tests {
     use super::*;
     use crate::job_source::{GeneralPurposeBits, MerkleRootKind, VersionTemplate};
-    use crate::types::target_for_share_rate;
     use bitcoin::BlockHash;
     use bitcoin::block::Version;
     use bitcoin::hashes::Hash;
@@ -240,8 +239,8 @@ mod tests {
         // Modify the job
         let modified = harness.wrapper.modify_job(job);
 
-        // Verify the target matches what target_for_share_rate computes
-        let expected_target = target_for_share_rate(target_rate, hashrate);
+        // Verify the target matches what to_target computes
+        let expected_target = target_rate.to_target(hashrate);
         assert_eq!(modified.share_target, expected_target);
     }
 
@@ -326,7 +325,7 @@ mod tests {
 
         // Receive modified job and verify target
         let event = outer_event_rx.recv().await.unwrap();
-        let expected_target = target_for_share_rate(target_rate, hashrate);
+        let expected_target = target_rate.to_target(hashrate);
 
         match event {
             SourceEvent::ReplaceJob(job) => {

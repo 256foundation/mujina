@@ -8,11 +8,13 @@
 pub mod adc;
 pub mod gpio;
 pub mod i2c;
+pub mod rgb_led;
 
 // Re-export traits
 pub use adc::{Adc, AdcChannel};
 pub use gpio::{Gpio, GpioPin, PinMode, PinValue};
 pub use i2c::{I2c, I2cError};
+pub use rgb_led::{RgbColor, RgbLed};
 
 /// Common error type for hardware operations
 #[derive(Debug, thiserror::Error)]

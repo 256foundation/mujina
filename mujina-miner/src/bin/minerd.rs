@@ -37,7 +37,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing::init_journald_or_stdout();
+    tracing::init();
 
     let cli = Cli::parse();
 

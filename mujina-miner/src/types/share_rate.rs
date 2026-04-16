@@ -2,6 +2,11 @@
 
 use std::time::Duration;
 
+use bitcoin::Target;
+
+use super::{Difficulty, HashRate};
+use crate::u256::U256;
+
 /// Share submission rate (shares per unit time).
 ///
 /// Used to express rate limits for share submission to pools. The scheduler
@@ -57,6 +62,34 @@ impl ShareRate {
     /// Get the average interval between shares.
     pub fn as_interval(&self) -> Duration {
         self.0
+    }
+
+    /// Compute the target needed to achieve this share rate at the
+    /// given hashrate.
+    ///
+    /// A hash is valid if hash < target. With hashes uniform over
+    /// [0, 2^256), expected hashes per share = 2^256 / target, so
+    /// target = 2^256 / hashes_per_share.
+    ///
+    /// The returned target may exceed `Target::MAX` (Bitcoin
+    /// difficulty-1, ~2^224) at low hashrates. This is fine for
+    /// scheduler use -- it just means every hash qualifies as a
+    /// share.
+    pub fn to_target(&self, hashrate: HashRate) -> Target {
+        let hashes_per_share = hashrate.hashes_in(self.0);
+        if hashes_per_share <= 1.0 {
+            Target::from(U256::MAX)
+        } else {
+            Target::from(U256::MAX / hashes_per_share)
+        }
+    }
+
+    /// Compute the difficulty needed to achieve this share rate at
+    /// the given hashrate.
+    ///
+    /// Convenience for `Difficulty::from_target(self.to_target(..))`.
+    pub fn to_difficulty(&self, hashrate: HashRate) -> Difficulty {
+        Difficulty::from_target(self.to_target(hashrate))
     }
 }
 
@@ -118,5 +151,16 @@ mod tests {
         // < 1 share/min: display as shares/sec
         assert_eq!(ShareRate::per_second(0.01).to_string(), "0.010 shares/sec");
         assert_eq!(ShareRate::per_second(0.001).to_string(), "0.001 shares/sec");
+    }
+
+    #[test]
+    fn to_difficulty_matches_to_target() {
+        let rate = ShareRate::per_second(1.0);
+        let hashrate = HashRate::from_terahashes(1.0);
+
+        let via_target = Difficulty::from_target(rate.to_target(hashrate));
+        let direct = rate.to_difficulty(hashrate);
+
+        assert_eq!(via_target.as_f64(), direct.as_f64());
     }
 }

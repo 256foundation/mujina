@@ -13,7 +13,7 @@ use tokio_serial::SerialStream;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use super::{ControlCodec, Packet, Response};
+use super::{ControlCodec, Packet, Response, ResponseFormat};
 
 /// Control channel for bitaxe-raw protocol communication.
 ///
@@ -32,12 +32,15 @@ struct ControlChannelInner {
 
 impl ControlChannel {
     /// Create a new control channel from a serial stream.
-    pub fn new(stream: SerialStream) -> Self {
+    ///
+    /// The `format` parameter selects the response framing and error
+    /// signaling variant. See [`ResponseFormat`] for details.
+    pub fn new(stream: SerialStream, format: ResponseFormat) -> Self {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             inner: Arc::new(Mutex::new(ControlChannelInner {
-                writer: FramedWrite::new(writer, ControlCodec::default()),
-                reader: FramedRead::new(reader, ControlCodec::default()),
+                writer: FramedWrite::new(writer, ControlCodec::new(format)),
+                reader: FramedRead::new(reader, ControlCodec::new(format)),
                 next_id: 0,
             })),
         }
@@ -90,5 +93,18 @@ impl ControlChannel {
         }
 
         Ok(response)
+    }
+
+    /// Send a packet without waiting for a response.
+    ///
+    /// Used for commands where the remote side will not (or cannot)
+    /// reply, such as a reboot that resets the device immediately.
+    pub async fn send_packet_no_reply(&self, mut packet: Packet) -> io::Result<()> {
+        let mut inner = self.inner.lock().await;
+
+        packet.id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+
+        inner.writer.send(packet).await
     }
 }

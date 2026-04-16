@@ -1,117 +1,133 @@
 # mujina-miner
 
-Open source Bitcoin mining software written in Rust for ASIC mining hardware.
+Open-source Bitcoin mining firmware.
 
-> **Developer Preview**: This software is under heavy development and not ready
-> for production use. The code is made available for developers interested in
-> contributing, learning about Bitcoin mining protocols, or evaluating the
-> architecture. APIs, protocols, and features are subject to change without
-> notice. Documentation is incomplete and may be inaccurate. Use at your own
-> risk.
+## Why Mujina
 
-## Overview
+You bought the hardware, but someone else controls the software. Whether
+you have thousands of machines in a data center or one in your basement,
+the firmware running them is closed. It comes from the manufacturer or a
+third-party vendor, and you can't read it, audit it, or change it.
 
-mujina-miner is a modern, async Rust implementation of Bitcoin mining software
-designed to communicate with various Bitcoin mining hash boards via USB serial
-interfaces. Part of the larger Mujina OS project, an open source, Debian-based
-embedded Linux distribution optimized for Bitcoin mining hardware.
+Mujina is here to change that: one open-source codebase to run any
+hashboard from any vendor on any control board, written by hardware
+engineers, protocol authors, and mining operators from across the industry.
+Read every line, modify it without permission, control it through a
+documented API, and pay no dev fee. Own your firmware.
 
-## Features
+## Current Status
 
-- **Heterogeneous Multi-Board Support**: Mix and match different hash board
-  types in a single deployment; hot-swappable, no need to restart when adding
-  or removing boards
-- **Hackable & Extensible**: Clear, modular architecture with well-documented
-  internals - designed for modification, experimentation, and custom extensions
-- **Reference-Grade Documentation**: Thorough documentation at every layer,
-  from chip protocols to system architecture, serving as both implementation
-  guide and educational resource
-- **API-Driven Control**: REST API for all operations---implement your own
-  control strategies, automate operations, or build custom interfaces on top
-- **Open-Source, Open-Contribution**: Active development with open
-  contribution; not code dumps or abandonware, a living project built by
-  the entire community
-- **Accessible Development**: Start developing with minimal hardware; a laptop
-  and a single [Bitaxe](mujina-miner/src/board/bitaxe_gamma.md) board is enough
-  to contribute meaningfully
+Mujina is under active development. Today's supported hardware is a
+starting point:
 
-## Supported Hardware
+**Working now**
 
-Currently supported:
-- [**Bitaxe Gamma**](mujina-miner/src/board/bitaxe_gamma.md) with BM1370 ASIC
+- **[Bitaxe Gamma](mujina-miner/src/board/bitaxe_gamma.md)** (single
+  BM1370 ASIC): an open-source single-chip miner. Good for developers
+  and advanced users who want to run Mujina on real hardware today.
+- **CPU backend**: software SHA-256 hashing, no hardware required.
+  Useful for exercising Mujina itself, testing pool and other server
+  software against a working miner client, and teaching the full mining
+  pipeline. See [CPU Mining](docs/cpu-mining.md).
 
-Planned support:
-- **EmberOne** with BM1362 ASIC
-- **EmberOne** with Intel BZM2 ASICs
-- Antminer S19j Pro hash boards
-- Any and all ASIC mining hardware
+**Landing now**
 
-## Documentation
+- **[EmberOne00](https://github.com/256foundation/emberone00-pcb)**
+  (twelve BM1362 ASICs): a sister project from the 256 Foundation. An
+  open-source hashboard designed to be driven by open firmware.
 
-### Project Documentation
+**Near-term targets**
 
-- [Architecture Overview](docs/architecture.md) - System design and component
-  interaction
-- [REST API](docs/api.md) - API contract, conventions, and endpoints
-- [CPU Mining](docs/cpu-mining.md) - Run without hardware for development and
-  testing
-- [Container Image](docs/container.md) - Build and run as a container
-- [Contribution Guide](CONTRIBUTING.md) - How to contribute to the project
-- [Code Style Guide](CODE_STYLE.md) - Formatting and style rules
-- [Coding Guidelines](CODING_GUIDELINES.md) - Best practices and design
-  patterns
+- Installable images for the Antminer S19 series
+- The 256 Foundation's forthcoming
+  [Libreboard](https://github.com/256foundation/libreboard) control
+  board
+- Broader support for commercial mining machines
 
-### Protocol Documentation
+APIs are still moving and parts of the docs lag the code.
 
-- [BM13xx ASIC Protocol](mujina-miner/src/asic/bm13xx/PROTOCOL.md) - Serial
-  protocol for BM13xx series mining chips
-- [Bitaxe-Raw Control Protocol](mujina-miner/src/mgmt_protocol/bitaxe_raw/PROTOCOL.md) -
-  Management protocol for Bitaxe board peripherals
+## Quick Start
 
-### Hardware Documentation
+Build Mujina and watch it run end to end, no mining hardware required.
+On Debian or Ubuntu:
 
-- [Bitaxe Gamma Board Guide](mujina-miner/src/board/bitaxe_gamma.md) - Hardware
-  and software interface documentation for Bitaxe Gamma
+```bash
+git clone https://github.com/256foundation/mujina.git
+cd mujina
+sudo apt-get install libudev-dev libssl-dev
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=1 \
+MUJINA__BACKPLANE__USB_ENABLED=false \
+  cargo run --bin mujina-minerd
+```
+
+In this example, the CPU backend hashes in software against a dummy job
+source, exercising the full pipeline: job distribution, hashing, share
+detection, logging, and the API. When you're ready to mine for real,
+continue below.
 
 ## Build Requirements
 
+Mujina builds with the current stable
+[Rust toolchain](https://rustup.rs). Install the additional packages
+below for your platform.
+
 ### Linux
 
-On Debian/Ubuntu systems:
+On Debian or Ubuntu:
 
 ```bash
 sudo apt-get install libudev-dev libssl-dev
 ```
 
+Other distributions need their equivalents of the udev and openssl
+development packages.
+
 ### macOS
 
-macOS support is planned, but USB discovery using IOKit is not yet implemented.
+macOS is supported. Install Xcode Command Line Tools alongside the Rust
+toolchain. A build failure on `openssl-sys` usually means the build
+can't find openssl; see the
+[openssl crate's macOS notes](https://docs.rs/openssl/latest/openssl/#automatic)
+for the supported installation and environment options.
 
 ## Building
 
-A [justfile](https://github.com/casey/just) provides common development tasks:
-
-```bash
-just test      # Run unit tests (no hardware required)
-just run       # Build and run the miner
-just checks    # Run all checks (fmt, lint, test)
-```
-
-Or use cargo directly:
+mujina-miner is a cargo workspace. Build and test it the usual way:
 
 ```bash
 cargo build
 cargo test
 ```
 
+The workspace contains several binaries: `mujina-minerd` (the daemon),
+`mujina-cli`, and others. Running requires picking one:
+
+```bash
+cargo run --bin mujina-minerd
+```
+
+If you'll be working in the repo regularly, install
+[just](https://github.com/casey/just) (`cargo install just`) for
+shorter aliases that avoid retyping the `--bin` flag:
+
+```bash
+just run        # same as cargo run --bin mujina-minerd
+just test       # same as cargo test
+just checks     # fmt, lint, and test in one step
+```
+
+Examples in the rest of this README use plain cargo so they work
+without `just` installed.
+
 ## Running
 
 Configuration is managed through a YAML config file, environment variables, or
 CLI flags. See [Configuration](docs/configuration.md) for the full reference.
 
-### Pool Configuration
+### Connecting to a job source
 
-Connect to a Stratum v1 mining pool:
+Point Mujina at a Stratum v1 mining pool:
 
 ```bash
 MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
@@ -174,41 +190,117 @@ Combine pool configuration with logging as needed:
 
 ```bash
 RUST_LOG=mujina_miner=debug \
-MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
+MUJINA__POOL__URL="stratum+tcp://pool.example.com:3333" \
 MUJINA__POOL__USER="your-address.worker" \
-cargo run
+cargo run --bin mujina-minerd
 ```
 
-## Protocol Analysis Tool
+`MUJINA__POOL__USER` defaults to `mujina-testing` and `MUJINA__POOL__PASSWORD`
+defaults to `x`, so only `MUJINA__POOL__URL` is strictly required.
 
-The `mujina-dissect` tool analyzes captured communication between the host and
-mining hardware, providing detailed protocol-level insights for BM13xx serial
-commands, PMBus/I2C power management, and fan control.
+### Testing without a pool
 
-See [tools/mujina-dissect/README.md](tools/mujina-dissect/README.md) for
-detailed usage and documentation.
+Omit `MUJINA_POOL_URL` to use a dummy job source that generates
+synthetic mining work. Useful for development without a network
+connection.
 
-## License
+```bash
+cargo run --bin mujina-minerd
+```
 
-This project is licensed under the GNU General Public License v3.0 or later.
-See the [LICENSE](LICENSE) file for details.
+### Controlling log output
+
+The default filter emits Mujina log entries at info level and
+third-party crates at warn. `RUST_LOG` directives are additive: set
+per-module levels to dig into specific subsystems without flooding the
+rest of the log.
+
+```bash
+# Default: info for Mujina, warn for third-party crates
+cargo run --bin mujina-minerd
+
+# Trace the Stratum v1 client, everything else unchanged
+RUST_LOG=mujina_miner::stratum_v1=trace cargo run --bin mujina-minerd
+
+# Debug Stratum v1 and trace BM13xx at the same time
+RUST_LOG=mujina_miner::stratum_v1=debug,mujina_miner::asic::bm13xx=trace \
+  cargo run --bin mujina-minerd
+```
+
+Debug shows logical stages and summaries: chip initialization, jobs
+received from the pool, shares submitted. Trace adds step-by-step
+execution detail: individual serial frames, I2C transactions, and USB
+device events.
+
+### Using the REST API
+
+Mujina logs the API bind address at startup. By default it's
+`127.0.0.1:7785`; set `MUJINA_API_LISTEN` to change it:
+
+```bash
+# All interfaces, default port
+MUJINA__API__LISTEN="0.0.0.0" cargo run --bin mujina-minerd
+
+# All interfaces, custom port
+MUJINA__API__LISTEN="0.0.0.0:9000" cargo run --bin mujina-minerd
+```
+
+See [REST API](docs/api.md) for endpoints and conventions. The
+`/api/v0/` prefix signals the API is still in flux. Authentication
+is on the roadmap.
 
 ## Contributing
 
-We welcome contributions! Whether you're fixing bugs, adding features, improving
-documentation, or simply exploring the codebase to learn about Bitcoin mining
-protocols and hardware, your involvement is valued.
+We welcome contributions! Whether you're fixing bugs, adding features,
+improving documentation, or simply exploring the codebase to learn
+about Bitcoin mining protocols and hardware, your involvement is
+valued.
 
-Please see our [Contribution Guide](CONTRIBUTING.md) for details on how to get
-started.
+Please see our [Contribution Guide](CONTRIBUTING.md) for details on how
+to get started.
+
+## Further Reading
+
+### Design and operation
+
+- [Architecture Overview](docs/architecture.md): system design and
+  component interaction
+- [REST API](docs/api.md): endpoints, conventions, and OpenAPI spec
+- [CPU Mining](docs/cpu-mining.md): the CPU backend in detail
+- [Container Image](docs/container.md): build and run Mujina as a
+  container
+
+### Protocols
+
+- [BM13xx ASIC Protocol](mujina-miner/src/asic/bm13xx/PROTOCOL.md):
+  serial protocol for the BM13xx mining-chip family
+- [Bitaxe-Raw Control Protocol](mujina-miner/src/mgmt_protocol/bitaxe_raw/PROTOCOL.md):
+  management protocol for Bitaxe board peripherals
+
+### Hardware
+
+- [Bitaxe Gamma Board Guide](mujina-miner/src/board/bitaxe_gamma.md):
+  board hardware, firmware flashing, and Mujina integration
+
+### Contributor reference
+
+- [Contribution Guide](CONTRIBUTING.md): process and requirements
+- [Code Style Guide](CODE_STYLE.md): formatting and mechanical style
+- [Coding Guidelines](CODING_GUIDELINES.md): design patterns and best
+  practices
 
 ## Related Projects
 
-- [Bitaxe](https://github.com/bitaxeorg) - Open-source Bitcoin mining
-  hardware designs
-- [bitaxe-raw](https://github.com/bitaxeorg/bitaxe-raw) - Firmware for Bitaxe
-  boards
-- [EmberOne](https://github.com/256foundation/emberone00-pcb) - Open-source
-  Bitcoin mining hashboard
-- [emberone-usbserial-fw](https://github.com/256foundation/emberone-usbserial-fw) -
-  Firmware for EmberOne boards
+- [Bitaxe](https://github.com/bitaxeorg): open-source Bitcoin mining
+  hardware
+- [bitaxe-raw](https://github.com/bitaxeorg/bitaxe-raw): pass-through firmware for
+  Bitaxe boards required for use by Mujina
+- [EmberOne00](https://github.com/256foundation/emberone00-pcb): 256
+  Foundation's first open-source Bitcoin mining hashboard
+- [Libreboard](https://github.com/256foundation/libreboard): 256
+  Foundation's open-source mining control board
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 or
+later. See the [LICENSE](LICENSE) file for details.

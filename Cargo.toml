@@ -1,8 +1,9 @@
 [workspace]
-members = ["mujina-miner", "tools/mujina-dissect"]
+members = ["mujina-miner"]
 resolver = "2"
 
 [workspace.package]
+# When bumping the compiler version, also update build.Containerfile.
 edition = "2024"
 license = "GPL-3.0-or-later"
 authors = ["Ryan Kuester <rkuester@insymbols.com>"]
@@ -19,14 +20,14 @@ bitflags = "2.6"
 bitvec = "1.0"
 bytes = "1"
 crc_all = "0.2"
+core-foundation = "0.10"
 futures = "0.3"
 hex = "0.4"
-hyper = { version = "1", features = ["full"] }
 inventory = "0.3"
-modular-bitfield = "0.12"
+io-kit-sys = "0.4"
+nusb = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
 strum = { version = "0.27", features = ["derive"] }
 test-case = "3.3.1"
 thiserror = "2.0"
@@ -46,7 +47,6 @@ regex = "1.10"
 reqwest = { version = "0.12", features = ["json"] }
 rustix = { version = "0.38", features = ["fs", "termios"] }
 slotmap = "1.0"
-tokio-udev = "0.10"
 udev = "0.9"
 utoipa = "5.4"
 utoipa-axum = "0.2"

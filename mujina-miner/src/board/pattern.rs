@@ -81,6 +81,42 @@ pub enum StringMatch {
     Contains(&'static str),
 }
 
+/// BCD version matching strategy for USB bcdDevice field.
+///
+/// USB bcdDevice is a BCD-encoded version number. The convention used here is:
+/// `0xJJMN` = version `JJ.M.N`, where major (`JJ`) indicates hardware revision
+/// and minor.patch (`M.N`) indicates firmware version.
+#[derive(Debug, Clone, Copy)]
+pub enum BcdVersionMatch {
+    /// Match exact bcdDevice value
+    Exact(u16),
+    /// Match only the major version (hardware revision).
+    /// For `0xJJMN`, this matches any device where `JJ` equals the specified value.
+    Major(u8),
+}
+
+impl BcdVersionMatch {
+    /// Check if this matcher matches the given bcdDevice value.
+    pub fn matches(&self, bcd_device: u16) -> bool {
+        match self {
+            BcdVersionMatch::Exact(expected) => bcd_device == *expected,
+            BcdVersionMatch::Major(major) => {
+                // Extract major version (upper byte) from 0xJJMN
+                let device_major = (bcd_device >> 8) as u8;
+                device_major == *major
+            }
+        }
+    }
+
+    /// Calculate specificity score for this matcher type.
+    fn specificity(&self) -> u32 {
+        match self {
+            BcdVersionMatch::Exact(_) => 15,
+            BcdVersionMatch::Major(_) => 10,
+        }
+    }
+}
+
 impl StringMatch {
     /// Check if this matcher matches the given string.
     pub fn matches(&self, s: &Option<String>) -> bool {
@@ -128,6 +164,10 @@ pub struct BoardPattern {
     pub vid: Match<u16>,
     /// USB Product ID
     pub pid: Match<u16>,
+    /// USB device release number (bcdDevice).
+    /// Uses BCD format `0xJJMN` = version `JJ.M.N` where major indicates
+    /// hardware revision and minor.patch indicates firmware version.
+    pub bcd_device: Match<BcdVersionMatch>,
     /// Manufacturer string match
     pub manufacturer: Match<StringMatch>,
     /// Product string match
@@ -146,6 +186,7 @@ impl BoardPattern {
         Self {
             vid: Match::Any,
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -167,6 +208,13 @@ impl BoardPattern {
         // PID must match if specified
         if let Match::Specific(pid) = self.pid
             && device.pid != pid
+        {
+            return false;
+        }
+
+        // bcdDevice must match if specified
+        if let Match::Specific(ref matcher) = self.bcd_device
+            && !matcher.matches(device.bcd_device)
         {
             return false;
         }
@@ -208,6 +256,9 @@ impl BoardPattern {
         if self.pid.is_specific() {
             score += 10;
         }
+        if let Match::Specific(ref m) = self.bcd_device {
+            score += m.specificity();
+        }
         if let Match::Specific(ref m) = self.manufacturer {
             score += m.specificity();
         }
@@ -241,14 +292,15 @@ mod tests {
         product: Option<&str>,
         serial: Option<&str>,
     ) -> UsbDeviceInfo {
-        UsbDeviceInfo::new_for_test(
+        UsbDeviceInfo {
             vid,
             pid,
-            serial.map(|s| s.to_string()),
-            manufacturer.map(|s| s.to_string()),
-            product.map(|s| s.to_string()),
-            "/sys/devices/test".to_string(),
-        )
+            serial_number: serial.map(|s| s.to_string()),
+            manufacturer: manufacturer.map(|s| s.to_string()),
+            product: product.map(|s| s.to_string()),
+            device_path: "/sys/devices/test".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -256,6 +308,7 @@ mod tests {
         let pattern = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Specific(0x5678),
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("ACME Corp")),
             product: Match::Specific(StringMatch::Exact("Widget Pro")),
             serial_pattern: Match::Any,
@@ -279,6 +332,7 @@ mod tests {
         let pattern = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Specific(StringMatch::Regex(r"Bitaxe.*Gamma")),
             serial_pattern: Match::Any,
@@ -299,6 +353,7 @@ mod tests {
         let pattern = BoardPattern {
             vid: Match::Specific(0x0403),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Contains("FTDI")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -322,6 +377,7 @@ mod tests {
         let pattern = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -351,6 +407,7 @@ mod tests {
         let vid_only = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -358,6 +415,7 @@ mod tests {
         let vid_and_pid = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Specific(0x5678),
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -368,6 +426,7 @@ mod tests {
         let exact = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("ACME")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -375,6 +434,7 @@ mod tests {
         let regex = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Regex("ACME")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -382,6 +442,7 @@ mod tests {
         let contains = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Contains("ACME")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -393,6 +454,7 @@ mod tests {
         let with_manufacturer = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Specific(0x5678),
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("ACME")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -403,6 +465,7 @@ mod tests {
         let full_spec = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Specific(0x5678),
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Exact("ACME")),
             product: Match::Specific(StringMatch::Exact("Widget")),
             serial_pattern: Match::Specific(StringMatch::Exact("SN123")),
@@ -425,6 +488,7 @@ mod tests {
         let generic_ftdi = BoardPattern {
             vid: Match::Specific(0x0403),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Specific(StringMatch::Contains("FTDI")),
             product: Match::Any,
             serial_pattern: Match::Any,
@@ -434,6 +498,7 @@ mod tests {
         let bitaxe = BoardPattern {
             vid: Match::Specific(0x0403),
             pid: Match::Specific(0x6015),
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Specific(StringMatch::Regex("Bitaxe")),
             serial_pattern: Match::Any,
@@ -443,6 +508,7 @@ mod tests {
         let bitaxe_gamma = BoardPattern {
             vid: Match::Specific(0x0403),
             pid: Match::Specific(0x6015),
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Specific(StringMatch::Exact("Bitaxe Gamma")),
             serial_pattern: Match::Specific(StringMatch::Regex("^BX")),
@@ -474,6 +540,7 @@ mod tests {
         let pattern = BoardPattern {
             vid: Match::Specific(0x1234),
             pid: Match::Any,
+            bcd_device: Match::Any,
             manufacturer: Match::Any,
             product: Match::Any,
             serial_pattern: Match::Specific(StringMatch::Regex(r"^E1-\d+$")),
@@ -490,5 +557,112 @@ mod tests {
 
         let device = make_device(0x1234, 0x5678, None, None, None);
         assert!(!pattern.matches(&device)); // No serial number
+    }
+
+    fn make_device_with_bcd(
+        vid: u16,
+        pid: u16,
+        bcd_device: u16,
+        manufacturer: Option<&str>,
+        product: Option<&str>,
+        serial: Option<&str>,
+    ) -> UsbDeviceInfo {
+        UsbDeviceInfo {
+            vid,
+            pid,
+            bcd_device,
+            serial_number: serial.map(|s| s.to_string()),
+            manufacturer: manufacturer.map(|s| s.to_string()),
+            product: product.map(|s| s.to_string()),
+            device_path: "/sys/devices/test".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_bcd_version_exact_match() {
+        let pattern = BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Specific(BcdVersionMatch::Exact(0x0500)),
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        };
+
+        // Exact match
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0500, None, None, None);
+        assert!(pattern.matches(&device));
+
+        // Wrong bcdDevice
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0501, None, None, None);
+        assert!(!pattern.matches(&device));
+    }
+
+    #[test]
+    fn test_bcd_version_major_match() {
+        // Match hardware revision 5 (0x05xx)
+        let pattern = BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Specific(BcdVersionMatch::Major(5)),
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        };
+
+        // 0x0500 = version 5.0.0
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0500, None, None, None);
+        assert!(pattern.matches(&device));
+
+        // 0x0512 = version 5.1.2
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0512, None, None, None);
+        assert!(pattern.matches(&device));
+
+        // 0x05FF = version 5.15.15 (max minor/patch)
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x05FF, None, None, None);
+        assert!(pattern.matches(&device));
+
+        // 0x0400 = version 4.0.0 (wrong major)
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0400, None, None, None);
+        assert!(!pattern.matches(&device));
+
+        // 0x0600 = version 6.0.0 (wrong major)
+        let device = make_device_with_bcd(0x1234, 0x5678, 0x0600, None, None, None);
+        assert!(!pattern.matches(&device));
+    }
+
+    #[test]
+    fn test_bcd_version_specificity() {
+        // Exact match should have higher specificity than major match
+        let exact = BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Specific(BcdVersionMatch::Exact(0x0500)),
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        };
+
+        let major = BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Specific(BcdVersionMatch::Major(5)),
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        };
+
+        let wildcard = BoardPattern {
+            vid: Match::Any,
+            pid: Match::Any,
+            bcd_device: Match::Any,
+            manufacturer: Match::Any,
+            product: Match::Any,
+            serial_pattern: Match::Any,
+        };
+
+        assert!(exact.specificity() > major.specificity());
+        assert!(major.specificity() > wildcard.specificity());
     }
 }

@@ -29,6 +29,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use bitcoin::BlockHash;
 use bitcoin::block::Version;
@@ -101,28 +102,6 @@ pub enum HashThreadEvent {
     StatusUpdate(HashThreadStatus),
 }
 
-/// Error types for HashThread operations.
-#[derive(Debug, thiserror::Error)]
-pub enum HashThreadError {
-    #[error("Thread has been shut down")]
-    ThreadOffline,
-
-    #[error("Channel closed: {0}")]
-    ChannelClosed(String),
-
-    #[error("Work assignment failed: {0}")]
-    WorkAssignmentFailed(String),
-
-    #[error("Preemption failed: {0}")]
-    PreemptionFailed(String),
-
-    #[error("Shutdown timeout")]
-    ShutdownTimeout,
-
-    #[error("Chip initialization failed: {0}")]
-    InitializationFailed(String),
-}
-
 // ---------------------------------------------------------------------------
 // Hardware abstraction traits for hash threads
 // ---------------------------------------------------------------------------
@@ -135,10 +114,10 @@ pub enum HashThreadError {
 #[async_trait]
 pub trait AsicEnable: Send + Sync {
     /// Enable the ASIC (allow it to run).
-    async fn enable(&mut self) -> anyhow::Result<()>;
+    async fn enable(&mut self) -> Result<()>;
 
     /// Disable the ASIC (put it in a safe, non-hashing state).
-    async fn disable(&mut self) -> anyhow::Result<()>;
+    async fn disable(&mut self) -> Result<()>;
 }
 
 /// Voltage regulator control for ASIC core voltage.
@@ -147,7 +126,7 @@ pub trait AsicEnable: Send + Sync {
 #[async_trait]
 pub trait VoltageRegulator: Send + Sync {
     /// Set output voltage in volts.
-    async fn set_voltage(&mut self, volts: f32) -> anyhow::Result<()>;
+    async fn set_voltage(&mut self, volts: f32) -> Result<()>;
 }
 
 /// Hardware interfaces provided by the board to the hash thread.
@@ -212,10 +191,7 @@ pub trait HashThread: Send {
     ///
     /// Used when pool sends updated job (difficulty change, new transactions in
     /// mempool) but the work is fundamentally still valid.
-    async fn update_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> std::result::Result<Option<HashTask>, HashThreadError>;
+    async fn update_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>>;
 
     /// Replace current task (old task invalidated)
     ///
@@ -225,16 +201,13 @@ pub trait HashThread: Send {
     ///
     /// Used when blockchain tip changes (new prevhash) or pool signals
     /// clean_jobs.
-    async fn replace_task(
-        &mut self,
-        new_task: HashTask,
-    ) -> std::result::Result<Option<HashTask>, HashThreadError>;
+    async fn replace_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>>;
 
     /// Put thread in idle state (low power, no hashing)
     ///
     /// Returns the current task if thread was working (None if already idle).
     /// Thread enters low-power mode, stops hashing.
-    async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError>;
+    async fn go_idle(&mut self) -> Result<Option<HashTask>>;
 
     /// Take ownership of the event receiver for this thread
     ///

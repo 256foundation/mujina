@@ -76,6 +76,8 @@ backplane:
 boards:
 
   # -- Bitaxe family (BM1370-based boards) --
+  # NOTE: These fields are parsed but not yet wired to board behavior.
+  # They are reserved for near-term implementation.
   bitaxe:
     # Emergency shutdown temperature in Celsius.
     # The board halts hashing if any sensor reads above this value.
@@ -107,6 +109,8 @@ boards:
 
 # ------------------------------------------------------------
 # hash_thread — ASIC hash thread tuning
+# NOTE: These fields are parsed but not yet wired to board behavior.
+# They are reserved for near-term implementation.
 # ------------------------------------------------------------
 hash_thread:
   # Difficulty target configured on-chip for share reporting.

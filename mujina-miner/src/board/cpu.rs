@@ -1,107 +1,19 @@
-//! CPU mining board implementation.
+//! CPU hashboard implementation.
 //!
 //! Provides a virtual board that uses CPU cores for SHA-256 hashing.
-//! Configured via environment variables, creates one HashThread per core.
+//! See [`CpuMinerConfig`] for environment variable configuration.
 
-use async_trait::async_trait;
+use anyhow::Result;
+use futures::future::BoxFuture;
 use tokio::sync::watch;
 
-use super::{Board, BoardError, BoardInfo, VirtualBoardDescriptor};
+use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::{
-    api_client::types::BoardState,
+    api_client::types::BoardTelemetry,
     asic::hash_thread::HashThread,
     cpu_miner::{CpuHashThread, CpuMinerConfig},
     transport::cpu::CpuDeviceInfo,
 };
-
-/// CPU mining board.
-///
-/// A virtual board that spawns CPU-based mining threads. Unlike hardware
-/// boards, this doesn't require any physical devices---it's configured
-/// entirely via environment variables.
-pub struct CpuBoard {
-    /// Configuration parsed from environment.
-    config: CpuMinerConfig,
-
-    /// Threads created by this board (kept for shutdown).
-    threads: Vec<CpuHashThread>,
-
-    /// Channel for publishing board state to the API server.
-    #[expect(dead_code, reason = "will publish telemetry in a follow-up commit")]
-    state_tx: watch::Sender<BoardState>,
-}
-
-impl CpuBoard {
-    /// Create a new CPU mining board from environment configuration.
-    pub fn new(config: CpuMinerConfig, state_tx: watch::Sender<BoardState>) -> Self {
-        Self {
-            config,
-            threads: Vec::new(),
-            state_tx,
-        }
-    }
-}
-
-#[async_trait]
-impl Board for CpuBoard {
-    fn board_info(&self) -> BoardInfo {
-        BoardInfo {
-            model: "CPU Miner".into(),
-            firmware_version: None,
-            serial_number: Some(format!(
-                "cpu-{}x{}%",
-                self.config.thread_count, self.config.duty_percent
-            )),
-        }
-    }
-
-    async fn shutdown(&mut self) -> Result<(), BoardError> {
-        // Signal all threads to stop
-        for thread in &self.threads {
-            thread.shutdown();
-        }
-        self.threads.clear();
-        Ok(())
-    }
-
-    async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
-        let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
-
-        for i in 0..self.config.thread_count {
-            let thread = CpuHashThread::new(format!("CPU Core {}", i), self.config.duty_percent);
-            threads.push(Box::new(thread));
-        }
-
-        Ok(threads)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Virtual board registration
-// ---------------------------------------------------------------------------
-
-/// Factory function for creating CpuBoard instances.
-async fn create_cpu_board(
-    device_info: CpuDeviceInfo,
-) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    let config = CpuMinerConfig {
-        thread_count: device_info.thread_count,
-        duty_percent: device_info.duty_percent,
-    };
-
-    let serial = format!("cpu-{}x{}%", config.thread_count, config.duty_percent);
-    let initial_state = BoardState {
-        name: serial.clone(),
-        model: "CPU Miner".into(),
-        serial: Some(serial),
-        ..Default::default()
-    };
-    let (state_tx, state_rx) = watch::channel(initial_state);
-
-    let board = CpuBoard::new(config, state_tx);
-    let registration = super::BoardRegistration { state_rx };
-    Ok((Box::new(board), registration))
-}
 
 inventory::submit! {
     VirtualBoardDescriptor {
@@ -109,4 +21,51 @@ inventory::submit! {
         name: "CPU Miner",
         create_fn: |info| Box::pin(create_cpu_board(info)),
     }
+}
+
+async fn create_cpu_board(device_info: CpuDeviceInfo) -> Result<BackplaneConnector> {
+    let config = CpuMinerConfig {
+        thread_count: device_info.thread_count,
+        duty_percent: device_info.duty_percent,
+    };
+
+    let info = BoardInfo {
+        model: "CPU Miner".into(),
+        firmware_version: None,
+        serial_number: Some(format!(
+            "cpu-{}x{}%",
+            config.thread_count, config.duty_percent
+        )),
+    };
+
+    let initial_state = BoardTelemetry {
+        name: info.serial_number.clone().unwrap(),
+        model: info.model.clone(),
+        serial: info.serial_number.clone(),
+        ..Default::default()
+    };
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+
+    let threads: Vec<Box<dyn HashThread>> = (0..config.thread_count)
+        .map(|i| {
+            Box::new(CpuHashThread::new(
+                format!("CPU Core {i}"),
+                config.duty_percent,
+            )) as _
+        })
+        .collect();
+
+    // Keep the telemetry sender alive until the board is shut down.
+    // Without this, the watch channel closes immediately and the API
+    // registry prunes the board as disconnected.
+    let shutdown: BoxFuture<'static, ()> = Box::pin(async move {
+        drop(telemetry_tx);
+    });
+
+    Ok(BackplaneConnector {
+        info,
+        threads,
+        telemetry_rx,
+        shutdown: Some(shutdown),
+    })
 }

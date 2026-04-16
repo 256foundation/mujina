@@ -1,7 +1,7 @@
 //! Dynamic board registration tracking.
 
-use crate::api_client::types::BoardState;
-use crate::board::BoardRegistration;
+use crate::api_client::types::BoardTelemetry;
+use tokio::sync::watch;
 
 /// Dynamic collection of board registrations.
 ///
@@ -27,13 +27,19 @@ impl BoardRegistry {
     ///
     /// Removes boards whose sender has been dropped (board disconnected)
     /// and returns the current state of each.
-    pub fn boards(&mut self) -> Vec<BoardState> {
-        self.boards.retain(|reg| reg.state_rx.has_changed().is_ok());
+    pub fn boards(&mut self) -> Vec<BoardTelemetry> {
+        self.boards
+            .retain(|reg| reg.telemetry_rx.has_changed().is_ok());
         self.boards
             .iter()
-            .map(|reg| reg.state_rx.borrow().clone())
+            .map(|reg| reg.telemetry_rx.borrow().clone())
             .collect()
     }
+}
+
+/// A board's registration with the API server.
+pub struct BoardRegistration {
+    pub telemetry_rx: watch::Receiver<BoardTelemetry>,
 }
 
 #[cfg(test)]
@@ -41,18 +47,17 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
-    use crate::board::BoardRegistration;
 
     /// Create a board registration with the given name, returning the
     /// state sender so the test can update or drop it.
-    fn make_board(name: &str) -> (watch::Sender<BoardState>, BoardRegistration) {
-        let state = BoardState {
+    fn make_board(name: &str) -> (watch::Sender<BoardTelemetry>, BoardRegistration) {
+        let telemetry = BoardTelemetry {
             name: name.into(),
             model: "Test".into(),
             ..Default::default()
         };
-        let (tx, rx) = watch::channel(state);
-        (tx, BoardRegistration { state_rx: rx })
+        let (tx, rx) = watch::channel(telemetry);
+        (tx, BoardRegistration { telemetry_rx: rx })
     }
 
     #[test]

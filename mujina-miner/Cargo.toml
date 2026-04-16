@@ -21,12 +21,10 @@ bytes = { workspace = true }
 crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
-hyper = { workspace = true }
 inventory = { workspace = true }
-modular-bitfield = { workspace = true }
+nusb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
@@ -39,7 +37,6 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 tracing = { workspace = true }
-tracing-journald = { workspace = true }
 tracing-subscriber = { workspace = true }
 nix = { workspace = true }
 parking_lot = { workspace = true }
@@ -50,8 +47,12 @@ slotmap = { workspace = true }
 num-traits = { workspace = true }
 ruint = "1.17.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
+io-kit-sys = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-udev = { workspace = true }
+tracing-journald = { workspace = true }
 udev = { workspace = true }
 
 [[bin]]

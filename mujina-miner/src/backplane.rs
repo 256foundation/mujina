@@ -5,18 +5,22 @@
 //! boards to plug into, routes events between components, and manages board
 //! lifecycle (hotplug, emergency shutdown, etc.).
 
+use anyhow::Result;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+
+use futures::future::BoxFuture;
+
 use crate::{
+    api::BoardRegistration,
     asic::hash_thread::HashThread,
-    board::{Board, BoardDescriptor, BoardRegistration, VirtualBoardRegistry},
-    error::Result,
+    board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
     tracing::prelude::*,
     transport::{
         TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
         usb::TransportEvent as UsbTransportEvent,
     },
 };
-use std::collections::HashMap;
-use tokio::sync::mpsc;
 
 /// Board registry that uses inventory to find registered boards.
 pub struct BoardRegistry;
@@ -45,7 +49,7 @@ pub struct Backplane {
     registry: BoardRegistry,
     virtual_registry: VirtualBoardRegistry,
     /// Active boards managed by the backplane
-    boards: HashMap<String, Box<dyn Board + Send>>,
+    boards: HashMap<String, ActiveBoard>,
     event_rx: mpsc::Receiver<TransportEvent>,
     /// Channel to send hash threads to the scheduler
     scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
@@ -92,37 +96,63 @@ impl Backplane {
 
         for board_id in board_ids {
             if let Some(mut board) = self.boards.remove(&board_id) {
-                let model = board.board_info().model;
-                debug!(board = %model, serial = %board_id, "Shutting down board");
-
-                match board.shutdown().await {
-                    Ok(()) => {
-                        debug!(board = %model, serial = %board_id, "Board shutdown complete");
-                    }
-                    Err(e) => {
-                        error!(
-                            board = %model,
-                            serial = %board_id,
-                            error = %e,
-                            "Failed to shutdown board"
-                        );
-                    }
-                }
+                board.shutdown().await;
+                info!(
+                    board = %board.info.model,
+                    serial = %board_id,
+                    "Board stopped"
+                );
             }
         }
+    }
+
+    /// Route a board connection's parts to where they belong.
+    async fn start_board(&mut self, board_id: String, conn: BackplaneConnector) {
+        let BackplaneConnector {
+            info,
+            threads,
+            telemetry_rx,
+            shutdown,
+        } = conn;
+
+        let registration = BoardRegistration { telemetry_rx };
+        if let Err(e) = self.board_reg_tx.send(registration).await {
+            error!(
+                board = %info.model,
+                error = %e,
+                "Failed to register board with API server"
+            );
+        }
+
+        info!(
+            board = %info.model,
+            serial = %board_id,
+            threads = threads.len(),
+            "Board started."
+        );
+
+        for thread in threads {
+            if let Err(e) = self.scheduler_tx.send(thread).await {
+                error!(
+                    board = %info.model,
+                    error = %e,
+                    "Failed to send thread to scheduler"
+                );
+                break;
+            }
+        }
+
+        self.boards.insert(board_id, ActiveBoard { info, shutdown });
     }
 
     /// Handle USB transport events.
     async fn handle_usb_event(&mut self, event: UsbTransportEvent) -> Result<()> {
         match event {
             UsbTransportEvent::UsbDeviceConnected(device_info) => {
-                // Check if this device matches any registered board pattern
                 let Some(descriptor) = self.registry.find_descriptor(&device_info) else {
-                    // No match - this is expected for most USB devices
                     return Ok(());
                 };
 
-                // Pattern matched - log the match
                 info!(
                     board = descriptor.name,
                     vid = %format!("{:04x}", device_info.vid),
@@ -133,9 +163,8 @@ impl Backplane {
                     "Hash board connected via USB."
                 );
 
-                // Create the board using the descriptor's factory function
-                let (mut board, registration) = match (descriptor.create_fn)(device_info).await {
-                    Ok(result) => result,
+                let conn = match (descriptor.create_fn)(device_info).await {
+                    Ok(conn) => conn,
                     Err(e) => {
                         error!(
                             board = descriptor.name,
@@ -146,48 +175,13 @@ impl Backplane {
                     }
                 };
 
-                let board_info = board.board_info();
-                let board_id = board_info
+                let board_id = conn
+                    .info
                     .serial_number
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
 
-                // Forward board registration to the API server
-                if let Err(e) = self.board_reg_tx.send(registration).await {
-                    error!(
-                        board = %board_info.model,
-                        error = %e,
-                        "Failed to register board with API server"
-                    );
-                }
-
-                // Create hash threads from the board
-                match board.create_hash_threads().await {
-                    Ok(threads) => {
-                        // Store board for lifecycle management
-                        self.boards.insert(board_id.clone(), board);
-
-                        // Send threads to scheduler individually
-                        for thread in threads {
-                            if let Err(e) = self.scheduler_tx.send(thread).await {
-                                tracing::error!(
-                                    board = %board_info.model,
-                                    error = %e,
-                                    "Failed to send thread to scheduler"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            board = %board_info.model,
-                            serial = %board_id,
-                            error = %e,
-                            "Hash board failed to start."
-                        );
-                    }
-                }
+                self.start_board(board_id, conn).await;
             }
             UsbTransportEvent::UsbDeviceDisconnected { device_path: _ } => {
                 // Find and shutdown the board
@@ -197,27 +191,12 @@ impl Backplane {
                 let board_ids: Vec<String> = self.boards.keys().cloned().collect();
                 for board_id in board_ids {
                     if let Some(mut board) = self.boards.remove(&board_id) {
-                        let model = board.board_info().model;
-                        debug!(board = %model, serial = %board_id, "Shutting down board");
-
-                        match board.shutdown().await {
-                            Ok(()) => {
-                                info!(
-                                    board = %model,
-                                    serial = %board_id,
-                                    "Board disconnected"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    board = %model,
-                                    serial = %board_id,
-                                    error = %e,
-                                    "Failed to shutdown board"
-                                );
-                            }
-                        }
-                        // Don't re-insert - board is removed
+                        board.shutdown().await;
+                        info!(
+                            board = %board.info.model,
+                            serial = %board_id,
+                            "Board disconnected"
+                        );
                         break; // For now, assume one board per device
                     }
                 }
@@ -231,7 +210,6 @@ impl Backplane {
     async fn handle_cpu_event(&mut self, event: CpuTransportEvent) -> Result<()> {
         match event {
             CpuTransportEvent::CpuDeviceConnected(device_info) => {
-                // Find the virtual board descriptor for cpu_miner
                 let Some(descriptor) = self.virtual_registry.find("cpu_miner") else {
                     error!("No virtual board descriptor found for cpu_miner");
                     return Ok(());
@@ -244,9 +222,8 @@ impl Backplane {
                     "CPU miner board connected."
                 );
 
-                // Create the board using the descriptor's factory function
-                let (mut board, registration) = match (descriptor.create_fn)(device_info.clone()).await {
-                    Ok(result) => result,
+                let conn = match (descriptor.create_fn)(device_info.clone()).await {
+                    Ok(conn) => conn,
                     Err(e) => {
                         error!(
                             board = descriptor.name,
@@ -257,75 +234,31 @@ impl Backplane {
                     }
                 };
 
-                let board_info = board.board_info();
                 let board_id = device_info.device_id.clone();
-
-                // Forward board registration to the API server
-                if let Err(e) = self.board_reg_tx.send(registration).await {
-                    error!(
-                        board = %board_info.model,
-                        error = %e,
-                        "Failed to register board with API server"
-                    );
-                }
-
-                // Create hash threads from the board
-                match board.create_hash_threads().await {
-                    Ok(threads) => {
-                        let thread_count = threads.len();
-
-                        // Store board for lifecycle management
-                        self.boards.insert(board_id.clone(), board);
-
-                        // Send threads to scheduler individually
-                        for thread in threads {
-                            if let Err(e) = self.scheduler_tx.send(thread).await {
-                                tracing::error!(
-                                    board = %board_info.model,
-                                    error = %e,
-                                    "Failed to send thread to scheduler"
-                                );
-                                break;
-                            }
-                        }
-
-                        info!(
-                            board = %board_info.model,
-                            threads = thread_count,
-                            "CPU miner started."
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            board = %board_info.model,
-                            error = %e,
-                            "CPU miner failed to start."
-                        );
-                    }
-                }
+                self.start_board(board_id, conn).await;
             }
             CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
                 if let Some(mut board) = self.boards.remove(&device_id) {
-                    let model = board.board_info().model;
-                    debug!(board = %model, id = %device_id, "Shutting down CPU miner");
-
-                    match board.shutdown().await {
-                        Ok(()) => {
-                            info!(board = %model, id = %device_id, "CPU miner disconnected");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                board = %model,
-                                id = %device_id,
-                                error = %e,
-                                "Failed to shutdown CPU miner"
-                            );
-                        }
-                    }
+                    board.shutdown().await;
+                    info!(board = %board.info.model, serial = %device_id, "Board disconnected");
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Per-board state the backplane keeps for lifecycle management.
+struct ActiveBoard {
+    info: BoardInfo,
+    shutdown: Option<BoxFuture<'static, ()>>,
+}
+
+impl ActiveBoard {
+    async fn shutdown(&mut self) {
+        if let Some(fut) = self.shutdown.take() {
+            fut.await;
+        }
     }
 }

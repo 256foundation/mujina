@@ -1,5 +1,10 @@
 #!/bin/sh
-# Pre-commit hook
+# Pre-commit hook: fast check for whitespace and formatting.
+#
+# Checks the worktree, not the index. With partially staged files
+# this may flag formatting issues in unstaged code, which is a
+# false positive when only the staged content matters. Skip with
+# git commit --no-verify.
 
 # Color codes for output
 RED='\033[0;31m'
@@ -17,45 +22,27 @@ echo "Running .githooks/pre-commit..."
 
 # Check for whitespace errors
 if git diff --cached --check; then
-    echo "${GREEN}[OK]${NC} No git whitespace errors"
+    printf "${GREEN}[OK]${NC} No git whitespace errors\n"
 else
-    echo "${RED}[ERROR]${NC} Whitespace errors detected by git. Fix them with:"
+    printf "${RED}[ERROR]${NC} Whitespace errors detected by git. Fix them with:\n"
     echo "  git diff --cached --name-only | xargs sed -i 's/[[:space:]]*$//'"
     FAILED=1
 fi
 
-# Check if any Rust files are being committed
+# Check Rust formatting (against the worktree)
 if git diff --cached --name-only | grep -q '\.rs$'; then
-    # Stash unstaged changes only if there are any
-    STASHED=0
-    if ! git diff --quiet; then
-        STASH_NAME="pre-commit-$(date +%s)"
-        git stash push -q --keep-index -m "$STASH_NAME"
-        STASHED=$?
-    fi
-
-    # Check formatting on staged content
     if cargo fmt -- --check 2>/dev/null; then
-        echo "${GREEN}[OK]${NC} cargo fmt --check passes"
+        printf "${GREEN}[OK]${NC} cargo fmt --check passes\n"
     else
-        echo -e "${RED}[ERROR]${NC} cargo fmt --check issues detected in staged files. Fix with:"
+        printf "${RED}[ERROR]${NC} cargo fmt --check failed. Fix with:\n"
         echo "  cargo fmt"
-        echo "  git add -u"
         FAILED=1
-    fi
-
-    # Restore working directory if we stashed
-    if [ $STASHED -eq 0 ] && git stash list | grep -q "$STASH_NAME"; then
-        if ! git stash pop -q; then
-            echo -e "${RED}[ERROR]${NC} Failed to restore working directory. Manually run:"
-            echo "  git stash pop"
-        fi
     fi
 fi
 
 if [ $FAILED -eq 1 ]; then
     echo ""
-    echo -e "${RED}Commit aborted due to errors above.${NC}"
+    printf "${RED}Commit aborted due to errors above.${NC}\n"
     exit 1
 fi
 

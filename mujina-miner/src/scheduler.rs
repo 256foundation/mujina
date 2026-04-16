@@ -42,7 +42,7 @@ use tokio_stream::{StreamExt, StreamMap};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::commands::SchedulerCommand;
-use crate::api_client::types::{MinerState, SourceState};
+use crate::api_client::types::{MinerTelemetry, SourceTelemetry};
 use crate::asic::hash_thread::{HashTask, HashThread, HashThreadEvent, Share};
 use crate::job_source::{
     JobTemplate, MerkleRootKind, Share as SourceShare, SourceCommand, SourceEvent,
@@ -50,7 +50,7 @@ use crate::job_source::{
 use crate::tracing::prelude::*;
 use crate::types::{
     AlarmStatus, DebouncedAlarm, Difficulty, HashRate, HashrateEstimator, ShareRate, Target,
-    expected_time_to_share_from_target, target_for_share_rate,
+    expected_time_to_share_from_target,
 };
 
 /// Unique identifier for a job source, assigned by the scheduler.
@@ -227,13 +227,13 @@ impl Scheduler {
             .sum()
     }
 
-    /// Build a [`MinerState`] snapshot from current scheduler state.
+    /// Build a [`MinerTelemetry`] snapshot from current scheduler state.
     ///
     /// The scheduler contributes aggregate stats and source info. Board
     /// and thread details come from the backplane, not the scheduler, so
     /// `boards` is left empty here.
-    fn compute_miner_state(&mut self) -> MinerState {
-        MinerState {
+    fn compute_miner_telemetry(&mut self) -> MinerTelemetry {
+        MinerTelemetry {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
             shares_submitted: self.stats.shares_submitted,
@@ -242,13 +242,13 @@ impl Scheduler {
             sources: self
                 .sources
                 .values()
-                .map(|s| SourceState {
+                .map(|s| SourceTelemetry {
                     name: s.name.clone(),
                     url: s.url.clone(),
-                    difficulty: s
-                        .last_job
-                        .as_ref()
-                        .map(|j| Difficulty::from_target(j.share_target).as_f64()),
+                    difficulty: s.last_job.as_ref().map(|j| {
+                        let d = Difficulty::from_target(j.share_target).as_f64();
+                        if d >= 10.0 { d.round() } else { d }
+                    }),
                 })
                 .collect(),
         }
@@ -265,12 +265,10 @@ impl Scheduler {
             return source_target;
         }
 
-        // 1 share/sec -> more hashes per share -> harder (lower) target
-        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-        // 10 shares/sec -> fewer hashes per share -> easier (higher) target
-        let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
+        let measurement_target = MEASUREMENT_SHARE_RATE.to_target(hashrate);
+        let flood_cap_target = FLOOD_CAP_RATE.to_target(hashrate);
 
-        source_target.clamp(hardest, easiest)
+        source_target.clamp(measurement_target, flood_cap_target)
     }
 
     /// Collects hashrate command senders from all sources.
@@ -703,19 +701,19 @@ impl Scheduler {
     fn handle_api_command(
         &mut self,
         cmd: SchedulerCommand,
-        miner_state_tx: &watch::Sender<MinerState>,
+        miner_telemetry_tx: &watch::Sender<MinerTelemetry>,
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
                 self.paused = true;
                 warn!("Mining paused via API (not yet implemented)");
-                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
                 self.paused = false;
                 warn!("Mining resumed via API (not yet implemented)");
-                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
         }
@@ -727,7 +725,7 @@ impl Scheduler {
         running: CancellationToken,
         mut thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
         mut source_reg_rx: mpsc::Receiver<SourceRegistration>,
-        miner_state_tx: watch::Sender<MinerState>,
+        miner_telemetry_tx: watch::Sender<MinerTelemetry>,
         mut cmd_rx: mpsc::Receiver<SchedulerCommand>,
     ) {
         // StreamMaps as locals (not in self) to avoid borrow conflicts in select!
@@ -819,12 +817,12 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
-                    self.handle_api_command(cmd, &miner_state_tx);
+                    self.handle_api_command(cmd, &miner_telemetry_tx);
                 }
 
                 // Periodic state publishing
                 _ = hashrate_interval.tick() => {
-                    let _ = miner_state_tx.send(self.compute_miner_state());
+                    let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 }
 
                 // Shutdown
@@ -885,12 +883,18 @@ pub async fn task(
     running: CancellationToken,
     thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
-    miner_state_tx: watch::Sender<MinerState>,
+    miner_telemetry_tx: watch::Sender<MinerTelemetry>,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
 ) {
     let mut scheduler = Scheduler::new();
     scheduler
-        .run(running, thread_rx, source_reg_rx, miner_state_tx, cmd_rx)
+        .run(
+            running,
+            thread_rx,
+            source_reg_rx,
+            miner_telemetry_tx,
+            cmd_rx,
+        )
         .await;
 }
 
@@ -990,8 +994,11 @@ mod tests {
         let very_hard = Difficulty::from(1_000_000).to_target();
         let result = Scheduler::compute_scheduler_target(hashrate, very_hard);
 
-        let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-        assert_eq!(result, hardest, "should clamp to measurement floor");
+        let measurement_target = MEASUREMENT_SHARE_RATE.to_target(hashrate);
+        assert_eq!(
+            result, measurement_target,
+            "should clamp to measurement floor"
+        );
         assert!(result > very_hard, "clamped target should be easier");
     }
 
@@ -1003,29 +1010,25 @@ mod tests {
         let very_easy = Target::MAX;
         let result = Scheduler::compute_scheduler_target(hashrate, very_easy);
 
-        let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
-        assert_eq!(result, easiest, "should clamp to flood ceiling");
+        let flood_cap_target = FLOOD_CAP_RATE.to_target(hashrate);
+        assert_eq!(result, flood_cap_target, "should clamp to flood ceiling");
         assert!(result < very_easy, "clamped target should be harder");
     }
 
+    /// Regression test: compute_scheduler_target produces a result
+    /// without panicking across a wide range of hashrates.
     #[test]
-    fn scheduler_target_clamp_ordering_invariant() {
-        // Verify hardest <= easiest in Ord terms for several
-        // representative hashrates. This is the invariant that
-        // clamp(hardest, easiest) relies on to not panic.
+    fn scheduler_target_across_hashrates() {
+        let source_target = Difficulty::from(1).to_target();
         for hashrate in [
+            HashRate::from(5),
+            HashRate::from(5_000),
             HashRate::from_megahashes(5.0),
             HashRate::from_gigahashes(500.0),
             HashRate::from_terahashes(1.0),
             HashRate::from_terahashes(100.0),
         ] {
-            let hardest = target_for_share_rate(MEASUREMENT_SHARE_RATE, hashrate);
-            let easiest = target_for_share_rate(FLOOD_CAP_RATE, hashrate);
-            assert!(
-                hardest <= easiest,
-                "clamp invariant violated at {hashrate}: \
-                 hardest={hardest:?} easiest={easiest:?}"
-            );
+            let _result = Scheduler::compute_scheduler_target(hashrate, source_target);
         }
     }
 }

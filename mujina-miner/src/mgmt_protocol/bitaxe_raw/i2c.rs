@@ -24,7 +24,6 @@ impl BitaxeRawI2c {
 impl I2c for BitaxeRawI2c {
     async fn write(&mut self, addr: u8, data: &[u8]) -> Result<()> {
         let packet = Packet::new(
-            0, // ID will be assigned by channel
             Page::I2C,
             I2CCommand::Write as u8,
             [vec![addr], data.to_vec()].concat(),
@@ -40,7 +39,6 @@ impl I2c for BitaxeRawI2c {
 
     async fn read(&mut self, addr: u8, buffer: &mut [u8]) -> Result<()> {
         let packet = Packet::new(
-            0, // ID will be assigned by channel
             Page::I2C,
             I2CCommand::Read as u8,
             vec![addr, buffer.len() as u8],
@@ -69,12 +67,7 @@ impl I2c for BitaxeRawI2c {
         data.extend_from_slice(write);
         data.push(read.len() as u8);
 
-        let packet = Packet::new(
-            0, // ID will be assigned by channel
-            Page::I2C,
-            I2CCommand::WriteRead as u8,
-            data,
-        );
+        let packet = Packet::new(Page::I2C, I2CCommand::WriteRead as u8, data);
 
         let response = self
             .channel
@@ -96,7 +89,6 @@ impl I2c for BitaxeRawI2c {
 
     async fn set_frequency(&mut self, hz: u32) -> Result<()> {
         let packet = Packet::new(
-            0, // ID will be assigned by channel
             Page::I2C,
             I2CCommand::SetFrequency as u8,
             hz.to_le_bytes().to_vec(),

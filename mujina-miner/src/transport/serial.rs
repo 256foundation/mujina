@@ -28,7 +28,7 @@ use std::time::Duration;
 use futures::ready;
 use parking_lot::RwLock;
 use rustix::fs::{Mode, OFlags, open};
-use rustix::termios::{ControlModes, tcdrain, tcgetattr, tcsetattr};
+use rustix::termios::{ControlModes, tcgetattr, tcsetattr};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -516,17 +516,6 @@ impl SerialControl {
     pub fn reset_stats(&self) {
         self.inner.bytes_read.store(0, Ordering::Relaxed);
         self.inner.bytes_written.store(0, Ordering::Relaxed);
-    }
-}
-
-impl Drop for SerialInner {
-    fn drop(&mut self) {
-        // Note: AsyncFd automatically closes the file descriptor
-        // But we should drain pending output data first
-        let fd = self.fd.as_raw_fd();
-
-        // Best effort drain - ignore errors on drop
-        let _ = tcdrain(unsafe { BorrowedFd::borrow_raw(fd) });
     }
 }
 

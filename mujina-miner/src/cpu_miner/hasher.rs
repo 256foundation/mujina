@@ -27,10 +27,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use bitcoin::block::Header as BlockHeader;
 
 use crate::{
-    asic::hash_thread::{HashTask, HashThreadError, HashThreadStatus, Share},
+    asic::hash_thread::{HashTask, HashThreadStatus, Share},
     job_source::MerkleRootKind,
     tracing::prelude::*,
     types::HashRate,
@@ -42,18 +43,18 @@ pub enum MinerCommand {
     /// Update task (old shares still valid).
     UpdateTask {
         task: HashTask,
-        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Replace task (old shares invalid).
     ReplaceTask {
         task: HashTask,
-        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Go idle (stop hashing).
     GoIdle {
-        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+        response_tx: tokio::sync::oneshot::Sender<Result<Option<HashTask>>>,
     },
 
     /// Shutdown the thread.

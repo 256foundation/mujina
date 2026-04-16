@@ -5,6 +5,8 @@
 //! implementation provides device discovery and emits transport-specific
 //! events when devices are connected or disconnected.
 
+use anyhow::Result;
+
 pub mod cpu;
 pub mod serial;
 pub mod usb;
@@ -34,8 +36,8 @@ pub enum TransportEvent {
 #[async_trait::async_trait]
 pub trait TransportDiscovery: Send + Sync {
     /// Start discovering devices on this transport.
-    async fn start_discovery(&self) -> crate::error::Result<()>;
+    async fn start_discovery(&self) -> Result<()>;
 
     /// Stop discovery and clean up resources.
-    async fn stop_discovery(&self) -> crate::error::Result<()>;
+    async fn stop_discovery(&self) -> Result<()>;
 }
