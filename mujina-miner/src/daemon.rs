@@ -250,7 +250,9 @@ impl Daemon {
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
-                let api_config = ApiConfig { bind_addr: api_listen };
+                let api_config = ApiConfig {
+                    bind_addr: api_listen,
+                };
                 if let Err(e) = api::serve(
                     api_config,
                     shutdown,

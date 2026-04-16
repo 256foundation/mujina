@@ -30,15 +30,14 @@ const ENV_SEPARATOR: &str = "__";
 /// Normally `/etc/mujina/mujina.yaml`. Override via `MUJINA_DEFAULT_CONFIG_PATH`
 /// (useful in tests to avoid requiring root access to `/etc`).
 fn default_config_path() -> String {
-    std::env::var(DEFAULT_CONFIG_PATH_ENV_VAR)
-        .unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string())
+    std::env::var(DEFAULT_CONFIG_PATH_ENV_VAR).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub daemon: DaemonConfig,
@@ -47,19 +46,6 @@ pub struct Config {
     pub backplane: BackplaneConfig,
     pub boards: BoardsConfig,
     pub hash_thread: HashThreadConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            api: ApiConfig::default(),
-            pool: PoolConfig::default(),
-            backplane: BackplaneConfig::default(),
-            boards: BoardsConfig::default(),
-            hash_thread: HashThreadConfig::default(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,20 +120,11 @@ impl Default for BackplaneConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BoardsConfig {
     pub bitaxe: BitaxeConfig,
     pub cpu_miner: CpuMinerConfig,
-}
-
-impl Default for BoardsConfig {
-    fn default() -> Self {
-        Self {
-            bitaxe: BitaxeConfig::default(),
-            cpu_miner: CpuMinerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -33,7 +33,6 @@ pub struct ForcedRateConfig {
     pub target_rate: ShareRate,
 }
 
-
 /// Wrapper that overrides share_target to force a specific share rate.
 ///
 /// Sits between the scheduler and an inner source (typically StratumV1Source),

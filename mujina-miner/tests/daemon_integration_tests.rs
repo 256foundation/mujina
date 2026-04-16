@@ -35,11 +35,7 @@ async fn wait_for_boards(base_url: &str, timeout: Duration) -> usize {
     let deadline = tokio::time::Instant::now() + timeout;
     let client = reqwest::Client::new();
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client
-            .get(format!("{base_url}/api/v0/miner"))
-            .send()
-            .await
-        {
+        if let Ok(resp) = client.get(format!("{base_url}/api/v0/miner")).send().await {
             if let Ok(state) = resp.json::<serde_json::Value>().await {
                 if let Some(boards) = state.get("boards").and_then(|b| b.as_array()) {
                     if !boards.is_empty() {
@@ -368,8 +364,14 @@ async fn test_cpu_miner_starts_from_config() {
     // SAFETY: same serial-test guarantee as above.
     unsafe { std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH") };
 
-    assert!(config.boards.cpu_miner.enabled, "config should have cpu_miner.enabled = true");
-    assert_eq!(config.boards.cpu_miner.threads, 1, "config should have cpu_miner.threads = 1");
+    assert!(
+        config.boards.cpu_miner.enabled,
+        "config should have cpu_miner.enabled = true"
+    );
+    assert_eq!(
+        config.boards.cpu_miner.threads, 1,
+        "config should have cpu_miner.threads = 1"
+    );
 
     let daemon = Daemon::new(config);
     let shutdown = daemon.shutdown_token();
