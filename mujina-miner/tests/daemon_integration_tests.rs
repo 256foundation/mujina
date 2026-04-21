@@ -3,7 +3,7 @@
 //! Each test starts a real `Daemon` instance and verifies runtime behaviour
 //! end-to-end: config priority, board lifecycle, API responses.
 //!
-//! Tests mutate process-wide environment variables and are serialized with
+//! Tests that set process-wide environment variables are serialized with
 //! `#[serial]`. Do not run with `--test-threads > 1`.
 
 use std::time::Duration;
@@ -53,46 +53,29 @@ async fn wait_for_boards(base_url: &str, timeout: Duration) -> usize {
 // Config priority tests
 // ---------------------------------------------------------------------------
 
-/// Verify that the daemon reads the default config file and binds the API
-/// server to the port declared there.
+/// Verify that `--config` is read and its values take effect.
 ///
 /// Uses port 17785 (≠ default 7785) so a passing test proves the file was
-/// actually read, not that the default happened to match.
-///
-/// A temporary directory is used instead of /etc/mujina so the test runs
-/// without elevated permissions. `MUJINA_DEFAULT_CONFIG_PATH` redirects
-/// `Config::load()` to that temp file.
+/// actually read rather than the hard-coded default matching by coincidence.
 #[tokio::test]
 #[serial]
-async fn test_default_config_file() {
+async fn test_cli_config_file_is_read() {
     const TEST_PORT: u16 = 17785;
     let listen_addr = format!("127.0.0.1:{TEST_PORT}");
 
-    let tmp_dir = tempfile::tempdir().expect("failed to create tempdir");
-    let config_path = tmp_dir.path().join("mujina.yaml");
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let config_path = tmp.path().join("mujina.yaml");
     std::fs::write(
         &config_path,
         format!("api:\n  listen: \"{listen_addr}\"\nbackplane:\n  usb_enabled: false\n"),
     )
     .expect("failed to write temp config");
 
-    // Redirect the default config path to our temp file. Also clear
-    // MUJINA_CONFIG_FILE_PATH so a value set in the shell cannot override
-    // the default config file we are trying to test.
-    // SAFETY: test is marked #[serial] so no other threads touch the environment.
-    unsafe {
-        std::env::set_var("MUJINA_DEFAULT_CONFIG_PATH", &config_path);
-        std::env::remove_var("MUJINA_CONFIG_FILE_PATH");
-    }
-
-    let config = Config::load().expect("Config::load() failed");
-
-    // SAFETY: same serial-test guarantee as above.
-    unsafe { std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH") };
+    let config = Config::load_with(Some(config_path), &[]).expect("Config::load_with() failed");
 
     assert_eq!(
         config.api.listen, listen_addr,
-        "config.api.listen should reflect the value from the default config file"
+        "config.api.listen should reflect the value from the --config file"
     );
 
     let daemon = Daemon::new(config);
@@ -106,127 +89,47 @@ async fn test_default_config_file() {
 
     assert!(
         listening,
-        "mujina-minerd should be listening on {listen_addr} (port from default config file)"
+        "mujina-minerd should be listening on {listen_addr} (port from --config file)"
     );
 }
 
-/// Verify that a user-specified config file (via `MUJINA_CONFIG_FILE_PATH`)
-/// overrides the value set in the default config file, which itself overrides
-/// the hard-coded default listen address.
+/// Verify that a `MUJINA__*` environment variable overrides both the config
+/// file and the hard-coded default.
 ///
 /// Priority chain exercised:
-///   user config file (17786)  >  default config file (17785)  >  built-in default (7785)
+///   env var (17787)  >  --config file (17785)  >  built-in default (7785)
 #[tokio::test]
 #[serial]
-async fn test_user_config_override() {
-    const TEST_PORT_DEFAULT_CONFIG: u16 = 17785;
-    const TEST_PORT_USER_CONFIG: u16 = 17786;
+async fn test_env_var_overrides_config_file() {
+    const TEST_PORT_CONFIG: u16 = 17785;
+    const TEST_PORT_ENV: u16 = 17787;
 
-    let default_listen = format!("127.0.0.1:{TEST_PORT_DEFAULT_CONFIG}");
-    let user_listen = format!("127.0.0.1:{TEST_PORT_USER_CONFIG}");
+    let config_listen = format!("127.0.0.1:{TEST_PORT_CONFIG}");
+    let env_listen = format!("127.0.0.1:{TEST_PORT_ENV}");
 
-    let tmp_default = tempfile::tempdir().expect("failed to create tempdir for default config");
-    let default_config_path = tmp_default.path().join("mujina.yaml");
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let config_path = tmp.path().join("mujina.yaml");
     std::fs::write(
-        &default_config_path,
-        format!("api:\n  listen: \"{default_listen}\"\nbackplane:\n  usb_enabled: false\n"),
+        &config_path,
+        format!("api:\n  listen: \"{config_listen}\"\nbackplane:\n  usb_enabled: false\n"),
     )
-    .expect("failed to write default temp config");
-
-    let tmp_user = tempfile::tempdir().expect("failed to create tempdir for user config");
-    let user_config_path = tmp_user.path().join("mujina.yaml");
-    std::fs::write(
-        &user_config_path,
-        format!("api:\n  listen: \"{user_listen}\"\n"),
-    )
-    .expect("failed to write user temp config");
+    .expect("failed to write temp config");
 
     // SAFETY: test is marked #[serial] so no other threads touch the environment.
     unsafe {
-        std::env::set_var("MUJINA_DEFAULT_CONFIG_PATH", &default_config_path);
-        std::env::set_var("MUJINA_CONFIG_FILE_PATH", &user_config_path);
-    }
-
-    let config = Config::load().expect("Config::load() failed");
-
-    // SAFETY: same serial-test guarantee as above.
-    unsafe {
-        std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH");
-        std::env::remove_var("MUJINA_CONFIG_FILE_PATH");
-    }
-
-    assert_eq!(
-        config.api.listen, user_listen,
-        "user config file (port {TEST_PORT_USER_CONFIG}) should override default config file (port {TEST_PORT_DEFAULT_CONFIG})"
-    );
-
-    let daemon = Daemon::new(config);
-    let shutdown = daemon.shutdown_token();
-    let daemon_handle = tokio::spawn(async move { daemon.run().await });
-
-    let listening = wait_for_port(&user_listen, Duration::from_secs(5)).await;
-
-    shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(5), daemon_handle).await;
-
-    assert!(
-        listening,
-        "mujina-minerd should be listening on {user_listen} (port from user config file)"
-    );
-}
-
-/// Verify that a `MUJINA__*` environment variable overrides both config files
-/// and the hard-coded default.
-///
-/// Priority chain exercised:
-///   env var (17787)  >  user config file (17786)  >  default config file (17785)  >  built-in default (7785)
-#[tokio::test]
-#[serial]
-async fn test_env_var_override() {
-    const TEST_PORT_DEFAULT_CONFIG: u16 = 17785;
-    const TEST_PORT_USER_CONFIG: u16 = 17786;
-    const TEST_PORT_ENV_VAR: u16 = 17787;
-
-    let default_listen = format!("127.0.0.1:{TEST_PORT_DEFAULT_CONFIG}");
-    let user_listen = format!("127.0.0.1:{TEST_PORT_USER_CONFIG}");
-    let env_listen = format!("127.0.0.1:{TEST_PORT_ENV_VAR}");
-
-    let tmp_default = tempfile::tempdir().expect("failed to create tempdir for default config");
-    let default_config_path = tmp_default.path().join("mujina.yaml");
-    std::fs::write(
-        &default_config_path,
-        format!("api:\n  listen: \"{default_listen}\"\nbackplane:\n  usb_enabled: false\n"),
-    )
-    .expect("failed to write default temp config");
-
-    let tmp_user = tempfile::tempdir().expect("failed to create tempdir for user config");
-    let user_config_path = tmp_user.path().join("mujina.yaml");
-    std::fs::write(
-        &user_config_path,
-        format!("api:\n  listen: \"{user_listen}\"\n"),
-    )
-    .expect("failed to write user temp config");
-
-    // SAFETY: test is marked #[serial] so no other threads touch the environment.
-    unsafe {
-        std::env::set_var("MUJINA_DEFAULT_CONFIG_PATH", &default_config_path);
-        std::env::set_var("MUJINA_CONFIG_FILE_PATH", &user_config_path);
-        // Layer 2: env var override — highest priority short of CLI flags.
         std::env::set_var("MUJINA__API__LISTEN", &env_listen);
     }
 
-    let config = Config::load().expect("Config::load() failed");
+    let config = Config::load_with(Some(config_path), &[]).expect("Config::load_with() failed");
 
     // SAFETY: same serial-test guarantee as above.
     unsafe {
-        std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH");
-        std::env::remove_var("MUJINA_CONFIG_FILE_PATH");
         std::env::remove_var("MUJINA__API__LISTEN");
     }
 
     assert_eq!(
         config.api.listen, env_listen,
-        "MUJINA__API__LISTEN (port {TEST_PORT_ENV_VAR}) should override user config (port {TEST_PORT_USER_CONFIG}) and default config (port {TEST_PORT_DEFAULT_CONFIG})"
+        "MUJINA__API__LISTEN (port {TEST_PORT_ENV}) should override --config file (port {TEST_PORT_CONFIG})"
     );
 
     let daemon = Daemon::new(config);
@@ -244,7 +147,7 @@ async fn test_env_var_override() {
     );
 }
 
-/// Verify that a CLI flag override wins over env vars, both config files, and
+/// Verify that a CLI flag override wins over env vars, the config file, and
 /// the hard-coded default.
 ///
 /// CLI flags are not handled inside `Config::load_with`; they are applied by
@@ -252,59 +155,43 @@ async fn test_env_var_override() {
 /// The test mirrors that pattern exactly.
 ///
 /// Priority chain exercised:
-///   CLI flag (17788)  >  env var (17787)  >  user config (17786)  >  default config (17785)  >  built-in default (7785)
+///   CLI flag (17788)  >  env var (17787)  >  --config file (17785)  >  built-in default (7785)
 #[tokio::test]
 #[serial]
 async fn test_command_line_arg_override() {
-    const TEST_PORT_DEFAULT_CONFIG: u16 = 17785;
-    const TEST_PORT_USER_CONFIG: u16 = 17786;
-    const TEST_PORT_ENV_VAR: u16 = 17787;
-    const TEST_PORT_COMMAND_LINE_ARG: u16 = 17788;
+    const TEST_PORT_CONFIG: u16 = 17785;
+    const TEST_PORT_ENV: u16 = 17787;
+    const TEST_PORT_CLI: u16 = 17788;
 
-    let default_listen = format!("127.0.0.1:{TEST_PORT_DEFAULT_CONFIG}");
-    let user_listen = format!("127.0.0.1:{TEST_PORT_USER_CONFIG}");
-    let env_listen = format!("127.0.0.1:{TEST_PORT_ENV_VAR}");
-    let cli_listen = format!("127.0.0.1:{TEST_PORT_COMMAND_LINE_ARG}");
+    let config_listen = format!("127.0.0.1:{TEST_PORT_CONFIG}");
+    let env_listen = format!("127.0.0.1:{TEST_PORT_ENV}");
+    let cli_listen = format!("127.0.0.1:{TEST_PORT_CLI}");
 
-    let tmp_default = tempfile::tempdir().expect("failed to create tempdir for default config");
-    let default_config_path = tmp_default.path().join("mujina.yaml");
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let config_path = tmp.path().join("mujina.yaml");
     std::fs::write(
-        &default_config_path,
-        format!("api:\n  listen: \"{default_listen}\"\nbackplane:\n  usb_enabled: false\n"),
+        &config_path,
+        format!("api:\n  listen: \"{config_listen}\"\nbackplane:\n  usb_enabled: false\n"),
     )
-    .expect("failed to write default temp config");
-
-    let tmp_user = tempfile::tempdir().expect("failed to create tempdir for user config");
-    let user_config_path = tmp_user.path().join("mujina.yaml");
-    std::fs::write(
-        &user_config_path,
-        format!("api:\n  listen: \"{user_listen}\"\n"),
-    )
-    .expect("failed to write user temp config");
+    .expect("failed to write temp config");
 
     // SAFETY: test is marked #[serial] so no other threads touch the environment.
     unsafe {
-        std::env::set_var("MUJINA_DEFAULT_CONFIG_PATH", &default_config_path);
-        std::env::set_var("MUJINA_CONFIG_FILE_PATH", &user_config_path);
         std::env::set_var("MUJINA__API__LISTEN", &env_listen);
     }
 
-    let mut config = Config::load().expect("Config::load() failed");
+    let set_overrides = vec![("api.listen".to_string(), cli_listen.clone())];
+    let config =
+        Config::load_with(Some(config_path), &set_overrides).expect("Config::load_with() failed");
 
     // SAFETY: same serial-test guarantee as above.
     unsafe {
-        std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH");
-        std::env::remove_var("MUJINA_CONFIG_FILE_PATH");
         std::env::remove_var("MUJINA__API__LISTEN");
     }
 
-    // Layer 1 (highest): CLI flag applied as a direct field assignment,
-    // exactly as minerd.rs does after calling Config::load_with().
-    config.api.listen = cli_listen.clone();
-
     assert_eq!(
         config.api.listen, cli_listen,
-        "CLI flag (port {TEST_PORT_COMMAND_LINE_ARG}) should override env var (port {TEST_PORT_ENV_VAR}), user config (port {TEST_PORT_USER_CONFIG}), and default config (port {TEST_PORT_DEFAULT_CONFIG})"
+        "CLI flag (port {TEST_PORT_CLI}) should override env var (port {TEST_PORT_ENV}) and --config file (port {TEST_PORT_CONFIG})"
     );
 
     let daemon = Daemon::new(config);
@@ -350,19 +237,12 @@ async fn test_cpu_miner_starts_from_config() {
 
     // SAFETY: test is marked #[serial] so no other threads touch the environment.
     unsafe {
-        std::env::set_var("MUJINA_DEFAULT_CONFIG_PATH", &config_path);
-        // Clear the user config file path so a shell value cannot override
-        // the test config.
-        std::env::remove_var("MUJINA_CONFIG_FILE_PATH");
         // Ensure legacy env vars are absent — they must not be required.
         std::env::remove_var("MUJINA_CPUMINER_THREADS");
         std::env::remove_var("MUJINA_CPUMINER_DUTY");
     }
 
-    let config = Config::load().expect("Config::load() failed");
-
-    // SAFETY: same serial-test guarantee as above.
-    unsafe { std::env::remove_var("MUJINA_DEFAULT_CONFIG_PATH") };
+    let config = Config::load_with(Some(config_path), &[]).expect("Config::load_with() failed");
 
     assert!(
         config.boards.cpu_miner.enabled,

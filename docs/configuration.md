@@ -5,8 +5,7 @@ This document describes the configuration system for `mujina-minerd`.
 - [1. Priority Order](#1-priority-order)
 - [2. Config Files](#2-config-files)
   - [2.1. Default location](#21-default-location)
-  - [2.2. User-specified location](#22-user-specified-location)
-  - [2.3. Bootstrap variables](#23-bootstrap-variables)
+  - [2.2. Specifying a config file](#22-specifying-a-config-file)
 - [3. Environment Variables](#3-environment-variables)
   - [3.1. Migration from Legacy Environment Variables](#31-migration-from-legacy-environment-variables)
 - [4. CLI Flags](#4-cli-flags)
@@ -21,9 +20,9 @@ more than one source, the **highest-priority source wins**:
 
 | Priority | Source |
 |----------|--------|
-| 1 (highest) | CLI flags (`--pool-url`, `--log-level`, etc.) |
+| 1 (highest) | `--set key=value` CLI overrides |
 | 2 | Environment variables (`MUJINA__*`) |
-| 3 | User config file (`$MUJINA_CONFIG_FILE_PATH`) |
+| 3 | Config file specified via `--config` |
 | 4 | Default config file (`/etc/mujina/mujina.yaml`) |
 | 5 (lowest) | Hard-coded defaults |
 
@@ -38,40 +37,22 @@ will start with sensible defaults (dummy job source, API on localhost).
 `/etc/mujina/mujina.yaml`
 
 This is the standard system-wide config file, suitable for installation by a
-package manager or system administrator.
+package manager or system administrator. It is optional — if absent, Mujina
+starts with hard-coded defaults.
 
-> [!NOTE]
-> This path can be overridden via `MUJINA_DEFAULT_CONFIG_PATH`.
+### 2.2. Specifying a config file
 
-### 2.2. User-specified location
-
-Set `MUJINA_CONFIG_FILE_PATH` to an absolute path to load a second config file
-that supplements (and overrides) the default location:
+Use the `--config` flag to load a config file from any path:
 
 ```sh
-MUJINA_CONFIG_FILE_PATH=/home/operator/mujina.yaml mujina-minerd
+mujina-minerd --config /home/operator/mujina.yaml
 ```
 
-Keys present in the user-specified file take precedence over the same keys in
-`/etc/mujina/mujina.yaml`. Keys absent from the user file fall back to the
-default file, then to hard-coded defaults.
+Keys in the specified file take precedence over `/etc/mujina/mujina.yaml`.
+Keys absent from the file fall back to the default file, then to hard-coded
+defaults.
 
 An example config file is provided at `configs/mujina.example.yaml`.
-
-### 2.3. Bootstrap variables
-
-`MUJINA_CONFIG_FILE_PATH` and `MUJINA_DEFAULT_CONFIG_PATH` use single
-underscores and are **not** part of the `MUJINA__*` config-key system. They are
-bootstrap variables read by the loader before the config system is constructed,
-so the double-underscore naming convention does not apply to them.
-
-`MUJINA_DEFAULT_CONFIG_PATH` overrides the default system config path
-(`/etc/mujina/mujina.yaml`). It is primarily intended for testing, where
-writing to `/etc` requires root access:
-
-```sh
-MUJINA_DEFAULT_CONFIG_PATH=/tmp/mujina-test.yaml mujina-minerd
-```
 
 ## 3. Environment Variables
 
@@ -138,25 +119,33 @@ the daemon config and is unchanged.
 
 ## 4. CLI Flags
 
-CLI flags override all other sources, including environment variables. They are
-intended for one-off overrides and testing, not permanent configuration.
-
-`mujina-minerd` accepts the following flags:
+CLI flags override all other sources and are intended for one-off overrides and
+testing, not permanent configuration.
 
 ```
 USAGE:
     mujina-minerd [OPTIONS]
 
 OPTIONS:
-    -c, --config <PATH>         Config file path (overrides MUJINA_CONFIG_FILE_PATH)
-        --log-level <LEVEL>     Log level: error, warn, info, debug, trace [default: info]
-        --api-listen <ADDR>     API listen address [default: 127.0.0.1:7785]
-        --pool-url <URL>        Pool URL, e.g. stratum+tcp://pool.example.com:3333
-        --pool-user <USER>      Pool worker username
-        --pool-pass <PASS>      Pool worker password
-    -h, --help                  Print help
-    -V, --version               Print version
+    -c, --config <PATH>           Config file path (overrides /etc/mujina/mujina.yaml)
+        --set <KEY=VALUE>         Override a config key (may be repeated)
+    -h, --help                    Print help
+    -V, --version                 Print version
 ```
+
+`--set` uses the same dot-path namespace as the YAML file, so any key from
+the YAML structure can be overridden without a dedicated flag:
+
+```sh
+mujina-minerd \
+  --set pool.url=stratum+tcp://pool.example.com:3333 \
+  --set pool.user=bc1q....worker \
+  --set api.listen=0.0.0.0:7785 \
+  --set boards.cpu_miner.enabled=true
+```
+
+Multiple `--set` flags are applied in order; later values win if the same key
+appears more than once.
 
 ## 5. YAML Structure
 
@@ -168,9 +157,7 @@ api:          # HTTP API server
 pool:         # Mining pool connection (primary)
 backplane:    # Board discovery and lifecycle
 boards:       # Per-board-type hardware settings
-  bitaxe:     # Bitaxe family boards (BM1370, etc.)
   cpu_miner:  # Software CPU miner (testing/development)
-hash_thread:  # ASIC hash thread tuning
 ```
 
 ### 5.1. Full reference with defaults
@@ -180,27 +167,26 @@ annotated example file showing every key with its default value.
 
 ## 6. Testing the Priority Chain
 
-`mujina-miner/tests/config_priority_tests.rs` contains integration tests that
+`mujina-miner/tests/daemon_integration_tests.rs` contains integration tests that
 exercise each layer of the priority chain end-to-end. Each test starts a real
 `Daemon` instance and polls the API port to confirm the daemon bound to the
 address that the winning source declared.
 
 | Test | Layer(s) exercised |
 |------|--------------------|
-| `test_default_config_file` | default config file overrides hard-coded default |
-| `test_user_config_override` | user config file overrides default config file |
-| `test_env_var_override` | `MUJINA__*` env var overrides both config files |
-| `test_command_line_arg_override` | CLI flag (direct field assignment) overrides env var and both config files |
+| `test_cli_config_file_is_read` | `--config` file overrides hard-coded default |
+| `test_env_var_overrides_config_file` | `MUJINA__*` env var overrides `--config` file |
+| `test_command_line_arg_override` | `--set` override wins over env var and `--config` file |
+| `test_cpu_miner_starts_from_config` | CPU miner board starts from `--config` file |
 
 The tests use `tempfile` to write config files in a temporary directory, so
-**no root access is required** — the default config path is redirected via
-`MUJINA_DEFAULT_CONFIG_PATH` during the test run.
+**no root access is required**.
 
 Run only these tests with:
 
 ```sh
-cargo test -p mujina-miner --test config_priority_tests
+cargo test -p mujina-miner --test daemon_integration_tests
 ```
 
-Because the tests mutate process-wide environment variables they are serialized
+Because some tests mutate process-wide environment variables they are serialized
 with `#[serial]` from the `serial_test` crate. Do not run them with `--test-threads > 1`.

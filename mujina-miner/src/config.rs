@@ -5,9 +5,8 @@
 //! 1. CLI flags (caller merges these on top after calling `Config::load`)
 //! 2. Environment variables — prefix `MUJINA`, separator `__`
 //!    e.g. `MUJINA__POOL__URL=stratum+tcp://pool.example.com:3333`
-//! 3. User config file — path from `MUJINA_CONFIG_FILE_PATH` env var, or the
-//!    `--config` path passed as `cli_config_path` to `Config::load_with`
-//! 4. Default config file — `/etc/mujina/mujina.yaml`
+//! 3. Config file specified via `--config` (passed as `cli_config_path`)
+//! 4. Default config file — `/etc/mujina/mujina.yaml` (optional, not required)
 //! 5. Hard-coded defaults — `Default` impls on each struct (lowest priority)
 //!
 //! See `docs/configuration.md` and `configs/mujina.example.yaml` for the full
@@ -20,18 +19,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/mujina/mujina.yaml";
-const DEFAULT_CONFIG_PATH_ENV_VAR: &str = "MUJINA_DEFAULT_CONFIG_PATH";
-const CONFIG_FILE_ENV_VAR: &str = "MUJINA_CONFIG_FILE_PATH";
 const ENV_PREFIX: &str = "MUJINA";
 const ENV_SEPARATOR: &str = "__";
-
-/// Returns the path to the default system config file.
-///
-/// Normally `/etc/mujina/mujina.yaml`. Override via `MUJINA_DEFAULT_CONFIG_PATH`
-/// (useful in tests to avoid requiring root access to `/etc`).
-fn default_config_path() -> String {
-    std::env::var(DEFAULT_CONFIG_PATH_ENV_VAR).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string())
-}
 
 // ---------------------------------------------------------------------------
 // Top-level config
@@ -45,7 +34,6 @@ pub struct Config {
     pub pool: PoolConfig,
     pub backplane: BackplaneConfig,
     pub boards: BoardsConfig,
-    pub hash_thread: HashThreadConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,28 +111,7 @@ impl Default for BackplaneConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BoardsConfig {
-    pub bitaxe: BitaxeConfig,
     pub cpu_miner: CpuMinerConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BitaxeConfig {
-    pub temp_limit_c: f32,
-    pub fan_min_pct: u8,
-    pub fan_max_pct: u8,
-    pub power_limit_w: Option<f32>,
-}
-
-impl Default for BitaxeConfig {
-    fn default() -> Self {
-        Self {
-            temp_limit_c: 85.0,
-            fan_min_pct: 20,
-            fan_max_pct: 100,
-            power_limit_w: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -165,20 +132,6 @@ impl Default for CpuMinerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HashThreadConfig {
-    pub chip_target_difficulty: u32,
-}
-
-impl Default for HashThreadConfig {
-    fn default() -> Self {
-        Self {
-            chip_target_difficulty: 256,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -186,97 +139,64 @@ impl Default for HashThreadConfig {
 impl Config {
     /// Load configuration using the standard source hierarchy.
     ///
-    /// The user config path is read from `MUJINA_CONFIG_FILE_PATH` if set.
-    /// To supply a path from a CLI `--config` flag instead, use
-    /// [`Config::load_with`].
+    /// Equivalent to `Config::load_with(None, &[])`. Use when no `--config`
+    /// flag or `--set` overrides were supplied on the command line.
     pub fn load() -> anyhow::Result<Self> {
-        Self::load_with(None)
+        Self::load_with(None, &[])
     }
 
-    /// Load configuration, optionally overriding the user config file path.
+    /// Load configuration with an optional config file and `--set` overrides.
     ///
-    /// `cli_config_path` corresponds to the `--config` CLI flag and takes
-    /// precedence over `MUJINA_CONFIG_FILE_PATH`.
-    pub fn load_with(cli_config_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        // Detect misuse of bootstrap variables before the config system is
-        // constructed. Neither `config` nor `default` are valid config
-        // sections — the likely mistakes are:
-        //   MUJINA__CONFIG__FILE__PATH  instead of  MUJINA_CONFIG_FILE_PATH
-        //   MUJINA__DEFAULT__CONFIG__PATH  instead of  MUJINA_DEFAULT_CONFIG_PATH
-        let bad_vars: Vec<String> = std::env::vars()
-            .filter(|(k, _)| {
-                let u = k.to_uppercase();
-                u.starts_with("MUJINA__CONFIG") || u.starts_with("MUJINA__DEFAULT")
-            })
-            .map(|(k, _)| k)
-            .collect();
-        if !bad_vars.is_empty() {
-            anyhow::bail!(
-                "Invalid environment variable(s): {}\n\n\
-                 These are not config sections. Did you mean one of the \
-                 bootstrap variables `MUJINA_CONFIG_FILE_PATH` or \
-                 `MUJINA_DEFAULT_CONFIG_PATH` (single underscores)?",
-                bad_vars.join(", ")
-            );
-        }
-
+    /// Priority order (highest wins):
+    /// 1. `overrides` — `--set key=value` pairs, applied in order
+    /// 2. `MUJINA__*` environment variables
+    /// 3. `cli_config_path` — `--config` file, required to exist if supplied
+    /// 4. `/etc/mujina/mujina.yaml` — optional system default
+    /// 5. Hard-coded `Default` impls
+    pub fn load_with(
+        cli_config_path: Option<PathBuf>,
+        overrides: &[(String, String)],
+    ) -> anyhow::Result<Self> {
         // Log config file sources so startup problems are easy to diagnose.
-        {
-            let default_path = default_config_path();
-            let default_exists = std::path::Path::new(&default_path).exists();
-            debug!(
-                path = %default_path,
-                exists = default_exists,
-                env_var = std::env::var(DEFAULT_CONFIG_PATH_ENV_VAR).ok().as_deref().unwrap_or("(not set)"),
-                "Default config file (MUJINA_DEFAULT_CONFIG_PATH)"
-            );
-
-            let user_path = cli_config_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .or_else(|| std::env::var(CONFIG_FILE_ENV_VAR).ok());
-            match &user_path {
-                Some(path) => {
-                    let exists = std::path::Path::new(path).exists();
-                    debug!(
-                        path = %path,
-                        exists = exists,
-                        "User config file (MUJINA_CONFIG_FILE_PATH)"
-                    );
-                }
-                None => {
-                    debug!("User config file (MUJINA_CONFIG_FILE_PATH): not set");
-                }
-            }
+        let default_exists = std::path::Path::new(DEFAULT_CONFIG_PATH).exists();
+        debug!(
+            path = DEFAULT_CONFIG_PATH,
+            exists = default_exists,
+            "Default config file"
+        );
+        match &cli_config_path {
+            Some(path) => debug!(path = %path.display(), "--config file"),
+            None => debug!("--config: not specified"),
         }
 
         let mut builder = config::Config::builder()
-            // Layer 4 (lowest): default system config file
+            // Layer 4 (lowest file): default system config file
             .add_source(
-                File::with_name(&default_config_path())
+                File::with_name(DEFAULT_CONFIG_PATH)
                     .format(FileFormat::Yaml)
                     .required(false),
             );
 
-        // Layer 3: user-specified config file (CLI flag beats env var)
-        let user_path = cli_config_path
-            .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| std::env::var(CONFIG_FILE_ENV_VAR).ok());
-
-        if let Some(path) = user_path {
+        // Layer 3: --config file
+        if let Some(path) = cli_config_path {
             builder = builder.add_source(
-                File::with_name(&path)
+                File::with_name(&path.to_string_lossy())
                     .format(FileFormat::Yaml)
                     .required(true),
             );
         }
 
-        // Layer 2 (highest file-based): environment variables
+        // Layer 2: environment variables
         builder = builder.add_source(
             Environment::with_prefix(ENV_PREFIX)
                 .separator(ENV_SEPARATOR)
                 .try_parsing(true),
         );
+
+        // Layer 1 (highest): --set key=value overrides
+        for (key, value) in overrides {
+            builder = builder.set_override(key.as_str(), value.as_str())?;
+        }
 
         Ok(builder.build()?.try_deserialize::<Config>()?)
     }
@@ -299,15 +219,13 @@ mod tests {
         assert!(cfg.pool.url.is_none());
         assert!(cfg.backplane.usb_enabled);
         assert!(!cfg.boards.cpu_miner.enabled);
-        assert_eq!(cfg.boards.bitaxe.temp_limit_c, 85.0);
-        assert_eq!(cfg.hash_thread.chip_target_difficulty, 256);
     }
 
     #[test]
     fn load_with_no_files_uses_defaults() {
         // Verify load succeeds when no config file is present (the default
         // path won't exist in a dev environment).
-        let result = Config::load_with(None);
+        let result = Config::load_with(None, &[]);
         assert!(result.is_ok(), "load_with(None) failed: {:?}", result);
     }
 }
