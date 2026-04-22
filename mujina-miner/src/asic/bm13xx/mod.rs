@@ -3,6 +3,7 @@
 //! This module provides protocol implementation and utilities for
 //! communicating with BM13xx series mining chips (BM1366, BM1370, etc).
 
+pub mod chip_config;
 pub mod crc;
 pub mod error;
 pub mod protocol;

@@ -18,7 +18,4 @@ pub enum ProtocolError {
 
     #[error("Buffer too small: need {need} bytes, have {have}")]
     BufferTooSmall { need: usize, have: usize },
-
-    #[error("Invalid frequency: {mhz} MHz (must be between 50-800 MHz)")]
-    InvalidFrequency { mhz: u32 },
 }
