@@ -454,9 +454,9 @@ impl Bitaxe {
             warn!("Failed to hold chips in reset: {}", e);
         }
 
-        match self.regulator.lock().await.set_vout(0.0).await {
+        match self.regulator.lock().await.disable_output().await {
             Ok(()) => debug!("Core voltage turned off"),
-            Err(e) => warn!("Failed to turn off core voltage: {}", e),
+            Err(e) => warn!("Failed to disable output: {}", e),
         }
     }
 }
@@ -523,9 +523,17 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     const DEFAULT_VOUT: f32 = 1.15;
     tps546
-        .set_vout(DEFAULT_VOUT)
+        .set_vout_target(DEFAULT_VOUT)
         .await
-        .context("failed to set core voltage")?;
+        .context("failed to set core voltage target")?;
+    tps546
+        .clear_faults()
+        .await
+        .context("failed to clear faults")?;
+    tps546
+        .enable_output()
+        .await
+        .context("failed to enable output")?;
     debug!("Core voltage set to {DEFAULT_VOUT}V");
 
     time::sleep(Duration::from_millis(500)).await;
