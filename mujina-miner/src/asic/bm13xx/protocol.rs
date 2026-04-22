@@ -159,9 +159,9 @@ impl From<PllConfig> for [u8; 4] {
     }
 }
 
-/// Known chip types in the BM13xx family
+/// Known chip models in the BM13xx family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChipType {
+pub enum ChipModel {
     /// BM1362 - Used in Antminer S19 J Pro (126 chips)
     /// Core count unknown
     BM1362,
@@ -172,11 +172,11 @@ pub enum ChipType {
     BM1370,
     /// BM1397 - Previous generation chip
     BM1397,
-    /// Unknown chip type with raw ID bytes
+    /// Unknown chip model with raw ID bytes.
     Unknown([u8; 2]),
 }
 
-impl ChipType {
+impl ChipModel {
     /// Get the raw chip ID bytes
     pub fn id_bytes(&self) -> [u8; 2] {
         match self {
@@ -188,7 +188,7 @@ impl ChipType {
         }
     }
 
-    /// Get expected hash engine count for this chip type, if known
+    /// Returns the expected hash engine count for this model, if known.
     pub fn core_count(&self) -> Option<u32> {
         match self {
             Self::BM1370 => Some(2048), // 128 x 16; esp-miner uses 2040
@@ -197,7 +197,7 @@ impl ChipType {
     }
 }
 
-impl From<[u8; 2]> for ChipType {
+impl From<[u8; 2]> for ChipModel {
     fn from(bytes: [u8; 2]) -> Self {
         match bytes {
             [0x13, 0x62] => Self::BM1362,
@@ -209,9 +209,9 @@ impl From<[u8; 2]> for ChipType {
     }
 }
 
-impl From<ChipType> for [u8; 2] {
-    fn from(chip_type: ChipType) -> Self {
-        chip_type.id_bytes()
+impl From<ChipModel> for [u8; 2] {
+    fn from(model: ChipModel) -> Self {
+        model.id_bytes()
     }
 }
 
@@ -533,9 +533,9 @@ pub enum RegisterAddress {
 #[derive(Clone)]
 pub enum Register {
     ChipId {
-        chip_type: ChipType, // Chip type identifier
-        core_count: u8,      // Core configuration byte
-        address: u8,         // Assigned chip address
+        model: ChipModel,
+        core_count: u8, // Core configuration byte
+        address: u8,    // Assigned chip address
     },
     PllDivider(PllConfig),
     NonceRange(NonceRangeConfig),
@@ -571,7 +571,7 @@ impl Register {
         let raw_value = u32::from_le_bytes(*bytes);
         match address {
             RegisterAddress::ChipId => Register::ChipId {
-                chip_type: ChipType::from([bytes[0], bytes[1]]),
+                model: ChipModel::from([bytes[0], bytes[1]]),
                 core_count: bytes[2],
                 address: bytes[3],
             },
@@ -641,11 +641,11 @@ impl Register {
     fn encode_data(&self, dst: &mut BytesMut) {
         match self {
             Register::ChipId {
-                chip_type,
+                model,
                 core_count,
                 address,
             } => {
-                dst.put_slice(&chip_type.id_bytes());
+                dst.put_slice(&model.id_bytes());
                 dst.put_u8(*core_count);
                 dst.put_u8(*address);
             }
@@ -693,12 +693,12 @@ impl std::fmt::Debug for Register {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Register::ChipId {
-                chip_type,
+                model,
                 core_count,
                 address,
             } => f
                 .debug_struct("ChipId")
-                .field("chip_type", chip_type)
+                .field("model", model)
                 .field("core_count", core_count)
                 .field("address", address)
                 .finish(),
@@ -1486,7 +1486,7 @@ mod command_tests {
                 broadcast: false,
                 chip_address: 0x01,
                 register: Register::ChipId {
-                    chip_type: ChipType::BM1370,
+                    model: ChipModel::BM1370,
                     core_count: 0x00,
                     address: 0x01,
                 },
@@ -1863,7 +1863,7 @@ mod response_tests {
         assert_eq!(chip_address, 0x00);
 
         let Register::ChipId {
-            chip_type,
+            model,
             core_count,
             address,
         } = register
@@ -1871,7 +1871,7 @@ mod response_tests {
             panic!("Expected ChipId register, got {:?}", register);
         };
 
-        assert_eq!(chip_type, ChipType::BM1370);
+        assert_eq!(model, ChipModel::BM1370);
         assert_eq!(core_count, 0x00);
         assert_eq!(address, 0x00);
     }
