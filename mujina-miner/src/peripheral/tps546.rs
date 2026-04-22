@@ -115,6 +115,8 @@ pub enum Tps546Error {
     VoltageOutOfRange(f32, f32, f32),
     #[error("PMBus fault detected: {0}")]
     FaultDetected(String),
+    #[error("OPERATION reads back 0x{readback:02x} after commanding 0x{commanded:02x}")]
+    OperationNotAccepted { commanded: u8, readback: u8 },
 }
 
 /// TPS546 driver
@@ -492,6 +494,56 @@ impl<I2C: I2c> Tps546<I2C> {
         self.i2c
             .write(TPS546_I2C_ADDR, &[PmbusCommand::ClearFaults.as_u8()])
             .await?;
+        Ok(())
+    }
+
+    /// Sets the target voltage without changing the output state.
+    pub async fn set_vout_target(&mut self, volts: f32) -> Result<()> {
+        if volts < self.config.vout_min || volts > self.config.vout_max {
+            bail!(Tps546Error::VoltageOutOfRange(
+                volts,
+                self.config.vout_min,
+                self.config.vout_max
+            ));
+        }
+
+        let value = self.encode_voltage(volts).await?;
+        self.write_word(PmbusCommand::VoutCommand, value).await?;
+        debug!("VOUT_COMMAND set to {:.2}V", volts);
+        Ok(())
+    }
+
+    /// Enables the output (OPERATION = ON).
+    ///
+    /// Fails unless the command reads back from the device.
+    pub async fn enable_output(&mut self) -> Result<()> {
+        self.write_operation(pmbus::Operation::On).await?;
+        debug!("Output enabled");
+        Ok(())
+    }
+
+    /// Disables the output immediately (OPERATION = OFF).
+    ///
+    /// Fails unless the command reads back from the device.
+    pub async fn disable_output(&mut self) -> Result<()> {
+        self.write_operation(pmbus::Operation::OffImmediate).await?;
+        debug!("Output disabled");
+        Ok(())
+    }
+
+    /// Writes OPERATION and confirms the device accepted it.
+    ///
+    /// A PMBus write can be acknowledged on the bus yet ignored by
+    /// the device, so read the register back and fail on mismatch.
+    async fn write_operation(&mut self, op: pmbus::Operation) -> Result<()> {
+        self.write_byte(PmbusCommand::Operation, op.as_u8()).await?;
+        let readback = self.read_byte(PmbusCommand::Operation).await?;
+        if readback != op.as_u8() {
+            bail!(Tps546Error::OperationNotAccepted {
+                commanded: op.as_u8(),
+                readback,
+            });
+        }
         Ok(())
     }
 
