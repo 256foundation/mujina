@@ -547,68 +547,6 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(())
     }
 
-    /// Set output voltage
-    pub async fn set_vout(&mut self, volts: f32) -> Result<()> {
-        if volts == 0.0 {
-            // Turn off output
-            self.write_byte(
-                PmbusCommand::Operation,
-                pmbus::Operation::OffImmediate.as_u8(),
-            )
-            .await?;
-            debug!("Output voltage turned off");
-        } else {
-            // Check voltage range
-            if volts < self.config.vout_min || volts > self.config.vout_max {
-                bail!(Tps546Error::VoltageOutOfRange(
-                    volts,
-                    self.config.vout_min,
-                    self.config.vout_max
-                ));
-            }
-
-            // Set voltage
-            let value = self.encode_voltage(volts).await?;
-            self.write_word(PmbusCommand::VoutCommand, value).await?;
-            debug!("Output voltage set to {:.2}V", volts);
-
-            // Clear any faults before turning on
-            self.clear_faults().await?;
-            debug!("Cleared faults before turn-on");
-
-            // Turn on output
-            self.write_byte(PmbusCommand::Operation, pmbus::Operation::On.as_u8())
-                .await?;
-
-            // Verify operation
-            let op_val = self.read_byte(PmbusCommand::Operation).await?;
-            if op_val != pmbus::Operation::On.as_u8() {
-                error!("Failed to turn on output, OPERATION = 0x{:02X}", op_val);
-            } else {
-                debug!("Power turned ON successfully, OPERATION = 0x{:02X}", op_val);
-            }
-
-            // Check immediate status after turn-on
-            let status = self.read_word(PmbusCommand::StatusWord).await?;
-            if pmbus::StatusWord::from_bits_truncate(status).contains(pmbus::StatusWord::OFF) {
-                error!(
-                    "WARNING: Power is still OFF after turn-on command! STATUS_WORD = 0x{:04X}",
-                    status
-                );
-                // Read all status registers to understand why
-                if let Ok(vout_status) = self.read_byte(PmbusCommand::StatusVout).await {
-                    error!("  STATUS_VOUT: 0x{:02X}", vout_status);
-                }
-                if let Ok(iout_status) = self.read_byte(PmbusCommand::StatusIout).await {
-                    error!("  STATUS_IOUT: 0x{:02X}", iout_status);
-                }
-            } else {
-                debug!("Power is ON, STATUS_WORD = 0x{:04X}", status);
-            }
-        }
-        Ok(())
-    }
-
     /// Read input voltage in millivolts
     pub async fn get_vin(&mut self) -> Result<u32> {
         let value = self.read_word(PmbusCommand::ReadVin).await?;
