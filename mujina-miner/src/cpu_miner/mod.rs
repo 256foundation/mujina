@@ -5,10 +5,15 @@
 //!
 //! # Configuration
 //!
-//! Enable via environment variables:
+//! Enable via the config system (see `docs/configuration.md`):
 //!
-//! - `MUJINA_CPUMINER_THREADS=N` - Number of mining threads (presence enables)
-//! - `MUJINA_CPUMINER_DUTY=P` - Duty cycle percentage (default: 50)
+//! ```yaml
+//! boards:
+//!   cpu_miner:
+//!     enabled: true
+//!     threads: 2
+//!     duty_percent: 50
+//! ```
 
 mod config;
 mod hasher;

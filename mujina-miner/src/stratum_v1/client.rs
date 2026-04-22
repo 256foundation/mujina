@@ -869,19 +869,19 @@ mod tests {
     ///
     /// # Environment Variables
     ///
-    /// - `MUJINA_POOL_URL` - Pool URL (required, e.g., "stratum+tcp://localhost:3333")
-    /// - `MUJINA_POOL_USER` - Username/wallet address (optional, defaults to test address)
+    /// - `MUJINA__POOL__URL` - Pool URL (required, e.g., "stratum+tcp://localhost:3333")
+    /// - `MUJINA__POOL__USER` - Username/wallet address (optional, defaults to test address)
     ///
     /// # Running
     ///
     /// ```bash
     /// # Minimal (uses default test address)
-    /// MUJINA_POOL_URL="stratum+tcp://localhost:3333" \
+    /// MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
     /// cargo test --lib test_pool_from_env -- --ignored --nocapture
     ///
     /// # With custom username
-    /// MUJINA_POOL_URL="stratum+tcp://localhost:3333" \
-    /// MUJINA_POOL_USER="bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.my-worker" \
+    /// MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
+    /// MUJINA__POOL__USER="bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.my-worker" \
     /// cargo test --lib test_pool_from_env -- --ignored --nocapture
     /// ```
     ///
@@ -890,9 +890,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_pool_from_env() {
-        let pool_url =
-            std::env::var("MUJINA_POOL_URL").expect("MUJINA_POOL_URL environment variable not set");
-        let username = std::env::var("MUJINA_POOL_USER").unwrap_or_else(|_| {
+        let pool_url = std::env::var("MUJINA__POOL__URL")
+            .expect("MUJINA__POOL__URL environment variable not set");
+        let username = std::env::var("MUJINA__POOL__USER").unwrap_or_else(|_| {
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test".to_string()
         });
 

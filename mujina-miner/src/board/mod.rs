@@ -8,7 +8,9 @@ use futures::future::BoxFuture;
 use tokio::sync::watch;
 
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api_client::types::BoardTelemetry,
+    asic::hash_thread::HashThread,
+    transport::{UsbDeviceInfo, cpu::CpuDeviceInfo},
 };
 
 /// Returned by board factory functions with everything the backplane
@@ -80,10 +82,10 @@ inventory::collect!(BoardDescriptor);
 
 /// Factory function signature for creating a virtual board.
 ///
-/// Same contract as [`BoardFactoryFn`], but virtual boards don't
-/// receive USB device info. They are configured via environment
-/// variables or other means.
-pub type VirtualBoardFactoryFn = fn() -> BoxFuture<'static, Result<BackplaneConnector>>;
+/// Same contract as [`BoardFactoryFn`], but virtual boards receive their
+/// configuration via [`CpuDeviceInfo`] rather than USB device info.
+pub type VirtualBoardFactoryFn =
+    fn(CpuDeviceInfo) -> BoxFuture<'static, Result<BackplaneConnector>>;
 
 /// Descriptor for virtual boards (CPU miner, test boards, etc.).
 ///

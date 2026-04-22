@@ -18,15 +18,16 @@ Pull and run from GitHub Container Registry:
 
 ```bash
 podman run --rm -it \
-  -e MUJINA_USB_DISABLE=1 \
-  -e MUJINA_CPUMINER_THREADS=2 \
-  -e MUJINA_POOL_URL="stratum+tcp://pool.example.com:3333" \
-  -e MUJINA_POOL_USER="your-address.worker" \
+  -e MUJINA__BACKPLANE__USB_ENABLED=false \
+  -e MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+  -e MUJINA__BOARDS__CPU_MINER__THREADS=2 \
+  -e MUJINA__POOL__URL="stratum+tcp://pool.example.com:3333" \
+  -e MUJINA__POOL__USER="your-address.worker" \
   ghcr.io/256foundation/mujina-minerd:latest
 ```
 
 This starts a 2-thread CPU miner connected to your pool. See
-[CPU Mining](cpu-mining.md) for all environment variables.
+[CPU Mining](cpu-mining.md) for all config options.
 
 ## Building the Image
 
@@ -60,8 +61,9 @@ The REST API listens on port 7785. To access it from the host:
 ```bash
 podman run --rm -it \
   -p 7785:7785 \
-  -e MUJINA_USB_DISABLE=1 \
-  -e MUJINA_CPUMINER_THREADS=2 \
+  -e MUJINA__BACKPLANE__USB_ENABLED=false \
+  -e MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+  -e MUJINA__BOARDS__CPU_MINER__THREADS=2 \
   mujina-minerd:latest
 ```
 

@@ -222,7 +222,7 @@ impl Backplane {
                     "CPU miner board connected."
                 );
 
-                let conn = match (descriptor.create_fn)().await {
+                let conn = match (descriptor.create_fn)(device_info.clone()).await {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(

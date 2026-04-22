@@ -3,8 +3,6 @@
 //! This module handles the core daemon functionality including initialization,
 //! task management, signal handling, and graceful shutdown.
 
-use std::env;
-
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -15,7 +13,7 @@ use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     asic::hash_thread::HashThread,
     backplane::Backplane,
-    cpu_miner::CpuMinerConfig,
+    config::Config,
     job_source::{
         SourceCommand, SourceEvent,
         dummy::DummySource,
@@ -29,48 +27,61 @@ use crate::{
 
 /// The main daemon.
 pub struct Daemon {
+    config: Config,
     shutdown: CancellationToken,
     tracker: TaskTracker,
 }
 
 impl Daemon {
-    /// Create a new daemon instance.
-    pub fn new() -> Self {
+    /// Create a new daemon instance with the provided configuration.
+    pub fn new(config: Config) -> Self {
         Self {
+            config,
             shutdown: CancellationToken::new(),
             tracker: TaskTracker::new(),
         }
     }
 
+    /// Return a cancellation token that triggers a clean shutdown when cancelled.
+    ///
+    /// Call this before [`run`] (which consumes `self`), then cancel the token
+    /// from a test or management interface to stop the daemon without a signal.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
+        let config = self.config;
+
         // Create channels for component communication
         let (transport_tx, transport_rx) = mpsc::channel::<TransportEvent>(100);
         let (thread_tx, thread_rx) = mpsc::channel::<Box<dyn HashThread>>(10);
         let (source_reg_tx, source_reg_rx) = mpsc::channel::<SourceRegistration>(10);
 
         // Create and start USB transport discovery
-        if std::env::var("MUJINA_USB_DISABLE").is_err() {
+        if config.backplane.usb_enabled {
             let usb_transport = UsbTransport::new(transport_tx.clone());
             if let Err(e) = usb_transport.start_discovery(self.shutdown.clone()).await {
                 error!("Failed to start USB discovery: {}", e);
             }
         } else {
-            info!("USB discovery disabled (MUJINA_USB_DISABLE set)");
+            info!("USB discovery disabled (backplane.usb_enabled = false)");
         }
 
         // Inject CPU miner virtual device if configured
-        if let Some(config) = CpuMinerConfig::from_env() {
+        if config.boards.cpu_miner.enabled {
+            let cpu_cfg = &config.boards.cpu_miner;
             info!(
-                threads = config.thread_count,
-                duty = config.duty_percent,
+                threads = cpu_cfg.threads,
+                duty = cpu_cfg.duty_percent,
                 "CPU miner enabled"
             );
             let event = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
                 CpuDeviceInfo {
-                    device_id: format!("cpu-{}x{}%", config.thread_count, config.duty_percent),
-                    thread_count: config.thread_count,
-                    duty_percent: config.duty_percent,
+                    device_id: format!("cpu-{}x{}%", cpu_cfg.threads, cpu_cfg.duty_percent),
+                    thread_count: cpu_cfg.threads,
+                    duty_percent: cpu_cfg.duty_percent,
                 },
             ));
             if let Err(e) = transport_tx.send(event).await {
@@ -100,29 +111,24 @@ impl Daemon {
             }
         });
 
-        // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        // Create job source (Stratum v1 or Dummy).
+        // pool.url in the config selects Stratum v1; absent means dummy source.
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
+        if let Some(pool_url) = config.pool.url.clone() {
             // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
-
             let stratum_config = StratumPoolConfig {
                 url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
+                username: config.pool.user.clone(),
+                password: config.pool.password.clone(),
                 user_agent: "mujina-miner/0.1.0-alpha".to_string(),
             };
 
             // Optionally wrap with ForcedRateSource for testing
-            if let Some(forced_rate_config) = ForcedRateConfig::from_env() {
+            if let Some(forced_rate_config) = config.pool.forced_rate.map(|rate| ForcedRateConfig {
+                target_rate: crate::types::ShareRate::per_minute(rate),
+            }) {
                 info!(
                     rate = %forced_rate_config.target_rate,
                     "Forced share rate wrapper enabled"
@@ -199,7 +205,7 @@ impl Daemon {
             }
         } else {
             // Use DummySource
-            info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
+            info!("Using dummy job source (set pool.url or MUJINA__POOL__URL to use Stratum v1)");
 
             let dummy_source = DummySource::new(
                 source_cmd_rx,
@@ -240,20 +246,15 @@ impl Daemon {
         ));
 
         // Start the API server
+        let api_listen = config.api.listen.clone();
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
-                // ASCII 'M' (77) + 'U' (85) = 7785
-                const API_PORT: u16 = 7785;
-
-                let bind_addr = match env::var("MUJINA_API_LISTEN") {
-                    Ok(addr) if addr.contains(':') => addr,
-                    Ok(addr) => format!("{addr}:{API_PORT}"),
-                    Err(_) => format!("127.0.0.1:{API_PORT}"),
+                let api_config = ApiConfig {
+                    bind_addr: api_listen,
                 };
-                let config = ApiConfig { bind_addr };
                 if let Err(e) = api::serve(
-                    config,
+                    api_config,
                     shutdown,
                     miner_telemetry_rx,
                     board_reg_rx,
@@ -275,13 +276,16 @@ impl Daemon {
         let mut sigint = unix::signal(SignalKind::interrupt())?;
         let mut sigterm = unix::signal(SignalKind::terminate())?;
 
-        // Wait for shutdown signal
+        // Wait for shutdown signal or programmatic cancellation
         tokio::select! {
             _ = sigint.recv() => {
                 info!("Received SIGINT.");
             },
             _ = sigterm.recv() => {
                 info!("Received SIGTERM.");
+            },
+            _ = self.shutdown.cancelled() => {
+                info!("Shutdown requested programmatically.");
             },
         }
 
@@ -298,6 +302,6 @@ impl Daemon {
 
 impl Default for Daemon {
     fn default() -> Self {
-        Self::new()
+        Self::new(Config::default())
     }
 }

@@ -163,8 +163,8 @@ body:
       placeholder: |
         Environment variables:
         RUST_LOG=debug
-        MUJINA_POOL_URL=stratum+tcp://pool.example.com:3333
-        MUJINA_POOL_USER=your_wallet.worker_name
+        MUJINA__POOL__URL=stratum+tcp://pool.example.com:3333
+        MUJINA__POOL__USER=your_wallet.worker_name
       render: bash
     validations:
       required: false

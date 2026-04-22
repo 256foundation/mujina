@@ -3,7 +3,8 @@
 //! Provides a virtual board that uses CPU cores for SHA-256 hashing.
 //! See [`CpuMinerConfig`] for environment variable configuration.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use futures::future::BoxFuture;
 use tokio::sync::watch;
 
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
@@ -11,19 +12,22 @@ use crate::{
     api_client::types::BoardTelemetry,
     asic::hash_thread::HashThread,
     cpu_miner::{CpuHashThread, CpuMinerConfig},
+    transport::cpu::CpuDeviceInfo,
 };
 
 inventory::submit! {
     VirtualBoardDescriptor {
         device_type: "cpu_miner",
         name: "CPU Miner",
-        create_fn: || Box::pin(create_cpu_board()),
+        create_fn: |info| Box::pin(create_cpu_board(info)),
     }
 }
 
-async fn create_cpu_board() -> Result<BackplaneConnector> {
-    let config = CpuMinerConfig::from_env()
-        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
+async fn create_cpu_board(device_info: CpuDeviceInfo) -> Result<BackplaneConnector> {
+    let config = CpuMinerConfig {
+        thread_count: device_info.thread_count,
+        duty_percent: device_info.duty_percent,
+    };
 
     let info = BoardInfo {
         model: "CPU Miner".into(),
@@ -40,7 +44,7 @@ async fn create_cpu_board() -> Result<BackplaneConnector> {
         serial: info.serial_number.clone(),
         ..Default::default()
     };
-    let (_telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
 
     let threads: Vec<Box<dyn HashThread>> = (0..config.thread_count)
         .map(|i| {
@@ -51,10 +55,17 @@ async fn create_cpu_board() -> Result<BackplaneConnector> {
         })
         .collect();
 
+    // Keep the telemetry sender alive until the board is shut down.
+    // Without this, the watch channel closes immediately and the API
+    // registry prunes the board as disconnected.
+    let shutdown: BoxFuture<'static, ()> = Box::pin(async move {
+        drop(telemetry_tx);
+    });
+
     Ok(BackplaneConnector {
         info,
         threads,
         telemetry_rx,
-        shutdown: None,
+        shutdown: Some(shutdown),
     })
 }

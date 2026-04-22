@@ -55,7 +55,9 @@ On Debian or Ubuntu:
 git clone https://github.com/256foundation/mujina.git
 cd mujina
 sudo apt-get install libudev-dev libssl-dev
-MUJINA_CPUMINER_THREADS=1 MUJINA_CPUMINER_DUTY=50 MUJINA_USB_DISABLE=1 \
+MUJINA__BOARDS__CPU_MINER__ENABLED=true \
+MUJINA__BOARDS__CPU_MINER__THREADS=1 \
+MUJINA__BACKPLANE__USB_ENABLED=false \
   cargo run --bin mujina-minerd
 ```
 
@@ -120,22 +122,81 @@ without `just` installed.
 
 ## Running
 
-Mujina is currently configured through environment variables.
-Persistent configuration via the REST API and CLI will follow as those
-interfaces mature.
+Configuration is managed through a YAML config file, environment variables, or
+CLI flags. See [Configuration](docs/configuration.md) for the full reference.
 
 ### Connecting to a job source
 
 Point Mujina at a Stratum v1 mining pool:
 
 ```bash
-MUJINA_POOL_URL="stratum+tcp://pool.example.com:3333" \
-MUJINA_POOL_USER="your-address.worker" \
+MUJINA__POOL__URL="stratum+tcp://localhost:3333" \
+MUJINA__POOL__USER="bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina" \
+MUJINA__POOL__PASSWORD="custom-password" \
+cargo run
+```
+
+The password defaults to "x" if not specified.
+
+Without `pool.url` set, the miner runs with a dummy job source that generates
+synthetic mining work, useful for testing hardware without a pool connection.
+
+### API Server
+
+The REST API listens on `127.0.0.1:7785` by default. To listen
+on all interfaces:
+
+```bash
+MUJINA__API__LISTEN="0.0.0.0" cargo run
+```
+
+See [REST API](docs/api.md) for endpoints and details.
+
+### Running Without Hardware
+
+For development and testing without physical mining hardware, the miner
+includes a CPU mining backend. See [CPU Mining](docs/cpu-mining.md) for
+details.
+
+A container image is available for deploying to cloud infrastructure or
+Kubernetes for pool and miner testing. See [Container Image](docs/container.md).
+
+### Log Levels
+
+Control output verbosity with `RUST_LOG`:
+
+```bash
+# Info level (default) -- shows pool connection, shares, errors
+cargo run
+
+# Debug level -- adds job distribution, hardware state changes
+RUST_LOG=mujina_miner=debug cargo run
+
+# Trace level -- shows all protocol traffic (serial, network, I2C)
+RUST_LOG=mujina_miner=trace cargo run
+```
+
+Target specific modules for focused debugging:
+
+```bash
+# Trace just the Stratum v1 client
+RUST_LOG=mujina_miner::stratum_v1=trace cargo run
+
+# Debug Stratum v1, trace BM13xx protocol
+RUST_LOG=mujina_miner::stratum_v1=debug,mujina_miner::asic::bm13xx=trace cargo run
+```
+
+Combine pool configuration with logging as needed:
+
+```bash
+RUST_LOG=mujina_miner=debug \
+MUJINA__POOL__URL="stratum+tcp://pool.example.com:3333" \
+MUJINA__POOL__USER="your-address.worker" \
 cargo run --bin mujina-minerd
 ```
 
-`MUJINA_POOL_USER` defaults to `mujina-testing` and `MUJINA_POOL_PASS`
-defaults to `x`, so only `MUJINA_POOL_URL` is strictly required.
+`MUJINA__POOL__USER` defaults to `mujina-testing` and `MUJINA__POOL__PASSWORD`
+defaults to `x`, so only `MUJINA__POOL__URL` is strictly required.
 
 ### Testing without a pool
 
@@ -178,10 +239,10 @@ Mujina logs the API bind address at startup. By default it's
 
 ```bash
 # All interfaces, default port
-MUJINA_API_LISTEN="0.0.0.0" cargo run --bin mujina-minerd
+MUJINA__API__LISTEN="0.0.0.0" cargo run --bin mujina-minerd
 
 # All interfaces, custom port
-MUJINA_API_LISTEN="0.0.0.0:9000" cargo run --bin mujina-minerd
+MUJINA__API__LISTEN="0.0.0.0:9000" cargo run --bin mujina-minerd
 ```
 
 See [REST API](docs/api.md) for endpoints and conventions. The
