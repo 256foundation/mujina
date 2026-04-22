@@ -563,11 +563,11 @@ async fn discover_chips(
                 match response {
                     Some(Ok(bm13xx::Response::ReadRegister {
                         chip_address: _,
-                        register: bm13xx::Register::ChipId { chip_type, core_count, address }
+                        register: bm13xx::Register::ChipId { model, core_count, address }
                     })) => {
-                        let chip_id = chip_type.id_bytes();
+                        let chip_id = model.id_bytes();
                         debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
-                                     chip_type, chip_id[0], chip_id[1]);
+                                     model, chip_id[0], chip_id[1]);
 
                         chip_infos.push(ChipInfo {
                             chip_id,
