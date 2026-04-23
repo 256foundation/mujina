@@ -882,13 +882,19 @@ impl Command {
                     CommandFlagsCmd::WriteRegisterOrJob,
                 ));
 
-                const JOB_DATA_LEN: u8 = 82; // Size of JobFullFormat
-                const FLAGS_LEN: u8 = 1;
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 2; // Jobs use CRC16, not CRC5
-                const TOTAL_LEN: u8 = FLAGS_LEN + LENGTH_FIELD_LEN + JOB_DATA_LEN + CRC_LEN;
-
-                dst.put_u8(TOTAL_LEN);
+                // Captures from factory firmware use this value on both BM1362
+                // (S19 J Pro) and BM1370 (S21 Pro). esp-miner firmware on
+                // Bitaxe sends 86 instead; the BM1370 appears to tolerate
+                // both.
+                //
+                // Hypothesis for why 54: a single midstate JobMidstate frame
+                // is exactly 54 bytes on the wire (flags + length + header +
+                // midstate0 + crc16). JobFull transmits 88 bytes but declares
+                // its length as if the frame were in midstate format, where
+                // prev_block_hash is folded into midstate0 rather than sent
+                // raw.
+                const JOB_LENGTH_BYTE: u8 = 54;
+                dst.put_u8(JOB_LENGTH_BYTE);
 
                 // Write job data
                 // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
@@ -1314,6 +1320,11 @@ mod init_tests {
 #[cfg(test)]
 mod command_tests {
     use super::*;
+    use crate::asic::bm13xx::test_data::s19jpro_job;
+    use bitcoin::block::Version;
+    use bitcoin::hash_types::TxMerkleNode;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{BlockHash, CompactTarget};
 
     #[test]
     fn read_register() {
@@ -1518,7 +1529,7 @@ mod command_tests {
         // Verify packet structure
         assert_eq!(&frame[0..2], &[0x55, 0xaa]); // Preamble
         assert_eq!(frame[2], 0x21); // TYPE_JOB | GROUP_SINGLE | CMD_WRITE
-        assert_eq!(frame[3], 86); // Total length
+        assert_eq!(frame[3], 54); // Length byte per factory captures (not a byte count)
         assert_eq!(frame[4], job.job_id);
         assert_eq!(frame[5], job.num_midstates);
         assert_eq!(&frame[6..10], &job.starting_nonce.to_le_bytes());
@@ -1593,12 +1604,52 @@ mod command_tests {
             )
             .expect("Failed to encode job command");
 
-        // Verify our encoding exactly matches the hardware capture
-        assert_eq!(
-            frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "JobFull encoding doesn't match hardware capture"
-        );
+        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
+        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
+        assert_eq!(&frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
+    }
+
+    #[test]
+    fn job_full_matches_s19jpro_factory_capture() {
+        let job = job_full_from_wire(&s19jpro_job::wire_tx::FRAME);
+
+        let mut codec = FrameCodec;
+        let mut frame = BytesMut::new();
+        codec
+            .encode(Command::JobFull { job_data: job }, &mut frame)
+            .expect("Failed to encode job command");
+
+        // Byte-for-byte match, length byte and CRC16 included: the
+        // encoder reproduces factory firmware exactly.
+        assert_eq!(&frame[..], &s19jpro_job::wire_tx::FRAME[..]);
+    }
+
+    /// Builds a JobFullFormat from a captured JobFull wire frame.
+    fn job_full_from_wire(frame: &[u8; 88]) -> JobFullFormat {
+        // The wire sends each 32-byte hash as eight 4-byte words, most
+        // significant word first; internal order reverses the words.
+        fn hash_from_wire(wire: &[u8]) -> [u8; 32] {
+            let mut internal = [0u8; 32];
+            for i in 0..8 {
+                internal[(7 - i) * 4..(8 - i) * 4].copy_from_slice(&wire[i * 4..(i + 1) * 4]);
+            }
+            internal
+        }
+
+        JobFullFormat {
+            job_id: frame[4] >> 3,
+            num_midstates: frame[5],
+            starting_nonce: u32::from_le_bytes(frame[6..10].try_into().unwrap()),
+            nbits: CompactTarget::from_consensus(u32::from_le_bytes(
+                frame[10..14].try_into().unwrap(),
+            )),
+            ntime: u32::from_le_bytes(frame[14..18].try_into().unwrap()),
+            merkle_root: TxMerkleNode::from_byte_array(hash_from_wire(&frame[18..50])),
+            prev_block_hash: BlockHash::from_byte_array(hash_from_wire(&frame[50..82])),
+            version: Version::from_consensus(
+                u32::from_le_bytes(frame[82..86].try_into().unwrap()) as i32
+            ),
+        }
     }
 
     fn assert_frame_eq(cmd: Command, expect: &[u8]) {
@@ -1651,12 +1702,9 @@ mod command_tests {
             .encode(Command::JobFull { job_data: job }, &mut frame)
             .expect("Failed to encode job command");
 
-        // Verify our encoding exactly matches the wire capture
-        assert_eq!(
-            frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "JobFull encoding doesn't match hardware capture"
-        );
+        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
+        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
+        assert_eq!(&frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
     }
 }
 
@@ -2139,11 +2187,9 @@ mod response_tests {
             )
             .expect("Should encode JobFull command");
 
-        assert_eq!(
-            tx_frame.as_ref(),
-            &esp_miner_job::wire_tx::FRAME,
-            "TX frame should match hardware capture"
-        );
+        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
+        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
+        assert_eq!(&tx_frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
 
         let rx_response =
             decode_frame(&esp_miner_job::wire_rx::FRAME).expect("Should decode RX frame");
