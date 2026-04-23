@@ -705,8 +705,9 @@ pub fn hash_from_wire_bytes(wire_bytes: &[u8; 32]) -> [u8; 32] {
     hash
 }
 
+/// TYPE=2 frames: register reads/writes and chain addressing. Use CRC5.
 #[derive(Debug)]
-pub enum Command {
+pub enum RegisterCommand {
     /// Assign an address to the first unaddressed chip via daisy-chain forwarding
     SetChipAddress { chip_address: u8 },
     /// Put all chips into addressing mode (enables daisy-chain forwarding)
@@ -723,6 +724,11 @@ pub enum Command {
         chip_address: u8,
         register: Register,
     },
+}
+
+/// TYPE=1 frames: mining jobs. Use CRC16.
+#[derive(Debug)]
+pub enum JobCommand {
     /// Send a job with full block header (BM1370/BM1362 style)
     /// Chip calculates midstates internally
     JobFull { job_data: JobFullFormat },
@@ -773,20 +779,20 @@ pub struct JobMidstateFormat {
     pub midstate3: Option<[u8; 32]>, // Optional for version rolling
 }
 
-impl Command {
-    fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> u8 {
-        let mut flags = 0u8;
-        let field = flags.view_bits_mut::<Lsb0>();
-        field[5..7].store(typ as u8);
-        field[4..5].store(broadcast as u8);
-        field[0..4].store(cmd as u8);
-        flags
-    }
+fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> u8 {
+    let mut flags = 0u8;
+    let field = flags.view_bits_mut::<Lsb0>();
+    field[5..7].store(typ as u8);
+    field[4..5].store(broadcast as u8);
+    field[0..4].store(cmd as u8);
+    flags
+}
 
+impl RegisterCommand {
     fn encode(&self, dst: &mut BytesMut) {
         match self {
-            Command::SetChipAddress { chip_address } => {
-                dst.put_u8(Self::build_flags(
+            Self::SetChipAddress { chip_address } => {
+                dst.put_u8(build_flags(
                     CommandFlagsType::Command,
                     false, // Never broadcast
                     CommandFlagsCmd::SetChipAddress,
@@ -804,8 +810,8 @@ impl Command {
                 dst.put_u8(*chip_address);
                 dst.put_u8(0x00); // Reserved byte (always 0x00)
             }
-            Command::ChainInactive => {
-                dst.put_u8(Self::build_flags(
+            Self::ChainInactive => {
+                dst.put_u8(build_flags(
                     CommandFlagsType::Command,
                     true, // Always broadcast
                     CommandFlagsCmd::ChainInactive,
@@ -823,12 +829,12 @@ impl Command {
                 dst.put_u8(0x00); // Reserved byte
                 dst.put_u8(0x00); // Reserved byte
             }
-            Command::ReadRegister {
+            Self::ReadRegister {
                 broadcast,
                 chip_address,
                 register_address,
             } => {
-                dst.put_u8(Self::build_flags(
+                dst.put_u8(build_flags(
                     CommandFlagsType::Command,
                     *broadcast,
                     CommandFlagsCmd::ReadRegister,
@@ -846,12 +852,12 @@ impl Command {
                 dst.put_u8(*chip_address);
                 dst.put_u8(*register_address as u8);
             }
-            Command::WriteRegister {
+            Self::WriteRegister {
                 broadcast,
                 chip_address,
                 register,
             } => {
-                dst.put_u8(Self::build_flags(
+                dst.put_u8(build_flags(
                     CommandFlagsType::Command,
                     *broadcast,
                     CommandFlagsCmd::WriteRegisterOrJob,
@@ -875,8 +881,15 @@ impl Command {
                 dst.put_u8(register.address() as u8);
                 register.encode_data(dst);
             }
-            Command::JobFull { job_data } => {
-                dst.put_u8(Self::build_flags(
+        }
+    }
+}
+
+impl JobCommand {
+    fn encode(&self, dst: &mut BytesMut) {
+        match self {
+            Self::JobFull { job_data } => {
+                dst.put_u8(build_flags(
                     CommandFlagsType::Job,
                     false, // Jobs are never broadcast
                     CommandFlagsCmd::WriteRegisterOrJob,
@@ -915,8 +928,8 @@ impl Command {
 
                 dst.put_u32_le(job_data.version.to_consensus() as u32);
             }
-            Command::JobMidstate { job_data } => {
-                dst.put_u8(Self::build_flags(
+            Self::JobMidstate { job_data } => {
+                dst.put_u8(build_flags(
                     CommandFlagsType::Job,
                     false, // Jobs are never broadcast
                     CommandFlagsCmd::WriteRegisterOrJob,
@@ -1046,32 +1059,41 @@ impl Response {
 #[derive(Default)]
 pub struct FrameCodec;
 
-impl Encoder<Command> for FrameCodec {
+impl Encoder<RegisterCommand> for FrameCodec {
     type Error = io::Error;
 
-    fn encode(&mut self, command: Command, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, command: RegisterCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
         const PREAMBLE: [u8; 2] = [0x55, 0xaa];
         dst.put_slice(&PREAMBLE);
 
         let start_pos = dst.len();
         command.encode(dst);
+        let crc = crc5(&dst[start_pos..]);
+        dst.put_u8(crc);
 
-        // Jobs use CRC16, other commands use CRC5
-        match &command {
-            Command::JobFull { .. } | Command::JobMidstate { .. } => {
-                // Calculate CRC16 over flags + length + data
-                let crc = crc16(&dst[start_pos..]);
-                // Wire format: CRC transmitted big-endian (high byte, low byte)
-                dst.put_slice(&crc.to_be_bytes());
-            }
-            _ => {
-                // Calculate CRC5 over everything after preamble
-                let crc = crc5(&dst[2..]);
-                dst.put_u8(crc);
-            }
-        }
+        trace!(
+            cmd = ?command,
+            bytes = dst.len(),
+            frame = %HexBytes(dst.as_ref()),
+            "TX BM13xx"
+        );
 
-        // Log the encoded frame for debugging
+        Ok(())
+    }
+}
+
+impl Encoder<JobCommand> for FrameCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, command: JobCommand, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        const PREAMBLE: [u8; 2] = [0x55, 0xaa];
+        dst.put_slice(&PREAMBLE);
+
+        let start_pos = dst.len();
+        command.encode(dst);
+        let crc = crc16(&dst[start_pos..]);
+        dst.put_slice(&crc.to_be_bytes());
+
         trace!(
             cmd = ?command,
             bytes = dst.len(),
@@ -1174,7 +1196,7 @@ mod init_tests {
         // Verify the sequence starts with version rolling enable
         assert!(matches!(
             &commands[0],
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::VersionMask(_),
@@ -1184,7 +1206,7 @@ mod init_tests {
         // Verify chain inactive command
         let chain_inactive_pos = commands
             .iter()
-            .position(|c| matches!(c, Command::ChainInactive))
+            .position(|c| matches!(c, RegisterCommand::ChainInactive))
             .expect("ChainInactive command not found in initialization sequence");
         assert!(chain_inactive_pos > 0);
 
@@ -1192,7 +1214,7 @@ mod init_tests {
         let first_address_pos = chain_inactive_pos + 1;
         assert!(matches!(
             &commands[first_address_pos],
-            Command::SetChipAddress { chip_address: 0x00 }
+            RegisterCommand::SetChipAddress { chip_address: 0x00 }
         ));
 
         // Verify we have 65 address assignments
@@ -1204,7 +1226,7 @@ mod init_tests {
         // Verify addresses increment by 2
         for (i, cmd) in address_commands.iter().enumerate() {
             match cmd {
-                Command::SetChipAddress { chip_address } => {
+                RegisterCommand::SetChipAddress { chip_address } => {
                     assert_eq!(*chip_address, (i * 2) as u8);
                 }
                 _ => panic!("Expected SetChipAddress command, got {:?}", cmd),
@@ -1223,7 +1245,7 @@ mod init_tests {
             .filter(|c| {
                 matches!(
                     c,
-                    Command::WriteRegister {
+                    RegisterCommand::WriteRegister {
                         register: Register::IoDriverStrength { .. },
                         ..
                     }
@@ -1234,7 +1256,7 @@ mod init_tests {
 
         // Check first domain boundary (chip 8 = address 0x08)
         let first_boundary = io_strength_commands[0];
-        if let Command::WriteRegister {
+        if let RegisterCommand::WriteRegister {
             chip_address,
             register: Register::IoDriverStrength(strength),
             ..
@@ -1254,7 +1276,7 @@ mod init_tests {
         // Test single chip - full range
         let commands = protocol.configure_nonce_ranges(1);
         assert_eq!(commands.len(), 1);
-        if let Command::WriteRegister {
+        if let RegisterCommand::WriteRegister {
             register: Register::NonceRange(config),
             broadcast: true,
             ..
@@ -1267,7 +1289,7 @@ mod init_tests {
         // Test S21 Pro configuration (65 chips)
         let commands = protocol.configure_nonce_ranges(65);
         assert_eq!(commands.len(), 1);
-        if let Command::WriteRegister {
+        if let RegisterCommand::WriteRegister {
             register: Register::NonceRange(config),
             ..
         } = &commands[0]
@@ -1278,7 +1300,7 @@ mod init_tests {
 
         // Test small chain
         let commands = protocol.configure_nonce_ranges(8);
-        if let Command::WriteRegister {
+        if let RegisterCommand::WriteRegister {
             register: Register::NonceRange(config),
             ..
         } = &commands[0]
@@ -1297,7 +1319,7 @@ mod init_tests {
         let nonce_range_cmd = commands.iter().find(|c| {
             matches!(
                 c,
-                Command::WriteRegister {
+                RegisterCommand::WriteRegister {
                     register: Register::NonceRange { .. },
                     ..
                 }
@@ -1306,7 +1328,7 @@ mod init_tests {
 
         assert!(nonce_range_cmd.is_some());
 
-        if let Some(Command::WriteRegister {
+        if let Some(RegisterCommand::WriteRegister {
             register: Register::NonceRange(config),
             ..
         }) = nonce_range_cmd
@@ -1329,7 +1351,7 @@ mod command_tests {
     #[test]
     fn read_register() {
         assert_frame_eq(
-            Command::ReadRegister {
+            RegisterCommand::ReadRegister {
                 broadcast: true,
                 chip_address: 0,
                 register_address: RegisterAddress::ChipId,
@@ -1341,7 +1363,7 @@ mod command_tests {
     #[test]
     fn write_register_chip_address() {
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: false,
                 chip_address: 0x01,
                 register: Register::ChipId {
@@ -1361,7 +1383,7 @@ mod command_tests {
     fn write_version_mask_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 A4 90 00 FF FF 1C
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true, // 0x51 = broadcast
                 chip_address: 0x00,
                 register: Register::VersionMask(VersionMask::full_rolling()),
@@ -1377,7 +1399,7 @@ mod command_tests {
         // From Bitaxe capture: TX: 55 AA 51 09 00 A8 00 07 00 00 03
         // Value 0x00 07 00 00 in little-endian = 0x00000700
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::InitControl {
@@ -1394,7 +1416,7 @@ mod command_tests {
     fn write_misc_control_from_capture() {
         // From Bitaxe capture: TX: 55 AA 51 09 00 18 F0 00 C1 00 04
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::MiscControl {
@@ -1411,7 +1433,7 @@ mod command_tests {
     fn chain_inactive_from_capture() {
         // From S21 Pro capture: TX: 55 AA 53 05 00 00 03
         assert_frame_eq(
-            Command::ChainInactive,
+            RegisterCommand::ChainInactive,
             &[0x55, 0xaa, 0x53, 0x05, 0x00, 0x00, 0x03],
         );
     }
@@ -1420,7 +1442,7 @@ mod command_tests {
     fn set_chip_address_from_capture() {
         // From S21 Pro capture: TX: 55 AA 40 05 04 00 03 (assign address 0x04)
         assert_frame_eq(
-            Command::SetChipAddress { chip_address: 0x04 },
+            RegisterCommand::SetChipAddress { chip_address: 0x04 },
             &[0x55, 0xaa, 0x40, 0x05, 0x04, 0x00, 0x03],
         );
     }
@@ -1430,7 +1452,7 @@ mod command_tests {
         // From Bitaxe capture: TX: 55 AA 51 09 00 3C 80 00 8B 00 12
         // Core register uses big-endian encoding
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::Core {
@@ -1449,7 +1471,7 @@ mod command_tests {
         // Difficulty 256 = 8 zero_bits
         let log2_diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::TicketMask(TicketMask::new(log2_diff)),
@@ -1464,7 +1486,7 @@ mod command_tests {
     fn write_nonce_range_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 10 00 00 1E B5 0F
         assert_frame_eq(
-            Command::WriteRegister {
+            RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
                 register: Register::NonceRange(NonceRangeConfig::multi_chip(65)),
@@ -1519,7 +1541,7 @@ mod command_tests {
         let mut frame = BytesMut::new();
         codec
             .encode(
-                Command::JobFull {
+                JobCommand::JobFull {
                     job_data: job.clone(),
                 },
                 &mut frame,
@@ -1597,7 +1619,7 @@ mod command_tests {
         let mut frame = BytesMut::new();
         codec
             .encode(
-                Command::JobFull {
+                JobCommand::JobFull {
                     job_data: job.clone(),
                 },
                 &mut frame,
@@ -1616,7 +1638,7 @@ mod command_tests {
         let mut codec = FrameCodec;
         let mut frame = BytesMut::new();
         codec
-            .encode(Command::JobFull { job_data: job }, &mut frame)
+            .encode(JobCommand::JobFull { job_data: job }, &mut frame)
             .expect("Failed to encode job command");
 
         // Byte-for-byte match, length byte and CRC16 included: the
@@ -1652,7 +1674,10 @@ mod command_tests {
         }
     }
 
-    fn assert_frame_eq(cmd: Command, expect: &[u8]) {
+    fn assert_frame_eq<C>(cmd: C, expect: &[u8])
+    where
+        FrameCodec: Encoder<C, Error = io::Error>,
+    {
         let mut codec = FrameCodec;
         let mut frame = BytesMut::new();
         codec
@@ -2149,7 +2174,7 @@ mod response_tests {
         let mut tx_frame = BytesMut::new();
         codec
             .encode(
-                Command::JobFull {
+                JobCommand::JobFull {
                     job_data: job.clone(),
                 },
                 &mut tx_frame,
@@ -2326,8 +2351,8 @@ impl BM13xxProtocol {
     }
 
     /// Helper to create a broadcast write command
-    fn broadcast_write(&self, register: Register) -> Command {
-        Command::WriteRegister {
+    fn broadcast_write(&self, register: Register) -> RegisterCommand {
+        RegisterCommand::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register,
@@ -2336,8 +2361,8 @@ impl BM13xxProtocol {
 
     /// Helper to create a targeted write command
     #[cfg_attr(not(test), allow(dead_code))]
-    fn write_to(&self, chip_address: u8, register: Register) -> Command {
-        Command::WriteRegister {
+    fn write_to(&self, chip_address: u8, register: Register) -> RegisterCommand {
+        RegisterCommand::WriteRegister {
             broadcast: false,
             chip_address,
             register,
@@ -2357,7 +2382,7 @@ impl BM13xxProtocol {
         &self,
         chip_config: &ChipConfig,
         frequency: Frequency,
-    ) -> Option<Vec<Command>> {
+    ) -> Option<Vec<RegisterCommand>> {
         let pll_config = chip_config.calculate_pll(frequency)?;
         Some(vec![
             self.broadcast_write(Register::VersionMask(VersionMask::full_rolling())),
@@ -2374,7 +2399,7 @@ impl BM13xxProtocol {
     /// 4. Configure domain boundaries
     /// 5. Ramp up frequency gradually
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn multi_chip_init(&self, chain_length: usize) -> Vec<Command> {
+    pub fn multi_chip_init(&self, chain_length: usize) -> Vec<RegisterCommand> {
         // Multi-chip initialization register values
         const INIT_CONTROL_VALUE: u32 = 0x00000700;
         const MISC_CONTROL_MULTI_CHIP: u32 = 0x0000c1f0;
@@ -2399,12 +2424,12 @@ impl BM13xxProtocol {
         }));
 
         // Step 4: Set chain inactive for address assignment
-        commands.push(Command::ChainInactive);
+        commands.push(RegisterCommand::ChainInactive);
 
         // Step 5: Assign addresses (increment by 2)
         for i in 0..chain_length {
             let address = (i as u8) * ADDRESS_INCREMENT;
-            commands.push(Command::SetChipAddress {
+            commands.push(RegisterCommand::SetChipAddress {
                 chip_address: address,
             });
         }
@@ -2435,7 +2460,11 @@ impl BM13xxProtocol {
     /// Domains are groups of chips that share signal integrity settings.
     /// This configures IO driver strength and UART relay for domain boundaries.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn configure_domains(&self, chain_length: usize, chips_per_domain: usize) -> Vec<Command> {
+    pub fn configure_domains(
+        &self,
+        chain_length: usize,
+        chips_per_domain: usize,
+    ) -> Vec<RegisterCommand> {
         const UART_RELAY_BASE: u32 = 0x03000000;
         const ADDRESS_INCREMENT: u8 = 2;
 
@@ -2488,7 +2517,7 @@ impl BM13xxProtocol {
     /// This distributes the 32-bit nonce space across all chips in the chain
     /// to avoid duplicate work. Each chip searches a unique portion of the nonce space.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn configure_nonce_ranges(&self, chain_length: usize) -> Vec<Command> {
+    pub fn configure_nonce_ranges(&self, chain_length: usize) -> Vec<RegisterCommand> {
         let mut commands = Vec::new();
 
         // Calculate nonce range based on chain length
@@ -2501,8 +2530,8 @@ impl BM13xxProtocol {
     }
 
     /// Create a command to read a register.
-    pub fn read_register(&self, chip_address: u8, register: RegisterAddress) -> Command {
-        Command::ReadRegister {
+    pub fn read_register(&self, chip_address: u8, register: RegisterAddress) -> RegisterCommand {
+        RegisterCommand::ReadRegister {
             broadcast: false,
             chip_address,
             register_address: register,
@@ -2510,8 +2539,8 @@ impl BM13xxProtocol {
     }
 
     /// Set UART baud rate on all chips
-    pub fn set_baudrate(&self, baudrate: BaudRate) -> Command {
-        Command::WriteRegister {
+    pub fn set_baudrate(&self, baudrate: BaudRate) -> RegisterCommand {
+        RegisterCommand::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: Register::UartBaud(baudrate),
@@ -2526,7 +2555,7 @@ impl BM13xxProtocol {
         chip_address: u8,
         register: RegisterAddress,
         value: u32,
-    ) -> Result<Command, ProtocolError> {
+    ) -> Result<RegisterCommand, ProtocolError> {
         // TODO: Properly encode register based on type
         // For now, just handle RegA8 as an example
         let register_value = match register {
@@ -2566,7 +2595,7 @@ impl BM13xxProtocol {
             RegisterAddress::MiscSettings => Register::MiscSettings { raw_value: value },
         };
 
-        Ok(Command::WriteRegister {
+        Ok(RegisterCommand::WriteRegister {
             broadcast: false,
             chip_address,
             register: register_value,
@@ -2574,8 +2603,8 @@ impl BM13xxProtocol {
     }
 
     /// Create a broadcast command to discover all chips.
-    pub fn discover_chips() -> Command {
-        Command::ReadRegister {
+    pub fn discover_chips() -> RegisterCommand {
+        RegisterCommand::ReadRegister {
             broadcast: true,
             chip_address: 0,
             register_address: RegisterAddress::ChipId,

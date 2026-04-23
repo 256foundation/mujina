@@ -17,7 +17,7 @@ use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
-use super::protocol::{self, Log2Difficulty, TicketMask};
+use super::protocol::{self, JobCommand, Log2Difficulty, Register, RegisterCommand, TicketMask};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -125,7 +125,7 @@ impl BM13xxThread {
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
-    pub fn new<R, W>(
+    pub fn new<R, W, E>(
         name: String,
         chip_responses: R,
         chip_commands: W,
@@ -134,8 +134,8 @@ impl BM13xxThread {
     ) -> Self
     where
         R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
-        W: Sink<protocol::Command> + Unpin + Send + 'static,
-        W::Error: std::fmt::Debug,
+        W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin + Send + 'static,
+        E: std::fmt::Debug + Send + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, evt_rx) = mpsc::channel(100);
@@ -241,17 +241,15 @@ impl HashThread for BM13xxThread {
 /// Initialize BM13xx chip for mining.
 ///
 /// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W>(
+async fn initialize_chip<W, E>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
 ) -> Result<()>
 where
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
+    W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
+    E: std::fmt::Debug,
 {
-    use protocol::{Command, Register};
-
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
         debug!("Enabling ASIC");
@@ -264,13 +262,17 @@ where
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Send a register write command, converting the sink error to anyhow.
-    async fn send_reg<W>(chip_commands: &mut W, broadcast: bool, register: Register) -> Result<()>
+    async fn send_reg<W, E>(
+        chip_commands: &mut W,
+        broadcast: bool,
+        register: Register,
+    ) -> Result<()>
     where
-        W: Sink<protocol::Command> + Unpin,
-        W::Error: std::fmt::Debug,
+        W: Sink<RegisterCommand, Error = E> + Unpin,
+        E: std::fmt::Debug,
     {
         chip_commands
-            .send(Command::WriteRegister {
+            .send(RegisterCommand::WriteRegister {
                 broadcast,
                 chip_address: 0x00,
                 register,
@@ -315,13 +317,13 @@ where
     .await?;
 
     chip_commands
-        .send(Command::ChainInactive)
+        .send(RegisterCommand::ChainInactive)
         .await
         .map_err(|e| anyhow!("{e:?}"))
         .context("failed to send ChainInactive")?;
 
     chip_commands
-        .send(Command::SetChipAddress { chip_address: 0x00 })
+        .send(RegisterCommand::SetChipAddress { chip_address: 0x00 })
         .await
         .map_err(|e| anyhow!("{e:?}"))
         .context("failed to send SetChipAddress")?;
@@ -602,7 +604,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 ///
 /// Chip is disabled on startup to establish known state. Chip is enabled and
 /// configured when scheduler assigns first work.
-async fn bm13xx_thread_actor<R, W>(
+async fn bm13xx_thread_actor<R, W, E>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
@@ -612,8 +614,8 @@ async fn bm13xx_thread_actor<R, W>(
     mut peripherals: BoardPeripherals,
 ) where
     R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
-    W: Sink<protocol::Command> + Unpin,
-    W::Error: std::fmt::Debug,
+    W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
+    E: std::fmt::Debug,
 {
     // Disable ASIC on startup to establish known state
     if let Some(ref mut asic_enable) = peripherals.asic_enable
@@ -693,7 +695,7 @@ async fn bm13xx_thread_actor<R, W>(
                         let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
+                                if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
                                     let err = anyhow!("failed to send job to chip: {e:?}");
                                     response_tx.send(Err(err)).ok();
@@ -746,7 +748,7 @@ async fn bm13xx_thread_actor<R, W>(
                         let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
+                                if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
                                     let err = anyhow!("failed to send job to chip: {e:?}");
                                     response_tx.send(Err(err)).ok();
@@ -906,7 +908,7 @@ async fn bm13xx_thread_actor<R, W>(
                 // Convert to chip format and send
                 match task_to_job_full(task, chip_jobs.insert(task.clone())) {
                     Ok(job_data) => {
-                        if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
+                        if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
                             error!(error = ?e, "Failed to send JobFull to chip");
                         } else {
                             trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
