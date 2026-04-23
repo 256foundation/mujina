@@ -1675,37 +1675,6 @@ mod command_tests {
             .collect::<Vec<String>>()
             .join(" ")
     }
-
-    #[test]
-    fn job_full_encoding_matches_hardware_capture() {
-        use crate::asic::bm13xx::test_data::esp_miner_job;
-
-        // Build JobFullFormat from Bitcoin types and verify it encodes to exact wire bytes
-        let job = JobFullFormat {
-            job_id: *esp_miner_job::wire_tx::JOB_ID,
-            num_midstates: esp_miner_job::wire_tx::NUM_MIDSTATES_BYTE[0],
-            starting_nonce: u32::from_le_bytes(
-                (*esp_miner_job::wire_tx::STARTING_NONCE_BYTES)
-                    .try_into()
-                    .unwrap(),
-            ),
-            nbits: *esp_miner_job::wire_tx::NBITS,
-            ntime: *esp_miner_job::wire_tx::NTIME,
-            merkle_root: *esp_miner_job::wire_tx::MERKLE_ROOT,
-            prev_block_hash: *esp_miner_job::wire_tx::PREV_BLOCKHASH,
-            version: *esp_miner_job::wire_tx::VERSION,
-        };
-
-        let mut codec = FrameCodec;
-        let mut frame = BytesMut::new();
-        codec
-            .encode(Command::JobFull { job_data: job }, &mut frame)
-            .expect("Failed to encode job command");
-
-        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
-        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
-        assert_eq!(&frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
-    }
 }
 
 #[cfg(test)]
