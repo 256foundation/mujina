@@ -35,7 +35,7 @@ impl fmt::Display for HexBytes<'_> {
 
 /// PLL configuration for frequency control.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PllConfig {
+pub struct PllDivider {
     /// VCO control flag (0x40 for low VCO, 0x50 for high VCO).
     pub flag: u8,
     /// Feedback divider.
@@ -46,7 +46,7 @@ pub struct PllConfig {
     pub post_div: u8,
 }
 
-impl PllConfig {
+impl PllDivider {
     /// Create a PLL configuration, deriving the VCO flag from the
     /// resulting VCO frequency: `vco >= 2400 MHz` picks flag `0x50`,
     /// otherwise flag `0x40`.
@@ -62,7 +62,7 @@ impl PllConfig {
     }
 }
 
-impl From<u32> for PllConfig {
+impl From<u32> for PllDivider {
     fn from(raw: u32) -> Self {
         Self {
             flag: (raw & 0xff) as u8,
@@ -73,8 +73,8 @@ impl From<u32> for PllConfig {
     }
 }
 
-impl From<PllConfig> for [u8; 4] {
-    fn from(config: PllConfig) -> Self {
+impl From<PllDivider> for [u8; 4] {
+    fn from(config: PllDivider) -> Self {
         [config.flag, config.fb_div, config.ref_div, config.post_div]
     }
 }
@@ -141,12 +141,12 @@ impl From<ChipModel> for [u8; 2] {
 /// because the exact bit-level interpretation is still being reverse-engineered.
 /// The values below are empirically observed from production hardware.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NonceRangeConfig {
+pub struct NonceRange {
     /// Raw bytes as sent over the wire
     bytes: [u8; 4],
 }
 
-impl NonceRangeConfig {
+impl NonceRange {
     // Nonce range values for different chain lengths (captured from hardware)
     const SINGLE_CHIP: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
     const SMALL_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x1f]; // 2-8 chips
@@ -186,8 +186,8 @@ impl NonceRangeConfig {
     }
 }
 
-impl From<NonceRangeConfig> for [u8; 4] {
-    fn from(config: NonceRangeConfig) -> Self {
+impl From<NonceRange> for [u8; 4] {
+    fn from(config: NonceRange) -> Self {
         config.bytes
     }
 }
@@ -312,7 +312,7 @@ fn decode_ticket_mask_bytes(bytes: &[u8; 4]) -> u32 {
 
 /// UART baud rate configuration
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BaudRate {
+pub enum UartBaud {
     /// 115200 baud
     Baud115200,
     /// 1 Mbaud
@@ -323,17 +323,17 @@ pub enum BaudRate {
     Custom(u32),
 }
 
-impl From<BaudRate> for [u8; 4] {
-    fn from(baud: BaudRate) -> Self {
+impl From<UartBaud> for [u8; 4] {
+    fn from(baud: UartBaud) -> Self {
         let value = match baud {
             // From esp-miner BM1370/BM1366/BM1368 default baud config
-            BaudRate::Baud115200 => 0x00000271,
+            UartBaud::Baud115200 => 0x00000271,
             // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
             // All three chips use identical register value for 1Mbaud
-            BaudRate::Baud1M => 0x00023011,
+            UartBaud::Baud1M => 0x00023011,
             // From S21 Pro captures (BM1370 multi-chip chains)
-            BaudRate::Baud3M => 0x00003001,
-            BaudRate::Custom(val) => val,
+            UartBaud::Baud3M => 0x00003001,
+            UartBaud::Custom(val) => val,
         };
         value.to_le_bytes()
     }
@@ -457,13 +457,13 @@ pub enum Register {
         core_count: u8, // Core configuration byte
         address: u8,    // Assigned chip address
     },
-    PllDivider(PllConfig),
-    NonceRange(NonceRangeConfig),
+    PllDivider(PllDivider),
+    NonceRange(NonceRange),
     TicketMask(TicketMask),
     MiscControl {
         raw_value: u32,
     },
-    UartBaud(BaudRate),
+    UartBaud(UartBaud),
     UartRelay {
         raw_value: u32, // Domain relay configuration (complex format)
     },
@@ -496,7 +496,7 @@ impl Register {
                 address: bytes[3],
             },
             RegisterAddress::PllDivider => Register::PllDivider(raw_value.into()),
-            RegisterAddress::NonceRange => Register::NonceRange(NonceRangeConfig { bytes: *bytes }),
+            RegisterAddress::NonceRange => Register::NonceRange(NonceRange { bytes: *bytes }),
             RegisterAddress::TicketMask => {
                 // Decode wire bytes to TicketMask
                 // Wire bytes are in encoded format; decode to extract zero_bits value
@@ -508,10 +508,10 @@ impl Register {
             RegisterAddress::UartBaud => {
                 // Decode known baud rates
                 let baud = match raw_value {
-                    0x00000271 => BaudRate::Baud115200,
-                    0x00000130 => BaudRate::Baud1M,
-                    0x00003001 => BaudRate::Baud3M,
-                    other => BaudRate::Custom(other),
+                    0x00000271 => UartBaud::Baud115200,
+                    0x00000130 => UartBaud::Baud1M,
+                    0x00003001 => UartBaud::Baud3M,
+                    other => UartBaud::Custom(other),
                 };
                 Register::UartBaud(baud)
             }
@@ -1489,7 +1489,7 @@ mod command_tests {
             RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
-                register: Register::NonceRange(NonceRangeConfig::multi_chip(65)),
+                register: Register::NonceRange(NonceRange::multi_chip(65)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x1e, 0xb5, 0x0f,
@@ -2521,7 +2521,7 @@ impl BM13xxProtocol {
         let mut commands = Vec::new();
 
         // Calculate nonce range based on chain length
-        let nonce_config = NonceRangeConfig::multi_chip(chain_length);
+        let nonce_config = NonceRange::multi_chip(chain_length);
 
         // Write nonce range to all chips
         commands.push(self.broadcast_write(Register::NonceRange(nonce_config)));
@@ -2539,7 +2539,7 @@ impl BM13xxProtocol {
     }
 
     /// Set UART baud rate on all chips
-    pub fn set_baudrate(&self, baudrate: BaudRate) -> RegisterCommand {
+    pub fn set_baudrate(&self, baudrate: UartBaud) -> RegisterCommand {
         RegisterCommand::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
@@ -2564,7 +2564,7 @@ impl BM13xxProtocol {
                 return Err(ProtocolError::ReadOnlyRegister(register));
             }
             RegisterAddress::PllDivider => Register::PllDivider(value.into()),
-            RegisterAddress::NonceRange => Register::NonceRange(NonceRangeConfig {
+            RegisterAddress::NonceRange => Register::NonceRange(NonceRange {
                 bytes: value.to_le_bytes(),
             }),
             RegisterAddress::TicketMask => {
@@ -2574,7 +2574,7 @@ impl BM13xxProtocol {
                 Register::TicketMask(TicketMask { zero_bits })
             }
             RegisterAddress::MiscControl => Register::MiscControl { raw_value: value },
-            RegisterAddress::UartBaud => Register::UartBaud(BaudRate::Custom(value)),
+            RegisterAddress::UartBaud => Register::UartBaud(UartBaud::Custom(value)),
             RegisterAddress::UartRelay => Register::UartRelay { raw_value: value },
             RegisterAddress::Core => Register::Core { raw_value: value },
             RegisterAddress::AnalogMux => Register::AnalogMux { raw_value: value },
