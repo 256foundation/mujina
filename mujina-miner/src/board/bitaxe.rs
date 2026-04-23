@@ -23,7 +23,7 @@ use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::Command, thread::BM13xxThread},
+        bm13xx::{self, BM13xxProtocol, protocol::RegisterCommand, thread::BM13xxThread},
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -121,7 +121,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     debug!("Sending version mask configuration (3 times)");
     for i in 1..=3 {
         trace!("Version mask send {}/3", i);
-        let version_cmd = Command::WriteRegister {
+        let version_cmd = RegisterCommand::WriteRegister {
             broadcast: true,
             chip_address: 0x00,
             register: bm13xx::protocol::Register::VersionMask(
