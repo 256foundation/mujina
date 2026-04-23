@@ -459,7 +459,7 @@ where
     send_reg(
         chip_commands,
         true,
-        Register::NonceRange(protocol::NonceRangeConfig::from_raw(0xB51E0000)),
+        Register::NonceRange(protocol::NonceRange::from_raw(0xB51E0000)),
     )
     .await?;
     send_reg(
@@ -479,7 +479,7 @@ fn generate_frequency_ramp_steps(
     start_mhz: f32,
     target_mhz: f32,
     step_mhz: f32,
-) -> Vec<protocol::PllConfig> {
+) -> Vec<protocol::PllDivider> {
     let mut configs = Vec::new();
     let mut current = start_mhz;
 
@@ -536,7 +536,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
 }
 
 /// Calculate PLL configuration for a specific frequency
-fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> {
+fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllDivider> {
     const CRYSTAL_FREQ: f32 = 25.0;
     const MAX_FREQ_ERROR: f32 = 1.0;
 
@@ -586,7 +586,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
     }
 
     let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
-    Some(protocol::PllConfig::new(
+    Some(protocol::PllDivider::new(
         best_fb_div,
         best_ref_div,
         post_div,
