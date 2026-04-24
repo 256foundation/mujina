@@ -686,34 +686,119 @@ impl Destination {
     }
 }
 
+/// Assign an address to the first unaddressed chip via daisy-chain forwarding.
+#[derive(Debug, Clone, Copy)]
+pub struct SetChipAddress {
+    pub chip_address: u8,
+}
+
+impl SetChipAddress {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Command,
+            false, // never broadcast
+            CommandFlagsCmd::SetChipAddress,
+        ));
+        dst.put_u8(5); // flags + length + chip_addr + reg_addr + crc5
+        dst.put_u8(self.chip_address);
+        dst.put_u8(0x00); // reserved
+    }
+}
+
+/// Put all chips into addressing mode (enables daisy-chain forwarding).
+#[derive(Debug, Clone, Copy)]
+pub struct ChainInactive;
+
+impl ChainInactive {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Command,
+            true, // always broadcast
+            CommandFlagsCmd::ChainInactive,
+        ));
+        dst.put_u8(5); // flags + length + reserved + reserved + crc5
+        dst.put_u8(0x00);
+        dst.put_u8(0x00);
+    }
+}
+
+/// Read a register from chip(s).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadRegister {
+    pub destination: Destination,
+    pub register_address: RegisterAddress,
+}
+
+impl ReadRegister {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Command,
+            self.destination.is_broadcast(),
+            CommandFlagsCmd::ReadRegister,
+        ));
+        dst.put_u8(5); // flags + length + chip_addr + reg_addr + crc5
+        dst.put_u8(self.destination.address_byte());
+        dst.put_u8(self.register_address as u8);
+    }
+}
+
+/// Write a register to chip(s).
+#[derive(Debug, Clone)]
+pub struct WriteRegister {
+    pub destination: Destination,
+    pub register: Register,
+}
+
+impl WriteRegister {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Command,
+            self.destination.is_broadcast(),
+            CommandFlagsCmd::WriteRegisterOrJob,
+        ));
+        dst.put_u8(9); // flags + length + chip_addr + reg_addr + 4 data + crc5
+        dst.put_u8(self.destination.address_byte());
+        dst.put_u8(self.register.address() as u8);
+        self.register.encode(dst);
+    }
+}
+
 /// TYPE=2 frames: register reads/writes and chain addressing. Use CRC5.
 #[derive(Debug)]
 pub enum RegisterCommand {
-    /// Assign an address to the first unaddressed chip via daisy-chain forwarding
-    SetChipAddress { chip_address: u8 },
-    /// Put all chips into addressing mode (enables daisy-chain forwarding)
-    ChainInactive,
-    /// Read a register from chip(s)
-    ReadRegister {
-        destination: Destination,
-        register_address: RegisterAddress,
-    },
-    /// Write a register to chip(s)
-    WriteRegister {
-        destination: Destination,
-        register: Register,
-    },
+    SetChipAddress(SetChipAddress),
+    ChainInactive(ChainInactive),
+    ReadRegister(ReadRegister),
+    WriteRegister(WriteRegister),
+}
+
+impl RegisterCommand {
+    fn encode(&self, dst: &mut BytesMut) {
+        match self {
+            Self::SetChipAddress(c) => c.encode(dst),
+            Self::ChainInactive(c) => c.encode(dst),
+            Self::ReadRegister(c) => c.encode(dst),
+            Self::WriteRegister(c) => c.encode(dst),
+        }
+    }
 }
 
 /// TYPE=1 frames: mining jobs. Use CRC16.
 #[derive(Debug)]
 pub enum JobCommand {
-    /// Send a job with full block header (BM1370/BM1362 style)
-    /// Chip calculates midstates internally
-    JobFull { job_data: JobFullFormat },
-    /// Send a job with pre-calculated midstates (BM1397 style)
-    /// Host calculates midstates to save chip computation
-    JobMidstate { job_data: JobMidstateFormat },
+    /// Full block header; chip calculates midstates internally (BM1370/BM1362 style).
+    JobFull(JobFullFormat),
+    /// Host pre-calculated midstates (BM1397 style).
+    JobMidstate(JobMidstateFormat),
+}
+
+impl JobCommand {
+    fn encode(&self, dst: &mut BytesMut) {
+        match self {
+            Self::JobFull(j) => j.encode(dst),
+            Self::JobMidstate(j) => j.encode(dst),
+        }
+    }
 }
 
 /// Full format job structure
@@ -741,6 +826,45 @@ pub struct JobFullFormat {
     pub version: bitcoin::block::Version,
 }
 
+impl JobFullFormat {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Job,
+            false, // jobs are never broadcast
+            CommandFlagsCmd::WriteRegisterOrJob,
+        ));
+
+        // Captures from factory firmware use this value on both BM1362
+        // (S19 J Pro) and BM1370 (S21 Pro). esp-miner firmware on
+        // Bitaxe sends 86 instead; the BM1370 appears to tolerate
+        // both.
+        //
+        // Hypothesis for why 54: a single midstate JobMidstate frame
+        // is exactly 54 bytes on the wire (flags + length + header +
+        // midstate0 + crc16). JobFull transmits 88 bytes but declares
+        // its length as if the frame were in midstate format, where
+        // prev_block_hash is folded into midstate0 rather than sent
+        // raw.
+        dst.put_u8(54);
+
+        // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
+        debug_assert!(self.job_id <= 15, "job_id must be 0-15");
+        dst.put_u8(self.job_id << 3);
+        dst.put_u8(self.num_midstates);
+        dst.put_u32_le(self.starting_nonce);
+        dst.put_u32_le(self.nbits.to_consensus());
+        dst.put_u32_le(self.ntime);
+
+        let merkle_root_bytes = hash_to_wire_bytes(&self.merkle_root.to_byte_array());
+        dst.put_slice(&merkle_root_bytes);
+
+        let prev_hash_bytes = hash_to_wire_bytes(&self.prev_block_hash.to_byte_array());
+        dst.put_slice(&prev_hash_bytes);
+
+        dst.put_u32_le(self.version.to_consensus() as u32);
+    }
+}
+
 /// Midstate format job structure (BM1397?).
 /// Host pre-calculates SHA256 midstates to reduce chip workload.
 /// Supports up to 4 midstates for version rolling.
@@ -758,6 +882,39 @@ pub struct JobMidstateFormat {
     pub midstate3: Option<[u8; 32]>, // Optional for version rolling
 }
 
+impl JobMidstateFormat {
+    fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(build_flags(
+            CommandFlagsType::Job,
+            false, // jobs are never broadcast
+            CommandFlagsCmd::WriteRegisterOrJob,
+        ));
+
+        // Layout: flags + length + 18 header bytes + num_midstates * 32 + crc16 (2)
+        dst.put_u8(1 + 1 + 18 + self.num_midstates * 32 + 2);
+
+        // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
+        debug_assert!(self.job_id <= 15, "job_id must be 0-15");
+        dst.put_u8(self.job_id << 3);
+        dst.put_u8(self.num_midstates);
+        dst.put_slice(&self.starting_nonce);
+        dst.put_slice(&self.nbits);
+        dst.put_slice(&self.ntime);
+        dst.put_slice(&self.merkle4);
+        dst.put_slice(&self.midstate0);
+
+        if let Some(midstate) = &self.midstate1 {
+            dst.put_slice(midstate);
+        }
+        if let Some(midstate) = &self.midstate2 {
+            dst.put_slice(midstate);
+        }
+        if let Some(midstate) = &self.midstate3 {
+            dst.put_slice(midstate);
+        }
+    }
+}
+
 fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> u8 {
     let mut flags = 0u8;
     let field = flags.view_bits_mut::<Lsb0>();
@@ -765,189 +922,6 @@ fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> 
     field[4..5].store(broadcast as u8);
     field[0..4].store(cmd as u8);
     flags
-}
-
-impl RegisterCommand {
-    fn encode(&self, dst: &mut BytesMut) {
-        match self {
-            Self::SetChipAddress { chip_address } => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Command,
-                    false, // Never broadcast
-                    CommandFlagsCmd::SetChipAddress,
-                ));
-
-                const FLAGS_LEN: u8 = 1;
-                const CHIP_ADDR_LEN: u8 = 1;
-                const REG_ADDR_LEN: u8 = 1; // Always 0x00 for set address
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 1;
-                const TOTAL_LEN: u8 =
-                    FLAGS_LEN + LENGTH_FIELD_LEN + CHIP_ADDR_LEN + REG_ADDR_LEN + CRC_LEN;
-
-                dst.put_u8(TOTAL_LEN);
-                dst.put_u8(*chip_address);
-                dst.put_u8(0x00); // Reserved byte (always 0x00)
-            }
-            Self::ChainInactive => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Command,
-                    true, // Always broadcast
-                    CommandFlagsCmd::ChainInactive,
-                ));
-
-                // From capture: 55 AA 53 05 00 00 03
-                // Length field (0x05) includes everything after preamble except itself
-                const FLAGS_LEN: u8 = 1; // 0x53
-                const CHIP_ADDR_LEN: u8 = 1; // 0x00
-                const REG_ADDR_LEN: u8 = 1; // 0x00
-                const CRC_LEN: u8 = 1; // 0x03
-                const TOTAL_LEN: u8 = FLAGS_LEN + CHIP_ADDR_LEN + REG_ADDR_LEN + CRC_LEN + 1; // +1 for length field
-
-                dst.put_u8(TOTAL_LEN);
-                dst.put_u8(0x00); // Reserved byte
-                dst.put_u8(0x00); // Reserved byte
-            }
-            Self::ReadRegister {
-                destination,
-                register_address,
-            } => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Command,
-                    destination.is_broadcast(),
-                    CommandFlagsCmd::ReadRegister,
-                ));
-
-                const FLAGS_LEN: u8 = 1;
-                const CHIP_ADDR_LEN: u8 = 1;
-                const REG_ADDR_LEN: u8 = 1;
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 1;
-                const TOTAL_LEN: u8 =
-                    FLAGS_LEN + LENGTH_FIELD_LEN + CHIP_ADDR_LEN + REG_ADDR_LEN + CRC_LEN;
-
-                dst.put_u8(TOTAL_LEN);
-                dst.put_u8(destination.address_byte());
-                dst.put_u8(*register_address as u8);
-            }
-            Self::WriteRegister {
-                destination,
-                register,
-            } => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Command,
-                    destination.is_broadcast(),
-                    CommandFlagsCmd::WriteRegisterOrJob,
-                ));
-
-                const FLAGS_LEN: u8 = 1;
-                const CHIP_ADDR_LEN: u8 = 1;
-                const REG_ADDR_LEN: u8 = 1;
-                const REG_DATA_LEN: u8 = 4;
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 1;
-                const TOTAL_LEN: u8 = FLAGS_LEN
-                    + LENGTH_FIELD_LEN
-                    + CHIP_ADDR_LEN
-                    + REG_ADDR_LEN
-                    + REG_DATA_LEN
-                    + CRC_LEN;
-
-                dst.put_u8(TOTAL_LEN);
-                dst.put_u8(destination.address_byte());
-                dst.put_u8(register.address() as u8);
-                register.encode(dst);
-            }
-        }
-    }
-}
-
-impl JobCommand {
-    fn encode(&self, dst: &mut BytesMut) {
-        match self {
-            Self::JobFull { job_data } => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Job,
-                    false, // Jobs are never broadcast
-                    CommandFlagsCmd::WriteRegisterOrJob,
-                ));
-
-                // Captures from factory firmware use this value on both BM1362
-                // (S19 J Pro) and BM1370 (S21 Pro). esp-miner firmware on
-                // Bitaxe sends 86 instead; the BM1370 appears to tolerate
-                // both.
-                //
-                // Hypothesis for why 54: a single midstate JobMidstate frame
-                // is exactly 54 bytes on the wire (flags + length + header +
-                // midstate0 + crc16). JobFull transmits 88 bytes but declares
-                // its length as if the frame were in midstate format, where
-                // prev_block_hash is folded into midstate0 rather than sent
-                // raw.
-                const JOB_LENGTH_BYTE: u8 = 54;
-                dst.put_u8(JOB_LENGTH_BYTE);
-
-                // Write job data
-                // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
-                debug_assert!(job_data.job_id <= 15, "job_id must be 0-15");
-                dst.put_u8(job_data.job_id << 3);
-                dst.put_u8(job_data.num_midstates);
-                dst.put_u32_le(job_data.starting_nonce);
-                dst.put_u32_le(job_data.nbits.to_consensus());
-                dst.put_u32_le(job_data.ntime);
-
-                // Convert merkle_root from Bitcoin internal format to wire format
-                let merkle_root_bytes = hash_to_wire_bytes(&job_data.merkle_root.to_byte_array());
-                dst.put_slice(&merkle_root_bytes);
-
-                // Convert prev_block_hash from Bitcoin internal format to wire format
-                let prev_hash_bytes = hash_to_wire_bytes(&job_data.prev_block_hash.to_byte_array());
-                dst.put_slice(&prev_hash_bytes);
-
-                dst.put_u32_le(job_data.version.to_consensus() as u32);
-            }
-            Self::JobMidstate { job_data } => {
-                dst.put_u8(build_flags(
-                    CommandFlagsType::Job,
-                    false, // Jobs are never broadcast
-                    CommandFlagsCmd::WriteRegisterOrJob,
-                ));
-
-                // Calculate data length based on number of midstates
-                const BASE_LEN: u8 = 18; // job_id(1) + num_midstates(1) + nonce(4) + nbits(4) + ntime(4) + merkle4(4)
-                const MIDSTATE_LEN: u8 = 32;
-                let data_len = BASE_LEN + (job_data.num_midstates * MIDSTATE_LEN);
-
-                const FLAGS_LEN: u8 = 1;
-                const LENGTH_FIELD_LEN: u8 = 1;
-                const CRC_LEN: u8 = 2; // Jobs use CRC16
-                let total_len = FLAGS_LEN + LENGTH_FIELD_LEN + data_len + CRC_LEN;
-
-                dst.put_u8(total_len);
-
-                // Write job data
-                // job_id is a 4-bit value (0-15), encode into bits 6-3 of job_header
-                debug_assert!(job_data.job_id <= 15, "job_id must be 0-15");
-                dst.put_u8(job_data.job_id << 3);
-                dst.put_u8(job_data.num_midstates);
-                dst.put_slice(&job_data.starting_nonce);
-                dst.put_slice(&job_data.nbits);
-                dst.put_slice(&job_data.ntime);
-                dst.put_slice(&job_data.merkle4);
-                dst.put_slice(&job_data.midstate0);
-
-                // Write optional midstates
-                if let Some(midstate) = &job_data.midstate1 {
-                    dst.put_slice(midstate);
-                }
-                if let Some(midstate) = &job_data.midstate2 {
-                    dst.put_slice(midstate);
-                }
-                if let Some(midstate) = &job_data.midstate3 {
-                    dst.put_slice(midstate);
-                }
-            }
-        }
-    }
 }
 
 #[derive(FromRepr)]
@@ -1173,16 +1147,16 @@ mod init_tests {
         // Verify the sequence starts with version rolling enable
         assert!(matches!(
             &commands[0],
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::VersionMask(_),
-            }
+            })
         ));
 
         // Verify chain inactive command
         let chain_inactive_pos = commands
             .iter()
-            .position(|c| matches!(c, RegisterCommand::ChainInactive))
+            .position(|c| matches!(c, RegisterCommand::ChainInactive(ChainInactive)))
             .expect("ChainInactive command not found in initialization sequence");
         assert!(chain_inactive_pos > 0);
 
@@ -1190,7 +1164,7 @@ mod init_tests {
         let first_address_pos = chain_inactive_pos + 1;
         assert!(matches!(
             &commands[first_address_pos],
-            RegisterCommand::SetChipAddress { chip_address: 0x00 }
+            RegisterCommand::SetChipAddress(SetChipAddress { chip_address: 0x00 })
         ));
 
         // Verify we have 65 address assignments
@@ -1202,7 +1176,7 @@ mod init_tests {
         // Verify addresses increment by 2
         for (i, cmd) in address_commands.iter().enumerate() {
             match cmd {
-                RegisterCommand::SetChipAddress { chip_address } => {
+                RegisterCommand::SetChipAddress(SetChipAddress { chip_address }) => {
                     assert_eq!(*chip_address, (i * 2) as u8);
                 }
                 _ => panic!("Expected SetChipAddress command, got {:?}", cmd),
@@ -1221,10 +1195,10 @@ mod init_tests {
             .filter(|c| {
                 matches!(
                     c,
-                    RegisterCommand::WriteRegister {
+                    RegisterCommand::WriteRegister(WriteRegister {
                         register: Register::IoDriverStrength { .. },
                         ..
-                    }
+                    })
                 )
             })
             .collect();
@@ -1232,10 +1206,10 @@ mod init_tests {
 
         // Check first domain boundary (chip 8 = address 0x08)
         let first_boundary = io_strength_commands[0];
-        if let RegisterCommand::WriteRegister {
+        if let RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(chip_address),
             register: Register::IoDriverStrength(strength),
-        } = first_boundary
+        }) = first_boundary
         {
             assert_eq!(*chip_address, 0x08); // 5th chip (index 4) * 2
             let mut buf = BytesMut::new();
@@ -1252,10 +1226,10 @@ mod init_tests {
         // Test single chip - full range
         let commands = protocol.configure_nonce_ranges(1);
         assert_eq!(commands.len(), 1);
-        if let RegisterCommand::WriteRegister {
+        if let RegisterCommand::WriteRegister(WriteRegister {
             register: Register::NonceRange(config),
             destination: Destination::Broadcast,
-        } = &commands[0]
+        }) = &commands[0]
         {
             let mut buf = BytesMut::new();
             config.encode(&mut buf);
@@ -1265,10 +1239,10 @@ mod init_tests {
         // Test S21 Pro configuration (65 chips)
         let commands = protocol.configure_nonce_ranges(65);
         assert_eq!(commands.len(), 1);
-        if let RegisterCommand::WriteRegister {
+        if let RegisterCommand::WriteRegister(WriteRegister {
             register: Register::NonceRange(config),
             ..
-        } = &commands[0]
+        }) = &commands[0]
         {
             let mut buf = BytesMut::new();
             config.encode(&mut buf);
@@ -1277,10 +1251,10 @@ mod init_tests {
 
         // Test small chain
         let commands = protocol.configure_nonce_ranges(8);
-        if let RegisterCommand::WriteRegister {
+        if let RegisterCommand::WriteRegister(WriteRegister {
             register: Register::NonceRange(config),
             ..
-        } = &commands[0]
+        }) = &commands[0]
         {
             let mut buf = BytesMut::new();
             config.encode(&mut buf);
@@ -1297,19 +1271,19 @@ mod init_tests {
         let nonce_range_cmd = commands.iter().find(|c| {
             matches!(
                 c,
-                RegisterCommand::WriteRegister {
+                RegisterCommand::WriteRegister(WriteRegister {
                     register: Register::NonceRange { .. },
                     ..
-                }
+                })
             )
         });
 
         assert!(nonce_range_cmd.is_some());
 
-        if let Some(RegisterCommand::WriteRegister {
+        if let Some(RegisterCommand::WriteRegister(WriteRegister {
             register: Register::NonceRange(config),
             ..
-        }) = nonce_range_cmd
+        })) = nonce_range_cmd
         {
             let mut buf = BytesMut::new();
             config.encode(&mut buf);
@@ -1330,10 +1304,10 @@ mod command_tests {
     #[test]
     fn read_register() {
         assert_frame_eq(
-            RegisterCommand::ReadRegister {
+            RegisterCommand::ReadRegister(ReadRegister {
                 destination: Destination::Broadcast,
                 register_address: RegisterAddress::ChipId,
-            },
+            }),
             &[0x55, 0xaa, 0x52, 0x05, 0x00, 0x00, 0x0a],
         );
     }
@@ -1341,14 +1315,14 @@ mod command_tests {
     #[test]
     fn write_register_chip_address() {
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Chip(0x01),
                 register: Register::ChipId(ChipId {
                     model: ChipModel::BM1370,
                     core_count: 0x00,
                     address: 0x01,
                 }),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x41, 0x09, 0x01, 0x00, 0x13, 0x70, 0x00, 0x01, 0x0a,
             ],
@@ -1360,10 +1334,10 @@ mod command_tests {
     fn write_version_mask_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 A4 90 00 FF FF 1C
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast, // 0x51 = broadcast
                 register: Register::VersionMask(VersionMask::full_rolling()),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0xa4, 0x90, 0x00, 0xff, 0xff, 0x1c,
             ],
@@ -1375,10 +1349,10 @@ mod command_tests {
         // From Bitaxe capture: TX: 55 AA 51 09 00 A8 00 07 00 00 03
         // Value 0x00 07 00 00 in little-endian = 0x00000700
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::InitControl(InitControl(0x00000700)),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0xa8, 0x00, 0x07, 0x00, 0x00, 0x03,
             ],
@@ -1389,10 +1363,10 @@ mod command_tests {
     fn write_misc_control_from_capture() {
         // From Bitaxe capture: TX: 55 AA 51 09 00 18 F0 00 C1 00 04
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::MiscControl(MiscControl(0x00C100F0)),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x18, 0xf0, 0x00, 0xc1, 0x00, 0x04,
             ],
@@ -1403,7 +1377,7 @@ mod command_tests {
     fn chain_inactive_from_capture() {
         // From S21 Pro capture: TX: 55 AA 53 05 00 00 03
         assert_frame_eq(
-            RegisterCommand::ChainInactive,
+            RegisterCommand::ChainInactive(ChainInactive),
             &[0x55, 0xaa, 0x53, 0x05, 0x00, 0x00, 0x03],
         );
     }
@@ -1412,7 +1386,7 @@ mod command_tests {
     fn set_chip_address_from_capture() {
         // From S21 Pro capture: TX: 55 AA 40 05 04 00 03 (assign address 0x04)
         assert_frame_eq(
-            RegisterCommand::SetChipAddress { chip_address: 0x04 },
+            RegisterCommand::SetChipAddress(SetChipAddress { chip_address: 0x04 }),
             &[0x55, 0xaa, 0x40, 0x05, 0x04, 0x00, 0x03],
         );
     }
@@ -1422,11 +1396,11 @@ mod command_tests {
         // From Bitaxe capture: TX: 55 AA 51 09 00 3C 80 00 8B 00 12
         // Core register uses big-endian encoding
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 // Big-endian: produces bytes 80 00 8B 00
                 register: Register::Core(Core(0x80008B00)),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x3c, 0x80, 0x00, 0x8b, 0x00, 0x12,
             ],
@@ -1439,10 +1413,10 @@ mod command_tests {
         // Difficulty 256 = 8 zero_bits
         let log2_diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::TicketMask(TicketMask::new(log2_diff)),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x14, 0x00, 0x00, 0x00, 0xff, 0x08,
             ],
@@ -1453,10 +1427,10 @@ mod command_tests {
     fn write_nonce_range_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 10 00 00 1E B5 0F
         assert_frame_eq(
-            RegisterCommand::WriteRegister {
+            RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::NonceRange(NonceRange::multi_chip(65)),
-            },
+            }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x1e, 0xb5, 0x0f,
             ],
@@ -1506,12 +1480,7 @@ mod command_tests {
         let mut codec = FrameCodec;
         let mut frame = BytesMut::new();
         codec
-            .encode(
-                JobCommand::JobFull {
-                    job_data: job.clone(),
-                },
-                &mut frame,
-            )
+            .encode(JobCommand::JobFull(job.clone()), &mut frame)
             .expect("Failed to encode job command");
 
         // Verify packet structure
@@ -1584,16 +1553,12 @@ mod command_tests {
         let mut codec = FrameCodec;
         let mut frame = BytesMut::new();
         codec
-            .encode(
-                JobCommand::JobFull {
-                    job_data: job.clone(),
-                },
-                &mut frame,
-            )
+            .encode(JobCommand::JobFull(job.clone()), &mut frame)
             .expect("Failed to encode job command");
 
-        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
-        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
+        // Our body bytes match esp-miner's wire capture. Byte 3 (length
+        // byte) and bytes 86..88 (CRC16) intentionally differ; see the
+        // length-byte comment in JobFullFormat::encode.
         assert_eq!(&frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
     }
 
@@ -1604,7 +1569,7 @@ mod command_tests {
         let mut codec = FrameCodec;
         let mut frame = BytesMut::new();
         codec
-            .encode(JobCommand::JobFull { job_data: job }, &mut frame)
+            .encode(JobCommand::JobFull(job), &mut frame)
             .expect("Failed to encode job command");
 
         // Byte-for-byte match, length byte and CRC16 included: the
@@ -2139,16 +2104,12 @@ mod response_tests {
         let mut codec = FrameCodec;
         let mut tx_frame = BytesMut::new();
         codec
-            .encode(
-                JobCommand::JobFull {
-                    job_data: job.clone(),
-                },
-                &mut tx_frame,
-            )
+            .encode(JobCommand::JobFull(job.clone()), &mut tx_frame)
             .expect("Should encode JobFull command");
 
-        // Our body bytes match esp-miner's wire capture. Byte 3 (length byte)
-        // and bytes 86..88 (CRC16) intentionally differ; see JOB_LENGTH_BYTE.
+        // Our body bytes match esp-miner's wire capture. Byte 3 (length
+        // byte) and bytes 86..88 (CRC16) intentionally differ; see the
+        // length-byte comment in JobFullFormat::encode.
         assert_eq!(&tx_frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
 
         let rx_response =
@@ -2319,19 +2280,19 @@ impl BM13xxProtocol {
 
     /// Helper to create a broadcast write command
     fn broadcast_write(&self, register: Register) -> RegisterCommand {
-        RegisterCommand::WriteRegister {
+        RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register,
-        }
+        })
     }
 
     /// Helper to create a targeted write command
     #[cfg_attr(not(test), allow(dead_code))]
     fn write_to(&self, chip_address: u8, register: Register) -> RegisterCommand {
-        RegisterCommand::WriteRegister {
+        RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(chip_address),
             register,
-        }
+        })
     }
 
     /// Returns the initialization sequence for a single chip (e.g., Bitaxe).
@@ -2387,14 +2348,14 @@ impl BM13xxProtocol {
         );
 
         // Step 4: Set chain inactive for address assignment
-        commands.push(RegisterCommand::ChainInactive);
+        commands.push(RegisterCommand::ChainInactive(ChainInactive));
 
         // Step 5: Assign addresses (increment by 2)
         for i in 0..chain_length {
             let address = (i as u8) * ADDRESS_INCREMENT;
-            commands.push(RegisterCommand::SetChipAddress {
+            commands.push(RegisterCommand::SetChipAddress(SetChipAddress {
                 chip_address: address,
-            });
+            }));
         }
 
         // Step 6: Configure core registers on all chips
@@ -2486,18 +2447,18 @@ impl BM13xxProtocol {
 
     /// Create a command to read a register.
     pub fn read_register(&self, chip_address: u8, register: RegisterAddress) -> RegisterCommand {
-        RegisterCommand::ReadRegister {
+        RegisterCommand::ReadRegister(ReadRegister {
             destination: Destination::Chip(chip_address),
             register_address: register,
-        }
+        })
     }
 
     /// Set UART baud rate on all chips
     pub fn set_baudrate(&self, baudrate: UartBaud) -> RegisterCommand {
-        RegisterCommand::WriteRegister {
+        RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::UartBaud(baudrate),
-        }
+        })
     }
 
     /// Create a command to write a register.
@@ -2550,17 +2511,17 @@ impl BM13xxProtocol {
             RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings(value)),
         };
 
-        Ok(RegisterCommand::WriteRegister {
+        Ok(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(chip_address),
             register: register_value,
-        })
+        }))
     }
 
     /// Create a broadcast command to discover all chips.
     pub fn discover_chips() -> RegisterCommand {
-        RegisterCommand::ReadRegister {
+        RegisterCommand::ReadRegister(ReadRegister {
             destination: Destination::Broadcast,
             register_address: RegisterAddress::ChipId,
-        }
+        })
     }
 }
