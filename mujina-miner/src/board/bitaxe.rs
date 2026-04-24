@@ -25,7 +25,7 @@ use crate::{
         ChipInfo,
         bm13xx::{
             self, BM13xxProtocol, Register, Response,
-            protocol::{ChipId, RegisterCommand},
+            protocol::{ChipId, Destination, RegisterCommand, VersionMask},
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
@@ -123,17 +123,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     // Version mask and chip discovery
     debug!("Sending version mask configuration (3 times)");
-    for i in 1..=3 {
-        trace!("Version mask send {}/3", i);
-        let version_cmd = RegisterCommand::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
+    for _ in 1..=3 {
         data_writer
-            .send(version_cmd)
+            .send(RegisterCommand::WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::VersionMask(VersionMask::full_rolling()),
+            })
             .await
             .context("failed to send config command")?;
         time::sleep(Duration::from_millis(5)).await;

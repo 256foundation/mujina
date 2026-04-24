@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
 use super::protocol::{
-    self, AnalogMux, Core, InitControl, JobCommand, Log2Difficulty, MiscControl, MiscSettings,
-    Register, RegisterCommand, TicketMask,
+    self, AnalogMux, Core, Destination, InitControl, IoDriverStrength, JobCommand, Log2Difficulty,
+    MiscControl, MiscSettings, NonceRange, Register, RegisterCommand, TicketMask, VersionMask,
 };
 use crate::{
     asic::hash_thread::{
@@ -264,35 +264,16 @@ where
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    async fn send_reg<W, E>(
-        chip_commands: &mut W,
-        broadcast: bool,
-        register: Register,
-    ) -> Result<()>
-    where
-        W: Sink<RegisterCommand, Error = E> + Unpin,
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        chip_commands
-            .send(RegisterCommand::WriteRegister {
-                broadcast,
-                chip_address: 0x00,
-                register,
-            })
-            .await?;
-        Ok(())
-    }
-
     // Send version mask configuration (3 times)
     debug!("Configuring version mask");
     for _ in 1..=3 {
-        send_reg(
-            chip_commands,
-            true,
-            Register::VersionMask(protocol::VersionMask::full_rolling()),
-        )
-        .await
-        .context("failed to send version mask")?;
+        chip_commands
+            .send(RegisterCommand::WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::VersionMask(VersionMask::full_rolling()),
+            })
+            .await
+            .context("failed to send version mask")?;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
@@ -301,18 +282,18 @@ where
     // Pre-configuration registers
     debug!("Sending pre-configuration registers");
 
-    send_reg(
-        chip_commands,
-        true,
-        Register::InitControl(InitControl(0x00000700)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscControl(MiscControl(0x00C100F0)),
-    )
-    .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::InitControl(InitControl(0x00000700)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::MiscControl(MiscControl(0x00C100F0)),
+        })
+        .await?;
 
     chip_commands
         .send(RegisterCommand::ChainInactive)
@@ -327,66 +308,105 @@ where
     // Core configuration (broadcast)
     debug!("Sending broadcast core configuration");
 
-    send_reg(chip_commands, true, Register::Core(Core(0x8000_8B00))).await?;
-    send_reg(chip_commands, true, Register::Core(Core(0x8000_800C))).await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::Core(Core(0x8000_8B00)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::Core(Core(0x8000_800C)),
+        })
+        .await?;
 
     // Ticket mask
     let ticket_mask = TicketMask::new(asic_difficulty);
 
-    send_reg(chip_commands, true, Register::TicketMask(ticket_mask)).await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::IoDriverStrength(protocol::IoDriverStrength::normal()),
-    )
-    .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::TicketMask(ticket_mask),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::IoDriverStrength(IoDriverStrength::normal()),
+        })
+        .await?;
 
     // Chip-specific configuration
     debug!("Sending chip-specific configuration");
 
-    send_reg(
-        chip_commands,
-        false,
-        Register::InitControl(InitControl(0xF0010700)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::MiscControl(MiscControl(0x00C100F0)),
-    )
-    .await?;
-    send_reg(chip_commands, false, Register::Core(Core(0x8000_8B00))).await?;
-    send_reg(chip_commands, false, Register::Core(Core(0x8000_800C))).await?;
-    send_reg(chip_commands, false, Register::Core(Core(0x8000_82AA))).await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Chip(0x00),
+            register: Register::InitControl(InitControl(0xF0010700)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Chip(0x00),
+            register: Register::MiscControl(MiscControl(0x00C100F0)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Chip(0x00),
+            register: Register::Core(Core(0x8000_8B00)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Chip(0x00),
+            register: Register::Core(Core(0x8000_800C)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Chip(0x00),
+            register: Register::Core(Core(0x8000_82AA)),
+        })
+        .await?;
 
     // Additional settings
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings(MiscSettings(0x80440000)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::AnalogMux(AnalogMux(0x02000000)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::MiscSettings(MiscSettings(0x80440000)),
-    )
-    .await?;
-    send_reg(chip_commands, true, Register::Core(Core(0x8000_8DEE))).await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::MiscSettings(MiscSettings(0x80440000)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::AnalogMux(AnalogMux(0x02000000)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::MiscSettings(MiscSettings(0x80440000)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::Core(Core(0x8000_8DEE)),
+        })
+        .await?;
 
     // Frequency ramping (56.25 MHz -> 525 MHz)
     debug!("Ramping frequency from 56.25 MHz to 525 MHz");
     let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
-        send_reg(chip_commands, true, Register::PllDivider(*pll_config))
+        chip_commands
+            .send(RegisterCommand::WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::PllDivider(*pll_config),
+            })
             .await
             .context("PLL ramp failed")?;
 
@@ -400,18 +420,18 @@ where
     debug!("Frequency ramping complete");
 
     // Final configuration
-    send_reg(
-        chip_commands,
-        true,
-        Register::NonceRange(protocol::NonceRange::from_raw(0xB51E0000)),
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::VersionMask(protocol::VersionMask::full_rolling()),
-    )
-    .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::NonceRange(NonceRange::from_raw(0xB51E0000)),
+        })
+        .await?;
+    chip_commands
+        .send(RegisterCommand::WriteRegister {
+            destination: Destination::Broadcast,
+            register: Register::VersionMask(VersionMask::full_rolling()),
+        })
+        .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
