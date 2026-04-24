@@ -23,7 +23,11 @@ use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         ChipInfo,
-        bm13xx::{self, BM13xxProtocol, protocol::RegisterCommand, thread::BM13xxThread},
+        bm13xx::{
+            self, BM13xxProtocol, Register, Response,
+            protocol::{ChipId, RegisterCommand},
+            thread::BM13xxThread,
+        },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -569,9 +573,9 @@ async fn discover_chips(
         tokio::select! {
             response = reader.next() => {
                 match response {
-                    Some(Ok(bm13xx::Response::ReadRegister {
+                    Some(Ok(Response::ReadRegister {
                         chip_address: _,
-                        register: bm13xx::Register::ChipId { model, core_count, address }
+                        register: Register::ChipId(ChipId { model, core_count, address }),
                     })) => {
                         let chip_id = model.id_bytes();
                         debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
