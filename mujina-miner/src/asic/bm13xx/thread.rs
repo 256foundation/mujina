@@ -18,8 +18,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
 use super::protocol::{
-    self, AnalogMux, Core, Destination, InitControl, IoDriverStrength, JobCommand, Log2Difficulty,
-    MiscControl, MiscSettings, NonceRange, Register, RegisterCommand, TicketMask, VersionMask,
+    self, AnalogMux, ChainInactive, Core, Destination, InitControl, IoDriverStrength, JobCommand,
+    Log2Difficulty, MiscControl, MiscSettings, NonceRange, Register, RegisterCommand,
+    SetChipAddress, TicketMask, VersionMask, WriteRegister,
 };
 use crate::{
     asic::hash_thread::{
@@ -268,10 +269,10 @@ where
     debug!("Configuring version mask");
     for _ in 1..=3 {
         chip_commands
-            .send(RegisterCommand::WriteRegister {
+            .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::VersionMask(VersionMask::full_rolling()),
-            })
+            }))
             .await
             .context("failed to send version mask")?;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -283,25 +284,27 @@ where
     debug!("Sending pre-configuration registers");
 
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::InitControl(InitControl(0x00000700)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::MiscControl(MiscControl(0x00C100F0)),
-        })
+        }))
         .await?;
 
     chip_commands
-        .send(RegisterCommand::ChainInactive)
+        .send(RegisterCommand::ChainInactive(ChainInactive))
         .await
         .context("failed to send ChainInactive")?;
 
     chip_commands
-        .send(RegisterCommand::SetChipAddress { chip_address: 0x00 })
+        .send(RegisterCommand::SetChipAddress(SetChipAddress {
+            chip_address: 0x00,
+        }))
         .await
         .context("failed to send SetChipAddress")?;
 
@@ -309,92 +312,92 @@ where
     debug!("Sending broadcast core configuration");
 
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::Core(Core(0x8000_8B00)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::Core(Core(0x8000_800C)),
-        })
+        }))
         .await?;
 
     // Ticket mask
     let ticket_mask = TicketMask::new(asic_difficulty);
 
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::TicketMask(ticket_mask),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::IoDriverStrength(IoDriverStrength::normal()),
-        })
+        }))
         .await?;
 
     // Chip-specific configuration
     debug!("Sending chip-specific configuration");
 
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
             register: Register::InitControl(InitControl(0xF0010700)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
             register: Register::MiscControl(MiscControl(0x00C100F0)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
             register: Register::Core(Core(0x8000_8B00)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
             register: Register::Core(Core(0x8000_800C)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
             register: Register::Core(Core(0x8000_82AA)),
-        })
+        }))
         .await?;
 
     // Additional settings
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::MiscSettings(MiscSettings(0x80440000)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::AnalogMux(AnalogMux(0x02000000)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::MiscSettings(MiscSettings(0x80440000)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::Core(Core(0x8000_8DEE)),
-        })
+        }))
         .await?;
 
     // Frequency ramping (56.25 MHz -> 525 MHz)
@@ -403,10 +406,10 @@ where
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
         chip_commands
-            .send(RegisterCommand::WriteRegister {
+            .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
                 register: Register::PllDivider(*pll_config),
-            })
+            }))
             .await
             .context("PLL ramp failed")?;
 
@@ -421,16 +424,16 @@ where
 
     // Final configuration
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::NonceRange(NonceRange::from_raw(0xB51E0000)),
-        })
+        }))
         .await?;
     chip_commands
-        .send(RegisterCommand::WriteRegister {
+        .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
             register: Register::VersionMask(VersionMask::full_rolling()),
-        })
+        }))
         .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -659,7 +662,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                         let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
+                                if let Err(e) = chip_commands.send(JobCommand::JobFull(job_data)).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
                                     let err = anyhow!("failed to send job to chip: {e:?}");
                                     response_tx.send(Err(err)).ok();
@@ -712,7 +715,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                         let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
-                                if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
+                                if let Err(e) = chip_commands.send(JobCommand::JobFull(job_data)).await {
                                     error!(error = ?e, "Failed to send initial JobFull to chip");
                                     let err = anyhow!("failed to send job to chip: {e:?}");
                                     response_tx.send(Err(err)).ok();
@@ -872,7 +875,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                 // Convert to chip format and send
                 match task_to_job_full(task, chip_jobs.insert(task.clone())) {
                     Ok(job_data) => {
-                        if let Err(e) = chip_commands.send(JobCommand::JobFull { job_data }).await {
+                        if let Err(e) = chip_commands.send(JobCommand::JobFull(job_data)).await {
                             error!(error = ?e, "Failed to send JobFull to chip");
                         } else {
                             trace!(ntime = task.ntime, "Sent ntime-rolled job to chip");
