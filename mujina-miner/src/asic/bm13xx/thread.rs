@@ -17,7 +17,10 @@ use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
-use super::protocol::{self, JobCommand, Log2Difficulty, Register, RegisterCommand, TicketMask};
+use super::protocol::{
+    self, AnalogMux, Core, InitControl, JobCommand, Log2Difficulty, MiscControl, MiscSettings,
+    Register, RegisterCommand, TicketMask,
+};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -302,17 +305,13 @@ where
     send_reg(
         chip_commands,
         true,
-        Register::InitControl {
-            raw_value: 0x00000700,
-        },
+        Register::InitControl(InitControl(0x00000700)),
     )
     .await?;
     send_reg(
         chip_commands,
         true,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
+        Register::MiscControl(MiscControl(0x00C100F0)),
     )
     .await?;
 
@@ -331,22 +330,8 @@ where
     // Core configuration (broadcast)
     debug!("Sending broadcast core configuration");
 
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
+    send_reg(chip_commands, true, Register::Core(Core(0x8000_8B00))).await?;
+    send_reg(chip_commands, true, Register::Core(Core(0x8000_800C))).await?;
 
     // Ticket mask
     let ticket_mask = TicketMask::new(asic_difficulty);
@@ -365,77 +350,39 @@ where
     send_reg(
         chip_commands,
         false,
-        Register::InitControl {
-            raw_value: 0xF0010700,
-        },
+        Register::InitControl(InitControl(0xF0010700)),
     )
     .await?;
     send_reg(
         chip_commands,
         false,
-        Register::MiscControl {
-            raw_value: 0x00C100F0,
-        },
+        Register::MiscControl(MiscControl(0x00C100F0)),
     )
     .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_8B00,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_800C,
-        },
-    )
-    .await?;
-    send_reg(
-        chip_commands,
-        false,
-        Register::Core {
-            raw_value: 0x8000_82AA,
-        },
-    )
-    .await?;
+    send_reg(chip_commands, false, Register::Core(Core(0x8000_8B00))).await?;
+    send_reg(chip_commands, false, Register::Core(Core(0x8000_800C))).await?;
+    send_reg(chip_commands, false, Register::Core(Core(0x8000_82AA))).await?;
 
     // Additional settings
     send_reg(
         chip_commands,
         true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
+        Register::MiscSettings(MiscSettings(0x80440000)),
     )
     .await?;
     send_reg(
         chip_commands,
         true,
-        Register::AnalogMux {
-            raw_value: 0x02000000,
-        },
+        Register::AnalogMux(AnalogMux(0x02000000)),
     )
     .await?;
     send_reg(
         chip_commands,
         true,
-        Register::MiscSettings {
-            raw_value: 0x80440000,
-        },
+        Register::MiscSettings(MiscSettings(0x80440000)),
     )
     .await?;
-    send_reg(
-        chip_commands,
-        true,
-        Register::Core {
-            raw_value: 0x8000_8DEE,
-        },
-    )
-    .await?;
+    send_reg(chip_commands, true, Register::Core(Core(0x8000_8DEE))).await?;
 
     // Frequency ramping (56.25 MHz -> 525 MHz)
     debug!("Ramping frequency from 56.25 MHz to 525 MHz");
