@@ -138,7 +138,7 @@ impl BM13xxThread {
     where
         R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
         W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin + Send + 'static,
-        E: std::fmt::Debug + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, evt_rx) = mpsc::channel(100);
@@ -251,7 +251,7 @@ async fn initialize_chip<W, E>(
 ) -> Result<()>
 where
     W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
-    E: std::fmt::Debug,
+    E: std::error::Error + Send + Sync + 'static,
 {
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
@@ -264,7 +264,6 @@ where
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Send a register write command, converting the sink error to anyhow.
     async fn send_reg<W, E>(
         chip_commands: &mut W,
         broadcast: bool,
@@ -272,7 +271,7 @@ where
     ) -> Result<()>
     where
         W: Sink<RegisterCommand, Error = E> + Unpin,
-        E: std::fmt::Debug,
+        E: std::error::Error + Send + Sync + 'static,
     {
         chip_commands
             .send(RegisterCommand::WriteRegister {
@@ -280,8 +279,8 @@ where
                 chip_address: 0x00,
                 register,
             })
-            .await
-            .map_err(|e| anyhow!("{e:?}"))
+            .await?;
+        Ok(())
     }
 
     // Send version mask configuration (3 times)
@@ -318,13 +317,11 @@ where
     chip_commands
         .send(RegisterCommand::ChainInactive)
         .await
-        .map_err(|e| anyhow!("{e:?}"))
         .context("failed to send ChainInactive")?;
 
     chip_commands
         .send(RegisterCommand::SetChipAddress { chip_address: 0x00 })
         .await
-        .map_err(|e| anyhow!("{e:?}"))
         .context("failed to send SetChipAddress")?;
 
     // Core configuration (broadcast)
@@ -562,7 +559,7 @@ async fn bm13xx_thread_actor<R, W, E>(
 ) where
     R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
     W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
-    E: std::fmt::Debug,
+    E: std::error::Error + Send + Sync + 'static,
 {
     // Disable ASIC on startup to establish known state
     if let Some(ref mut asic_enable) = peripherals.asic_enable
