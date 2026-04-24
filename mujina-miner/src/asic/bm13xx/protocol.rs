@@ -60,22 +60,21 @@ impl PllDivider {
             post_div,
         }
     }
-}
 
-impl From<u32> for PllDivider {
-    fn from(raw: u32) -> Self {
-        Self {
-            flag: (raw & 0xff) as u8,
-            fb_div: ((raw >> 8) & 0xff) as u8,
-            ref_div: ((raw >> 16) & 0xff) as u8,
-            post_div: ((raw >> 24) & 0xff) as u8,
-        }
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.flag);
+        dst.put_u8(self.fb_div);
+        dst.put_u8(self.ref_div);
+        dst.put_u8(self.post_div);
     }
-}
 
-impl From<PllDivider> for [u8; 4] {
-    fn from(config: PllDivider) -> Self {
-        [config.flag, config.fb_div, config.ref_div, config.post_div]
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self {
+            flag: bytes[0],
+            fb_div: bytes[1],
+            ref_div: bytes[2],
+            post_div: bytes[3],
+        }
     }
 }
 
@@ -184,11 +183,13 @@ impl NonceRange {
             bytes: value.to_le_bytes(),
         }
     }
-}
 
-impl From<NonceRange> for [u8; 4] {
-    fn from(config: NonceRange) -> Self {
-        config.bytes
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.bytes);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self { bytes }
     }
 }
 
@@ -280,11 +281,15 @@ impl TicketMask {
 
         bytes
     }
-}
 
-impl From<TicketMask> for [u8; 4] {
-    fn from(mask: TicketMask) -> Self {
-        mask.to_wire_bytes()
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.to_wire_bytes());
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let mask_value = decode_ticket_mask_bytes(&bytes);
+        let zero_bits = mask_value.count_ones() as u8;
+        Self { zero_bits }
     }
 }
 
@@ -323,9 +328,9 @@ pub enum UartBaud {
     Custom(u32),
 }
 
-impl From<UartBaud> for [u8; 4] {
-    fn from(baud: UartBaud) -> Self {
-        let value = match baud {
+impl UartBaud {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let value = match self {
             // From esp-miner BM1370/BM1366/BM1368 default baud config
             UartBaud::Baud115200 => 0x00000271,
             // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
@@ -333,9 +338,17 @@ impl From<UartBaud> for [u8; 4] {
             UartBaud::Baud1M => 0x00023011,
             // From S21 Pro captures (BM1370 multi-chip chains)
             UartBaud::Baud3M => 0x00003001,
-            UartBaud::Custom(val) => val,
+            UartBaud::Custom(val) => *val,
         };
-        value.to_le_bytes()
+        dst.put_u32_le(value);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        match u32::from_le_bytes(bytes) {
+            0x00000271 => UartBaud::Baud115200,
+            0x00000130 => UartBaud::Baud1M,
+            0x00003001 => UartBaud::Baud3M,
+            other => UartBaud::Custom(other),
+        }
     }
 }
 
@@ -362,25 +375,23 @@ impl IoDriverStrength {
             strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
         }
     }
-}
 
-impl From<IoDriverStrength> for [u8; 4] {
-    fn from(strength: IoDriverStrength) -> Self {
-        // Pack 8 4-bit values into 4 bytes (2 per byte)
-        // Each byte contains two strength values: [high_nibble|low_nibble]
-        [
-            strength.strengths[0] | (strength.strengths[1] << 4),
-            strength.strengths[2] | (strength.strengths[3] << 4),
-            strength.strengths[4] | (strength.strengths[5] << 4),
-            strength.strengths[6] | (strength.strengths[7] << 4),
-        ]
+    pub fn encode(&self, dst: &mut BytesMut) {
+        // Pack 8 4-bit values into 4 bytes (2 per byte).
+        // Each byte contains two strength values: [high_nibble|low_nibble].
+        dst.put_u8(self.strengths[0] | (self.strengths[1] << 4));
+        dst.put_u8(self.strengths[2] | (self.strengths[3] << 4));
+        dst.put_u8(self.strengths[4] | (self.strengths[5] << 4));
+        dst.put_u8(self.strengths[6] | (self.strengths[7] << 4));
     }
-}
 
-impl IoDriverStrength {
-    /// Get the raw bytes for testing
-    pub fn as_bytes(&self) -> [u8; 4] {
-        (*self).into()
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let raw = u32::from_le_bytes(bytes);
+        let mut strengths = [0u8; 8];
+        for (i, strength) in strengths.iter_mut().enumerate() {
+            *strength = ((raw >> (i * 4)) & 0xf) as u8;
+        }
+        Self { strengths }
     }
 }
 
@@ -406,6 +417,19 @@ impl VersionMask {
             control: Self::ENABLE_ROLLING,
         }
     }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u16_le(self.control);
+        dst.put_u16_le(self.mask);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let raw = u32::from_le_bytes(bytes);
+        Self {
+            control: (raw & 0xffff) as u16,
+            mask: (raw >> 16) as u16,
+        }
+    }
 }
 
 impl fmt::Debug for VersionMask {
@@ -419,15 +443,6 @@ impl fmt::Debug for VersionMask {
             .field("mask", &format_args!("{:#06x}", self.mask))
             .field("control", &control_str)
             .finish()
-    }
-}
-
-impl From<VersionMask> for [u8; 4] {
-    fn from(mask: VersionMask) -> Self {
-        let mut bytes = [0u8; 4];
-        bytes[0..2].copy_from_slice(&mask.control.to_le_bytes());
-        bytes[2..4].copy_from_slice(&mask.mask.to_le_bytes());
-        bytes
     }
 }
 
@@ -450,207 +465,149 @@ pub enum RegisterAddress {
     MiscSettings = 0xB9,
 }
 
-#[derive(Clone)]
+/// Chip model + core count + assigned chain address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipId {
+    pub model: ChipModel,
+    pub core_count: u8,
+    pub address: u8,
+}
+
+impl ChipId {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.model.id_bytes());
+        dst.put_u8(self.core_count);
+        dst.put_u8(self.address);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self {
+            model: ChipModel::from([bytes[0], bytes[1]]),
+            core_count: bytes[2],
+            address: bytes[3],
+        }
+    }
+}
+
+// Placeholder newtypes for registers whose bit layout is not yet decomposed.
+// Each wraps a raw u32 written little-endian to the wire.
+macro_rules! raw_u32_register {
+    ($($(#[$meta:meta])* $name:ident),* $(,)?) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct $name(pub u32);
+
+            impl $name {
+                pub fn encode(&self, dst: &mut BytesMut) {
+                    dst.put_u32_le(self.0);
+                }
+                pub fn decode(bytes: [u8; 4]) -> Self {
+                    Self(u32::from_le_bytes(bytes))
+                }
+            }
+        )*
+    };
+}
+
+raw_u32_register! {
+    MiscControl,
+    UartRelay,
+    AnalogMux,
+    Pll3Parameter,
+    InitControl,
+    MiscSettings,
+}
+
+/// Transmitted big-endian, unlike the other raw-u32 registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Core(pub u32);
+
+impl Core {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.0);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self(u32::from_be_bytes(bytes))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum Register {
-    ChipId {
-        model: ChipModel,
-        core_count: u8, // Core configuration byte
-        address: u8,    // Assigned chip address
-    },
+    ChipId(ChipId),
     PllDivider(PllDivider),
     NonceRange(NonceRange),
     TicketMask(TicketMask),
-    MiscControl {
-        raw_value: u32,
-    },
+    MiscControl(MiscControl),
     UartBaud(UartBaud),
-    UartRelay {
-        raw_value: u32, // Domain relay configuration (complex format)
-    },
-    Core {
-        raw_value: u32,
-    },
-    AnalogMux {
-        raw_value: u32,
-    },
+    UartRelay(UartRelay),
+    Core(Core),
+    AnalogMux(AnalogMux),
     IoDriverStrength(IoDriverStrength),
-    Pll3Parameter {
-        raw_value: u32,
-    },
+    Pll3Parameter(Pll3Parameter),
     VersionMask(VersionMask),
-    InitControl {
-        raw_value: u32,
-    },
-    MiscSettings {
-        raw_value: u32,
-    },
+    InitControl(InitControl),
+    MiscSettings(MiscSettings),
 }
 
 impl Register {
-    pub fn decode(address: RegisterAddress, bytes: &[u8; 4]) -> Register {
-        let raw_value = u32::from_le_bytes(*bytes);
+    pub fn decode(address: RegisterAddress, bytes: [u8; 4]) -> Register {
         match address {
-            RegisterAddress::ChipId => Register::ChipId {
-                model: ChipModel::from([bytes[0], bytes[1]]),
-                core_count: bytes[2],
-                address: bytes[3],
-            },
-            RegisterAddress::PllDivider => Register::PllDivider(raw_value.into()),
-            RegisterAddress::NonceRange => Register::NonceRange(NonceRange { bytes: *bytes }),
-            RegisterAddress::TicketMask => {
-                // Decode wire bytes to TicketMask
-                // Wire bytes are in encoded format; decode to extract zero_bits value
-                let mask_value = decode_ticket_mask_bytes(bytes);
-                let zero_bits = mask_value.count_ones() as u8;
-                Register::TicketMask(TicketMask { zero_bits })
-            }
-            RegisterAddress::MiscControl => Register::MiscControl { raw_value },
-            RegisterAddress::UartBaud => {
-                // Decode known baud rates
-                let baud = match raw_value {
-                    0x00000271 => UartBaud::Baud115200,
-                    0x00000130 => UartBaud::Baud1M,
-                    0x00003001 => UartBaud::Baud3M,
-                    other => UartBaud::Custom(other),
-                };
-                Register::UartBaud(baud)
-            }
-            RegisterAddress::UartRelay => Register::UartRelay { raw_value },
-            RegisterAddress::Core => Register::Core { raw_value },
-            RegisterAddress::AnalogMux => Register::AnalogMux { raw_value },
+            RegisterAddress::ChipId => Register::ChipId(ChipId::decode(bytes)),
+            RegisterAddress::PllDivider => Register::PllDivider(PllDivider::decode(bytes)),
+            RegisterAddress::NonceRange => Register::NonceRange(NonceRange::decode(bytes)),
+            RegisterAddress::TicketMask => Register::TicketMask(TicketMask::decode(bytes)),
+            RegisterAddress::MiscControl => Register::MiscControl(MiscControl::decode(bytes)),
+            RegisterAddress::UartBaud => Register::UartBaud(UartBaud::decode(bytes)),
+            RegisterAddress::UartRelay => Register::UartRelay(UartRelay::decode(bytes)),
+            RegisterAddress::Core => Register::Core(Core::decode(bytes)),
+            RegisterAddress::AnalogMux => Register::AnalogMux(AnalogMux::decode(bytes)),
             RegisterAddress::IoDriverStrength => {
-                // Parse driver strength from raw value
-                let mut strengths = [0u8; 8];
-                for (i, strength) in strengths.iter_mut().enumerate() {
-                    *strength = ((raw_value >> (i * 4)) & 0xf) as u8;
-                }
-                Register::IoDriverStrength(IoDriverStrength { strengths })
+                Register::IoDriverStrength(IoDriverStrength::decode(bytes))
             }
-            RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value },
-            RegisterAddress::VersionMask => {
-                let mask = (raw_value >> 16) as u16;
-                let control = (raw_value & 0xffff) as u16;
-                Register::VersionMask(VersionMask { mask, control })
-            }
-            RegisterAddress::InitControl => Register::InitControl { raw_value },
-            RegisterAddress::MiscSettings => Register::MiscSettings { raw_value },
+            RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter::decode(bytes)),
+            RegisterAddress::VersionMask => Register::VersionMask(VersionMask::decode(bytes)),
+            RegisterAddress::InitControl => Register::InitControl(InitControl::decode(bytes)),
+            RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings::decode(bytes)),
         }
     }
 
     /// Get the register address for this register
     fn address(&self) -> RegisterAddress {
         match self {
-            Register::ChipId { .. } => RegisterAddress::ChipId,
+            Register::ChipId(_) => RegisterAddress::ChipId,
             Register::PllDivider(_) => RegisterAddress::PllDivider,
             Register::NonceRange(_) => RegisterAddress::NonceRange,
             Register::TicketMask(_) => RegisterAddress::TicketMask,
-            Register::MiscControl { .. } => RegisterAddress::MiscControl,
+            Register::MiscControl(_) => RegisterAddress::MiscControl,
             Register::UartBaud(_) => RegisterAddress::UartBaud,
-            Register::UartRelay { .. } => RegisterAddress::UartRelay,
-            Register::Core { .. } => RegisterAddress::Core,
-            Register::AnalogMux { .. } => RegisterAddress::AnalogMux,
+            Register::UartRelay(_) => RegisterAddress::UartRelay,
+            Register::Core(_) => RegisterAddress::Core,
+            Register::AnalogMux(_) => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
-            Register::Pll3Parameter { .. } => RegisterAddress::Pll3Parameter,
+            Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
             Register::VersionMask(_) => RegisterAddress::VersionMask,
-            Register::InitControl { .. } => RegisterAddress::InitControl,
-            Register::MiscSettings { .. } => RegisterAddress::MiscSettings,
+            Register::InitControl(_) => RegisterAddress::InitControl,
+            Register::MiscSettings(_) => RegisterAddress::MiscSettings,
         }
     }
 
     /// Encode the register data (not the address)
-    fn encode_data(&self, dst: &mut BytesMut) {
+    fn encode(&self, dst: &mut BytesMut) {
         match self {
-            Register::ChipId {
-                model,
-                core_count,
-                address,
-            } => {
-                dst.put_slice(&model.id_bytes());
-                dst.put_u8(*core_count);
-                dst.put_u8(*address);
-            }
-            Register::PllDivider(config) => {
-                let bytes: [u8; 4] = (*config).into();
-                dst.put_slice(&bytes);
-            }
-            Register::NonceRange(config) => {
-                let bytes: [u8; 4] = (*config).into();
-                dst.put_slice(&bytes);
-            }
-            Register::TicketMask(mask) => {
-                let bytes: [u8; 4] = (*mask).into();
-                dst.put_slice(&bytes);
-            }
-            Register::UartBaud(baud) => {
-                let bytes: [u8; 4] = (*baud).into();
-                dst.put_slice(&bytes);
-            }
-            Register::Core { raw_value } => {
-                // Core register needs big-endian encoding
-                dst.put_u32(*raw_value);
-            }
-            Register::MiscControl { raw_value }
-            | Register::UartRelay { raw_value }
-            | Register::AnalogMux { raw_value }
-            | Register::Pll3Parameter { raw_value }
-            | Register::InitControl { raw_value }
-            | Register::MiscSettings { raw_value } => {
-                dst.put_u32_le(*raw_value);
-            }
-            Register::IoDriverStrength(strength) => {
-                let bytes: [u8; 4] = (*strength).into();
-                dst.put_slice(&bytes);
-            }
-            Register::VersionMask(mask) => {
-                let bytes: [u8; 4] = (*mask).into();
-                dst.put_slice(&bytes);
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for Register {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Register::ChipId {
-                model,
-                core_count,
-                address,
-            } => f
-                .debug_struct("ChipId")
-                .field("model", model)
-                .field("core_count", core_count)
-                .field("address", address)
-                .finish(),
-            Register::PllDivider(config) => f.debug_tuple("PllDivider").field(config).finish(),
-            Register::NonceRange(config) => f.debug_tuple("NonceRange").field(config).finish(),
-            Register::TicketMask(mask) => f.debug_tuple("TicketMask").field(mask).finish(),
-            Register::UartBaud(baud) => f.debug_tuple("UartBaud").field(baud).finish(),
-            Register::IoDriverStrength(strength) => {
-                f.debug_tuple("IoDriverStrength").field(strength).finish()
-            }
-            Register::VersionMask(mask) => f.debug_tuple("VersionMask").field(mask).finish(),
-            Register::MiscControl { raw_value }
-            | Register::UartRelay { raw_value }
-            | Register::AnalogMux { raw_value }
-            | Register::Pll3Parameter { raw_value }
-            | Register::InitControl { raw_value }
-            | Register::Core { raw_value }
-            | Register::MiscSettings { raw_value } => {
-                let register_name = match self {
-                    Register::MiscControl { .. } => "MiscControl",
-                    Register::UartRelay { .. } => "UartRelay",
-                    Register::AnalogMux { .. } => "AnalogMux",
-                    Register::Pll3Parameter { .. } => "Pll3Parameter",
-                    Register::InitControl { .. } => "InitControl",
-                    Register::Core { .. } => "Core",
-                    Register::MiscSettings { .. } => "MiscSettings",
-                    _ => unreachable!(),
-                };
-                f.debug_struct(register_name)
-                    .field("raw_value", &format_args!("0x{:08x}", raw_value))
-                    .finish()
-            }
+            Register::ChipId(r) => r.encode(dst),
+            Register::PllDivider(r) => r.encode(dst),
+            Register::NonceRange(r) => r.encode(dst),
+            Register::TicketMask(r) => r.encode(dst),
+            Register::MiscControl(r) => r.encode(dst),
+            Register::UartBaud(r) => r.encode(dst),
+            Register::UartRelay(r) => r.encode(dst),
+            Register::Core(r) => r.encode(dst),
+            Register::AnalogMux(r) => r.encode(dst),
+            Register::IoDriverStrength(r) => r.encode(dst),
+            Register::Pll3Parameter(r) => r.encode(dst),
+            Register::VersionMask(r) => r.encode(dst),
+            Register::InitControl(r) => r.encode(dst),
+            Register::MiscSettings(r) => r.encode(dst),
         }
     }
 }
@@ -879,7 +836,7 @@ impl RegisterCommand {
                 dst.put_u8(TOTAL_LEN);
                 dst.put_u8(*chip_address);
                 dst.put_u8(register.address() as u8);
-                register.encode_data(dst);
+                register.encode(dst);
             }
         }
     }
@@ -1015,7 +972,7 @@ impl Response {
                 let register_address_repr = bytes.get_u8();
 
                 if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
-                    let register = Register::decode(register_address, &value);
+                    let register = Register::decode(register_address, value);
                     Ok(Response::ReadRegister {
                         chip_address,
                         register,
@@ -1263,9 +1220,10 @@ mod init_tests {
         } = first_boundary
         {
             assert_eq!(*chip_address, 0x08); // 5th chip (index 4) * 2
-            let strength_bytes: [u8; 4] = (*strength).into();
+            let mut buf = BytesMut::new();
+            strength.encode(&mut buf);
             // Expected bytes from hardware capture
-            assert_eq!(strength_bytes, [0x00, 0xf1, 0x11, 0x11]);
+            assert_eq!(&buf[..], &[0x00, 0xf1, 0x11, 0x11]);
         }
     }
 
@@ -1282,8 +1240,9 @@ mod init_tests {
             ..
         } = &commands[0]
         {
-            let config_bytes: [u8; 4] = (*config).into();
-            assert_eq!(config_bytes, [0xff, 0xff, 0xff, 0xff]);
+            let mut buf = BytesMut::new();
+            config.encode(&mut buf);
+            assert_eq!(&buf[..], &[0xff, 0xff, 0xff, 0xff]);
         }
 
         // Test S21 Pro configuration (65 chips)
@@ -1294,8 +1253,9 @@ mod init_tests {
             ..
         } = &commands[0]
         {
-            let config_bytes: [u8; 4] = (*config).into();
-            assert_eq!(config_bytes, [0x00, 0x00, 0x1e, 0xb5]);
+            let mut buf = BytesMut::new();
+            config.encode(&mut buf);
+            assert_eq!(&buf[..], &[0x00, 0x00, 0x1e, 0xb5]);
         }
 
         // Test small chain
@@ -1305,8 +1265,9 @@ mod init_tests {
             ..
         } = &commands[0]
         {
-            let config_bytes: [u8; 4] = (*config).into();
-            assert_eq!(config_bytes, [0xff, 0xff, 0xff, 0x1f]);
+            let mut buf = BytesMut::new();
+            config.encode(&mut buf);
+            assert_eq!(&buf[..], &[0xff, 0xff, 0xff, 0x1f]);
         }
     }
 
@@ -1333,8 +1294,9 @@ mod init_tests {
             ..
         }) = nonce_range_cmd
         {
-            let config_bytes: [u8; 4] = (*config).into();
-            assert_eq!(config_bytes, [0x00, 0x00, 0x1e, 0xb5]); // S21 Pro value
+            let mut buf = BytesMut::new();
+            config.encode(&mut buf);
+            assert_eq!(&buf[..], &[0x00, 0x00, 0x1e, 0xb5]); // S21 Pro value
         }
     }
 }
@@ -1366,11 +1328,11 @@ mod command_tests {
             RegisterCommand::WriteRegister {
                 broadcast: false,
                 chip_address: 0x01,
-                register: Register::ChipId {
+                register: Register::ChipId(ChipId {
                     model: ChipModel::BM1370,
                     core_count: 0x00,
                     address: 0x01,
-                },
+                }),
             },
             &[
                 0x55, 0xaa, 0x41, 0x09, 0x01, 0x00, 0x13, 0x70, 0x00, 0x01, 0x0a,
@@ -1402,9 +1364,7 @@ mod command_tests {
             RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
-                register: Register::InitControl {
-                    raw_value: 0x00000700,
-                },
+                register: Register::InitControl(InitControl(0x00000700)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0xa8, 0x00, 0x07, 0x00, 0x00, 0x03,
@@ -1419,9 +1379,7 @@ mod command_tests {
             RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
-                register: Register::MiscControl {
-                    raw_value: 0x00C100F0,
-                },
+                register: Register::MiscControl(MiscControl(0x00C100F0)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x18, 0xf0, 0x00, 0xc1, 0x00, 0x04,
@@ -1455,9 +1413,8 @@ mod command_tests {
             RegisterCommand::WriteRegister {
                 broadcast: true,
                 chip_address: 0x00,
-                register: Register::Core {
-                    raw_value: 0x80008B00, // Big-endian: produces bytes 80 00 8B 00
-                },
+                // Big-endian: produces bytes 80 00 8B 00
+                register: Register::Core(Core(0x80008B00)),
             },
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x3c, 0x80, 0x00, 0x8b, 0x00, 0x12,
@@ -1752,11 +1709,11 @@ mod response_tests {
 
         assert_eq!(chip_address, 0x00);
 
-        let Register::ChipId {
+        let Register::ChipId(ChipId {
             model,
             core_count,
             address,
-        } = register
+        }) = register
         else {
             panic!("Expected ChipId register, got {:?}", register);
         };
@@ -2311,11 +2268,12 @@ mod ticket_mask_tests {
     }
 
     #[test]
-    fn into_bytes_matches_to_wire_bytes() {
+    fn encode_matches_to_wire_bytes() {
         let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
         let mask = TicketMask::new(diff);
-        let bytes: [u8; 4] = mask.into();
-        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+        let mut buf = BytesMut::new();
+        mask.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x00, 0x00, 0x00, 0xFF]);
     }
 
     #[test]
@@ -2414,14 +2372,12 @@ impl BM13xxProtocol {
         commands.push(self.broadcast_write(Register::VersionMask(VersionMask::full_rolling())));
 
         // Step 2: Configure init control register
-        commands.push(self.broadcast_write(Register::InitControl {
-            raw_value: INIT_CONTROL_VALUE,
-        }));
+        commands.push(self.broadcast_write(Register::InitControl(InitControl(INIT_CONTROL_VALUE))));
 
         // Step 3: Configure misc control
-        commands.push(self.broadcast_write(Register::MiscControl {
-            raw_value: MISC_CONTROL_MULTI_CHIP,
-        }));
+        commands.push(
+            self.broadcast_write(Register::MiscControl(MiscControl(MISC_CONTROL_MULTI_CHIP))),
+        );
 
         // Step 4: Set chain inactive for address assignment
         commands.push(RegisterCommand::ChainInactive);
@@ -2435,12 +2391,8 @@ impl BM13xxProtocol {
         }
 
         // Step 6: Configure core registers on all chips
-        commands.push(self.broadcast_write(Register::Core {
-            raw_value: CORE_REG_INIT_1,
-        }));
-        commands.push(self.broadcast_write(Register::Core {
-            raw_value: CORE_REG_INIT_2,
-        }));
+        commands.push(self.broadcast_write(Register::Core(Core(CORE_REG_INIT_1))));
+        commands.push(self.broadcast_write(Register::Core(Core(CORE_REG_INIT_2))));
 
         // Step 7: Set ticket mask (difficulty 256 = ~1 nonce/sec at 1 TH/s)
         let log2_diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
@@ -2492,9 +2444,7 @@ impl BM13xxProtocol {
             let relay_offset = (domain * chips_per_domain) as u32;
             commands.push(self.write_to(
                 first_address,
-                Register::UartRelay {
-                    raw_value: UART_RELAY_BASE | (relay_offset << 8),
-                },
+                Register::UartRelay(UartRelay(UART_RELAY_BASE | (relay_offset << 8))),
             ));
 
             // Configure last chip in domain
@@ -2502,9 +2452,7 @@ impl BM13xxProtocol {
                 let last_address = (last_chip as u8) * ADDRESS_INCREMENT;
                 commands.push(self.write_to(
                     last_address,
-                    Register::UartRelay {
-                        raw_value: UART_RELAY_BASE | (relay_offset << 8),
-                    },
+                    Register::UartRelay(UartRelay(UART_RELAY_BASE | (relay_offset << 8))),
                 ));
             }
         }
@@ -2563,7 +2511,9 @@ impl BM13xxProtocol {
                 // Can't write chip ID register directly
                 return Err(ProtocolError::ReadOnlyRegister(register));
             }
-            RegisterAddress::PllDivider => Register::PllDivider(value.into()),
+            RegisterAddress::PllDivider => {
+                Register::PllDivider(PllDivider::decode(value.to_le_bytes()))
+            }
             RegisterAddress::NonceRange => Register::NonceRange(NonceRange {
                 bytes: value.to_le_bytes(),
             }),
@@ -2573,11 +2523,11 @@ impl BM13xxProtocol {
                 let zero_bits = mask_value.count_ones() as u8;
                 Register::TicketMask(TicketMask { zero_bits })
             }
-            RegisterAddress::MiscControl => Register::MiscControl { raw_value: value },
+            RegisterAddress::MiscControl => Register::MiscControl(MiscControl(value)),
             RegisterAddress::UartBaud => Register::UartBaud(UartBaud::Custom(value)),
-            RegisterAddress::UartRelay => Register::UartRelay { raw_value: value },
-            RegisterAddress::Core => Register::Core { raw_value: value },
-            RegisterAddress::AnalogMux => Register::AnalogMux { raw_value: value },
+            RegisterAddress::UartRelay => Register::UartRelay(UartRelay(value)),
+            RegisterAddress::Core => Register::Core(Core(value)),
+            RegisterAddress::AnalogMux => Register::AnalogMux(AnalogMux(value)),
             RegisterAddress::IoDriverStrength => {
                 let mut strengths = [0u8; 8];
                 for (i, strength) in strengths.iter_mut().enumerate() {
@@ -2585,14 +2535,14 @@ impl BM13xxProtocol {
                 }
                 Register::IoDriverStrength(IoDriverStrength { strengths })
             }
-            RegisterAddress::Pll3Parameter => Register::Pll3Parameter { raw_value: value },
+            RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter(value)),
             RegisterAddress::VersionMask => {
                 let mask = (value >> 16) as u16;
                 let control = (value & 0xffff) as u16;
                 Register::VersionMask(VersionMask { mask, control })
             }
-            RegisterAddress::InitControl => Register::InitControl { raw_value: value },
-            RegisterAddress::MiscSettings => Register::MiscSettings { raw_value: value },
+            RegisterAddress::InitControl => Register::InitControl(InitControl(value)),
+            RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings(value)),
         };
 
         Ok(RegisterCommand::WriteRegister {
