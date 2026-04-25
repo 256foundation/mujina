@@ -6,7 +6,7 @@
 //! each supported model, validated against serial captures of an
 //! S19 J Pro (BM1362) and an S21 Pro and Bitaxe Gamma (BM1370).
 
-use super::protocol::{ChipModel, PllDivider};
+use super::register::{ChipModel, PllDivider};
 use crate::types::Frequency;
 
 /// Per-chip-model configuration.
