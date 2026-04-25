@@ -1,0 +1,695 @@
+//! BM13xx chip registers as typed values.
+//!
+//! [`RegisterAddress`] names each register on a BM13xx chip.
+//! [`Register`] carries the same set with a typed payload per
+//! variant, so values coming off the wire are typed rather than raw
+//! bit fields.
+
+use bitcoin::pow::Work;
+use bytes::{BufMut, BytesMut};
+use std::fmt;
+use strum::FromRepr;
+
+use crate::types::Difficulty;
+
+/// Register addresses on the wire.
+#[derive(FromRepr, Copy, Clone, Debug)]
+#[repr(u8)]
+pub enum RegisterAddress {
+    ChipId = 0x00,
+    PllDivider = 0x08,
+    NonceRange = 0x10,
+    TicketMask = 0x14,
+    MiscControl = 0x18,
+    UartBaud = 0x28,
+    UartRelay = 0x2C,
+    Core = 0x3C,
+    AnalogMux = 0x54,
+    IoDriverStrength = 0x58,
+    Pll3Parameter = 0x68,
+    VersionMask = 0xA4,
+    InitControl = 0xA8,
+    MiscSettings = 0xB9,
+}
+
+/// A register with its typed payload.
+#[derive(Debug, Clone)]
+pub enum Register {
+    ChipId(ChipId),
+    PllDivider(PllDivider),
+    NonceRange(NonceRange),
+    TicketMask(TicketMask),
+    MiscControl(MiscControl),
+    UartBaud(UartBaud),
+    UartRelay(UartRelay),
+    Core(Core),
+    AnalogMux(AnalogMux),
+    IoDriverStrength(IoDriverStrength),
+    Pll3Parameter(Pll3Parameter),
+    VersionMask(VersionMask),
+    InitControl(InitControl),
+    MiscSettings(MiscSettings),
+}
+
+impl Register {
+    pub fn decode(address: RegisterAddress, bytes: [u8; 4]) -> Register {
+        match address {
+            RegisterAddress::ChipId => Register::ChipId(ChipId::decode(bytes)),
+            RegisterAddress::PllDivider => Register::PllDivider(PllDivider::decode(bytes)),
+            RegisterAddress::NonceRange => Register::NonceRange(NonceRange::decode(bytes)),
+            RegisterAddress::TicketMask => Register::TicketMask(TicketMask::decode(bytes)),
+            RegisterAddress::MiscControl => Register::MiscControl(MiscControl::decode(bytes)),
+            RegisterAddress::UartBaud => Register::UartBaud(UartBaud::decode(bytes)),
+            RegisterAddress::UartRelay => Register::UartRelay(UartRelay::decode(bytes)),
+            RegisterAddress::Core => Register::Core(Core::decode(bytes)),
+            RegisterAddress::AnalogMux => Register::AnalogMux(AnalogMux::decode(bytes)),
+            RegisterAddress::IoDriverStrength => {
+                Register::IoDriverStrength(IoDriverStrength::decode(bytes))
+            }
+            RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter::decode(bytes)),
+            RegisterAddress::VersionMask => Register::VersionMask(VersionMask::decode(bytes)),
+            RegisterAddress::InitControl => Register::InitControl(InitControl::decode(bytes)),
+            RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings::decode(bytes)),
+        }
+    }
+
+    pub(super) fn address(&self) -> RegisterAddress {
+        match self {
+            Register::ChipId(_) => RegisterAddress::ChipId,
+            Register::PllDivider(_) => RegisterAddress::PllDivider,
+            Register::NonceRange(_) => RegisterAddress::NonceRange,
+            Register::TicketMask(_) => RegisterAddress::TicketMask,
+            Register::MiscControl(_) => RegisterAddress::MiscControl,
+            Register::UartBaud(_) => RegisterAddress::UartBaud,
+            Register::UartRelay(_) => RegisterAddress::UartRelay,
+            Register::Core(_) => RegisterAddress::Core,
+            Register::AnalogMux(_) => RegisterAddress::AnalogMux,
+            Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
+            Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
+            Register::VersionMask(_) => RegisterAddress::VersionMask,
+            Register::InitControl(_) => RegisterAddress::InitControl,
+            Register::MiscSettings(_) => RegisterAddress::MiscSettings,
+        }
+    }
+
+    pub(super) fn encode(&self, dst: &mut BytesMut) {
+        match self {
+            Register::ChipId(r) => r.encode(dst),
+            Register::PllDivider(r) => r.encode(dst),
+            Register::NonceRange(r) => r.encode(dst),
+            Register::TicketMask(r) => r.encode(dst),
+            Register::MiscControl(r) => r.encode(dst),
+            Register::UartBaud(r) => r.encode(dst),
+            Register::UartRelay(r) => r.encode(dst),
+            Register::Core(r) => r.encode(dst),
+            Register::AnalogMux(r) => r.encode(dst),
+            Register::IoDriverStrength(r) => r.encode(dst),
+            Register::Pll3Parameter(r) => r.encode(dst),
+            Register::VersionMask(r) => r.encode(dst),
+            Register::InitControl(r) => r.encode(dst),
+            Register::MiscSettings(r) => r.encode(dst),
+        }
+    }
+}
+
+/// Chip model + core count + assigned chain address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChipId {
+    pub model: ChipModel,
+    pub core_count: u8,
+    pub address: u8,
+}
+
+impl ChipId {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.model.id_bytes());
+        dst.put_u8(self.core_count);
+        dst.put_u8(self.address);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self {
+            model: ChipModel::from([bytes[0], bytes[1]]),
+            core_count: bytes[2],
+            address: bytes[3],
+        }
+    }
+}
+
+/// Known chip models in the BM13xx family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipModel {
+    /// BM1362 - Used in Antminer S19 J Pro (126 chips)
+    /// Core count unknown
+    BM1362,
+    /// BM1366 - Newer generation chip
+    BM1366,
+    /// BM1370 - Used in Bitaxe Gamma and Antminer S21 Pro
+    /// ~2,040 hash engines organized as 128 domains of ~16 engines each
+    BM1370,
+    /// BM1397 - Previous generation chip
+    BM1397,
+    /// Unknown chip model with raw ID bytes.
+    Unknown([u8; 2]),
+}
+
+impl ChipModel {
+    /// Returns the raw chip ID bytes.
+    pub fn id_bytes(&self) -> [u8; 2] {
+        match self {
+            Self::BM1362 => [0x13, 0x62],
+            Self::BM1366 => [0x13, 0x66],
+            Self::BM1370 => [0x13, 0x70],
+            Self::BM1397 => [0x13, 0x97],
+            Self::Unknown(bytes) => *bytes,
+        }
+    }
+
+    /// Returns the expected hash engine count for this model, if known.
+    pub fn core_count(&self) -> Option<u32> {
+        match self {
+            Self::BM1370 => Some(2048), // 128 x 16; esp-miner uses 2040
+            _ => None,
+        }
+    }
+}
+
+impl From<[u8; 2]> for ChipModel {
+    fn from(bytes: [u8; 2]) -> Self {
+        match bytes {
+            [0x13, 0x62] => Self::BM1362,
+            [0x13, 0x66] => Self::BM1366,
+            [0x13, 0x70] => Self::BM1370,
+            [0x13, 0x97] => Self::BM1397,
+            _ => Self::Unknown(bytes),
+        }
+    }
+}
+
+impl From<ChipModel> for [u8; 2] {
+    fn from(model: ChipModel) -> Self {
+        model.id_bytes()
+    }
+}
+
+/// PLL configuration for frequency control.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PllDivider {
+    /// VCO control flag (0x40 for low VCO, 0x50 for high VCO).
+    pub flag: u8,
+    /// Feedback divider.
+    pub fb_div: u8,
+    /// Reference divider (typically 1 or 2).
+    pub ref_div: u8,
+    /// Post divider, encoded as `((post_div1-1) << 4) | (post_div2-1)`.
+    pub post_div: u8,
+}
+
+impl PllDivider {
+    /// Create a PLL configuration, deriving the VCO flag from the
+    /// resulting VCO frequency: `vco >= 2400 MHz` picks flag `0x50`,
+    /// otherwise flag `0x40`.
+    pub fn new(fb_div: u8, ref_div: u8, post_div: u8) -> Self {
+        let vco_mhz = fb_div as f32 * 25.0 / ref_div as f32;
+        let flag = if vco_mhz >= 2400.0 { 0x50 } else { 0x40 };
+        Self {
+            flag,
+            fb_div,
+            ref_div,
+            post_div,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u8(self.flag);
+        dst.put_u8(self.fb_div);
+        dst.put_u8(self.ref_div);
+        dst.put_u8(self.post_div);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self {
+            flag: bytes[0],
+            fb_div: bytes[1],
+            ref_div: bytes[2],
+            post_div: bytes[3],
+        }
+    }
+}
+
+/// Nonce range configuration for work distribution.
+///
+/// NOTE: We store this as a byte array rather than interpreting it as a u32
+/// because the exact bit-level interpretation is still being reverse-engineered.
+/// The values below are empirically observed from production hardware.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonceRange {
+    /// Raw bytes as sent over the wire
+    bytes: [u8; 4],
+}
+
+impl NonceRange {
+    // Nonce range values for different chain lengths (captured from hardware)
+    const SINGLE_CHIP: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+    const SMALL_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x1f]; // 2-8 chips
+    const MEDIUM_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x0f]; // 9-16 chips
+    const LARGE_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x07]; // 17-32 chips
+    const XLARGE_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x03]; // 33-64 chips
+    const S21_PRO: [u8; 4] = [0x00, 0x00, 0x1e, 0xb5]; // 65-128 chips (empirical)
+    const DEFAULT_LARGE: [u8; 4] = [0xff, 0xff, 0xff, 0x01]; // >128 chips
+
+    /// Create config for single chip (full range)
+    pub fn single_chip() -> Self {
+        Self {
+            bytes: Self::SINGLE_CHIP,
+        }
+    }
+
+    /// Create config for multi-chip chain
+    pub fn multi_chip(chain_length: usize) -> Self {
+        let bytes = match chain_length {
+            1 => Self::SINGLE_CHIP,
+            2..=8 => Self::SMALL_CHAIN,
+            9..=16 => Self::MEDIUM_CHAIN,
+            17..=32 => Self::LARGE_CHAIN,
+            33..=64 => Self::XLARGE_CHAIN,
+            65..=128 => Self::S21_PRO,
+            _ => Self::DEFAULT_LARGE,
+        };
+        Self { bytes }
+    }
+
+    /// Create config from raw 32-bit value (little-endian)
+    /// Used for exact configuration from protocol captures
+    pub fn from_raw(value: u32) -> Self {
+        Self {
+            bytes: value.to_le_bytes(),
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.bytes);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self { bytes }
+    }
+}
+
+/// Ticket mask controlling ASIC nonce reporting
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TicketMask {
+    // Number of additional zero bits required in the bit-reversed hash,
+    // beyond the base 32 bits. The chip always requires bits 0-31 of the
+    // bit-reversed hash to be zero. This parameter adds bits 32..(32+zero_bits)
+    // that must also be zero.
+    zero_bits: u8,
+}
+
+impl TicketMask {
+    /// Create ticket mask from an ASIC difficulty.
+    ///
+    /// The [`Log2Difficulty`] exponent maps directly to the number
+    /// of extra zero bits the chip requires beyond its hardwired
+    /// difficulty-1 gate.
+    pub const fn new(difficulty: Log2Difficulty) -> Self {
+        Self {
+            zero_bits: difficulty.exponent(),
+        }
+    }
+
+    /// Encode ticket mask to wire format bytes
+    pub fn to_wire_bytes(&self) -> [u8; 4] {
+        if self.zero_bits == 0 {
+            return [0, 0, 0, 0];
+        }
+
+        // Create mask value: 2^zero_bits - 1
+        let mask_value = (1u32 << self.zero_bits) - 1;
+
+        // Encode to wire format with bit-reversal and byte-reversal
+        let mut bytes = [0u8; 4];
+        for i in 0..4 {
+            let byte = ((mask_value >> (8 * i)) & 0xFF) as u8;
+            bytes[3 - i] = reverse_bits(byte);
+        }
+
+        bytes
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_slice(&self.to_wire_bytes());
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let mask_value = decode_ticket_mask_bytes(&bytes);
+        let zero_bits = mask_value.count_ones() as u8;
+        Self { zero_bits }
+    }
+}
+
+/// ASIC difficulty as a power-of-2 exponent.
+///
+/// BM13xx chips filter nonces using bitmask comparison (`hash &
+/// mask == 0`) rather than numerical target comparison (`hash <
+/// target`). Each bit in the mask independently halves the pass
+/// rate, so only power-of-2 difficulty steps are representable.
+/// This type stores the log2 of the difficulty: a value of 8
+/// means difficulty 2^8 = 256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Log2Difficulty {
+    exponent: u8,
+}
+
+impl Log2Difficulty {
+    /// Floor an arbitrary difficulty to the nearest power-of-2
+    /// ASIC difficulty.
+    ///
+    /// The conversion is lossy: non-power-of-2 difficulties are
+    /// rounded down. This ensures the actual nonce rate is at least
+    /// as high as the rate implied by the input difficulty.
+    pub fn from_difficulty(difficulty: Difficulty) -> Self {
+        let d = difficulty.as_f64();
+        let exponent = if d >= 1.0 { d.log2().floor() as u8 } else { 0 };
+        Self { exponent }
+    }
+
+    /// The log2 of the difficulty (e.g., 8 for difficulty 256).
+    pub const fn exponent(&self) -> u8 {
+        self.exponent
+    }
+
+    /// Expected work per nonce at this difficulty.
+    ///
+    /// A nonce that passes the ASIC's difficulty filter represents
+    /// this many hashes of work on average.
+    pub fn to_work(&self) -> Work {
+        Difficulty::from(1_u64 << self.exponent)
+            .to_target()
+            .to_work()
+    }
+}
+
+impl fmt::Display for Log2Difficulty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "2^{}", self.exponent)
+    }
+}
+
+/// UART baud rate configuration
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UartBaud {
+    /// 115200 baud
+    Baud115200,
+    /// 1 Mbaud
+    Baud1M,
+    /// 3 Mbaud (common for multi-chip)
+    Baud3M,
+    /// Custom baud rate with raw register value
+    Custom(u32),
+}
+
+impl UartBaud {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let value = match self {
+            // From esp-miner BM1370/BM1366/BM1368 default baud config
+            UartBaud::Baud115200 => 0x00000271,
+            // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
+            // All three chips use identical register value for 1Mbaud
+            UartBaud::Baud1M => 0x00023011,
+            // From S21 Pro captures (BM1370 multi-chip chains)
+            UartBaud::Baud3M => 0x00003001,
+            UartBaud::Custom(val) => *val,
+        };
+        dst.put_u32_le(value);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        match u32::from_le_bytes(bytes) {
+            0x00000271 => UartBaud::Baud115200,
+            0x00000130 => UartBaud::Baud1M,
+            0x00003001 => UartBaud::Baud3M,
+            other => UartBaud::Custom(other),
+        }
+    }
+}
+
+/// Transmitted big-endian, unlike the other raw-u32 registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Core(pub u32);
+
+impl Core {
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.0);
+    }
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self(u32::from_be_bytes(bytes))
+    }
+}
+
+/// IO driver strength configuration
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IoDriverStrength {
+    /// Drive strength for each signal group (4 bits each)
+    strengths: [u8; 8],
+}
+
+impl IoDriverStrength {
+    /// Normal strength for chips in middle of chain
+    pub fn normal() -> Self {
+        // 0x11110100 = 0001 0001 0001 0001 0000 0001 0000 0000
+        Self {
+            strengths: [0x0, 0x0, 0x1, 0x0, 0x1, 0x1, 0x1, 0x1],
+        }
+    }
+
+    /// Strong drive for domain boundary chips
+    pub fn domain_boundary() -> Self {
+        // 0x1111f100 = 0001 0001 0001 0001 1111 0001 0000 0000
+        Self {
+            strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        // Pack 8 4-bit values into 4 bytes (2 per byte).
+        // Each byte contains two strength values: [high_nibble|low_nibble].
+        dst.put_u8(self.strengths[0] | (self.strengths[1] << 4));
+        dst.put_u8(self.strengths[2] | (self.strengths[3] << 4));
+        dst.put_u8(self.strengths[4] | (self.strengths[5] << 4));
+        dst.put_u8(self.strengths[6] | (self.strengths[7] << 4));
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let raw = u32::from_le_bytes(bytes);
+        let mut strengths = [0u8; 8];
+        for (i, strength) in strengths.iter_mut().enumerate() {
+            *strength = ((raw >> (i * 4)) & 0xf) as u8;
+        }
+        Self { strengths }
+    }
+}
+
+/// Version mask for version rolling
+#[derive(Clone, Copy, PartialEq)]
+pub struct VersionMask {
+    /// Which bits can be rolled
+    mask: u16,
+    /// Enable flag and other control bits
+    control: u16,
+}
+
+impl VersionMask {
+    /// Full 16-bit mask for version rolling
+    const FULL_MASK: u16 = 0xffff;
+    /// Fixed control pattern used by all implementations to enable version rolling
+    const ENABLE_ROLLING: u16 = 0x0090;
+
+    /// Create version mask with all lower 16 bits enabled
+    pub fn full_rolling() -> Self {
+        Self {
+            mask: Self::FULL_MASK,
+            control: Self::ENABLE_ROLLING,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u16_le(self.control);
+        dst.put_u16_le(self.mask);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let raw = u32::from_le_bytes(bytes);
+        Self {
+            control: (raw & 0xffff) as u16,
+            mask: (raw >> 16) as u16,
+        }
+    }
+}
+
+impl fmt::Debug for VersionMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let control_str = if self.control == Self::ENABLE_ROLLING {
+            "ENABLE_ROLLING".to_string()
+        } else {
+            format!("{:#06x}", self.control)
+        };
+        f.debug_struct("VersionMask")
+            .field("mask", &format_args!("{:#06x}", self.mask))
+            .field("control", &control_str)
+            .finish()
+    }
+}
+
+// Placeholder newtypes for registers whose bit layout is not yet
+// decomposed. Each wraps a raw u32 written little-endian to the wire.
+macro_rules! raw_u32_register {
+    ($($(#[$meta:meta])* $name:ident),* $(,)?) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct $name(pub u32);
+
+            impl $name {
+                pub fn encode(&self, dst: &mut BytesMut) {
+                    dst.put_u32_le(self.0);
+                }
+                pub fn decode(bytes: [u8; 4]) -> Self {
+                    Self(u32::from_le_bytes(bytes))
+                }
+            }
+        )*
+    };
+}
+
+raw_u32_register! {
+    MiscControl,
+    UartRelay,
+    AnalogMux,
+    Pll3Parameter,
+    InitControl,
+    MiscSettings,
+}
+
+/// Reverse bits within a single byte (bit 0 swaps with bit 7, etc.).
+fn reverse_bits(byte: u8) -> u8 {
+    let mut result = 0u8;
+    let mut b = byte;
+    for _ in 0..8 {
+        result = (result << 1) | (b & 1);
+        b >>= 1;
+    }
+    result
+}
+
+/// Inverse of [`TicketMask::to_wire_bytes`]: undo byte and bit reversal
+/// to recover the underlying mask value.
+fn decode_ticket_mask_bytes(bytes: &[u8; 4]) -> u32 {
+    let mut mask_value = 0u32;
+    for i in 0..4 {
+        let byte = reverse_bits(bytes[3 - i]);
+        mask_value |= (byte as u32) << (8 * i);
+    }
+    mask_value
+}
+
+#[cfg(test)]
+mod log2_difficulty_tests {
+    use super::*;
+    use crate::types::Difficulty;
+
+    #[test]
+    fn power_of_two_difficulty_exact() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        assert_eq!(diff.exponent(), 8);
+    }
+
+    #[test]
+    fn non_power_of_two_floors() {
+        // 300 is between 2^8=256 and 2^9=512, should floor to 8
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(300_u64));
+        assert_eq!(diff.exponent(), 8);
+    }
+
+    #[test]
+    fn difficulty_one() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1_u64));
+        assert_eq!(diff.exponent(), 0);
+    }
+
+    #[test]
+    fn large_difficulty() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(65536_u64));
+        assert_eq!(diff.exponent(), 16);
+    }
+
+    #[test]
+    fn display() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        assert_eq!(format!("{diff}"), "2^8");
+    }
+
+    #[test]
+    fn to_work_matches_target_to_work() {
+        // Log2Difficulty's to_work should agree with computing work
+        // from the equivalent target directly.
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let expected = Difficulty::from(256_u64).to_target().to_work();
+        assert_eq!(diff.to_work(), expected);
+    }
+}
+
+#[cfg(test)]
+mod ticket_mask_tests {
+    use super::*;
+    use crate::types::Difficulty;
+
+    #[test]
+    fn wire_encoding_difficulty_256() {
+        // 8 zero_bits -> mask 0xFF -> [00, 00, 00, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn wire_encoding_difficulty_1024() {
+        // 10 zero_bits -> mask 0x3FF -> [00, 00, C0, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1024_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0xC0, 0xFF]);
+    }
+
+    #[test]
+    fn wire_encoding_difficulty_65536() {
+        // 16 zero_bits -> mask 0xFFFF -> [00, 00, FF, FF]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(65536_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn wire_encoding_difficulty_1() {
+        // 0 zero_bits -> [00, 00, 00, 00]
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(1_u64));
+        let bytes = TicketMask::new(diff).to_wire_bytes();
+        assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_matches_to_wire_bytes() {
+        let diff = Log2Difficulty::from_difficulty(Difficulty::from(256_u64));
+        let mask = TicketMask::new(diff);
+        let mut buf = BytesMut::new();
+        mask.encode(&mut buf);
+        assert_eq!(&buf[..], &[0x00, 0x00, 0x00, 0xFF]);
+    }
+
+    #[test]
+    fn reverse_bits_examples() {
+        assert_eq!(reverse_bits(0x00), 0x00);
+        assert_eq!(reverse_bits(0xFF), 0xFF);
+        assert_eq!(reverse_bits(0x01), 0x80);
+        assert_eq!(reverse_bits(0x80), 0x01);
+        assert_eq!(reverse_bits(0x03), 0xC0);
+        assert_eq!(reverse_bits(0x0F), 0xF0);
+    }
+}

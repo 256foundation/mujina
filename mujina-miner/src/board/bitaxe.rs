@@ -25,7 +25,8 @@ use crate::{
         ChipInfo,
         bm13xx::{
             self, BM13xxProtocol, Register, Response,
-            protocol::{ChipId, Destination, RegisterCommand, VersionMask, WriteRegister},
+            command::{Destination, RegisterCommand, WriteRegister},
+            register::{ChipId, VersionMask},
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
