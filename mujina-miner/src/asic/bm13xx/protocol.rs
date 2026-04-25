@@ -612,14 +612,33 @@ impl Register {
     }
 }
 
+struct CommandFlags {
+    kind: Kind,
+    broadcast: bool,
+    cmd: Cmd,
+}
+
+impl CommandFlags {
+    fn encode(&self, dst: &mut BytesMut) {
+        let mut byte = 0u8;
+        let field = byte.view_bits_mut::<Lsb0>();
+        field[5..7].store(self.kind as u8);
+        field[4..5].store(self.broadcast as u8);
+        field[0..4].store(self.cmd as u8);
+        dst.put_u8(byte);
+    }
+}
+
+#[derive(Clone, Copy)]
 #[repr(u8)]
-enum CommandFlagsType {
+enum Kind {
     Job = 1,
     Command = 2,
 }
 
+#[derive(Clone, Copy)]
 #[repr(u8)]
-enum CommandFlagsCmd {
+enum Cmd {
     SetChipAddress = 0,
     WriteRegisterOrJob = 1,
     ReadRegister = 2,
@@ -694,11 +713,12 @@ pub struct SetChipAddress {
 
 impl SetChipAddress {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Command,
-            false, // never broadcast
-            CommandFlagsCmd::SetChipAddress,
-        ));
+        CommandFlags {
+            kind: Kind::Command,
+            broadcast: false,
+            cmd: Cmd::SetChipAddress,
+        }
+        .encode(dst);
         dst.put_u8(5); // flags + length + chip_addr + reg_addr + crc5
         dst.put_u8(self.chip_address);
         dst.put_u8(0x00); // reserved
@@ -711,11 +731,12 @@ pub struct ChainInactive;
 
 impl ChainInactive {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Command,
-            true, // always broadcast
-            CommandFlagsCmd::ChainInactive,
-        ));
+        CommandFlags {
+            kind: Kind::Command,
+            broadcast: true,
+            cmd: Cmd::ChainInactive,
+        }
+        .encode(dst);
         dst.put_u8(5); // flags + length + reserved + reserved + crc5
         dst.put_u8(0x00);
         dst.put_u8(0x00);
@@ -731,11 +752,12 @@ pub struct ReadRegister {
 
 impl ReadRegister {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Command,
-            self.destination.is_broadcast(),
-            CommandFlagsCmd::ReadRegister,
-        ));
+        CommandFlags {
+            kind: Kind::Command,
+            broadcast: self.destination.is_broadcast(),
+            cmd: Cmd::ReadRegister,
+        }
+        .encode(dst);
         dst.put_u8(5); // flags + length + chip_addr + reg_addr + crc5
         dst.put_u8(self.destination.address_byte());
         dst.put_u8(self.register_address as u8);
@@ -751,11 +773,12 @@ pub struct WriteRegister {
 
 impl WriteRegister {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Command,
-            self.destination.is_broadcast(),
-            CommandFlagsCmd::WriteRegisterOrJob,
-        ));
+        CommandFlags {
+            kind: Kind::Command,
+            broadcast: self.destination.is_broadcast(),
+            cmd: Cmd::WriteRegisterOrJob,
+        }
+        .encode(dst);
         dst.put_u8(9); // flags + length + chip_addr + reg_addr + 4 data + crc5
         dst.put_u8(self.destination.address_byte());
         dst.put_u8(self.register.address() as u8);
@@ -828,11 +851,12 @@ pub struct JobFullFormat {
 
 impl JobFullFormat {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Job,
-            false, // jobs are never broadcast
-            CommandFlagsCmd::WriteRegisterOrJob,
-        ));
+        CommandFlags {
+            kind: Kind::Job,
+            broadcast: false,
+            cmd: Cmd::WriteRegisterOrJob,
+        }
+        .encode(dst);
 
         // Captures from factory firmware use this value on both BM1362
         // (S19 J Pro) and BM1370 (S21 Pro). esp-miner firmware on
@@ -884,11 +908,12 @@ pub struct JobMidstateFormat {
 
 impl JobMidstateFormat {
     fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(build_flags(
-            CommandFlagsType::Job,
-            false, // jobs are never broadcast
-            CommandFlagsCmd::WriteRegisterOrJob,
-        ));
+        CommandFlags {
+            kind: Kind::Job,
+            broadcast: false,
+            cmd: Cmd::WriteRegisterOrJob,
+        }
+        .encode(dst);
 
         // Layout: flags + length + 18 header bytes + num_midstates * 32 + crc16 (2)
         dst.put_u8(1 + 1 + 18 + self.num_midstates * 32 + 2);
@@ -913,15 +938,6 @@ impl JobMidstateFormat {
             dst.put_slice(midstate);
         }
     }
-}
-
-fn build_flags(typ: CommandFlagsType, broadcast: bool, cmd: CommandFlagsCmd) -> u8 {
-    let mut flags = 0u8;
-    let field = flags.view_bits_mut::<Lsb0>();
-    field[5..7].store(typ as u8);
-    field[4..5].store(broadcast as u8);
-    field[0..4].store(cmd as u8);
-    flags
 }
 
 #[derive(FromRepr)]
