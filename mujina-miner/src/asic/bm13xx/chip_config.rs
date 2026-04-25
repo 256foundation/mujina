@@ -8,7 +8,7 @@
 
 use std::ops::RangeInclusive;
 
-use super::protocol::{ChipModel, PllDivider};
+use super::register::{ChipModel, PllDivider};
 use crate::types::Frequency;
 
 /// Per-chip-model configuration.

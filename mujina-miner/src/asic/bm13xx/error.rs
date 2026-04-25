@@ -11,7 +11,7 @@ pub enum ProtocolError {
     InvalidResponseType(u8),
 
     #[error("Cannot write to read-only register: {0:?}")]
-    ReadOnlyRegister(super::protocol::RegisterAddress),
+    ReadOnlyRegister(super::register::RegisterAddress),
 
     #[error("Invalid frame format")]
     InvalidFrame,

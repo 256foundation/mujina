@@ -17,11 +17,15 @@ use futures::{SinkExt, sink::Sink, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
-use super::protocol::{
-    self, AnalogMux, ChainInactive, Core, Destination, InitControl, IoDriverStrength, JobCommand,
-    Log2Difficulty, MiscControl, MiscSettings, NonceRange, Register, RegisterCommand,
-    SetChipAddress, TicketMask, VersionMask, WriteRegister,
+use super::command::{
+    ChainInactive, Destination, JobCommand, JobFullFormat, RegisterCommand, SetChipAddress,
+    WriteRegister,
 };
+use super::register::{
+    AnalogMux, Core, InitControl, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
+    NonceRange, PllDivider, Register, TicketMask, VersionMask,
+};
+use super::response::Response;
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -137,7 +141,7 @@ impl BM13xxThread {
         removal_rx: watch::Receiver<ThreadRemovalSignal>,
     ) -> Self
     where
-        R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin + Send + 'static,
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
         W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
@@ -446,7 +450,7 @@ fn generate_frequency_ramp_steps(
     start_mhz: f32,
     target_mhz: f32,
     step_mhz: f32,
-) -> Vec<protocol::PllDivider> {
+) -> Vec<PllDivider> {
     let mut configs = Vec::new();
     let mut current = start_mhz;
 
@@ -468,7 +472,7 @@ fn generate_frequency_ramp_steps(
 /// Extracts or computes the merkle root, then builds a JobFullFormat with all
 /// block header fields. For computed merkle roots, requires EN2. For fixed merkle
 /// roots (Stratum v2 header-only), uses the template's fixed value directly.
-fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFullFormat> {
+fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     use crate::job_source::MerkleRootKind;
 
     let template = task.template.as_ref();
@@ -490,7 +494,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
         MerkleRootKind::Fixed(merkle_root) => *merkle_root,
     };
 
-    Ok(protocol::JobFullFormat {
+    Ok(JobFullFormat {
         job_id: chip_job_id,
         num_midstates: 1,
         starting_nonce: 0,
@@ -503,7 +507,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<protocol::JobFul
 }
 
 /// Calculate PLL configuration for a specific frequency
-fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllDivider> {
+fn calculate_pll_for_frequency(target_freq: f32) -> Option<PllDivider> {
     const CRYSTAL_FREQ: f32 = 25.0;
     const MAX_FREQ_ERROR: f32 = 1.0;
 
@@ -553,11 +557,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllDivider>
     }
 
     let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
-    Some(protocol::PllDivider::new(
-        best_fb_div,
-        best_ref_div,
-        post_div,
-    ))
+    Some(PllDivider::new(best_fb_div, best_ref_div, post_div))
 }
 
 /// Internal actor task for BM13xxThread.
@@ -580,7 +580,7 @@ async fn bm13xx_thread_actor<R, W, E>(
     mut chip_commands: W,
     mut peripherals: BoardPeripherals,
 ) where
-    R: Stream<Item = Result<protocol::Response, std::io::Error>> + Unpin,
+    R: Stream<Item = Result<Response, std::io::Error>> + Unpin,
     W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -765,7 +765,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                 match result {
                     Ok(response) => {
                         match response {
-                            protocol::Response::Nonce { nonce, job_id, version, midstate_num, subcore_id } => {
+                            Response::Nonce { nonce, job_id, version, midstate_num, subcore_id } => {
                                 // Look up the task for this job_id
                                 if let Some(task) = chip_jobs.get(job_id) {
                                     let template = task.template.as_ref();
@@ -852,7 +852,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                                 let _ = (midstate_num, subcore_id); // Unused for now
                             }
 
-                            protocol::Response::ReadRegister { chip_address, register } => {
+                            Response::ReadRegister { chip_address, register } => {
                                 trace!(chip_address = %format!("0x{:02x}", chip_address), register = ?register, "Register read response");
                             }
                         }
