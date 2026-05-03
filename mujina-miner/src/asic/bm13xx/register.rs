@@ -10,6 +10,7 @@ use bytes::{BufMut, BytesMut};
 use std::fmt;
 use strum::FromRepr;
 
+use super::chip_config::CRYSTAL_MHZ;
 use crate::types::Difficulty;
 
 /// Register addresses on the wire.
@@ -205,12 +206,18 @@ pub struct PllDivider {
 }
 
 impl PllDivider {
-    /// Create a PLL configuration, deriving the VCO flag from the
-    /// resulting VCO frequency: `vco >= 2400 MHz` picks flag `0x50`,
-    /// otherwise flag `0x40`.
+    /// Builds a [`PllDivider`] with `flag` derived from the dividers.
     pub fn new(fb_div: u8, ref_div: u8, post_div: u8) -> Self {
-        let vco_mhz = fb_div as f32 * 25.0 / ref_div as f32;
-        let flag = if vco_mhz >= 2400.0 { 0x50 } else { 0x40 };
+        const VCO_FLAG_THRESHOLD_MHZ: f32 = 2400.0;
+        const PLL_FLAG_HIGH_VCO: u8 = 0x50;
+        const PLL_FLAG_LOW_VCO: u8 = 0x40;
+
+        let vco_mhz = fb_div as f32 * CRYSTAL_MHZ / ref_div as f32;
+        let flag = if vco_mhz >= VCO_FLAG_THRESHOLD_MHZ {
+            PLL_FLAG_HIGH_VCO
+        } else {
+            PLL_FLAG_LOW_VCO
+        };
         Self {
             flag,
             fb_div,
@@ -792,6 +799,31 @@ mod pll_divider_tests {
             ref_div: 0x01,
             post_div: 0x33,
         });
+    }
+
+    #[test]
+    fn new_picks_flag_from_resulting_vco() {
+        // VCO = fb_div * crystal / ref_div. Pick targets across the
+        // boundary, back-derive fb_div, and assert the flag matches
+        // the bracket. The threshold rule is `>=`, so a target that
+        // hits the boundary exactly picks the high flag.
+        const REF_DIV: u8 = 2;
+        let fb_div_for = |vco_mhz: f32| (vco_mhz * REF_DIV as f32 / CRYSTAL_MHZ) as u8;
+
+        let cases = [
+            (2000.0, 0x40u8), // below
+            (2400.0, 0x50),   // at threshold (>= picks high)
+            (2800.0, 0x50),   // above
+        ];
+        for (target_vco, expected_flag) in cases {
+            let fb_div = fb_div_for(target_vco);
+            assert_eq!(
+                PllDivider::new(fb_div, REF_DIV, 0).flag,
+                expected_flag,
+                "target VCO {} MHz",
+                target_vco,
+            );
+        }
     }
 }
 

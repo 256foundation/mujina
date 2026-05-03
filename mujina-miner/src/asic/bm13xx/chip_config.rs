@@ -138,7 +138,7 @@ pub struct PllParams {
 }
 
 /// Crystal oscillator frequency for BM13xx chips (25 MHz).
-const CRYSTAL_MHZ: f32 = 25.0;
+pub(super) const CRYSTAL_MHZ: f32 = 25.0;
 
 #[cfg(test)]
 mod tests {
@@ -217,24 +217,6 @@ mod tests {
         assert_eq!(bm1370().calculate_pll(Frequency::from_mhz(700.0)), None);
         assert_eq!(bm1362().calculate_pll(Frequency::from_mhz(600.0)), None);
         assert_eq!(bm1370().calculate_pll(Frequency::from_mhz(40.0)), None);
-    }
-
-    #[test]
-    fn pll_vco_flag_set_correctly() {
-        // Flag 0x50 for vco >= 2400 MHz, otherwise 0x40. Both families
-        // use the same rule; VCO bounds differ but the threshold does not.
-        for config in [bm1362(), bm1370()] {
-            for freq_mhz in [100.0, 200.0, 300.0, 400.0, 500.0, 525.0] {
-                let pll = config.calculate_pll(Frequency::from_mhz(freq_mhz)).unwrap();
-                let vco = pll.fb_div as f32 * CRYSTAL_MHZ / pll.ref_div as f32;
-                let expected = if vco >= 2400.0 { 0x50 } else { 0x40 };
-                assert_eq!(
-                    pll.flag, expected,
-                    "{:?} {} MHz: VCO={:.1} should use flag=0x{:02X}, got 0x{:02X}",
-                    config.model, freq_mhz, vco, expected, pll.flag
-                );
-            }
-        }
     }
 
     #[test]
