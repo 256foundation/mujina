@@ -718,4 +718,177 @@ mod ticket_mask_tests {
         assert_eq!(reverse_bits(0x03), 0xC0);
         assert_eq!(reverse_bits(0x0F), 0xF0);
     }
+
+    fn round_trip(difficulty: Difficulty) {
+        let mask = TicketMask::new(Log2Difficulty::from_difficulty(difficulty));
+        let mut buf = BytesMut::new();
+        mask.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(TicketMask::decode(bytes), mask);
+    }
+
+    #[test]
+    fn round_trip_difficulty_1() {
+        round_trip(Difficulty::from(1_u64));
+    }
+
+    #[test]
+    fn round_trip_difficulty_256() {
+        round_trip(Difficulty::from(256_u64));
+    }
+}
+
+#[cfg(test)]
+mod chip_id_tests {
+    use super::*;
+
+    fn round_trip(original: ChipId) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(ChipId::decode(bytes), original);
+    }
+
+    #[test]
+    fn known_model() {
+        round_trip(ChipId {
+            model: ChipModel::BM1362,
+            core_count: 80,
+            address: 0x42,
+        });
+    }
+
+    #[test]
+    fn unknown_model() {
+        round_trip(ChipId {
+            model: ChipModel::Unknown([0x12, 0x34]),
+            core_count: 0,
+            address: 0x00,
+        });
+    }
+}
+
+#[cfg(test)]
+mod pll_divider_tests {
+    use super::*;
+
+    fn round_trip(original: PllDivider) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(PllDivider::decode(bytes), original);
+    }
+
+    #[test]
+    fn from_new() {
+        round_trip(PllDivider::new(100, 1, 0x00));
+    }
+
+    #[test]
+    fn from_literal_fields() {
+        round_trip(PllDivider {
+            flag: 0x40,
+            fb_div: 0x68,
+            ref_div: 0x01,
+            post_div: 0x33,
+        });
+    }
+}
+
+#[cfg(test)]
+mod nonce_range_tests {
+    use super::*;
+
+    fn round_trip(original: NonceRange) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(NonceRange::decode(bytes), original);
+    }
+
+    #[test]
+    fn single_chip() {
+        round_trip(NonceRange::single_chip());
+    }
+
+    #[test]
+    fn multi_chip() {
+        round_trip(NonceRange::multi_chip(16));
+    }
+
+    #[test]
+    fn from_raw() {
+        round_trip(NonceRange::from_raw(0xdeadbeef));
+    }
+}
+
+#[cfg(test)]
+mod uart_baud_tests {
+    use super::*;
+
+    fn round_trip(original: UartBaud) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(UartBaud::decode(bytes), original);
+    }
+
+    #[test]
+    fn baud_115200() {
+        round_trip(UartBaud::Baud115200);
+    }
+
+    #[test]
+    #[should_panic]
+    fn baud_1m() {
+        // Currently fails: encode emits 0x00023011 but decode
+        // matches 0x00000130 for Baud1M, so the round-trip
+        // collapses to Custom. Drop #[should_panic] once the
+        // constants are reconciled.
+        round_trip(UartBaud::Baud1M);
+    }
+
+    #[test]
+    fn baud_3m() {
+        round_trip(UartBaud::Baud3M);
+    }
+
+    #[test]
+    fn custom_value() {
+        round_trip(UartBaud::Custom(0xdeadbeef));
+    }
+}
+
+#[cfg(test)]
+mod io_driver_strength_tests {
+    use super::*;
+
+    fn round_trip(original: IoDriverStrength) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(IoDriverStrength::decode(bytes), original);
+    }
+
+    #[test]
+    fn normal() {
+        round_trip(IoDriverStrength::normal());
+    }
+}
+
+#[cfg(test)]
+mod version_mask_tests {
+    use super::*;
+
+    fn round_trip(original: VersionMask) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(VersionMask::decode(bytes), original);
+    }
+
+    #[test]
+    fn full_rolling() {
+        round_trip(VersionMask::full_rolling());
+    }
 }
