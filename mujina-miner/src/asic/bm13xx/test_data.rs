@@ -15,10 +15,10 @@
 //! consistency of the test data itself (e.g., that Stratum constants match
 //! wire frame values, that computed merkle roots match captured values).
 //!
-//! **Parser tests live in their respective modules:**
-//! - Stratum parsing tests → `stratum_v1::messages::tests`
-//! - Job conversion tests → `job_source::stratum_v1::tests`
-//! - Wire protocol tests → `asic::bm13xx::protocol::tests`
+//! **Parser tests live in the module that owns the type under test:**
+//! - Stratum parsing tests in `stratum_v1::messages::tests`
+//! - Job conversion tests in `job_source::stratum_v1::tests`
+//! - Wire protocol tests alongside the wire types in `asic::bm13xx`
 //!
 //! This separation ensures test_data remains a reference dataset that other
 //! modules can depend on without circular dependencies.

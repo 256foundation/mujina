@@ -24,9 +24,9 @@ use crate::{
     asic::{
         ChipInfo,
         bm13xx::{
-            self, BM13xxProtocol, Register, Response,
-            command::{Destination, RegisterCommand, WriteRegister},
-            register::{ChipId, VersionMask},
+            self, Register, Response,
+            command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
+            register::{ChipId, RegisterAddress, VersionMask},
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
@@ -554,7 +554,10 @@ async fn discover_chips(
     reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
 ) -> Result<Vec<ChipInfo>> {
-    let discover_cmd = BM13xxProtocol::discover_chips();
+    let discover_cmd = RegisterCommand::ReadRegister(ReadRegister {
+        destination: Destination::Broadcast,
+        register_address: RegisterAddress::ChipId,
+    });
 
     writer
         .send(discover_cmd)

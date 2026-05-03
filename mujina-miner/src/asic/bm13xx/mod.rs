@@ -8,7 +8,6 @@ pub mod codec;
 pub mod command;
 pub mod crc;
 pub mod error;
-pub mod protocol;
 pub mod register;
 pub mod response;
 pub mod thread;
@@ -20,6 +19,3 @@ pub mod test_data;
 pub use codec::FrameCodec;
 pub use register::Register;
 pub use response::Response;
-
-// Re-export the protocol handler
-pub use protocol::BM13xxProtocol;
