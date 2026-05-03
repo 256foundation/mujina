@@ -8,8 +8,20 @@
 use bitcoin::hashes::Hash;
 use bitvec::prelude::*;
 use bytes::{BufMut, BytesMut};
+use futures::sink::Sink;
 
 use super::register::{Register, RegisterAddress};
+
+/// Sink that accepts both BM13xx command families.
+pub trait ChipCommandSink<E>:
+    Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E>
+{
+}
+
+impl<T, E> ChipCommandSink<E> for T where
+    T: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E>
+{
+}
 
 /// TYPE=2 frames: register reads/writes and chain addressing. Use CRC5.
 #[derive(Debug)]

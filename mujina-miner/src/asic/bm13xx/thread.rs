@@ -13,13 +13,13 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
-use futures::{SinkExt, sink::Sink, stream::Stream};
+use futures::{SinkExt, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::StreamExt;
 
 use super::command::{
-    ChainInactive, Destination, JobCommand, JobFullFormat, RegisterCommand, SetChipAddress,
-    WriteRegister,
+    ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
+    SetChipAddress, WriteRegister,
 };
 use super::register::{
     AnalogMux, Core, InitControl, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
@@ -142,7 +142,7 @@ impl BM13xxThread {
     ) -> Self
     where
         R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
-        W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin + Send + 'static,
+        W: ChipCommandSink<E> + Unpin + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
@@ -255,7 +255,7 @@ async fn initialize_chip<W, E>(
     asic_difficulty: Log2Difficulty,
 ) -> Result<()>
 where
-    W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
+    W: ChipCommandSink<E> + Unpin,
     E: std::error::Error + Send + Sync + 'static,
 {
     // Enable the ASIC
@@ -581,7 +581,7 @@ async fn bm13xx_thread_actor<R, W, E>(
     mut peripherals: BoardPeripherals,
 ) where
     R: Stream<Item = Result<Response, std::io::Error>> + Unpin,
-    W: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E> + Unpin,
+    W: ChipCommandSink<E> + Unpin,
     E: std::error::Error + Send + Sync + 'static,
 {
     // Disable ASIC on startup to establish known state
