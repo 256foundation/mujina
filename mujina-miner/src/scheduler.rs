@@ -201,28 +201,45 @@ impl Scheduler {
 
     /// Aggregate measured hashrate from per-thread estimators.
     ///
-    /// Returns the truth: zero if no shares have been recorded yet.
+    /// Falls back to the thread's self-reported `status().hashrate` when
+    /// the share-based estimator has no data yet. This surfaces a real
+    /// number for backends that measure hashrate directly (e.g. the CPU
+    /// miner, which counts hashes per cycle) without waiting for the
+    /// estimator to settle from observed shares -- which on slow
+    /// backends paired with a high source difficulty might never happen.
     fn measured_hashrate(&mut self) -> HashRate {
         self.threads
             .values_mut()
-            .map(|entry| entry.hashrate.hashrate())
+            .map(|entry| {
+                let estimated = entry.hashrate.hashrate();
+                if estimated.is_zero() {
+                    entry.thread.status().hashrate
+                } else {
+                    estimated
+                }
+            })
             .sum()
     }
 
     /// Aggregate hashrate for operational decisions.
     ///
-    /// Per thread, uses measured hashrate if the estimator has settled,
-    /// otherwise falls back to the static capability estimate. Suitable
-    /// for broadcasting to sources and difficulty warnings, where a zero
-    /// value at startup would be unhelpful.
+    /// Per thread, prefers the share-based estimator once settled, then
+    /// the thread's self-reported hashrate, then the static capability
+    /// estimate. Suitable for broadcasting to sources and difficulty
+    /// warnings, where a zero value at startup would be unhelpful.
     fn operational_hashrate(&mut self) -> HashRate {
         self.threads
             .values_mut()
             .map(|entry| {
-                entry
-                    .hashrate
-                    .settled_hashrate()
-                    .unwrap_or(entry.thread.capabilities().hashrate_estimate)
+                if let Some(settled) = entry.hashrate.settled_hashrate() {
+                    return settled;
+                }
+                let reported = entry.thread.status().hashrate;
+                if reported.is_zero() {
+                    entry.thread.capabilities().hashrate_estimate
+                } else {
+                    reported
+                }
             })
             .sum()
     }
