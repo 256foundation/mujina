@@ -108,6 +108,15 @@ impl CpuHashThread {
         self.shutdown.store(true, Ordering::Relaxed);
         let _ = self.command_tx.send(MinerCommand::Shutdown);
     }
+
+    /// Clone of the live status handle.
+    ///
+    /// Lets the board layer publish per-thread telemetry without taking
+    /// ownership of the thread itself (which gets handed to the
+    /// scheduler).
+    pub fn status_handle(&self) -> Arc<RwLock<HashThreadStatus>> {
+        Arc::clone(&self.status)
+    }
 }
 
 impl Drop for CpuHashThread {
