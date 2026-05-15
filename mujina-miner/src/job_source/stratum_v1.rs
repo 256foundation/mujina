@@ -1084,12 +1084,12 @@ mod tests {
 
     #[test]
     fn test_compute_suggested_difficulty_bitaxe_gamma() {
-        // ~500 GH/s at 20 shares/min (3-sec interval) should yield ~349
-        let diff = StratumV1Source::compute_suggested_difficulty(HashRate::from_gigahashes(500.0))
-            .unwrap();
+        // ~1 TH/s at 20 shares/min (3-sec interval) should yield ~698
+        let diff =
+            StratumV1Source::compute_suggested_difficulty(HashRate::from_terahashes(1.0)).unwrap();
         assert!(
-            (300..400).contains(&diff),
-            "Bitaxe Gamma difficulty {diff} not in expected range 300..400"
+            (600..800).contains(&diff),
+            "Bitaxe Gamma difficulty {diff} not in expected range 600..800"
         );
     }
 
