@@ -95,8 +95,9 @@ impl CpuHashThread {
             event_rx: Some(evt_rx),
             status,
             capabilities: HashThreadCapabilities {
-                // Conservative estimate: ~5 MH/s per core on modern hardware
-                hashrate_estimate: HashRate::from_megahashes(5.0),
+                // Conservative estimate: ~5 MH/s peak on modern hardware,
+                // scaled by duty cycle so the estimate reflects effective rate.
+                hashrate_estimate: HashRate::from_megahashes(5.0 * duty_percent as f64 / 100.0),
             },
             shutdown,
             _thread_handle: Some(handle),
