@@ -60,6 +60,7 @@ mod messages;
 mod reconnect;
 pub mod stratum_v1;
 pub mod test_blocks;
+pub mod upstream;
 mod version;
 
 // Re-export types from submodules
