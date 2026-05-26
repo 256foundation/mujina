@@ -45,6 +45,7 @@ rustix = { workspace = true }
 slotmap = { workspace = true }
 num-traits = { workspace = true }
 ruint = "1.17.0"
+stratum-apps = { version = "0.4", default-features = false, features = ["network", "core", "config"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
