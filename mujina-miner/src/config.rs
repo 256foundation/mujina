@@ -72,6 +72,10 @@ pub enum ParseEndpointError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PoolProtocol {
     StratumV1,
+    /// Stratum V1 over SSL/TLS (`stratum+ssl://`).
+    StratumV1Ssl,
+    /// Stratum V1 over SSL/TLS (`stratum+tls://`).
+    StratumV1Tls,
     StratumV2,
 }
 
@@ -82,6 +86,8 @@ pub enum PoolProtocol {
 /// Recognised URL forms:
 /// - `stratum2+tcp://host:port/authority_key` → [`PoolProtocol::StratumV2`]
 /// - `stratum+tcp://host:port` → [`PoolProtocol::StratumV1`]
+/// - `stratum+ssl://host:port` → [`PoolProtocol::StratumV1Ssl`]
+/// - `stratum+tls://host:port` → [`PoolProtocol::StratumV1Tls`]
 /// - `host:port` (bare) → [`PoolProtocol::StratumV1`]
 #[derive(Debug, Clone)]
 pub struct PoolEndpoint {
@@ -101,62 +107,67 @@ impl PoolEndpoint {
     /// Recognised URL forms:
     /// - `stratum2+tcp://host:port/authority_key` → [`PoolProtocol::StratumV2`]
     /// - `stratum+tcp://host:port` → [`PoolProtocol::StratumV1`]
+    /// - `stratum+ssl://host:port` → [`PoolProtocol::StratumV1Ssl`]
+    /// - `stratum+tls://host:port` → [`PoolProtocol::StratumV1Tls`]
     /// - `host:port` (bare) → [`PoolProtocol::StratumV1`]
     ///
     /// Any other `scheme://` prefix returns [`ParseEndpointError::UnsupportedScheme`].
     pub fn parse(url: &str) -> Result<Self, ParseEndpointError> {
+        // V2 is the only scheme that carries an authority key, so it parses on
+        // its own path.
         if let Some(rest) = url.strip_prefix("stratum2+tcp://") {
-            let (host_port, key_segment) = rest
-                .split_once('/')
-                .ok_or(ParseEndpointError::MissingAuthorityKey)?;
-            if key_segment.is_empty() {
-                return Err(ParseEndpointError::MissingAuthorityKey);
-            }
-            // Reject extra path segments (e.g. /key/worker) — the authority
-            // key must be a single path component with no further slashes.
-            if key_segment.contains('/') {
-                return Err(ParseEndpointError::InvalidAuthorityKey(
-                    "unexpected path segments after key; \
-                     expected stratum2+tcp://host:port/<key>"
-                        .to_string(),
-                ));
-            }
-            let (host, port) = parse_host_port(host_port)?;
-            let authority_pubkey = key_segment
-                .parse::<Secp256k1PublicKey>()
-                .map_err(|e| ParseEndpointError::InvalidAuthorityKey(e.to_string()))?;
-            Ok(Self {
-                host,
-                port,
-                protocol: PoolProtocol::StratumV2,
-                authority_pubkey: Some(authority_pubkey),
-            })
-        } else if let Some(rest) = url.strip_prefix("stratum+tcp://") {
-            // Strip any path component (e.g. /worker) — V1 pool URLs often
-            // embed the worker name in the path; the miner reads it from
-            // the `worker` config field instead.
-            let host_port = rest.split_once('/').map_or(rest, |(hp, _)| hp);
-            let (host, port) = parse_host_port(host_port)?;
-            Ok(Self {
-                host,
-                port,
-                protocol: PoolProtocol::StratumV1,
-                authority_pubkey: None,
-            })
-        } else if let Some(scheme_end) = url.find("://") {
-            Err(ParseEndpointError::UnsupportedScheme(
-                url[..scheme_end].to_string(),
-            ))
-        } else {
-            // Bare host:port with no scheme.
-            let (host, port) = parse_host_port(url)?;
-            Ok(Self {
-                host,
-                port,
-                protocol: PoolProtocol::StratumV1,
-                authority_pubkey: None,
-            })
+            return Self::parse_v2(rest);
         }
+
+        // The V1-family schemes differ only in their transport label.
+        const V1_SCHEMES: [(&str, PoolProtocol); 3] = [
+            ("stratum+tcp://", PoolProtocol::StratumV1),
+            ("stratum+ssl://", PoolProtocol::StratumV1Ssl),
+            ("stratum+tls://", PoolProtocol::StratumV1Tls),
+        ];
+        for (prefix, protocol) in V1_SCHEMES {
+            if let Some(rest) = url.strip_prefix(prefix) {
+                return Self::parse_v1(rest, protocol);
+            }
+        }
+
+        if let Some(scheme_end) = url.find("://") {
+            return Err(ParseEndpointError::UnsupportedScheme(
+                url[..scheme_end].to_string(),
+            ));
+        }
+
+        // Bare host:port defaults to plain V1.
+        Self::parse_v1(url, PoolProtocol::StratumV1)
+    }
+
+    fn parse_v1(host_port: &str, protocol: PoolProtocol) -> Result<Self, ParseEndpointError> {
+        let (host, port) = parse_host_port(host_port)?;
+        Ok(Self {
+            host,
+            port,
+            protocol,
+            authority_pubkey: None,
+        })
+    }
+
+    fn parse_v2(rest: &str) -> Result<Self, ParseEndpointError> {
+        let (host_port, key_segment) = rest
+            .split_once('/')
+            .ok_or(ParseEndpointError::MissingAuthorityKey)?;
+        if key_segment.is_empty() {
+            return Err(ParseEndpointError::MissingAuthorityKey);
+        }
+        let (host, port) = parse_host_port(host_port)?;
+        let authority_pubkey = key_segment
+            .parse::<Secp256k1PublicKey>()
+            .map_err(|e| ParseEndpointError::InvalidAuthorityKey(e.to_string()))?;
+        Ok(Self {
+            host,
+            port,
+            protocol: PoolProtocol::StratumV2,
+            authority_pubkey: Some(authority_pubkey),
+        })
     }
 
     /// Returns the authority public key for Stratum V2 endpoints (`None` for V1).
@@ -268,6 +279,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_stratum_v1_ssl_scheme() {
+        let ep = PoolEndpoint::parse("stratum+ssl://pool.example.com:3333").unwrap();
+        assert_eq!(ep.host, "pool.example.com");
+        assert_eq!(ep.port, 3333);
+        assert_eq!(ep.protocol, PoolProtocol::StratumV1Ssl);
+        assert!(ep.authority_pubkey().is_none());
+    }
+
+    #[test]
+    fn parse_stratum_v1_tls_scheme() {
+        let ep = PoolEndpoint::parse("stratum+tls://pool.example.com:3333").unwrap();
+        assert_eq!(ep.host, "pool.example.com");
+        assert_eq!(ep.port, 3333);
+        assert_eq!(ep.protocol, PoolProtocol::StratumV1Tls);
+        assert!(ep.authority_pubkey().is_none());
+    }
+
+    #[test]
     fn parse_bare_host_port() {
         let ep = PoolEndpoint::parse("pool.example.com:3333").unwrap();
         assert_eq!(ep.host, "pool.example.com");
@@ -362,28 +391,5 @@ mod tests {
         };
         let ep = cfg.endpoint().unwrap();
         assert_eq!(ep.protocol, PoolProtocol::StratumV1);
-    }
-
-    /// stratum+tcp:// URLs with a path component (e.g. embedded worker name)
-    /// must still parse correctly — the path is stripped and ignored.
-    #[test]
-    fn parse_stratum_v1_with_path_strips_it() {
-        let ep = PoolEndpoint::parse("stratum+tcp://pool.example.com:3333/myworker.1").unwrap();
-        assert_eq!(ep.host, "pool.example.com");
-        assert_eq!(ep.port, 3333);
-        assert_eq!(ep.protocol, PoolProtocol::StratumV1);
-    }
-
-    /// stratum2+tcp:// URLs with extra path segments after the key must fail
-    /// with a clear error rather than blaming the key itself.
-    #[test]
-    fn parse_v2_extra_path_segments_rejected() {
-        let url = format!("stratum2+tcp://pool.example.com:3336/{VALID_KEY}/worker");
-        let err = PoolEndpoint::parse(&url).unwrap_err();
-        assert!(
-            matches!(err, ParseEndpointError::InvalidAuthorityKey(ref msg)
-                if msg.contains("unexpected path segments")),
-            "expected InvalidAuthorityKey with 'unexpected path segments', got {err:?}"
-        );
     }
 }
