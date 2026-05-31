@@ -74,6 +74,7 @@ skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environ
 [dev-dependencies]
 http = "1"
 http-body-util = "0.1"
+integration_tests_sv2 = "0.2.0"
 serial_test = "3.3.1"
 test-case = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

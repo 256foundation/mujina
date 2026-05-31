@@ -12,6 +12,8 @@ FROM docker.io/library/rust:1.94-bookworm@sha256:b2fe2c0f26e0e1759752b6b2eb93b11
 RUN rustup component add rustfmt clippy
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    capnproto \
+    libcapnp-dev \
     libudev-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
