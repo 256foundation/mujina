@@ -34,6 +34,8 @@
 
 mod client;
 mod error;
+#[cfg(test)]
+mod integration_tests;
 
 pub use client::constants;
 pub(crate) use client::target_from_le_bytes;
