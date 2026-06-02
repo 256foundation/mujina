@@ -129,6 +129,24 @@ impl PoolConfig {
     pub(crate) fn host(&self) -> String {
         self.host.as_utf8_or_hex()
     }
+
+    /// Returns a copy of this configuration that connects to `host:port`.
+    ///
+    /// Every other field is kept, the authority public key included, so a
+    /// pool can move the miner between its own servers but never to a server
+    /// outside its authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StratumV2Error::Protocol`] if `host` exceeds the 255-byte
+    /// limit of the SV2 `STR0_255` type.
+    pub(crate) fn with_endpoint(&self, host: String, port: u16) -> StratumV2Result<Self> {
+        Ok(Self {
+            host: Str0255::try_from(host).map_err(protocol_error)?,
+            port,
+            ..self.clone()
+        })
+    }
 }
 
 /// Commands sent to the SV2 client from the consumer.
@@ -794,6 +812,25 @@ mod tests {
         assert_eq!(
             reconnect_endpoint(&config, &make_reconnect("backup.example.com", 0)),
             ("backup.example.com".to_string(), 3333)
+        );
+    }
+
+    /// Contract: moving a configuration to another endpoint keeps the
+    /// authority key, so a Reconnect cannot send the miner to a server
+    /// outside the pool's authority.
+    #[test]
+    fn with_endpoint_keeps_the_authority_key() {
+        let config = make_config();
+
+        let moved = config
+            .with_endpoint("backup.example.com".to_string(), 4444)
+            .unwrap();
+
+        assert_eq!(moved.host(), "backup.example.com");
+        assert_eq!(moved.port, 4444);
+        assert_eq!(
+            format!("{:?}", moved.authority_pubkey),
+            format!("{:?}", config.authority_pubkey)
         );
     }
 }

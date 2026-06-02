@@ -36,5 +36,6 @@ mod client;
 mod error;
 
 pub use client::constants;
+pub(crate) use client::target_from_le_bytes;
 pub use client::{ClientCommand, ClientEvent, ClientOutcome, PoolConfig, StratumV2Client};
 pub use error::{StratumV2Error, StratumV2Result};
