@@ -172,6 +172,7 @@ impl StratumV1Source {
             merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
                 coinbase1: job.coinbase1,
                 extranonce1: state.extranonce1.clone(),
+                extranonce2_size: extranonce2_range.size,
                 extranonce2_range,
                 coinbase2: job.coinbase2,
                 merkle_branches: job.merkle_branches,

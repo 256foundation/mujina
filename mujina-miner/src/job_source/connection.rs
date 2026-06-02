@@ -8,6 +8,9 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 /// Outcome of a single connection attempt, returned by each source's internal
 /// `connect_and_run` method.
 pub(super) enum ConnectOutcome {
@@ -70,5 +73,26 @@ impl ExponentialBackoff {
     /// Reset back-off to the initial delay (call after a stable connection).
     pub(super) fn reset(&mut self) {
         self.current = self.initial;
+    }
+}
+
+/// Drain `command_rx` while sleeping for `delay`, returning `true` if shutdown
+/// was requested before the sleep expired.
+///
+/// Keeps the command channel drained so it does not back up during reconnect
+/// waits.
+pub(super) async fn backoff_wait<C>(
+    delay: Duration,
+    command_rx: &mut mpsc::Receiver<C>,
+    shutdown: &CancellationToken,
+) -> bool {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            Some(_) = command_rx.recv() => {},
+            _ = shutdown.cancelled() => return true,
+        }
     }
 }

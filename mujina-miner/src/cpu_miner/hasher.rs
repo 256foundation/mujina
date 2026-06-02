@@ -455,6 +455,7 @@ mod tests {
             merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
                 coinbase1: block_881423::coinbase1_bytes().to_vec(),
                 extranonce1: block_881423::extranonce1_bytes().to_vec(),
+                extranonce2_size: extranonce2_range.size,
                 extranonce2_range,
                 coinbase2: block_881423::coinbase2_bytes().to_vec(),
                 merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
