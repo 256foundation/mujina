@@ -59,6 +59,7 @@ pub(crate) mod job;
 mod merkle;
 mod messages;
 pub mod stratum_v1;
+pub mod stratum_v2;
 pub mod test_blocks;
 mod version;
 
