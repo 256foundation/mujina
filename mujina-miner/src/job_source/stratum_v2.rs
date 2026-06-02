@@ -36,6 +36,9 @@ use stratum_apps::stratum_core::binary_sv2::B032;
 use stratum_apps::stratum_core::channels_sv2::chain_tip::ChainTip;
 use stratum_apps::stratum_core::channels_sv2::client::error::ExtendedChannelError;
 use stratum_apps::stratum_core::channels_sv2::client::extended::{ExtendedChannel, ExtendedJob};
+use stratum_apps::stratum_core::channels_sv2::client::share_accounting::{
+    ShareValidationError, ShareValidationResult,
+};
 use stratum_apps::stratum_core::channels_sv2::extranonce_manager::ExtranoncePrefix;
 use stratum_apps::stratum_core::mining_sv2::SubmitSharesExtended;
 use tokio::sync::mpsc;
@@ -521,6 +524,10 @@ impl StratumV2Source {
                         "Pool accepted shares"
                     );
                     session.acknowledge_up_to(msg.last_sequence_number);
+                    session.channel.on_share_acknowledgement(
+                        msg.new_submits_accepted_count,
+                        msg.new_shares_sum as f64,
+                    );
                     if msg.new_submits_accepted_count > 0 {
                         self.event_tx
                             .send(SourceEvent::SharesAccepted(msg.new_submits_accepted_count))
@@ -547,6 +554,9 @@ impl StratumV2Source {
                         "Share rejected by pool"
                     );
                     session.discard_pending(msg.sequence_number);
+                    session
+                        .channel
+                        .on_share_rejection(msg.error_code.as_utf8_or_hex());
                     self.event_tx.send(SourceEvent::SharesRejected).await?;
                 }
             }
@@ -564,6 +574,8 @@ impl StratumV2Source {
     /// - Extranonce2 bytes cannot be encoded as B032 (> 32 bytes; should not
     ///   happen because `client.rs` rejects `extranonce_size > MAX_EXTRANONCE_SIZE (32)`
     ///   at channel open).
+    /// - Local share validation fails (stale job, below target, duplicate, or
+    ///   version rolling violation); see [`ExtendedChannel::validate_share`].
     async fn handle_share_submission(
         &mut self,
         share: Share,
@@ -623,6 +635,23 @@ impl StratumV2Source {
             version: share.version.to_consensus() as u32,
             extranonce,
         };
+
+        match session.channel.validate_share(sv2_share.clone()) {
+            Ok(ShareValidationResult::BlockFound(_)) => {
+                info!(job_id, seq, "Block candidate found");
+            }
+            Ok(ShareValidationResult::Valid(_)) => {}
+            // Below-target shares still reach the pool — hardware/software filters at
+            // target before this point, so this is rare in practice. Pool feedback on
+            // these (e.g. difficulty-too-low after a SetTarget race) is more useful than
+            // a silent local drop.
+            Err(ShareValidationError::DoesNotMeetTarget) => {}
+            Err(e) => {
+                debug!(job_id, seq, error = ?e, "Share failed local validation; dropping");
+                session.pending_submits.pop_back();
+                return;
+            }
+        }
 
         trace!(
             job_id,
