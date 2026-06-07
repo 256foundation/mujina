@@ -72,6 +72,11 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 
+/// Fallback timeout for the startup gate, armed when the enumeration-complete
+/// signal arrives. Keeps a board that never reports its hashrate from blocking
+/// the first source broadcast forever.
+const STARTUP_GATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).
 ///
@@ -126,6 +131,18 @@ pub struct SourceRegistration {
 
     /// Command sender for this source (SubmitShare, etc.)
     pub command_tx: mpsc::Sender<SourceCommand>,
+}
+
+/// Item the backplane sends to the scheduler on the thread-registration channel.
+pub enum ThreadRegistration {
+    /// A new hash thread to schedule.
+    Thread(Box<dyn HashThread>),
+
+    /// Initial enumeration across all transports is complete.
+    ///
+    /// Sent once, after every starting thread, so the scheduler knows its
+    /// initial board set is fully registered.
+    InitialEnumerationComplete,
 }
 
 /// Internal scheduler tracking for a registered source.
@@ -187,6 +204,9 @@ struct Scheduler {
     /// Track thread count for disconnect detection
     last_thread_count: usize,
 
+    /// Holds the first source broadcast until startup enumeration completes
+    startup_gate: StartupGate,
+
     /// Mining paused
     paused: bool,
 }
@@ -199,6 +219,7 @@ impl Scheduler {
             tasks: SlotMap::new(),
             stats: MiningStats::default(),
             last_thread_count: 0,
+            startup_gate: StartupGate::new(),
             paused: false,
         }
     }
@@ -352,13 +373,11 @@ impl Scheduler {
             );
         }
 
-        // Catch the new source up to the current hashrate.
-        let hashrate = self.allocated_hashrate(source_id);
-        if !hashrate.is_zero() {
-            let _ = self.sources[source_id]
-                .command_tx
-                .send(SourceCommand::UpdateHashRate(hashrate))
-                .await;
+        // A new source changes how the total is divided, so re-send every
+        // source its allocation. While the startup gate holds, skip it; the
+        // broadcast when the gate opens covers every source.
+        if !self.startup_gate.is_holding() {
+            self.broadcast_hashrate_change().await;
         }
     }
 
@@ -634,7 +653,16 @@ impl Scheduler {
                         .await;
                 }
 
-                self.broadcast_hashrate_change().await;
+                // Count the first report toward the startup gate, then
+                // broadcast only once the gate is open. While it holds, the
+                // report is recorded but the broadcast is suppressed; the
+                // report that opens the gate sends the first one.
+                if first_report && self.startup_gate.is_holding() {
+                    self.startup_gate.record_reported();
+                }
+                if !self.startup_gate.is_holding() {
+                    self.broadcast_hashrate_change().await;
+                }
             }
         }
     }
@@ -659,6 +687,7 @@ impl Scheduler {
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
             expected: None,
         });
+        self.startup_gate.record_registered();
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
 
@@ -805,7 +834,7 @@ impl Scheduler {
     async fn run(
         &mut self,
         running: CancellationToken,
-        mut thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
+        mut thread_rx: mpsc::Receiver<ThreadRegistration>,
         mut source_reg_rx: mpsc::Receiver<SourceRegistration>,
         miner_telemetry_tx: watch::Sender<MinerTelemetry>,
         mut cmd_rx: mpsc::Receiver<SchedulerCommand>,
@@ -823,6 +852,10 @@ impl Scheduler {
         // Create interval for periodic API telemetry publishing
         let mut telemetry_interval = tokio::time::interval(Duration::from_secs(10));
         telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Deadline for the startup-gate fallback, set when the enumeration-
+        // complete signal arrives without immediately opening the gate.
+        let mut gate_deadline: Option<tokio::time::Instant> = None;
 
         while !running.is_cancelled() {
             tokio::select! {
@@ -882,9 +915,36 @@ impl Scheduler {
                     self.handle_thread_event(thread_id, event, &mut share_channels).await;
                 }
 
-                // New thread from backplane
-                Some(thread) = thread_rx.recv() => {
-                    self.handle_new_thread(thread, &mut thread_events).await;
+                // Thread registration from backplane
+                Some(registration) = thread_rx.recv() => {
+                    match registration {
+                        ThreadRegistration::Thread(thread) => {
+                            self.handle_new_thread(thread, &mut thread_events).await;
+                        }
+                        ThreadRegistration::InitialEnumerationComplete => {
+                            self.startup_gate.record_enumeration_complete();
+                            if self.startup_gate.is_holding() {
+                                gate_deadline =
+                                    Some(tokio::time::Instant::now() + STARTUP_GATE_TIMEOUT);
+                            } else {
+                                self.broadcast_hashrate_change().await;
+                            }
+                        }
+                    }
+                }
+
+                // Startup-gate fallback: open after the timeout even if some
+                // thread never reported.
+                _ = async {
+                    match gate_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.startup_gate.is_holding() => {
+                    self.startup_gate.record_timeout();
+                    debug!("Startup gate opened by fallback timeout; not every thread reported");
+                    self.broadcast_hashrate_change().await;
+                    gate_deadline = None;
                 }
 
                 // Periodic status logging
@@ -963,7 +1023,7 @@ fn is_difficulty_too_high(job: &JobTemplate, hashrate: HashRate) -> bool {
 /// Run the scheduler task, receiving hash threads and job sources.
 pub async fn task(
     running: CancellationToken,
-    thread_rx: mpsc::Receiver<Box<dyn HashThread>>,
+    thread_rx: mpsc::Receiver<ThreadRegistration>,
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
     miner_telemetry_tx: watch::Sender<MinerTelemetry>,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
@@ -1006,6 +1066,69 @@ fn format_duration(secs: u64) -> String {
         format!("{}m {}s", mins, s)
     } else {
         format!("{}s", secs)
+    }
+}
+
+/// One-shot gate that holds the first source broadcast until startup
+/// enumeration is provably complete.
+///
+/// Held until the enumeration-complete signal has been seen (so every starting
+/// thread is registered) and every registered thread has reported its expected
+/// hashrate, or until a fallback timeout forces it. Once open it stays open.
+#[derive(Debug)]
+struct StartupGate {
+    registered: usize,
+    reported: usize,
+    enumeration_complete: bool,
+    open: bool,
+}
+
+impl StartupGate {
+    fn new() -> Self {
+        Self {
+            registered: 0,
+            reported: 0,
+            enumeration_complete: false,
+            open: false,
+        }
+    }
+
+    fn is_holding(&self) -> bool {
+        !self.open
+    }
+
+    /// Count a newly-registered thread.
+    fn record_registered(&mut self) {
+        if !self.open {
+            self.registered += 1;
+        }
+    }
+
+    /// Count a thread's first report.
+    fn record_reported(&mut self) {
+        if !self.open {
+            self.reported += 1;
+            self.try_open();
+        }
+    }
+
+    /// Record the enumeration-complete signal.
+    fn record_enumeration_complete(&mut self) {
+        if !self.open {
+            self.enumeration_complete = true;
+            self.try_open();
+        }
+    }
+
+    /// Force the gate open via fallback timeout.
+    fn record_timeout(&mut self) {
+        self.open = true;
+    }
+
+    fn try_open(&mut self) {
+        if self.enumeration_complete && self.reported >= self.registered {
+            self.open = true;
+        }
     }
 }
 
@@ -1112,5 +1235,71 @@ mod tests {
         ] {
             let _result = Scheduler::compute_scheduler_target(hashrate, source_target);
         }
+    }
+
+    #[test]
+    fn startup_gate_opens_on_completion_when_all_reported() {
+        let mut gate = StartupGate::new();
+        gate.record_registered();
+        gate.record_registered();
+        gate.record_reported();
+        gate.record_reported();
+        assert!(gate.is_holding());
+        gate.record_enumeration_complete();
+        assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn startup_gate_opens_on_last_report_after_completion() {
+        let mut gate = StartupGate::new();
+        gate.record_registered();
+        gate.record_registered();
+        gate.record_enumeration_complete();
+        assert!(gate.is_holding());
+        gate.record_reported();
+        assert!(gate.is_holding());
+        gate.record_reported();
+        assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn startup_gate_holds_for_completion_even_after_all_reported() {
+        let mut gate = StartupGate::new();
+        gate.record_registered();
+        gate.record_reported();
+        assert!(gate.is_holding());
+        gate.record_enumeration_complete();
+        assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn startup_gate_opens_on_completion_with_no_threads() {
+        let mut gate = StartupGate::new();
+        gate.record_enumeration_complete();
+        assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn startup_gate_timeout_forces_open() {
+        let mut gate = StartupGate::new();
+        gate.record_registered();
+        gate.record_enumeration_complete();
+        assert!(gate.is_holding());
+        gate.record_timeout();
+        assert!(!gate.is_holding());
+    }
+
+    #[test]
+    fn startup_gate_stays_open_after_opening() {
+        let mut gate = StartupGate::new();
+        gate.record_registered();
+        gate.record_enumeration_complete();
+        gate.record_reported();
+        assert!(!gate.is_holding());
+        // Later events leave it open.
+        gate.record_reported();
+        gate.record_enumeration_complete();
+        gate.record_timeout();
+        assert!(!gate.is_holding());
     }
 }

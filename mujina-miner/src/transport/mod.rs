@@ -27,6 +27,13 @@ pub enum TransportEvent {
 
     /// CPU miner virtual device event
     Cpu(cpu::TransportEvent),
+
+    /// The transport finished its initial device scan.
+    ///
+    /// Emitted once per transport, after its starting devices and before any
+    /// later hotplug events. The backplane waits for one from every transport
+    /// before telling the scheduler that startup enumeration is complete.
+    InitialEnumerationComplete,
 }
 
 /// Common trait for transport discovery (future enhancement).

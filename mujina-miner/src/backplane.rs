@@ -6,15 +6,17 @@
 //! lifecycle (hotplug, emergency shutdown, etc.).
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, StreamMap};
 
 use futures::future::BoxFuture;
 
 use crate::{
     api::BoardRegistration,
-    asic::hash_thread::HashThread,
     board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
+    scheduler::ThreadRegistration,
     tracing::prelude::*,
     transport::{
         TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
@@ -50,9 +52,11 @@ pub struct Backplane {
     virtual_registry: VirtualBoardRegistry,
     /// Active boards managed by the backplane
     boards: HashMap<String, ActiveBoard>,
-    event_rx: mpsc::Receiver<TransportEvent>,
-    /// Channel to send hash threads to the scheduler
-    scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
+    /// One event receiver per transport; the count sets how many initial
+    /// enumeration completions to wait for.
+    event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
+    /// Channel to register hash threads with the scheduler
+    scheduler_tx: mpsc::Sender<ThreadRegistration>,
     /// Channel to forward board registrations to the API server
     board_reg_tx: mpsc::Sender<BoardRegistration>,
 }
@@ -60,15 +64,15 @@ pub struct Backplane {
 impl Backplane {
     /// Create a new backplane.
     pub fn new(
-        event_rx: mpsc::Receiver<TransportEvent>,
-        scheduler_tx: mpsc::Sender<Box<dyn HashThread>>,
+        event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
+        scheduler_tx: mpsc::Sender<ThreadRegistration>,
         board_reg_tx: mpsc::Sender<BoardRegistration>,
     ) -> Self {
         Self {
             registry: BoardRegistry,
             virtual_registry: VirtualBoardRegistry,
             boards: HashMap::new(),
-            event_rx,
+            event_rxs,
             scheduler_tx,
             board_reg_tx,
         }
@@ -76,13 +80,36 @@ impl Backplane {
 
     /// Run the backplane event loop.
     pub async fn run(&mut self) -> Result<()> {
-        while let Some(event) = self.event_rx.recv().await {
+        // Multiplex the per-transport receivers. The number of transports is
+        // how many initial-enumeration completions to wait for.
+        let mut streams: StreamMap<usize, ReceiverStream<TransportEvent>> = StreamMap::new();
+        for (i, rx) in std::mem::take(&mut self.event_rxs).into_iter().enumerate() {
+            streams.insert(i, ReceiverStream::new(rx));
+        }
+        let transport_count = streams.len();
+        let mut completed: HashSet<usize> = HashSet::new();
+        let mut completion_sent = false;
+
+        // No transports means nothing to enumerate; let the scheduler proceed.
+        if transport_count == 0 {
+            self.send_enumeration_complete().await;
+            completion_sent = true;
+        }
+
+        while let Some((transport, event)) = streams.next().await {
             match event {
                 TransportEvent::Usb(usb_event) => {
                     self.handle_usb_event(usb_event).await?;
                 }
                 TransportEvent::Cpu(cpu_event) => {
                     self.handle_cpu_event(cpu_event).await?;
+                }
+                TransportEvent::InitialEnumerationComplete => {
+                    completed.insert(transport);
+                    if !completion_sent && completed.len() == transport_count {
+                        self.send_enumeration_complete().await;
+                        completion_sent = true;
+                    }
                 }
             }
         }
@@ -132,7 +159,11 @@ impl Backplane {
         );
 
         for thread in threads {
-            if let Err(e) = self.scheduler_tx.send(thread).await {
+            if let Err(e) = self
+                .scheduler_tx
+                .send(ThreadRegistration::Thread(thread))
+                .await
+            {
                 error!(
                     board = %info.model,
                     error = %e,
@@ -143,6 +174,20 @@ impl Backplane {
         }
 
         self.boards.insert(board_id, ActiveBoard { info, shutdown });
+    }
+
+    /// Tell the scheduler that startup enumeration across all transports is
+    /// done. Sent on the thread channel, after every starting thread, so FIFO
+    /// ordering guarantees the scheduler has registered them all first.
+    async fn send_enumeration_complete(&mut self) {
+        if self
+            .scheduler_tx
+            .send(ThreadRegistration::InitialEnumerationComplete)
+            .await
+            .is_err()
+        {
+            debug!("Scheduler dropped before initial enumeration completed");
+        }
     }
 
     /// Handle USB transport events.

@@ -13,7 +13,6 @@ use crate::api_client::types::MinerTelemetry;
 use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
-    asic::hash_thread::HashThread,
     backplane::Backplane,
     cpu_miner::CpuMinerConfig,
     job_source::{
@@ -22,7 +21,7 @@ use crate::{
         forced_rate::{ForcedRateConfig, ForcedRateSource},
         stratum_v1::StratumV1Source,
     },
-    scheduler::{self, SourceRegistration},
+    scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
@@ -44,17 +43,21 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
-        // Create channels for component communication
-        let (transport_tx, transport_rx) = mpsc::channel::<TransportEvent>(100);
-        let (thread_tx, thread_rx) = mpsc::channel::<Box<dyn HashThread>>(10);
+        // Create channels for component communication. Each transport gets its
+        // own event channel; the backplane waits for one enumeration completion
+        // per channel.
+        let (thread_tx, thread_rx) = mpsc::channel::<ThreadRegistration>(10);
         let (source_reg_tx, source_reg_rx) = mpsc::channel::<SourceRegistration>(10);
+        let mut transport_rxs: Vec<mpsc::Receiver<TransportEvent>> = Vec::new();
 
         // Create and start USB transport discovery
         if std::env::var("MUJINA_USB_DISABLE").is_err() {
-            let usb_transport = UsbTransport::new(transport_tx.clone());
+            let (usb_tx, usb_rx) = mpsc::channel::<TransportEvent>(100);
+            let usb_transport = UsbTransport::new(usb_tx);
             if let Err(e) = usb_transport.start_discovery(self.shutdown.clone()).await {
                 error!("Failed to start USB discovery: {}", e);
             }
+            transport_rxs.push(usb_rx);
         } else {
             info!("USB discovery disabled (MUJINA_USB_DISABLE set)");
         }
@@ -66,16 +69,23 @@ impl Daemon {
                 duty = config.duty_percent,
                 "CPU miner enabled"
             );
-            let event = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
+            let (cpu_tx, cpu_rx) = mpsc::channel::<TransportEvent>(100);
+            let device = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
                 CpuDeviceInfo {
                     device_id: format!("cpu-{}x{}%", config.thread_count, config.duty_percent),
                     thread_count: config.thread_count,
                     duty_percent: config.duty_percent,
                 },
             ));
-            if let Err(e) = transport_tx.send(event).await {
+            // Send the device and its enumeration completion, then drop the
+            // sender; the CPU transport has no further events.
+            if let Err(e) = cpu_tx.send(device).await {
                 error!("Failed to send CPU miner event: {}", e);
             }
+            let _ = cpu_tx
+                .send(TransportEvent::InitialEnumerationComplete)
+                .await;
+            transport_rxs.push(cpu_rx);
         }
 
         // Board registration channel: backplane forwards board
@@ -83,7 +93,7 @@ impl Daemon {
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
         // Create and start backplane
-        let mut backplane = Backplane::new(transport_rx, thread_tx, board_reg_tx);
+        let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {

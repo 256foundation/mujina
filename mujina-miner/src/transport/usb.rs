@@ -171,6 +171,16 @@ async fn monitor(
         }
     }
 
+    // Signal that the initial scan is done, before watching for hotplug.
+    if event_tx
+        .send(OuterTransportEvent::InitialEnumerationComplete)
+        .await
+        .is_err()
+    {
+        debug!("Event receiver dropped during enumeration");
+        return Ok(());
+    }
+
     // Watch for hotplug events
     loop {
         tokio::select! {
