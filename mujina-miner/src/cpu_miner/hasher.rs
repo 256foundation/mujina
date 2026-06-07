@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::hashes::Hash;
 
 use crate::{
     asic::hash_thread::{HashTask, HashThreadStatus, Share},
@@ -242,6 +243,42 @@ pub fn run_mining_loop(
     }
 }
 
+/// Measure this CPU's peak single-thread hashrate.
+///
+/// Hashes a synthetic header flat-out for a fixed window and returns the
+/// observed rate. Used at startup to scale the thread's expected hashrate
+/// to the actual hardware, since CPUs vary too much for a fixed constant.
+/// Runs the same double-SHA path as mining, so the number is honest.
+pub fn probe_peak_hashrate() -> HashRate {
+    probe_peak_hashrate_for(Duration::from_millis(300))
+}
+
+fn probe_peak_hashrate_for(window: Duration) -> HashRate {
+    let mut header = BlockHeader {
+        version: bitcoin::block::Version::from_consensus(0x20000000),
+        prev_blockhash: bitcoin::BlockHash::all_zeros(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::pow::CompactTarget::from_consensus(0x1d00ffff),
+        nonce: 0,
+    };
+
+    let start = Instant::now();
+    let mut hashes: u64 = 0;
+    loop {
+        // Amortize the clock read across many hashes.
+        if hashes.is_multiple_of(10_000) && start.elapsed() >= window {
+            break;
+        }
+        header.nonce = header.nonce.wrapping_add(1);
+        std::hint::black_box(header.block_hash());
+        hashes += 1;
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    HashRate((hashes as f64 / elapsed) as u64)
+}
+
 /// Compute merkle root for a task (called once when task is assigned).
 fn compute_merkle_root(task: &HashTask) -> Option<bitcoin::TxMerkleNode> {
     let template = task.template.as_ref();
@@ -333,6 +370,12 @@ mod tests {
             ntime: 1234567890,
             share_tx,
         }
+    }
+
+    #[test]
+    fn probe_measures_a_positive_rate() {
+        let rate = probe_peak_hashrate_for(Duration::from_millis(20));
+        assert!(!rate.is_zero(), "probe should observe some hashing");
     }
 
     #[test]

@@ -126,9 +126,12 @@ impl HashThread for CpuHashThread {
     }
 
     async fn configure(&mut self) -> Result<()> {
-        // The hasher hashes for duty_percent of each cycle, so the effective
-        // rate is the ~5 MH/s peak scaled by the duty cycle.
-        let expected = HashRate::from_megahashes(5.0 * self.duty_percent as f64 / 100.0);
+        // Measure this CPU's peak rate, then scale by the duty cycle to get
+        // the effective rate the thread expects to sustain. Probing beats a
+        // fixed constant because peak throughput varies widely across CPUs.
+        let peak = tokio::task::spawn_blocking(hasher::probe_peak_hashrate).await?;
+        let expected =
+            HashRate::from_megahashes(peak.as_megahashes() * self.duty_percent as f64 / 100.0);
         self.event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))
             .await
