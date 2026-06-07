@@ -5,11 +5,13 @@
 //! the internal JobTemplate/Share types used by the scheduler.
 
 use std::collections::hash_map::RandomState;
+use std::future;
 use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::stratum_v1::{
@@ -37,6 +39,11 @@ const DOWN_FACTOR: f64 = 1.25;
 /// pool raises difficulty on its own, but below 2.0 so adding a second
 /// identical board still registers. A starting value, tune with use.
 const UP_FACTOR: f64 = 1.5;
+
+/// Minimum time between suggest_difficulty messages. A material change during
+/// the cooldown is held and flushed once when it expires, so a burst of changes
+/// costs at most one message per interval. A starting value, tune with use.
+const SUGGEST_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Minimum connection duration before backoff resets on disconnect.
 ///
@@ -137,6 +144,9 @@ pub struct StratumV1Source {
     /// Last difficulty we suggested to the pool (for material-change detection)
     last_suggested_difficulty: Option<u64>,
 
+    /// When the suggest_difficulty cooldown expires, `None` when not throttling.
+    cooldown_until: Option<Instant>,
+
     /// Factory for creating transport connections.
     connector: Box<dyn Connector>,
 }
@@ -175,6 +185,7 @@ impl StratumV1Source {
             first_share_logged: false,
             expected_hashrate: HashRate::default(),
             last_suggested_difficulty: None,
+            cooldown_until: None,
             connector,
         }
     }
@@ -415,23 +426,50 @@ impl StratumV1Source {
         new <= floor / DOWN_FACTOR || new >= floor * UP_FACTOR
     }
 
-    /// Send `SuggestDifficulty` if the computed value is a material change from
-    /// the last suggestion.
+    /// Suggest difficulty for the latest hashrate, subject to the deadband and
+    /// the cooldown.
+    ///
+    /// A material change during the cooldown is held; `flush_suggest` sends it
+    /// once the cooldown expires, so a burst collapses to one message per
+    /// interval.
     async fn maybe_suggest_difficulty(&mut self, client_command_tx: &mpsc::Sender<ClientCommand>) {
         let Some(new_diff) = Self::compute_suggested_difficulty(self.expected_hashrate) else {
             return;
         };
-
         if !Self::is_material_change(new_diff, self.last_suggested_difficulty) {
             return;
         }
+        if self.in_cooldown(Instant::now()) {
+            return;
+        }
+        self.send_suggest(new_diff, client_command_tx).await;
+    }
 
+    /// Re-test the latest hashrate when the cooldown expires, sending a still-
+    /// material suggestion or else ending the throttle.
+    async fn flush_suggest(&mut self, client_command_tx: &mpsc::Sender<ClientCommand>) {
+        let pending = Self::compute_suggested_difficulty(self.expected_hashrate)
+            .filter(|diff| Self::is_material_change(*diff, self.last_suggested_difficulty));
+        match pending {
+            Some(diff) => self.send_suggest(diff, client_command_tx).await,
+            None => self.cooldown_until = None,
+        }
+    }
+
+    /// Send a `SuggestDifficulty`, record it as the new floor, and arm the
+    /// cooldown.
+    async fn send_suggest(
+        &mut self,
+        new_diff: u64,
+        client_command_tx: &mpsc::Sender<ClientCommand>,
+    ) {
         debug!(
             difficulty = new_diff,
             hashrate = %self.expected_hashrate,
             "Suggesting difficulty to pool"
         );
         self.last_suggested_difficulty = Some(new_diff);
+        self.cooldown_until = Some(Instant::now() + SUGGEST_MIN_INTERVAL);
 
         if let Err(e) = client_command_tx
             .send(ClientCommand::SuggestDifficulty(new_diff))
@@ -439,6 +477,11 @@ impl StratumV1Source {
         {
             warn!(error = %e, "Failed to send suggest_difficulty to client");
         }
+    }
+
+    /// Whether the suggest cooldown is still active at `now`.
+    fn in_cooldown(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| now < until)
     }
 
     /// Run the source (main event loop).
@@ -484,7 +527,7 @@ impl StratumV1Source {
 
             info!(pool = %self.config.url, "Connecting to pool");
 
-            let connected_at = tokio::time::Instant::now();
+            let connected_at = Instant::now();
             match self.connect_and_run().await {
                 ConnectOutcome::Shutdown => return Ok(()),
                 ConnectOutcome::Fatal(e) => {
@@ -525,6 +568,7 @@ impl StratumV1Source {
         // during the handshake, before the first job arrives.
         let initial_difficulty = Self::compute_suggested_difficulty(self.expected_hashrate);
         self.last_suggested_difficulty = initial_difficulty;
+        self.cooldown_until = None;
 
         let client = StratumV1Client::with_commands(
             self.config.clone(),
@@ -556,6 +600,8 @@ impl StratumV1Source {
 
         // Main event loop
         loop {
+            // Copied out so the cooldown branch captures the value, not `self`.
+            let cooldown_until = self.cooldown_until;
             tokio::select! {
                 event_opt = client_event_rx.recv() => {
                     match event_opt {
@@ -600,6 +646,16 @@ impl StratumV1Source {
                             self.maybe_suggest_difficulty(&client_command_tx).await;
                         }
                     }
+                }
+
+                // Cooldown expiry: flush a suggestion held during the cooldown.
+                _ = async {
+                    match cooldown_until {
+                        Some(until) => time::sleep_until(until).await,
+                        None => future::pending().await,
+                    }
+                }, if cooldown_until.is_some() => {
+                    self.flush_suggest(&client_command_tx).await;
                 }
 
                 _ = self.shutdown.cancelled() => {
@@ -1180,6 +1236,117 @@ mod tests {
         assert!(StratumV1Source::is_material_change(71, floor));
     }
 
+    /// Build a source for testing the suggest policy in isolation. The other
+    /// ends of its channels are dropped; the policy methods don't use them.
+    fn throttle_test_source() -> StratumV1Source {
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (_command_tx, command_rx) = mpsc::channel(10);
+        let config = PoolConfig {
+            url: "stratum+tcp://test:3333".to_string(),
+            ..Default::default()
+        };
+        StratumV1Source::new(
+            config,
+            command_rx,
+            event_tx,
+            CancellationToken::new(),
+            Box::new(NeverConnector),
+        )
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<ClientCommand>) -> usize {
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        count
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_emits_first_change_immediately() {
+        let mut source = throttle_test_source();
+        let (client_tx, mut client_rx) = mpsc::channel(10);
+
+        source.expected_hashrate = HashRate::from_terahashes(1.0);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_holds_during_cooldown_then_flushes_once() {
+        let mut source = throttle_test_source();
+        let (client_tx, mut client_rx) = mpsc::channel(10);
+
+        source.expected_hashrate = HashRate::from_terahashes(1.0);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+
+        // A material change during the cooldown is held.
+        source.expected_hashrate = HashRate::from_terahashes(4.0);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 0);
+
+        // When the cooldown expires it flushes exactly once.
+        time::advance(SUGGEST_MIN_INTERVAL).await;
+        source.flush_suggest(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_subthreshold_oscillation_goes_quiet() {
+        let mut source = throttle_test_source();
+        let (client_tx, mut client_rx) = mpsc::channel(10);
+
+        // Floor at 1 TH/s.
+        source.expected_hashrate = HashRate::from_terahashes(1.0);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+
+        // A material drop, held during the cooldown, flushes as one down-step.
+        source.expected_hashrate = HashRate::from_terahashes(0.5);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        time::advance(SUGGEST_MIN_INTERVAL).await;
+        source.flush_suggest(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+
+        // Small oscillation around the new floor stays inside the deadband, so
+        // the next flush sends nothing.
+        for th in [0.52, 0.48, 0.55, 0.5] {
+            source.expected_hashrate = HashRate::from_terahashes(th);
+            source.maybe_suggest_difficulty(&client_tx).await;
+        }
+        time::advance(SUGGEST_MIN_INTERVAL).await;
+        source.flush_suggest(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn throttle_sustained_flapping_bounded_per_interval() {
+        let mut source = throttle_test_source();
+        let (client_tx, mut client_rx) = mpsc::channel(10);
+
+        source.expected_hashrate = HashRate::from_terahashes(1.0);
+        source.maybe_suggest_difficulty(&client_tx).await;
+        assert_eq!(drain(&mut client_rx), 1);
+
+        // Each interval flaps wildly but settles on a value that is material
+        // versus the prior suggestion; the flush emits at most once per
+        // interval.
+        for target in [5.0, 1.0, 5.0] {
+            for th in [2.0, 8.0, 0.5] {
+                source.expected_hashrate = HashRate::from_terahashes(th);
+                source.maybe_suggest_difficulty(&client_tx).await;
+            }
+            source.expected_hashrate = HashRate::from_terahashes(target);
+            source.maybe_suggest_difficulty(&client_tx).await;
+            assert_eq!(drain(&mut client_rx), 0, "flaps during cooldown are held");
+
+            time::advance(SUGGEST_MIN_INTERVAL).await;
+            source.flush_suggest(&client_tx).await;
+            assert_eq!(drain(&mut client_rx), 1, "one emit per interval");
+        }
+    }
+
     #[tokio::test]
     async fn test_maybe_suggest_difficulty_suppresses_small_changes() {
         let (event_tx, _event_rx) = mpsc::channel(10);
@@ -1213,7 +1380,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_maybe_suggest_difficulty_sends_on_material_change() {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
@@ -1238,12 +1405,13 @@ mod tests {
         source.maybe_suggest_difficulty(&client_tx).await;
         let _ = client_rx.try_recv().unwrap();
 
-        // Double hashrate -- 2x change, should re-suggest
+        // Past the cooldown, a material rise re-suggests.
+        time::advance(SUGGEST_MIN_INTERVAL).await;
         source.expected_hashrate = HashRate::from_terahashes(2.5);
         source.maybe_suggest_difficulty(&client_tx).await;
         assert!(
             client_rx.try_recv().is_ok(),
-            "should re-suggest after 2x hashrate change"
+            "should re-suggest after a material hashrate change"
         );
     }
 
@@ -1473,7 +1641,7 @@ mod tests {
         );
 
         // Advance past the backoff (max initial is 1s).
-        tokio::time::advance(Duration::from_secs(2)).await;
+        time::advance(Duration::from_secs(2)).await;
 
         // Second connection: handshake, receive a job.
         do_handshake(&mut handle2).await;
@@ -1514,7 +1682,7 @@ mod tests {
         assert!(matches!(event, SourceEvent::ClearJobs));
 
         // Advancing 0.4s is below the minimum (0.5s); no reconnect yet.
-        tokio::time::advance(Duration::from_millis(400)).await;
+        time::advance(Duration::from_millis(400)).await;
         tokio::task::yield_now().await;
         assert!(
             event_rx.try_recv().is_err(),
@@ -1522,14 +1690,14 @@ mod tests {
         );
 
         // Advance past the maximum (1.0s total) to trigger reconnect.
-        tokio::time::advance(Duration::from_millis(600)).await;
+        time::advance(Duration::from_millis(600)).await;
 
         // 2nd disconnect: nominal 2s, jittered to [1.0s, 2.0s).
         let event = event_rx.recv().await.unwrap();
         assert!(matches!(event, SourceEvent::ClearJobs));
 
         // Advancing 0.9s is below the minimum (1.0s); no reconnect yet.
-        tokio::time::advance(Duration::from_millis(900)).await;
+        time::advance(Duration::from_millis(900)).await;
         tokio::task::yield_now().await;
         assert!(
             event_rx.try_recv().is_err(),
@@ -1537,14 +1705,14 @@ mod tests {
         );
 
         // Advance past the maximum (2.0s total).
-        tokio::time::advance(Duration::from_millis(1100)).await;
+        time::advance(Duration::from_millis(1100)).await;
 
         // 3rd disconnect: nominal 4s, jittered to [2.0s, 4.0s).
         let event = event_rx.recv().await.unwrap();
         assert!(matches!(event, SourceEvent::ClearJobs));
 
         // Advancing 1.9s is below the minimum (2.0s); proves escalation.
-        tokio::time::advance(Duration::from_millis(1900)).await;
+        time::advance(Duration::from_millis(1900)).await;
         tokio::task::yield_now().await;
         assert!(
             event_rx.try_recv().is_err(),
@@ -1659,7 +1827,7 @@ mod tests {
             .unwrap();
 
         // Advance past backoff.
-        tokio::time::advance(Duration::from_secs(2)).await;
+        time::advance(Duration::from_secs(2)).await;
 
         // Handshake through authorize, then inspect suggest_difficulty.
         do_configure_and_subscribe(&mut handle2).await;
