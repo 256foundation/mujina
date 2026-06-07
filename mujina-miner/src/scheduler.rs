@@ -160,6 +160,10 @@ enum AssignMode {
 struct ThreadEntry {
     thread: Box<dyn HashThread>,
     hashrate: HashrateEstimator,
+
+    /// Hashrate the thread declared via `ExpectedHashRate`, `None` until its
+    /// first report.
+    expected: Option<HashRate>,
 }
 
 /// Core scheduler state.
@@ -209,21 +213,15 @@ impl Scheduler {
             .sum()
     }
 
-    /// Aggregate hashrate for operational decisions.
+    /// Aggregate of the hashrates threads declared they expect to deliver.
     ///
-    /// Per thread, uses measured hashrate if the estimator has settled,
-    /// otherwise falls back to the static capability estimate. Suitable
-    /// for broadcasting to sources and difficulty warnings, where a zero
-    /// value at startup would be unhelpful.
-    fn operational_hashrate(&mut self) -> HashRate {
+    /// Feed-forward, summed across threads that have reported; a thread that
+    /// has not yet reported contributes nothing. Drives source difficulty and
+    /// the difficulty-too-high warning, where a zero at startup is unhelpful.
+    fn expected_hashrate(&self) -> HashRate {
         self.threads
-            .values_mut()
-            .map(|entry| {
-                entry
-                    .hashrate
-                    .settled_hashrate()
-                    .unwrap_or(entry.thread.capabilities().hashrate_estimate)
-            })
+            .values()
+            .filter_map(|entry| entry.expected)
             .sum()
     }
 
@@ -318,7 +316,7 @@ impl Scheduler {
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");
 
         // Send current hashrate estimate to the new source
-        let hashrate = self.operational_hashrate();
+        let hashrate = self.expected_hashrate();
         let _ = self.sources[source_id]
             .command_tx
             .send(SourceCommand::UpdateHashRate(hashrate))
@@ -367,7 +365,7 @@ impl Scheduler {
         }
 
         // Debounced difficulty warning
-        let hashrate = self.operational_hashrate();
+        let hashrate = self.expected_hashrate();
         if let Some(source) = self.sources.get_mut(source_id) {
             let too_high = is_difficulty_too_high(&template, hashrate);
             match source.difficulty_alarm.check(too_high) {
@@ -412,7 +410,8 @@ impl Scheduler {
             let hashrate = entry
                 .hashrate
                 .settled_hashrate()
-                .unwrap_or(entry.thread.capabilities().hashrate_estimate);
+                .or(entry.expected)
+                .unwrap_or_default();
             let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
 
             // Create share channel for this task
@@ -559,6 +558,17 @@ impl Scheduler {
                     "Thread status"
                 );
             }
+
+            HashThreadEvent::ExpectedHashRate(rate) => {
+                if let Some(entry) = self.threads.get_mut(thread_id) {
+                    entry.expected = Some(rate);
+                    debug!(
+                        thread = %entry.thread.name(),
+                        expected = %rate.to_human_readable(),
+                        "Thread declared expected hashrate"
+                    );
+                }
+            }
         }
     }
 
@@ -577,12 +587,23 @@ impl Scheduler {
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+            expected: None,
         });
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
 
+        // Configure the thread; it replies with ExpectedHashRate on its event
+        // channel, handled in handle_thread_event.
+        let entry = self
+            .threads
+            .get_mut(thread_id)
+            .expect("Just inserted thread");
+        if let Err(e) = entry.thread.configure().await {
+            error!(thread = %thread_name, error = %e, "Failed to configure thread");
+        }
+
         // Broadcast updated hashrate to all sources
-        let hashrate = self.operational_hashrate();
+        let hashrate = self.expected_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 
@@ -593,9 +614,9 @@ impl Scheduler {
 
         self.last_thread_count = thread_events.len();
 
-        // Hashrate is constant for a brand-new thread (estimator has no
-        // samples yet, so this always falls back to the static estimate).
-        // Compute once rather than repeating inside the source loop.
+        // A brand-new thread has no measured samples and its expected report
+        // has not arrived yet, so this is zero and compute_scheduler_target
+        // leaves the source target unclamped. Compute once for the loop below.
         let thread_hashrate = {
             let entry = self
                 .threads
@@ -604,7 +625,8 @@ impl Scheduler {
             entry
                 .hashrate
                 .settled_hashrate()
-                .unwrap_or(entry.thread.capabilities().hashrate_estimate)
+                .or(entry.expected)
+                .unwrap_or_default()
         };
 
         // Assign cached jobs from all sources to the new thread
@@ -684,7 +706,7 @@ impl Scheduler {
         self.last_thread_count = current_count;
 
         // Broadcast updated hashrate to all sources
-        let hashrate = self.operational_hashrate();
+        let hashrate = self.expected_hashrate();
         let senders = self.hashrate_senders();
         broadcast_hashrate(senders, hashrate).await;
 

@@ -32,9 +32,10 @@ pub struct CpuHashThread {
     /// Channel for sending commands to the mining thread.
     command_tx: mpsc::Sender<MinerCommand>,
 
-    /// Event sender (kept alive to prevent channel closure).
-    /// Not currently used but must remain open for scheduler to consider thread active.
-    #[expect(dead_code)]
+    /// Target CPU duty cycle (1-100), sets the expected hashrate.
+    duty_percent: u8,
+
+    /// Event sender for reporting to the scheduler (e.g. expected hashrate).
     event_tx: tokio_mpsc::Sender<HashThreadEvent>,
 
     /// Event receiver (taken by scheduler).
@@ -91,14 +92,11 @@ impl CpuHashThread {
         Self {
             name,
             command_tx: cmd_tx,
+            duty_percent,
             event_tx: evt_tx,
             event_rx: Some(evt_rx),
             status,
-            capabilities: HashThreadCapabilities {
-                // Conservative estimate: ~5 MH/s peak on modern hardware,
-                // scaled by duty cycle so the estimate reflects effective rate.
-                hashrate_estimate: HashRate::from_megahashes(5.0 * duty_percent as f64 / 100.0),
-            },
+            capabilities: HashThreadCapabilities::default(),
             shutdown,
             _thread_handle: Some(handle),
         }
@@ -125,6 +123,17 @@ impl HashThread for CpuHashThread {
 
     fn capabilities(&self) -> &HashThreadCapabilities {
         &self.capabilities
+    }
+
+    async fn configure(&mut self) -> Result<()> {
+        // The hasher hashes for duty_percent of each cycle, so the effective
+        // rate is the ~5 MH/s peak scaled by the duty cycle.
+        let expected = HashRate::from_megahashes(5.0 * self.duty_percent as f64 / 100.0);
+        self.event_tx
+            .send(HashThreadEvent::ExpectedHashRate(expected))
+            .await
+            .map_err(|_| anyhow!("event channel closed"))?;
+        Ok(())
     }
 
     async fn update_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {

@@ -66,6 +66,9 @@ impl ChipJobTracker {
 /// Command messages sent from scheduler to thread
 #[derive(Debug)]
 enum ThreadCommand {
+    /// Declare expected hashrate and ready the thread for work
+    Configure,
+
     /// Update task (old shares still valid)
     UpdateTask {
         new_task: HashTask,
@@ -158,9 +161,7 @@ impl BM13xxThread {
             name,
             command_tx: cmd_tx,
             event_rx: Some(evt_rx),
-            capabilities: HashThreadCapabilities {
-                hashrate_estimate: HashRate::from_terahashes(1.0), // Stub
-            },
+            capabilities: HashThreadCapabilities::default(),
             status,
         }
     }
@@ -174,6 +175,13 @@ impl HashThread for BM13xxThread {
 
     fn capabilities(&self) -> &HashThreadCapabilities {
         &self.capabilities
+    }
+
+    async fn configure(&mut self) -> Result<()> {
+        self.command_tx
+            .send(ThreadCommand::Configure)
+            .await
+            .map_err(|_| anyhow!("command channel closed"))
     }
 
     async fn update_task(&mut self, new_task: HashTask) -> Result<Option<HashTask>> {
@@ -596,7 +604,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<protocol::PllConfig> 
 /// configured when scheduler assigns first work.
 async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
-    _evt_tx: mpsc::Sender<HashThreadEvent>,
+    evt_tx: mpsc::Sender<HashThreadEvent>,
     mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
     status: Arc<RwLock<HashThreadStatus>>,
     mut chip_responses: R,
@@ -650,6 +658,15 @@ async fn bm13xx_thread_actor<R, W>(
             // Commands from scheduler
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
+                    ThreadCommand::Configure => {
+                        // Nameplate rate for one BM1370 chip; a rough stand-in
+                        // for a real frequency-derived estimate.
+                        let expected = HashRate::from_terahashes(1.0);
+                        if evt_tx.send(HashThreadEvent::ExpectedHashRate(expected)).await.is_err() {
+                            debug!("Event channel closed during configure");
+                        }
+                    }
+
                     ThreadCommand::UpdateTask { new_task, response_tx } => {
                         if let Some(ref old) = current_task {
                             debug!(

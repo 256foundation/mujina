@@ -41,10 +41,11 @@ use crate::types::HashRate;
 use bitcoin::pow::Work;
 
 /// HashThread capabilities reported to scheduler for work assignment decisions.
-#[derive(Debug, Clone)]
+///
+/// Placeholder for future non-rate capabilities. Expected hashrate is a
+/// runtime signal, declared via `HashThreadEvent::ExpectedHashRate`.
+#[derive(Debug, Clone, Default)]
 pub struct HashThreadCapabilities {
-    /// Estimated hashrate
-    pub hashrate_estimate: HashRate,
     // Future capabilities:
     // pub can_roll_version: bool,
     // pub version_roll_bits: u32,
@@ -100,6 +101,11 @@ pub enum HashThreadEvent {
 
     /// Periodic status update
     StatusUpdate(HashThreadStatus),
+
+    /// Feed-forward hashrate the thread declares it expects to deliver.
+    ///
+    /// Emitted after `configure()` and whenever the expectation changes.
+    ExpectedHashRate(HashRate),
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +188,13 @@ pub trait HashThread: Send {
 
     /// Get thread capabilities for scheduling decisions
     fn capabilities(&self) -> &HashThreadCapabilities;
+
+    /// Configure the thread and declare its expected hashrate.
+    ///
+    /// Records settings, computes the expected hashrate, and emits
+    /// `HashThreadEvent::ExpectedHashRate`. The thread becomes eligible for
+    /// work; chip bring-up happens later, on the first job assignment.
+    async fn configure(&mut self) -> Result<()>;
 
     /// Update current task (shares from old task still valid)
     ///
