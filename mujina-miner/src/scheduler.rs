@@ -225,6 +225,23 @@ impl Scheduler {
             .sum()
     }
 
+    /// Expected hashrate allocated to one source.
+    ///
+    /// Degenerate today: the source gets the full aggregate. The signature
+    /// takes a source so a proportional split across sources is a localized
+    /// change here.
+    fn allocated_hashrate(&self, _source_id: SourceId) -> HashRate {
+        self.expected_hashrate()
+    }
+
+    /// Threads eligible for work: those that have reported an expected hashrate.
+    fn eligible_thread_ids(&self) -> impl Iterator<Item = ThreadId> + '_ {
+        self.threads
+            .iter()
+            .filter(|(_, entry)| entry.expected.is_some())
+            .map(|(id, _)| id)
+    }
+
     /// Build a [`MinerTelemetry`] snapshot from current scheduler state.
     ///
     /// The scheduler contributes aggregate stats and source info. Board
@@ -269,15 +286,25 @@ impl Scheduler {
         source_target.clamp(measurement_target, flood_cap_target)
     }
 
-    /// Collects hashrate command senders from all sources.
+    /// Pairs every source's command sender with its current hashrate allocation.
     ///
-    /// Used with `broadcast_hashrate()` to avoid capturing `&self` across
-    /// await points (Scheduler contains Box<dyn HashThread> which isn't Sync).
-    fn hashrate_senders(&self) -> Vec<mpsc::Sender<SourceCommand>> {
+    /// Collected up front so the caller can send without holding `&self`
+    /// across await points (Scheduler contains Box<dyn HashThread>, not Sync).
+    fn collect_hashrate_updates(&self) -> Vec<(mpsc::Sender<SourceCommand>, HashRate)> {
         self.sources
-            .values()
-            .map(|s| s.command_tx.clone())
+            .iter()
+            .map(|(id, s)| (s.command_tx.clone(), self.allocated_hashrate(id)))
             .collect()
+    }
+
+    /// React to a change in aggregate hashrate: reset the high-difficulty
+    /// warning debounce and resend every source its current allocation.
+    async fn broadcast_hashrate_change(&mut self) {
+        for source in self.sources.values_mut() {
+            source.difficulty_alarm.reset();
+        }
+        let updates = self.collect_hashrate_updates();
+        send_hashrate_updates(updates).await;
     }
 
     /// Remove tasks matching a predicate, closing their share channels.
@@ -315,12 +342,24 @@ impl Scheduler {
         source_events.insert(source_id, ReceiverStream::new(registration.event_rx));
         debug!(source_id = ?source_id, name = %registration.name, "Source registered");
 
-        // Send current hashrate estimate to the new source
-        let hashrate = self.expected_hashrate();
-        let _ = self.sources[source_id]
-            .command_tx
-            .send(SourceCommand::UpdateHashRate(hashrate))
-            .await;
+        // Hashrate is not yet split across sources: each is told the full
+        // aggregate, which over-suggests difficulty to every pool but the one
+        // that should get the whole hashrate.
+        if self.sources.len() > 1 {
+            warn!(
+                sources = self.sources.len(),
+                "Multiple sources active, but hashrate is not split across them"
+            );
+        }
+
+        // Catch the new source up to the current hashrate.
+        let hashrate = self.allocated_hashrate(source_id);
+        if !hashrate.is_zero() {
+            let _ = self.sources[source_id]
+                .command_tx
+                .send(SourceCommand::UpdateHashRate(hashrate))
+                .await;
+        }
     }
 
     /// Assign or replace work on all threads from a job template.
@@ -398,14 +437,26 @@ impl Scheduler {
             self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
         }
 
-        // Split EN2 range among all threads
+        // Split the EN2 range evenly across the currently-eligible threads.
+        //
+        // TODO: A thread that becomes eligible later is handed the full EN2
+        // range on its first report, overlapping these slices until the next
+        // job re-splits.
+        let eligible: Vec<ThreadId> = self.eligible_thread_ids().collect();
+        if eligible.is_empty() {
+            debug!(source = %source_name, "No eligible threads yet, job cached for later");
+            return;
+        }
         let en2_slices = full_en2_range
-            .split(self.threads.len())
+            .split(eligible.len())
             .expect("Failed to split EN2 range among threads");
 
-        // Assign work to all threads
-        for ((thread_id, entry), en2_range) in self.threads.iter_mut().zip(en2_slices) {
+        for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
+            let entry = self
+                .threads
+                .get_mut(thread_id)
+                .expect("eligible thread present");
 
             let hashrate = entry
                 .hashrate
@@ -530,7 +581,12 @@ impl Scheduler {
     }
 
     /// Handle an event from a hash thread.
-    fn handle_thread_event(&mut self, thread_id: ThreadId, event: HashThreadEvent) {
+    async fn handle_thread_event(
+        &mut self,
+        thread_id: ThreadId,
+        event: HashThreadEvent,
+        share_channels: &mut ShareStream,
+    ) {
         let thread_name = self
             .threads
             .get(thread_id)
@@ -560,24 +616,38 @@ impl Scheduler {
             }
 
             HashThreadEvent::ExpectedHashRate(rate) => {
-                if let Some(entry) = self.threads.get_mut(thread_id) {
-                    entry.expected = Some(rate);
-                    debug!(
-                        thread = %entry.thread.name(),
-                        expected = %rate.to_human_readable(),
-                        "Thread declared expected hashrate"
-                    );
+                let Some(entry) = self.threads.get_mut(thread_id) else {
+                    return;
+                };
+                let first_report = entry.expected.is_none();
+                entry.expected = Some(rate);
+                let name = entry.thread.name().to_string();
+                trace!(
+                    thread = %name,
+                    expected = %rate.to_human_readable(),
+                    "Thread declared expected hashrate"
+                );
+
+                // First report is the thread's connect: hand it any cached jobs.
+                if first_report {
+                    self.assign_cached_jobs_to_thread(thread_id, &name, share_channels)
+                        .await;
                 }
+
+                self.broadcast_hashrate_change().await;
             }
         }
     }
 
     /// Handle a new thread arriving from the backplane.
+    ///
+    /// Registers and configures the thread only. Work assignment and the source
+    /// broadcast happen when the thread makes its first ExpectedHashRate report,
+    /// not on arrival.
     async fn handle_new_thread(
         &mut self,
         mut thread: Box<dyn HashThread>,
         thread_events: &mut ThreadEventStream,
-        share_channels: &mut ShareStream,
     ) {
         let event_rx = thread
             .take_event_receiver()
@@ -602,26 +672,25 @@ impl Scheduler {
             error!(thread = %thread_name, error = %e, "Failed to configure thread");
         }
 
-        // Broadcast updated hashrate to all sources
-        let hashrate = self.expected_hashrate();
-        let senders = self.hashrate_senders();
-        broadcast_hashrate(senders, hashrate).await;
-
-        // Reset difficulty alarm since hashrate changed
-        for source in self.sources.values_mut() {
-            source.difficulty_alarm.reset();
-        }
-
         self.last_thread_count = thread_events.len();
+    }
 
-        // A brand-new thread has no measured samples and its expected report
-        // has not arrived yet, so this is zero and compute_scheduler_target
-        // leaves the source target unclamped. Compute once for the loop below.
+    /// Assign each source's cached job to a newly-eligible thread.
+    ///
+    /// Called from the thread's first ExpectedHashRate report. The thread takes
+    /// the full EN2 range for each source, overlapping the other threads until
+    /// the next job resplits the range.
+    async fn assign_cached_jobs_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        thread_name: &str,
+        share_channels: &mut ShareStream,
+    ) {
         let thread_hashrate = {
             let entry = self
                 .threads
                 .get_mut(thread_id)
-                .expect("Just inserted thread");
+                .expect("thread present for cached-job assignment");
             entry
                 .hashrate
                 .settled_hashrate()
@@ -629,7 +698,6 @@ impl Scheduler {
                 .unwrap_or_default()
         };
 
-        // Assign cached jobs from all sources to the new thread
         for (source_id, source) in self.sources.iter() {
             let Some(template) = &source.last_job else {
                 continue;
@@ -705,15 +773,7 @@ impl Scheduler {
 
         self.last_thread_count = current_count;
 
-        // Broadcast updated hashrate to all sources
-        let hashrate = self.expected_hashrate();
-        let senders = self.hashrate_senders();
-        broadcast_hashrate(senders, hashrate).await;
-
-        // Reset difficulty alarm since hashrate changed
-        for source in self.sources.values_mut() {
-            source.difficulty_alarm.reset();
-        }
+        self.broadcast_hashrate_change().await;
     }
 
     /// Handle an API command, sending the result back on the reply channel.
@@ -760,9 +820,9 @@ impl Scheduler {
         status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first_status_tick = true;
 
-        // Create interval for periodic hashrate broadcasts to sources
-        let mut hashrate_interval = tokio::time::interval(Duration::from_secs(10));
-        hashrate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Create interval for periodic API telemetry publishing
+        let mut telemetry_interval = tokio::time::interval(Duration::from_secs(10));
+        telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !running.is_cancelled() {
             tokio::select! {
@@ -819,12 +879,12 @@ impl Scheduler {
 
                 // Thread events
                 Some((thread_id, event)) = thread_events.next() => {
-                    self.handle_thread_event(thread_id, event);
+                    self.handle_thread_event(thread_id, event, &mut share_channels).await;
                 }
 
                 // New thread from backplane
                 Some(thread) = thread_rx.recv() => {
-                    self.handle_new_thread(thread, &mut thread_events, &mut share_channels).await;
+                    self.handle_new_thread(thread, &mut thread_events).await;
                 }
 
                 // Periodic status logging
@@ -843,7 +903,7 @@ impl Scheduler {
                 }
 
                 // Periodic state publishing
-                _ = hashrate_interval.tick() => {
+                _ = telemetry_interval.tick() => {
                     let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 }
 
@@ -867,12 +927,12 @@ impl Scheduler {
     }
 }
 
-/// Broadcasts hashrate update to all registered sources.
+/// Sends each source its hashrate allocation.
 ///
-/// Takes pre-collected senders to avoid capturing Scheduler across await
-/// points (it contains Box<dyn HashThread> which isn't Sync).
-async fn broadcast_hashrate(senders: Vec<mpsc::Sender<SourceCommand>>, hashrate: HashRate) {
-    for sender in senders {
+/// Takes pre-collected (sender, hashrate) pairs to avoid capturing Scheduler
+/// across await points (it contains Box<dyn HashThread> which isn't Sync).
+async fn send_hashrate_updates(updates: Vec<(mpsc::Sender<SourceCommand>, HashRate)>) {
+    for (sender, hashrate) in updates {
         let _ = sender.send(SourceCommand::UpdateHashRate(hashrate)).await;
     }
 }
