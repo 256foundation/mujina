@@ -26,8 +26,17 @@ use super::{
 /// Target share rate for suggest_difficulty: 20 shares/min (one every 3 sec).
 const SUGGESTED_SHARE_RATE: ShareRate = ShareRate::from_interval(Duration::from_secs(3));
 
-/// Re-suggest when new difficulty is >2x or <0.5x the last-suggested value.
-const MATERIAL_CHANGE_FACTOR: f64 = 2.0;
+/// Downward deadband. Re-suggest when the new difficulty falls to or below the
+/// last suggestion divided by this. Small, so we react quickly to a drop:
+/// below the floor the pool can't lower difficulty on its own, and a drop in
+/// board hashrate is a real change, not luck. A starting value, tune with use.
+const DOWN_FACTOR: f64 = 1.25;
+
+/// Upward deadband. Re-suggest when the new difficulty rises to or above the
+/// last suggestion times this. Larger than the downward factor because the
+/// pool raises difficulty on its own, but below 2.0 so adding a second
+/// identical board still registers. A starting value, tune with use.
+const UP_FACTOR: f64 = 1.5;
 
 /// Minimum connection duration before backoff resets on disconnect.
 ///
@@ -387,22 +396,33 @@ impl StratumV1Source {
         Some(diff)
     }
 
-    /// Send `SuggestDifficulty` if the computed value changed materially
-    /// (factor of 2) from the last suggestion.
+    /// Whether `new_diff` differs enough from the last suggestion to re-suggest.
+    ///
+    /// The deadband is asymmetric, measured from the last suggestion (which the
+    /// pool holds as a difficulty floor) using the down and up factors. Any
+    /// value is material when there is no prior suggestion.
+    ///
+    /// The baseline is deliberately our last suggestion, not the pool's live
+    /// set difficulty. Measuring against the live value would fight the pool's
+    /// vardiff and oscillate, re-suggesting against a change the pool just made
+    /// above the floor on its own.
+    fn is_material_change(new_diff: u64, last_suggested: Option<u64>) -> bool {
+        let Some(floor) = last_suggested else {
+            return true;
+        };
+        let floor = floor as f64;
+        let new = new_diff as f64;
+        new <= floor / DOWN_FACTOR || new >= floor * UP_FACTOR
+    }
+
+    /// Send `SuggestDifficulty` if the computed value is a material change from
+    /// the last suggestion.
     async fn maybe_suggest_difficulty(&mut self, client_command_tx: &mpsc::Sender<ClientCommand>) {
         let Some(new_diff) = Self::compute_suggested_difficulty(self.expected_hashrate) else {
             return;
         };
 
-        let dominated = match self.last_suggested_difficulty {
-            Some(prev) => {
-                let ratio = new_diff as f64 / prev as f64;
-                ratio >= MATERIAL_CHANGE_FACTOR || ratio <= 1.0 / MATERIAL_CHANGE_FACTOR
-            }
-            None => true,
-        };
-
-        if !dominated {
+        if !Self::is_material_change(new_diff, self.last_suggested_difficulty) {
             return;
         }
 
@@ -1131,6 +1151,33 @@ mod tests {
             other => panic!("expected SuggestDifficulty, got {other:?}"),
         }
         assert!(source.last_suggested_difficulty.is_some());
+    }
+
+    #[test]
+    fn material_change_with_no_prior_suggestion() {
+        assert!(StratumV1Source::is_material_change(100, None));
+    }
+
+    #[test]
+    fn material_change_deadband_around_floor() {
+        // Floor of 100: down fires at <= 80 (100 / 1.25), up at >= 150
+        // (100 * 1.5); the band between is suppressed.
+        let floor = Some(100);
+        assert!(StratumV1Source::is_material_change(80, floor)); // down threshold
+        assert!(!StratumV1Source::is_material_change(81, floor)); // just inside down
+        assert!(!StratumV1Source::is_material_change(100, floor)); // unchanged
+        assert!(!StratumV1Source::is_material_change(149, floor)); // just inside up
+        assert!(StratumV1Source::is_material_change(150, floor)); // up threshold
+        assert!(StratumV1Source::is_material_change(300, floor)); // well above
+    }
+
+    #[test]
+    fn material_change_is_asymmetric() {
+        // A 1.4x rise is suppressed (below the 1.5x up threshold) while a
+        // matching 1.4x fall fires (past the 1.25x down threshold).
+        let floor = Some(100);
+        assert!(!StratumV1Source::is_material_change(140, floor));
+        assert!(StratumV1Source::is_material_change(71, floor));
     }
 
     #[tokio::test]
