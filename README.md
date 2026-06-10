@@ -195,8 +195,12 @@ improving documentation, or simply exploring the codebase to learn
 about Bitcoin mining protocols and hardware, your involvement is
 valued.
 
-Please see our [Contribution Guide](CONTRIBUTING.md) for details on how
-to get started.
+Please see our [Contribution Guide](CONTRIBUTING.md) for details on
+how to get started. For user-oriented discussion and support, visit
+the [Mujina forum](https://forum.256foundation.org/c/mujina/7). For
+real-time chat, join our [Telegram group](https://t.me/the256foundation)---note
+that Telegram is ephemeral; decisions and important context belong on
+GitHub.
 
 ## Further Reading
 
