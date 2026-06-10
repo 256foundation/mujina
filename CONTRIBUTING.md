@@ -30,10 +30,12 @@ the feature before implementation.
 
 ### I've implemented a feature
 
-1. If there's an issue for the feature, open a pull request.
-2. If there's no issue, open a discussion first and link to your
-   branch. Getting feedback before the PR makes the review process
-   smoother.
+1. If there is a discussion for the feature, open a **draft** pull
+   request and link to it. Mark it ready for review when the code
+   is complete and ready to merge.
+2. If there is no discussion yet, open one first and link to your
+   branch. Getting alignment before the PR makes the review
+   process smoother.
 
 ### I'd like to contribute
 
@@ -46,36 +48,43 @@ contributors.
 
 ### I have a question
 
-Open a [Q&A discussion] or ask in our [Telegram group].
+For user support and general discussion, visit the [Mujina forum].
+For developer questions, open a [Q&A discussion] on GitHub. For
+real-time chat, join our [Telegram group]---note that Telegram is
+ephemeral; decisions and important context belong on GitHub.
 
+[Mujina forum]: https://forum.256foundation.org/c/mujina/7
 [Q&A discussion]: https://github.com/256foundation/mujina/discussions/new?category=q-a
 [Telegram group]: https://t.me/the256foundation
 
-## Workflow: Discussion, Issue, Pull Request
+## Workflow
 
-The path from idea to merged code has three steps:
+The path to merged code depends on the type of change:
 
-1. **Discussion.** Propose ideas, report bugs, or ask questions in
-   GitHub [discussions]. This is where design conversations happen.
-2. **Issue.** Once a discussion produces a well-understood,
-   actionable item, it moves to the [issue tracker]. Every issue in
-   the tracker is ready to be worked on.
-3. **Pull request.** Implement the issue and open a PR.
+**Bug reports** start in an ["Issue Triage" discussion]. The
+maintainers triage the report and, if confirmed, promote it to the
+[issue tracker]. Every issue in the tracker is ready to be worked on.
 
-This sequence matters. Without prior discussion, you risk spending
-time on work that conflicts with planned changes, doesn't fit the
-project direction, or solves a problem in a way that won't be
+**Features** start in the ["Ideas" category]. Once there is consensus
+on the approach, open a draft PR linked to the discussion and develop
+there. Keep the PR as a draft until the work is complete and ready to
+merge.
+
+**Simple fixes** go straight to a PR---no discussion or issue needed.
+This covers typo fixes, wording improvements, spelling corrections,
+log level adjustments, comment improvements, documentation
+clarifications, and clear bug fixes where the problem and solution are
+both obvious. Use your judgment; if the change is obviously correct
+and self-contained, just open the PR.
+
+The first two paths exist for a reason. Without prior alignment, you
+risk spending time on work that conflicts with planned changes, doesn't
+fit the project direction, or solves a problem in a way that won't be
 merged. A quick discussion up front saves everyone time.
 
 Issues tagged with "feature" or "enhancement" represent accepted,
 well-scoped work. If you implement an issue as described, your pull
 request will be accepted with a high degree of certainty.
-
-**Exception:** Trivial improvements don't need discussion or an
-issue. This includes typo fixes, wording improvements, spelling
-corrections, log level adjustments, comment improvements, and
-documentation clarifications. Use your judgment---if the change is
-obviously correct and self-contained, just open the PR.
 
 The above workflow is adapted from [Ghostty]. Thanks to Mitchell
 Hashimoto and contributors for the pattern!
@@ -301,11 +310,11 @@ Fixes: #234
      commits together or doesn't belong in any single commit
    - Relevant logs if applicable
 
-5. If the work isn't finished but you want early feedback, open
-   the PR as a **draft**. Mark it ready for review when the code
-   is complete. This keeps the review queue clear so reviewers can
-   trust that non-draft PRs represent finished work they can act
-   on.
+5. Open feature PRs as a **draft** while work is in progress.
+   Mark it ready for review only when the code is complete and
+   ready to merge. This keeps the review queue clear so reviewers
+   can trust that non-draft PRs represent finished work they can
+   act on.
 
 6. Address review feedback promptly.
 
