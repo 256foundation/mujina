@@ -6,6 +6,7 @@ pub mod board;
 pub mod config;
 pub mod cpu_miner;
 pub mod daemon;
+pub mod env_help;
 pub mod hw_trait;
 pub mod job_source;
 pub mod mgmt_protocol;
