@@ -1,7 +1,9 @@
 //! Dynamic board registration tracking.
 
+use tokio::sync::{mpsc, watch};
+
+use crate::api::commands::BoardCommand;
 use crate::api_client::types::BoardTelemetry;
-use tokio::sync::watch;
 
 /// Dynamic collection of board registrations.
 ///
@@ -23,23 +25,49 @@ impl BoardRegistry {
         self.boards.push(reg);
     }
 
+    /// Remove boards whose sender has been dropped (board disconnected).
+    fn prune_disconnected(&mut self) {
+        self.boards
+            .retain(|reg| reg.telemetry_rx.has_changed().is_ok());
+    }
+
     /// Snapshot all connected boards.
     ///
     /// Removes boards whose sender has been dropped (board disconnected)
     /// and returns the current state of each.
     pub fn boards(&mut self) -> Vec<BoardTelemetry> {
-        self.boards
-            .retain(|reg| reg.telemetry_rx.has_changed().is_ok());
+        self.prune_disconnected();
         self.boards
             .iter()
             .map(|reg| reg.telemetry_rx.borrow().clone())
             .collect()
+    }
+
+    /// Snapshot a single connected board by name.
+    pub fn board(&mut self, name: &str) -> Option<BoardTelemetry> {
+        self.prune_disconnected();
+        self.boards
+            .iter()
+            .find(|reg| reg.telemetry_rx.borrow().name == name)
+            .map(|reg| reg.telemetry_rx.borrow().clone())
+    }
+
+    /// Look up the command sender for a board by name. `None` if the
+    /// board is unknown or accepts no commands.
+    pub fn command_tx(&mut self, name: &str) -> Option<mpsc::Sender<BoardCommand>> {
+        self.prune_disconnected();
+        self.boards
+            .iter()
+            .find(|reg| reg.telemetry_rx.borrow().name == name)
+            .and_then(|reg| reg.command_tx.clone())
     }
 }
 
 /// A board's registration with the API server.
 pub struct BoardRegistration {
     pub telemetry_rx: watch::Receiver<BoardTelemetry>,
+    /// Sender for board commands. `None` if the board accepts no commands.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
 }
 
 #[cfg(test)]
@@ -57,7 +85,13 @@ mod tests {
             ..Default::default()
         };
         let (tx, rx) = watch::channel(telemetry);
-        (tx, BoardRegistration { telemetry_rx: rx })
+        (
+            tx,
+            BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+            },
+        )
     }
 
     #[test]
@@ -108,5 +142,35 @@ mod tests {
 
         tx.send_modify(|s| s.model = "Updated".into());
         assert_eq!(registry.boards()[0].model, "Updated");
+    }
+
+    #[test]
+    fn returns_single_board_by_name() {
+        let mut registry = BoardRegistry::new();
+
+        let (_keep, reg) = make_board("board-a");
+        registry.push(reg);
+
+        assert_eq!(registry.board("board-a").unwrap().name, "board-a");
+        assert!(registry.board("missing").is_none());
+    }
+
+    #[test]
+    fn returns_command_sender_for_named_board() {
+        use tokio::sync::mpsc;
+
+        let mut registry = BoardRegistry::new();
+
+        let (_keep, mut reg) = make_board("board-a");
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<BoardCommand>(1);
+        reg.command_tx = Some(cmd_tx);
+        registry.push(reg);
+
+        assert!(registry.command_tx("board-a").is_some());
+        assert!(registry.command_tx("missing").is_none());
+
+        let (_keep_b, reg_b) = make_board("no-commands");
+        registry.push(reg_b);
+        assert!(registry.command_tx("no-commands").is_none());
     }
 }
