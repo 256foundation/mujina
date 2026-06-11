@@ -77,8 +77,9 @@ pub enum ClientCommand {
     /// Submit a share to the pool
     SubmitShare(SubmitParams),
 
-    /// Suggest a new difficulty to the pool
-    SuggestDifficulty(u64),
+    /// Suggest a new difficulty to the pool. Fractional below 1 (for very
+    /// slow workers like the CPU miner); sent as an integer at or above 1.
+    SuggestDifficulty(f64),
 }
 
 /// Mining job notification from pool (mining.notify).

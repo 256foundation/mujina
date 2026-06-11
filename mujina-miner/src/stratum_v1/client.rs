@@ -68,7 +68,7 @@ pub struct StratumV1Client {
 
     /// Initial difficulty to suggest during the handshake (before the main
     /// event loop). Subsequent re-suggestions arrive via `ClientCommand`.
-    initial_suggest_difficulty: Option<u64>,
+    initial_suggest_difficulty: Option<f64>,
 }
 
 /// Protocol state after successful subscription.
@@ -112,7 +112,7 @@ impl StratumV1Client {
         event_tx: mpsc::Sender<ClientEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
         shutdown: CancellationToken,
-        initial_suggest_difficulty: Option<u64>,
+        initial_suggest_difficulty: Option<f64>,
     ) -> Self {
         Self {
             config,
@@ -410,15 +410,24 @@ impl StratumV1Client {
     async fn suggest_difficulty(
         &mut self,
         conn: &mut dyn Transport,
-        difficulty: u64,
+        difficulty: f64,
     ) -> StratumResult<()> {
         use serde_json::json;
+
+        // Send whole difficulties as integers (what pools expect); only drop to
+        // a fraction below 1, where an integer would round a slow worker's
+        // target to either 0 or a value it can never meet.
+        let param = if difficulty >= 1.0 {
+            json!([difficulty as u64])
+        } else {
+            json!([difficulty])
+        };
 
         let result = self
             .send_request(
                 conn,
                 "mining.suggest_difficulty",
-                json!([difficulty]),
+                param,
                 Duration::from_secs(3),
             )
             .await;

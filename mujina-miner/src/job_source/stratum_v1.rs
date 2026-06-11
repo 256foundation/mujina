@@ -142,7 +142,7 @@ pub struct StratumV1Source {
     expected_hashrate: HashRate,
 
     /// Last difficulty we suggested to the pool (for material-change detection)
-    last_suggested_difficulty: Option<u64>,
+    last_suggested_difficulty: Option<f64>,
 
     /// When the suggest_difficulty cooldown expires, `None` when not throttling.
     cooldown_until: Option<Instant>,
@@ -397,14 +397,16 @@ impl StratumV1Source {
 
     /// Compute the suggested difficulty for the given hashrate.
     ///
-    /// Returns `None` for zero hashrate (nothing to suggest yet).
-    fn compute_suggested_difficulty(hashrate: HashRate) -> Option<u64> {
+    /// Returns `None` for zero hashrate (nothing to suggest yet). The value is
+    /// fractional below 1, so a very slow worker (such as the CPU miner) still
+    /// gets a target it can meet; the client encodes whole difficulties as
+    /// integers on the wire.
+    fn compute_suggested_difficulty(hashrate: HashRate) -> Option<f64> {
         if hashrate.is_zero() {
             return None;
         }
         let target = SUGGESTED_SHARE_RATE.to_target(hashrate);
-        let diff = Difficulty::from_target(target).as_u64().max(1);
-        Some(diff)
+        Some(Difficulty::from_target(target).as_f64())
     }
 
     /// Whether `new_diff` differs enough from the last suggestion to re-suggest.
@@ -417,13 +419,11 @@ impl StratumV1Source {
     /// set difficulty. Measuring against the live value would fight the pool's
     /// vardiff and oscillate, re-suggesting against a change the pool just made
     /// above the floor on its own.
-    fn is_material_change(new_diff: u64, last_suggested: Option<u64>) -> bool {
+    fn is_material_change(new_diff: f64, last_suggested: Option<f64>) -> bool {
         let Some(floor) = last_suggested else {
             return true;
         };
-        let floor = floor as f64;
-        let new = new_diff as f64;
-        new <= floor / DOWN_FACTOR || new >= floor * UP_FACTOR
+        new_diff <= floor / DOWN_FACTOR || new_diff >= floor * UP_FACTOR
     }
 
     /// Suggest difficulty for the latest hashrate, subject to the deadband and
@@ -460,7 +460,7 @@ impl StratumV1Source {
     /// cooldown.
     async fn send_suggest(
         &mut self,
-        new_diff: u64,
+        new_diff: f64,
         client_command_tx: &mpsc::Sender<ClientCommand>,
     ) {
         debug!(
@@ -1164,17 +1164,21 @@ mod tests {
         let diff =
             StratumV1Source::compute_suggested_difficulty(HashRate::from_terahashes(1.0)).unwrap();
         assert!(
-            (600..800).contains(&diff),
+            (600.0..800.0).contains(&diff),
             "Bitaxe Gamma difficulty {diff} not in expected range 600..800"
         );
     }
 
     #[test]
-    fn test_compute_suggested_difficulty_always_at_least_one() {
-        // Even at very low hashrate, difficulty should be at least 1
+    fn test_compute_suggested_difficulty_fractional_for_slow_worker() {
+        // A very slow worker (e.g. the CPU miner) needs a fractional target it
+        // can actually meet, not one rounded up to 1.
         let diff =
             StratumV1Source::compute_suggested_difficulty(HashRate::from_megahashes(1.0)).unwrap();
-        assert!(diff >= 1);
+        assert!(
+            diff > 0.0 && diff < 1.0,
+            "slow-worker difficulty {diff} should be a fraction below 1"
+        );
     }
 
     #[tokio::test]
@@ -1202,7 +1206,7 @@ mod tests {
         let cmd = client_rx.try_recv().expect("should have sent command");
         match cmd {
             ClientCommand::SuggestDifficulty(d) => {
-                assert!(d > 0, "difficulty should be positive");
+                assert!(d > 0.0, "difficulty should be positive");
             }
             other => panic!("expected SuggestDifficulty, got {other:?}"),
         }
@@ -1211,29 +1215,29 @@ mod tests {
 
     #[test]
     fn material_change_with_no_prior_suggestion() {
-        assert!(StratumV1Source::is_material_change(100, None));
+        assert!(StratumV1Source::is_material_change(100.0, None));
     }
 
     #[test]
     fn material_change_deadband_around_floor() {
         // Floor of 100: down fires at <= 80 (100 / 1.25), up at >= 150
         // (100 * 1.5); the band between is suppressed.
-        let floor = Some(100);
-        assert!(StratumV1Source::is_material_change(80, floor)); // down threshold
-        assert!(!StratumV1Source::is_material_change(81, floor)); // just inside down
-        assert!(!StratumV1Source::is_material_change(100, floor)); // unchanged
-        assert!(!StratumV1Source::is_material_change(149, floor)); // just inside up
-        assert!(StratumV1Source::is_material_change(150, floor)); // up threshold
-        assert!(StratumV1Source::is_material_change(300, floor)); // well above
+        let floor = Some(100.0);
+        assert!(StratumV1Source::is_material_change(80.0, floor)); // down threshold
+        assert!(!StratumV1Source::is_material_change(81.0, floor)); // just inside down
+        assert!(!StratumV1Source::is_material_change(100.0, floor)); // unchanged
+        assert!(!StratumV1Source::is_material_change(149.0, floor)); // just inside up
+        assert!(StratumV1Source::is_material_change(150.0, floor)); // up threshold
+        assert!(StratumV1Source::is_material_change(300.0, floor)); // well above
     }
 
     #[test]
     fn material_change_is_asymmetric() {
         // A 1.4x rise is suppressed (below the 1.5x up threshold) while a
         // matching 1.4x fall fires (past the 1.25x down threshold).
-        let floor = Some(100);
-        assert!(!StratumV1Source::is_material_change(140, floor));
-        assert!(StratumV1Source::is_material_change(71, floor));
+        let floor = Some(100.0);
+        assert!(!StratumV1Source::is_material_change(140.0, floor));
+        assert!(StratumV1Source::is_material_change(71.0, floor));
     }
 
     /// Build a source for testing the suggest policy in isolation. The other
