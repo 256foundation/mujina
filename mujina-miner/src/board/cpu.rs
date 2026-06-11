@@ -23,7 +23,7 @@ inventory::submit! {
 
 async fn create_cpu_board() -> Result<BackplaneConnector> {
     let config = CpuMinerConfig::from_env()
-        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPU_MINER not set)"))?;
+        .ok_or_else(|| anyhow!("cpu miner not configured (MUJINA_CPUMINER_THREADS not set)"))?;
 
     let info = BoardInfo {
         model: "CPU Miner".into(),
