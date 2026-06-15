@@ -8,6 +8,7 @@
 //!
 //! - **Linux**: Uses udev for device enumeration and hotplug monitoring
 //! - **macOS**: Stub implementation (IOKit support planned for future)
+//! - **Windows**: Uses serialport crate for COM port enumeration with polling
 
 use crate::{error::Result, tracing::prelude::*};
 use std::sync::OnceLock;
@@ -36,6 +37,28 @@ pub struct UsbDeviceInfo {
     // Future: other interfaces like HID, mass storage, etc.
 }
 
+impl Clone for UsbDeviceInfo {
+    fn clone(&self) -> Self {
+        // Clone serial ports only if successful - errors cannot be cloned
+        let ports_clone = if let Some(Ok(ports)) = self.serial_ports.get() {
+            OnceLock::from(Ok(ports.clone()))
+        } else {
+            // If error or not cached, leave empty (will re-scan on access)
+            OnceLock::new()
+        };
+
+        Self {
+            vid: self.vid,
+            pid: self.pid,
+            serial_number: self.serial_number.clone(),
+            manufacturer: self.manufacturer.clone(),
+            product: self.product.clone(),
+            device_path: self.device_path.clone(),
+            serial_ports: ports_clone,
+        }
+    }
+}
+
 impl UsbDeviceInfo {
     /// Get serial ports associated with this USB device.
     ///
@@ -52,7 +75,11 @@ impl UsbDeviceInfo {
                 {
                     linux::find_serial_ports_for_device(&self.device_path)
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "windows")]
+                {
+                    windows::find_serial_ports_for_device(&self.device_path)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     Ok(vec![])
                 }
@@ -164,6 +191,9 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 /// Internal trait for platform-specific USB discovery implementations.
 ///
 /// This trait is not exposed publicly - only `UsbTransport` uses it internally.
@@ -212,7 +242,12 @@ fn create_discovery() -> Result<Box<dyn UsbDiscoveryImpl>> {
         Ok(Box::new(macos::MacOsIoKitDiscovery::new()?))
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows::WindowsSerialDiscovery::new()?))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         compile_error!("USB discovery is not implemented for this platform");
     }

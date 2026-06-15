@@ -5,7 +5,13 @@
 //! implementation provides device discovery and emits transport-specific
 //! events when devices are connected or disconnected.
 
+#[cfg(not(target_os = "windows"))]
 pub mod serial;
+
+#[cfg(target_os = "windows")]
+#[path = "serial_windows.rs"]
+pub mod serial;
+
 pub mod usb;
 
 // Re-export transport implementations

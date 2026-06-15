@@ -3,6 +3,7 @@
 //! This module handles the core daemon functionality including initialization,
 //! task management, signal handling, and graceful shutdown.
 
+#[cfg(unix)]
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -155,18 +156,28 @@ impl Daemon {
         info!("Started.");
         info!("For debugging, set RUST_LOG=mujina_miner=debug or trace.");
 
-        // Install signal handlers
-        let mut sigint = unix::signal(SignalKind::interrupt())?;
-        let mut sigterm = unix::signal(SignalKind::terminate())?;
+        // Wait for shutdown signal (platform-specific)
+        #[cfg(unix)]
+        {
+            // Install Unix signal handlers
+            let mut sigint = unix::signal(SignalKind::interrupt())?;
+            let mut sigterm = unix::signal(SignalKind::terminate())?;
 
-        // Wait for shutdown signal
-        tokio::select! {
-            _ = sigint.recv() => {
-                info!("Received SIGINT.");
-            },
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM.");
-            },
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT.");
+                },
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM.");
+                },
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            // Use Ctrl+C handler on Windows
+            tokio::signal::ctrl_c().await?;
+            info!("Received Ctrl+C.");
         }
 
         // Initiate shutdown
