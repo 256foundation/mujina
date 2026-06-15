@@ -261,7 +261,8 @@ impl Bitaxe {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if self.monitor_tick(&telemetry_tx, &mut last_log).await.is_err() {
+                    if let Err(e) = self.monitor_tick(&telemetry_tx, &mut last_log).await {
+                        error!(error = %e, "Board monitor failed");
                         self.shutdown().await;
                         return;
                     }
@@ -296,7 +297,7 @@ impl Bitaxe {
         &mut self,
         tx: &watch::Sender<BoardTelemetry>,
         last_log: &mut Instant,
-    ) -> Result<(), ()> {
+    ) -> Result<()> {
         // Read all sensors in one pass
         let raw_temp = self.emc2101.get_external_temperature().await;
         let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
@@ -333,6 +334,7 @@ impl Bitaxe {
         let diode_ready = self
             .asic_enable
             .enabled_since()
+            .context("failed to read ASIC enable state")?
             .is_some_and(|since| since.elapsed() >= DIODE_SETTLE);
         let asic_temp = if diode_ready {
             match raw_temp {
@@ -375,7 +377,10 @@ impl Bitaxe {
             if let Err(e) = self.emc2101.set_fan_speed(Percent::FULL).await {
                 error!("Failed to set fan speed: {}", e);
             }
-            return Err(());
+            bail!(
+                "thermal emergency after {} consecutive bad readings",
+                self.bad_thermal_count
+            );
         }
 
         // Publish telemetry
@@ -603,8 +608,11 @@ struct BitaxeAsicEnable {
 impl BitaxeAsicEnable {
     /// When the ASIC was last taken out of reset, or `None` if it
     /// is currently in reset. Safe to call from another task.
-    fn enabled_since(&self) -> Option<Instant> {
-        *self.enabled_since.lock().expect("enabled_since lock")
+    fn enabled_since(&self) -> Result<Option<Instant>> {
+        self.enabled_since
+            .lock()
+            .map(|guard| *guard)
+            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))
     }
 }
 
@@ -615,7 +623,10 @@ impl AsicEnable for BitaxeAsicEnable {
             .write(PinValue::High)
             .await
             .map_err(|e| anyhow!("failed to release reset: {}", e))?;
-        *self.enabled_since.lock().expect("enabled_since lock") = Some(Instant::now());
+        *self
+            .enabled_since
+            .lock()
+            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = Some(Instant::now());
         Ok(())
     }
 
@@ -624,7 +635,10 @@ impl AsicEnable for BitaxeAsicEnable {
             .write(PinValue::Low)
             .await
             .map_err(|e| anyhow!("failed to assert reset: {}", e))?;
-        *self.enabled_since.lock().expect("enabled_since lock") = None;
+        *self
+            .enabled_since
+            .lock()
+            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = None;
         Ok(())
     }
 }
