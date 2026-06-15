@@ -143,7 +143,8 @@ pub struct BitaxeBoard {
 }
 
 impl BitaxeBoard {
-    /// GPIO pin number for ASIC reset control (active low)
+    /// GPIO command for ASIC reset control (active low)
+    /// bitaxe-raw firmware uses command 0x00 for ASIC reset (not a GPIO pin number)
     const ASIC_RESET_PIN: u8 = 0;
 
     /// Bitaxe Gamma board configuration
@@ -166,7 +167,7 @@ impl BitaxeBoard {
     /// # Design Note
     /// In the future, a DeviceManager will create boards when USB devices
     /// are detected (by VID/PID) and pass already-opened serial streams.
-    pub fn new(
+    pub async fn new(
         control: tokio_serial::SerialStream,
         data_path: &str,
         serial_number: Option<String>,
@@ -176,7 +177,11 @@ impl BitaxeBoard {
         let i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Create SerialStream for data channel at initial baud rate
-        let data_stream = SerialStream::new(data_path, 115200).map_err(|e| {
+        let config = crate::transport::SerialConfig {
+            baud_rate: 115200,
+            ..Default::default()
+        };
+        let data_stream = SerialStream::open(data_path, config).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to open data port: {}", e))
         })?;
         let (data_reader, data_writer, data_control) = data_stream.split();
@@ -467,6 +472,26 @@ impl BitaxeBoard {
                 match fan.set_fan_speed(Percent::FULL).await {
                     Ok(()) => {
                         debug!("Fan speed set to 100%");
+
+                        // Wait for fan to spin up
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+                        // Read back and verify RPM
+                        match fan.get_rpm().await {
+                            Ok(rpm) => {
+                                info!("Fan RPM after initialization: {}", rpm);
+                                if rpm < 500 {
+                                    warn!("Fan RPM is suspiciously low! Check EMC2101 configuration");
+                                } else if rpm > 10000 {
+                                    warn!("Fan RPM is suspiciously high! Check EMC2101 configuration");
+                                } else {
+                                    info!("Fan RPM is within normal range");
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to read fan RPM: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("Failed to set fan speed: {}", e);
@@ -932,14 +957,15 @@ async fn create_from_usb(
         serial = ?device.serial_number,
         control = %serial_ports[0],
         data = %serial_ports[1],
-        "Opening Bitaxe Gamma serial ports"
+        "Opening Bitaxe Gamma serial ports (per bitaxe-raw source: interface 0=control, 1=data)"
     );
 
-    // Open control port at 115200 baud
+    // Open control port at 115200 baud (ttyACM0 = control per bitaxe-raw firmware)
     let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
 
-    // Create the board with the control port and data port path
+    // Create the board with the control port and data port path (ttyACM1 = data per bitaxe-raw firmware)
     let mut board = BitaxeBoard::new(control_port, &serial_ports[1], device.serial_number.clone())
+        .await
         .map_err(|e| crate::error::Error::Hardware(format!("Failed to create board: {}", e)))?;
 
     // Initialize the board (reset, discover chips, start event monitoring)
@@ -960,10 +986,12 @@ async fn create_from_usb(
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            // Match BitAxe by VID:PID (c0de:cafe for bitaxe-raw firmware)
+            // Windows reports generic "Microsoft" manufacturer instead of actual device strings
+            vid: Match::Specific(0xc0de),
+            pid: Match::Specific(0xcafe),
+            manufacturer: Match::Any,
+            product: Match::Any,
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
