@@ -145,6 +145,38 @@ Use standard Rust documentation format:
 - Include examples for complex functionality
 - Document panics, errors, and safety requirements
 
+Doc comment prose follows Rust's API documentation conventions
+([RFC 1574], building on [RFC 505]), the style used throughout the
+standard library. The basics:
+
+- Begin with a one-line summary. rustdoc shows this line by itself
+  in module indexes, so it must stand alone.
+- End the summary with a period. This includes noun-phrase
+  summaries for types and fields: `/// Pool connection
+  configuration.`
+- Describe functions and methods in third-person present tense:
+  `/// Returns the length in bytes.`, not `/// Return the length
+  in bytes`. A doc comment describes what the item does; it is not
+  a command to the reader.
+- Separate the summary from any further detail with a blank `///`
+  line.
+
+```rust
+/// Creates a frequency from a count of megahertz.
+///
+/// Values are stored internally as integer Hz, so fractional
+/// megahertz such as 62.5 are exact.
+pub fn from_mhz(mhz: f32) -> Self {
+```
+
+Older code predates this rule and mixes imperative, period-less
+summaries. Bring doc comments into conformance when you modify
+them; do not restyle otherwise-untouched code in a functional
+commit.
+
+[RFC 505]: https://rust-lang.github.io/rfcs/0505-api-comment-conventions.html
+[RFC 1574]: https://rust-lang.github.io/rfcs/1574-more-api-documentation-conventions.html
+
 See CODING_GUIDELINES.md for guidance on what to document and comment
 style.
 
