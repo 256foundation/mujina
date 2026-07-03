@@ -351,8 +351,8 @@ mod tests {
 
     use super::super::codec::FrameCodec;
     use super::super::register::{
-        ChipId, ChipModel, Core, InitControl, Log2Difficulty, MiscControl, NonceRange, Register,
-        RegisterAddress, TicketMask, VersionMask,
+        ChipId, ChipModel, Core, InitControl, IoDriverStrength, Log2Difficulty, MiscControl,
+        NonceRange, Register, RegisterAddress, TicketMask, VersionMask,
     };
     use super::*;
     use crate::asic::bm13xx::crc::crc16;
@@ -490,6 +490,34 @@ mod tests {
             }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x1e, 0xb5, 0x0f,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_io_driver_strength_from_capture() {
+        // From S19 J Pro and S21 Pro captures: TX: 55 AA 51 09 00 58 00 01 11 11 0D
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::IoDriverStrength(IoDriverStrength::normal()),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x58, 0x00, 0x01, 0x11, 0x11, 0x0d,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_domain_boundary_io_driver_strength_from_capture() {
+        // From S21 Pro capture: TX: 55 AA 41 09 08 58 00 01 F1 11 1F
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Chip(0x08),
+                register: Register::IoDriverStrength(IoDriverStrength::domain_boundary()),
+            }),
+            &[
+                0x55, 0xaa, 0x41, 0x09, 0x08, 0x58, 0x00, 0x01, 0xf1, 0x11, 0x1f,
             ],
         );
     }

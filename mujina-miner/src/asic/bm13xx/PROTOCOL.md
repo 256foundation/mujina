@@ -517,10 +517,25 @@ Controls analog multiplexer, possibly for temperature sensing:
 - Purpose not fully documented by manufacturer
 
 #### 0x58 - IO_DRIVER_STRENGTH
-Controls IO signal driver strength (4 bytes):
-- Normal chips: 0x00011111
-- Domain-end chips: 0x0001F111 (stronger drive for signal integrity)
-- Configured differently for last chip in each domain
+Sets the drive strength of each chip output pin. Each output has a
+4-bit field:
+
+| Bits  | Field    | Output                        |
+|-------|----------|-------------------------------|
+| 0-3   | CO_DS    | Command output (to next chip) |
+| 4-7   | BO_DS    | Busy output                   |
+| 8-11  | NRSTO_DS | Reset output                  |
+| 12-15 | CLKO_DS  | Clock output                  |
+| 16-19 | RO_DS    | Response output (to host)     |
+| 20-27 | (varies) | Relay enables, RF strength    |
+
+Note: this register's value travels big-endian on the wire, unlike
+most register data. Value 0x0001F111 appears as bytes `00 01 F1 11`.
+
+Values observed in factory captures:
+- All chips at init: 0x00011111 (every output at strength 1)
+- Last chip of each domain: 0x0001F111 (clock output raised to
+  maximum; the boundary chip drives the clock across the domain gap)
 
 #### 0x68 - PLL3_PARAMETER
 PLL3 configuration for multi-chip chains:

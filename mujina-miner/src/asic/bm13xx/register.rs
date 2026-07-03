@@ -445,46 +445,72 @@ impl Core {
     }
 }
 
-/// IO driver strength configuration
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Drive strength of each chip output pin.
+///
+/// Each output has a 4-bit drive strength. Factory firmware runs
+/// every output at strength 1 and raises the clock output on the
+/// last chip of each voltage domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoDriverStrength {
-    /// Drive strength for each signal group (4 bits each)
-    strengths: [u8; 8],
+    /// Drive strength of the command output (CO), toward the next chip.
+    command_out: u8,
+    /// Drive strength of the busy output (BO), toward the next chip.
+    busy_out: u8,
+    /// Drive strength of the reset output (NRSTO), toward the next chip.
+    reset_out: u8,
+    /// Drive strength of the clock output (CLKO), toward the next chip.
+    clock_out: u8,
+    /// Drive strength of the response output (RO), toward the host.
+    response_out: u8,
+    /// Relay enables and RF drive strength; zero in all captured traffic.
+    high_bits: u16,
 }
 
 impl IoDriverStrength {
-    /// Normal strength for chips in middle of chain
+    /// Returns the baseline strength: every output at 1.
     pub fn normal() -> Self {
-        // 0x11110100 = 0001 0001 0001 0001 0000 0001 0000 0000
         Self {
-            strengths: [0x0, 0x0, 0x1, 0x0, 0x1, 0x1, 0x1, 0x1],
+            command_out: 0x1,
+            busy_out: 0x1,
+            reset_out: 0x1,
+            clock_out: 0x1,
+            response_out: 0x1,
+            high_bits: 0,
         }
     }
 
-    /// Strong drive for domain boundary chips
+    /// Returns the strength for the last chip of a voltage domain:
+    /// clock output at maximum, the rest at the baseline. The boundary
+    /// chip drives the clock across the gap to the next domain.
     pub fn domain_boundary() -> Self {
-        // 0x1111f100 = 0001 0001 0001 0001 1111 0001 0000 0000
         Self {
-            strengths: [0x0, 0x0, 0x1, 0xf, 0x1, 0x1, 0x1, 0x1],
+            clock_out: 0xf,
+            ..Self::normal()
         }
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
-        // Pack 8 4-bit values into 4 bytes (2 per byte).
-        // Each byte contains two strength values: [high_nibble|low_nibble].
-        dst.put_u8(self.strengths[0] | (self.strengths[1] << 4));
-        dst.put_u8(self.strengths[2] | (self.strengths[3] << 4));
-        dst.put_u8(self.strengths[4] | (self.strengths[5] << 4));
-        dst.put_u8(self.strengths[6] | (self.strengths[7] << 4));
+        // Unlike most registers, captures show this register's value
+        // big-endian on the wire: 0x0001F111 is sent as 00 01 F1 11.
+        let value = (self.high_bits as u32) << 20
+            | (self.response_out as u32) << 16
+            | (self.clock_out as u32) << 12
+            | (self.reset_out as u32) << 8
+            | (self.busy_out as u32) << 4
+            | self.command_out as u32;
+        dst.put_u32(value);
     }
 
     pub fn decode(bytes: [u8; 4]) -> Self {
-        let raw = u32::from_le_bytes(bytes);
-        let mut strengths = [0u8; 8];
-        for (i, strength) in strengths.iter_mut().enumerate() {
-            *strength = ((raw >> (i * 4)) & 0xf) as u8;
+        let value = u32::from_be_bytes(bytes);
+        Self {
+            command_out: (value & 0xf) as u8,
+            busy_out: (value >> 4 & 0xf) as u8,
+            reset_out: (value >> 8 & 0xf) as u8,
+            clock_out: (value >> 12 & 0xf) as u8,
+            response_out: (value >> 16 & 0xf) as u8,
+            high_bits: (value >> 20) as u16,
         }
-        Self { strengths }
     }
 }
 
