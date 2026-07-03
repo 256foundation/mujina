@@ -389,7 +389,7 @@ Key registers used across BM13xx chips:
 | 0x58 | IO_DRIVER_STRENGTH | IO driver strength configuration |
 | 0x68 | PLL3_PARAMETER | PLL3 configuration (multi-chip chains) |
 | 0xA4 | VERSION_MASK | Version rolling mask configuration |
-| 0xA8 | INIT_CONTROL | Initialization control register |
+| 0xA8 | SOFT_RESET_CONTROL | Chip-internal soft resets |
 | 0xB9 | MISC_SETTINGS | Miscellaneous settings (BM1370 only, value 0x00004480) |
 
 ### Register Details
@@ -550,16 +550,35 @@ Controls version rolling for AsicBoost optimization (32-bit register):
   - Initial: `0xFFFF0090` (full rolling enabled)
   - Stratum: `0x3FFF0090` (from version_mask=0x1FFFE000)
 
-#### 0xA8 - INIT_CONTROL
-Initialization control register requiring specific magic values (purpose undocumented):
-- **Initial broadcast** (all chips):
-  - BM1362: `0x00000000`
-  - BM1366/68/70: `0x00070000`
-- **Per-chip configuration**:
-  - BM1362: `0x02000000`
-  - BM1366/68/70: `0xF0010700`
-- Written twice: first broadcast to all chips, then individually to each chip
-- Values appear fixed across all implementations, suggesting required magic values
+#### 0xA8 - SOFT_RESET_CONTROL
+Drives chip-internal soft resets. The register first appears in the
+BM1362 generation (BM1397 has no 0xA8) and its bit layout varies by
+model. "Core" here means the whole hashing array as a
+reset domain, in contrast to the always-on control logic that speaks
+UART and distributes work; nothing in this register addresses
+individual cores.
+
+Bit layout:
+- **BM1362**: bit 0 CORE_SRST, bit 1 CORE_SRST_FAST, bit 2 TVER_RST,
+  bit 3 TOPCTRL_RST, bit 4 CHIP_RST. Resets to `0x00000000`.
+- **BM1366/68/70**: bits 0-3 runtime core soft reset; bits 4-8 set
+  once per chip at bring-up and kept set while hashing; bits 16-18
+  set from power-on and preserved by every write. Resets to
+  `0x00070000`.
+
+Every observed write is either the model's reset default or the
+default plus reset-assert bits:
+- **Broadcast during bring-up**, normalizing chip state before
+  enumeration: the reset default. BM1362 `0x00000000`,
+  BM1366/68/70 `0x00070000`.
+- **Per chip, immediately before core configuration**, asserting the
+  core reset: BM1362 `0x00000002` (CORE_SRST_FAST),
+  BM1366/68/70 `0x000701F0`.
+
+Each 0xA8 write is followed by a MISC_CONTROL (0x18) write; the two
+registers cooperate during reset sequencing (MISC_CONTROL bits 16-19
+move with the reset state). The register is write-only in practice:
+no capture reads it back.
 
 #### 0xB9 - MISC_SETTINGS (BM1370 only)
 Undocumented miscellaneous settings register:

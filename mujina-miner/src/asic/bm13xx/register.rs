@@ -29,7 +29,7 @@ pub enum RegisterAddress {
     IoDriverStrength = 0x58,
     Pll3Parameter = 0x68,
     VersionMask = 0xA4,
-    InitControl = 0xA8,
+    SoftResetControl = 0xA8,
     MiscSettings = 0xB9,
 }
 
@@ -48,7 +48,7 @@ pub enum Register {
     IoDriverStrength(IoDriverStrength),
     Pll3Parameter(Pll3Parameter),
     VersionMask(VersionMask),
-    InitControl(InitControl),
+    SoftResetControl(SoftResetControl),
     MiscSettings(MiscSettings),
 }
 
@@ -69,7 +69,9 @@ impl Register {
             }
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter::decode(bytes)),
             RegisterAddress::VersionMask => Register::VersionMask(VersionMask::decode(bytes)),
-            RegisterAddress::InitControl => Register::InitControl(InitControl::decode(bytes)),
+            RegisterAddress::SoftResetControl => {
+                Register::SoftResetControl(SoftResetControl::decode(bytes))
+            }
             RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings::decode(bytes)),
         }
     }
@@ -88,7 +90,7 @@ impl Register {
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
             Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
             Register::VersionMask(_) => RegisterAddress::VersionMask,
-            Register::InitControl(_) => RegisterAddress::InitControl,
+            Register::SoftResetControl(_) => RegisterAddress::SoftResetControl,
             Register::MiscSettings(_) => RegisterAddress::MiscSettings,
         }
     }
@@ -107,7 +109,7 @@ impl Register {
             Register::IoDriverStrength(r) => r.encode(dst),
             Register::Pll3Parameter(r) => r.encode(dst),
             Register::VersionMask(r) => r.encode(dst),
-            Register::InitControl(r) => r.encode(dst),
+            Register::SoftResetControl(r) => r.encode(dst),
             Register::MiscSettings(r) => r.encode(dst),
         }
     }
@@ -572,6 +574,66 @@ impl fmt::Debug for VersionMask {
     }
 }
 
+/// Soft reset control (0xA8).
+///
+/// Drives chip-internal soft resets. The register first appears in
+/// the BM1362 generation (BM1397 has no 0xA8) and its bit layout
+/// varies by model.
+///
+/// BM1362:
+/// - bit 0: CORE_SRST
+/// - bit 1: CORE_SRST_FAST
+/// - bit 2: TVER_RST
+/// - bit 3: TOPCTRL_RST
+/// - bit 4: CHIP_RST
+/// - resets to 0x0000_0000
+///
+/// BM1366 and later:
+/// - bits 0-3: runtime core-domain soft reset
+/// - bits 4-8: set once per chip at bring-up, kept set while hashing
+/// - bits 16-18: set from power-on, preserved by every write
+/// - resets to 0x0007_0000
+///
+/// "Core" here means the whole hashing array as a reset domain, in
+/// contrast to the always-on control logic; nothing in this register
+/// addresses individual cores.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SoftResetControl(pub u32);
+
+impl SoftResetControl {
+    /// Returns the hardware reset value, broadcast during bring-up
+    /// to normalize chip state before enumeration.
+    pub fn defaults(model: ChipModel) -> Self {
+        match model {
+            ChipModel::BM1362 => Self(0x0000_0000),
+            _ => Self(0x0007_0000),
+        }
+    }
+
+    /// Returns the value asserting the core-domain reset, written
+    /// per chip immediately before core configuration.
+    pub fn core_reset(model: ChipModel) -> Self {
+        match model {
+            ChipModel::BM1362 => Self(0x0000_0002),
+            _ => Self(0x0007_01F0),
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.0);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self(u32::from_be_bytes(bytes))
+    }
+}
+
+impl fmt::Debug for SoftResetControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SoftResetControl({:#010x})", self.0)
+    }
+}
+
 // Placeholder newtypes for registers whose bit layout is not yet
 // decomposed. Each wraps a raw u32 written little-endian to the wire.
 macro_rules! raw_u32_register {
@@ -598,7 +660,6 @@ raw_u32_register! {
     UartRelay,
     AnalogMux,
     Pll3Parameter,
-    InitControl,
     MiscSettings,
 }
 
@@ -922,5 +983,29 @@ mod version_mask_tests {
     #[test]
     fn full_rolling() {
         round_trip(VersionMask::full_rolling());
+    }
+}
+
+#[cfg(test)]
+mod soft_reset_control_tests {
+    use super::*;
+
+    fn round_trip(original: SoftResetControl) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(SoftResetControl::decode(bytes), original);
+    }
+
+    #[test]
+    fn defaults() {
+        round_trip(SoftResetControl::defaults(ChipModel::BM1362));
+        round_trip(SoftResetControl::defaults(ChipModel::BM1370));
+    }
+
+    #[test]
+    fn core_reset() {
+        round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
+        round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
     }
 }

@@ -22,8 +22,8 @@ use super::command::{
     SetChipAddress, WriteRegister,
 };
 use super::register::{
-    AnalogMux, Core, InitControl, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
-    NonceRange, PllDivider, Register, TicketMask, VersionMask,
+    AnalogMux, ChipModel, Core, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
+    NonceRange, PllDivider, Register, SoftResetControl, TicketMask, VersionMask,
 };
 use super::response::Response;
 use crate::{
@@ -290,7 +290,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::InitControl(InitControl(0x00000700)),
+            register: Register::SoftResetControl(SoftResetControl::defaults(ChipModel::BM1370)),
         }))
         .await?;
     chip_commands
@@ -350,7 +350,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
-            register: Register::InitControl(InitControl(0xF0010700)),
+            register: Register::SoftResetControl(SoftResetControl::core_reset(ChipModel::BM1370)),
         }))
         .await?;
     chip_commands
