@@ -219,7 +219,7 @@ merkle_root[32] | prev_block_hash[32] | version[4] |
   - The chip extracts bits 6-3 as the job identifier
 - **num_midstates** (1 byte): Number of midstates (always 0x01 for BM1370)
   - ESP-miner hardcodes this to 0x01 regardless of version rolling
-  - Version rolling is actually controlled by register 0xA4 (VERSION_MASK)
+  - Version rolling is actually controlled by register 0xA4 (MIDSTATE_CONFIG)
   - This field may be vestigial for chips using full format
 - **starting_nonce** (4 bytes): Starting nonce value (always 0x00000000)
 - **nbits** (4 bytes): Encoded difficulty target (little-endian)
@@ -264,7 +264,7 @@ midstates for version rolling. In this format:
 
 Since BM1362/BM1370 calculate midstates internally, mujina-miner uses 
 the full format exclusively. Version rolling is controlled by register 0xA4 
-(VERSION_MASK), not by the `num_midstates` field.
+(MIDSTATE_CONFIG), not by the `num_midstates` field.
 
 ## Response Types
 
@@ -388,7 +388,7 @@ Key registers used across BM13xx chips:
 | 0x54 | ANALOG_MUX | Analog mux control (rumored to control temp diode) |
 | 0x58 | IO_DRIVER_STRENGTH | IO driver strength configuration |
 | 0x68 | PLL3_PARAMETER | PLL3 configuration (multi-chip chains) |
-| 0xA4 | VERSION_MASK | Version rolling mask configuration |
+| 0xA4 | MIDSTATE_CONFIG | Midstate generation and version rolling |
 | 0xA8 | SOFT_RESET_CONTROL | Chip-internal soft resets |
 | 0xB9 | MISC_SETTINGS | Miscellaneous settings (BM1370 only, value 0x00004480) |
 
@@ -542,13 +542,15 @@ PLL3 configuration for multi-chip chains:
 - Value: 0x5AA55AA5 (appears to be a magic pattern)
 - Only used in multi-chip configurations
 
-#### 0xA4 - VERSION_MASK
-Controls version rolling for AsicBoost optimization (32-bit register):
-- **Bits 0-15 (control)**: Always `0x0090` - fixed enable pattern in all implementations
-- **Bits 16-31 (mask)**: Which version bits can be rolled (from Stratum's version_mask >> 13)
-- Common values:
-  - Initial: `0xFFFF0090` (full rolling enabled)
-  - Stratum: `0x3FFF0090` (from version_mask=0x1FFFE000)
+#### 0xA4 - MIDSTATE_CONFIG
+Configures version rolling for AsicBoost: a 16-bit mask of rollable
+version bits, a midstate generation code, and a flag for automatic
+midstate generation. The bit layout and the model-specific meaning
+of the generation code live on the typed register in the code.
+Every capture writes `0x9000FFFF` (full mask, generation code 1,
+automatic generation on). A pool's version-rolling mask maps to the
+register's mask field shifted right by 13 bits, so Stratum's
+`0x1FFFE000` becomes a register mask of `0xFFFF`.
 
 #### 0xA8 - SOFT_RESET_CONTROL
 Drives chip-internal soft resets. The register first appears in the
@@ -592,7 +594,7 @@ Undocumented miscellaneous settings register:
 ### Single-Chip Initialization (e.g., Bitaxe)
 
 1. **Chip Detection**
-   - Write 0xFFFF0090 to register 0xA4 (enable and set version mask)
+   - Write 0x9000FFFF to register 0xA4 (enable and set version mask)
    - Read register 0x00 to get chip_id
    - Verify chip type
 
@@ -615,7 +617,7 @@ Undocumented miscellaneous settings register:
 ### Multi-Chip Initialization (e.g., S21 Pro, S19 J Pro)
 
 1. **Chain Reset and Discovery**
-   - Write 0xFFFF0090 to register 0xA4 three times
+   - Write 0x9000FFFF to register 0xA4 three times
    - Broadcast read register 0x00 (command 0x52)
    - Count responding chips
 
@@ -841,7 +843,7 @@ nonce range by modifying the block version field.
    - Continues until all allowed version values are exhausted
 
 2. **Version Rolling Control**:
-   - Version rolling is enabled via register 0xA4 (VERSION_MASK)
+   - Version rolling is enabled via register 0xA4 (MIDSTATE_CONFIG)
    - The chip internally modifies version bits as allowed by the mask
    - For BM1370, ESP-miner always sets `num_midstates = 1`
    - AsicBoost optimization happens internally in the chip

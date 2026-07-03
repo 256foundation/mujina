@@ -26,7 +26,7 @@ use crate::{
         bm13xx::{
             self, Register, Response,
             command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
-            register::{ChipId, RegisterAddress, VersionMask},
+            register::{ChipId, MidstateConfig, RegisterAddress},
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
@@ -128,7 +128,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         data_writer
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::VersionMask(VersionMask::full_rolling()),
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
             }))
             .await
             .context("failed to send config command")?;

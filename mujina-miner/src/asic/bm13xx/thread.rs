@@ -22,8 +22,8 @@ use super::command::{
     SetChipAddress, WriteRegister,
 };
 use super::register::{
-    AnalogMux, ChipModel, Core, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
-    NonceRange, PllDivider, Register, SoftResetControl, TicketMask, VersionMask,
+    AnalogMux, ChipModel, Core, IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl,
+    MiscSettings, NonceRange, PllDivider, Register, SoftResetControl, TicketMask,
 };
 use super::response::Response;
 use crate::{
@@ -275,7 +275,7 @@ where
         chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::VersionMask(VersionMask::full_rolling()),
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
             }))
             .await
             .context("failed to send version mask")?;
@@ -436,7 +436,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::VersionMask(VersionMask::full_rolling()),
+            register: Register::MidstateConfig(MidstateConfig::full_rolling()),
         }))
         .await?;
 

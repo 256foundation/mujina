@@ -28,7 +28,7 @@ pub enum RegisterAddress {
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
     Pll3Parameter = 0x68,
-    VersionMask = 0xA4,
+    MidstateConfig = 0xA4,
     SoftResetControl = 0xA8,
     MiscSettings = 0xB9,
 }
@@ -47,7 +47,7 @@ pub enum Register {
     AnalogMux(AnalogMux),
     IoDriverStrength(IoDriverStrength),
     Pll3Parameter(Pll3Parameter),
-    VersionMask(VersionMask),
+    MidstateConfig(MidstateConfig),
     SoftResetControl(SoftResetControl),
     MiscSettings(MiscSettings),
 }
@@ -68,7 +68,9 @@ impl Register {
                 Register::IoDriverStrength(IoDriverStrength::decode(bytes))
             }
             RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter::decode(bytes)),
-            RegisterAddress::VersionMask => Register::VersionMask(VersionMask::decode(bytes)),
+            RegisterAddress::MidstateConfig => {
+                Register::MidstateConfig(MidstateConfig::decode(bytes))
+            }
             RegisterAddress::SoftResetControl => {
                 Register::SoftResetControl(SoftResetControl::decode(bytes))
             }
@@ -89,7 +91,7 @@ impl Register {
             Register::AnalogMux(_) => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
             Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
-            Register::VersionMask(_) => RegisterAddress::VersionMask,
+            Register::MidstateConfig(_) => RegisterAddress::MidstateConfig,
             Register::SoftResetControl(_) => RegisterAddress::SoftResetControl,
             Register::MiscSettings(_) => RegisterAddress::MiscSettings,
         }
@@ -108,7 +110,7 @@ impl Register {
             Register::AnalogMux(r) => r.encode(dst),
             Register::IoDriverStrength(r) => r.encode(dst),
             Register::Pll3Parameter(r) => r.encode(dst),
-            Register::VersionMask(r) => r.encode(dst),
+            Register::MidstateConfig(r) => r.encode(dst),
             Register::SoftResetControl(r) => r.encode(dst),
             Register::MiscSettings(r) => r.encode(dst),
         }
@@ -523,53 +525,67 @@ impl IoDriverStrength {
     }
 }
 
-/// Version mask for version rolling
-#[derive(Clone, Copy, PartialEq)]
-pub struct VersionMask {
-    /// Which bits can be rolled
-    mask: u16,
-    /// Enable flag and other control bits
-    control: u16,
+/// Midstate configuration and version rolling (0xA4).
+///
+/// - bits 0-15: mask of rollable version bits, applied to block
+///   header version bits 28:16
+/// - bits 16-27: reserved, zero in every observation
+/// - bits 28-29: midstate generation code; how many midstates the
+///   chip generates per job. BM1366 and later: 1 means 8, 2 means
+///   12, 3 means 16. BM1362: only 1 (8 midstates) is used. The
+///   meaning of 0 is unobserved.
+/// - bit 30: version fix, zero in every observation
+/// - bit 31: generate midstates automatically
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MidstateConfig {
+    /// Mask of rollable version bits.
+    pub version_mask: u16,
+    /// Raw 2-bit midstate generation code.
+    pub midstate_gen: u8,
+    /// Fix the version field.
+    pub version_fix: bool,
+    /// Generate midstates automatically.
+    pub auto_gen: bool,
 }
 
-impl VersionMask {
-    /// Full 16-bit mask for version rolling
-    const FULL_MASK: u16 = 0xffff;
-    /// Fixed control pattern used by all implementations to enable version rolling
-    const ENABLE_ROLLING: u16 = 0x0090;
-
-    /// Create version mask with all lower 16 bits enabled
+impl MidstateConfig {
+    /// Returns the configuration every capture uses: full mask,
+    /// generation code 1, automatic midstate generation.
     pub fn full_rolling() -> Self {
         Self {
-            mask: Self::FULL_MASK,
-            control: Self::ENABLE_ROLLING,
+            version_mask: 0xffff,
+            midstate_gen: 1,
+            version_fix: false,
+            auto_gen: true,
         }
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u16_le(self.control);
-        dst.put_u16_le(self.mask);
+        let value = (self.auto_gen as u32) << 31
+            | (self.version_fix as u32) << 30
+            | (self.midstate_gen as u32 & 0x3) << 28
+            | self.version_mask as u32;
+        dst.put_u32(value);
     }
 
     pub fn decode(bytes: [u8; 4]) -> Self {
-        let raw = u32::from_le_bytes(bytes);
+        let value = u32::from_be_bytes(bytes);
         Self {
-            control: (raw & 0xffff) as u16,
-            mask: (raw >> 16) as u16,
+            version_mask: (value & 0xffff) as u16,
+            midstate_gen: (value >> 28 & 0x3) as u8,
+            version_fix: value >> 30 & 1 == 1,
+            auto_gen: value >> 31 & 1 == 1,
         }
     }
 }
 
-impl fmt::Debug for VersionMask {
+impl fmt::Debug for MidstateConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let control_str = if self.control == Self::ENABLE_ROLLING {
-            "ENABLE_ROLLING".to_string()
-        } else {
-            format!("{:#06x}", self.control)
-        };
-        f.debug_struct("VersionMask")
-            .field("mask", &format_args!("{:#06x}", self.mask))
-            .field("control", &control_str)
+        f.debug_struct("MidstateConfig")
+            .field("version_mask", &format_args!("{:#06x}", self.version_mask))
+            .field("midstate_gen", &self.midstate_gen)
+            .field("version_fix", &self.version_fix)
+            .field("auto_gen", &self.auto_gen)
             .finish()
     }
 }
@@ -970,19 +986,29 @@ mod io_driver_strength_tests {
 }
 
 #[cfg(test)]
-mod version_mask_tests {
+mod midstate_config_tests {
     use super::*;
 
-    fn round_trip(original: VersionMask) {
+    fn round_trip(original: MidstateConfig) {
         let mut buf = BytesMut::new();
         original.encode(&mut buf);
         let bytes: [u8; 4] = buf[..].try_into().unwrap();
-        assert_eq!(VersionMask::decode(bytes), original);
+        assert_eq!(MidstateConfig::decode(bytes), original);
     }
 
     #[test]
     fn full_rolling() {
-        round_trip(VersionMask::full_rolling());
+        round_trip(MidstateConfig::full_rolling());
+    }
+
+    #[test]
+    fn from_literal_fields() {
+        round_trip(MidstateConfig {
+            version_mask: 0x1fff,
+            midstate_gen: 3,
+            version_fix: true,
+            auto_gen: false,
+        });
     }
 }
 

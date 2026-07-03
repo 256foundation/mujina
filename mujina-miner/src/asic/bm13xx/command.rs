@@ -363,8 +363,8 @@ mod tests {
 
     use super::super::codec::FrameCodec;
     use super::super::register::{
-        ChipId, ChipModel, Core, IoDriverStrength, Log2Difficulty, MiscControl, NonceRange,
-        Register, RegisterAddress, SoftResetControl, TicketMask, VersionMask,
+        ChipId, ChipModel, Core, IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl,
+        NonceRange, Register, RegisterAddress, SoftResetControl, TicketMask,
     };
     use super::*;
     use crate::asic::bm13xx::crc::crc16;
@@ -400,12 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn write_version_mask_from_capture() {
+    fn write_midstate_config_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 A4 90 00 FF FF 1C
         assert_frame_eq(
             RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast, // 0x51 = broadcast
-                register: Register::VersionMask(VersionMask::full_rolling()),
+                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
             }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0xa4, 0x90, 0x00, 0xff, 0xff, 0x1c,
