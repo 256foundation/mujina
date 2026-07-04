@@ -16,6 +16,9 @@ pub enum ProtocolError {
     #[error("Invalid frame format")]
     InvalidFrame,
 
+    #[error("Unknown chip id: {:02x}{:02x}", .0[0], .0[1])]
+    UnknownChipId([u8; 2]),
+
     #[error("Buffer too small: need {need} bytes, have {have}")]
     BufferTooSmall { need: usize, have: usize },
 }
