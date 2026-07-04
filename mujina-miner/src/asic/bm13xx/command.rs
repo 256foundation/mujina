@@ -710,7 +710,7 @@ mod tests {
             version: bitcoin::block::Version::from_consensus(0x20000000),
         };
 
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
         let mut frame = BytesMut::new();
         codec
             .encode(JobCommand::JobFull(job.clone()), &mut frame)
@@ -781,7 +781,7 @@ mod tests {
             version: *esp_miner_job::wire_tx::VERSION,
         };
 
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
         let mut frame = BytesMut::new();
         codec
             .encode(JobCommand::JobFull(job.clone()), &mut frame)
@@ -797,7 +797,7 @@ mod tests {
     fn job_full_matches_s19jpro_factory_capture() {
         let job = job_full_from_wire(&s19jpro_job::wire_tx::FRAME);
 
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1362);
         let mut frame = BytesMut::new();
         codec
             .encode(JobCommand::JobFull(job), &mut frame)
@@ -840,7 +840,8 @@ mod tests {
     where
         FrameCodec: Encoder<C, Error = io::Error>,
     {
-        let mut codec = FrameCodec;
+        // Encoding does not depend on the chip model
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
         let mut frame = BytesMut::new();
         codec
             .encode(cmd, &mut frame)

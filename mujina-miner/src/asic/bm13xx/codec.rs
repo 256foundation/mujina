@@ -10,12 +10,20 @@ use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder};
 
 use super::command::{JobCommand, RegisterCommand};
+use super::register::ChipModel;
 use super::response::Response;
 use crate::asic::bm13xx::crc::{crc5, crc5_is_valid, crc16};
 use crate::tracing::prelude::*;
 
-#[derive(Default)]
-pub struct FrameCodec;
+pub struct FrameCodec {
+    model: ChipModel,
+}
+
+impl FrameCodec {
+    pub fn new(model: ChipModel) -> Self {
+        Self { model }
+    }
+}
 
 impl Encoder<RegisterCommand> for FrameCodec {
     type Error = io::Error;
@@ -118,7 +126,7 @@ impl Decoder for FrameCodec {
         let mut decode_buf = BytesMut::from(&src[..FRAME_LEN]);
         decode_buf.advance(2); // Skip preamble for Response::decode
 
-        match Response::decode(&mut decode_buf) {
+        match Response::decode(&mut decode_buf, self.model) {
             Ok(response) => {
                 // Only advance if decode was successful
                 src.advance(FRAME_LEN);
