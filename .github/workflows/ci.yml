@@ -15,10 +15,10 @@
 #    container and workflow, but that's visible in the diff and is the
 #    reviewer's job to catch.
 #
-# 4. PRs are checked commit by commit. Every commit must pass CI on
-#    its own (`just ci-each`) to keep history bisectable. The final
-#    `just ci` on the merge ref checks the result against current
-#    main.
+# 4. Every commit must pass CI on its own, keeping history
+#    bisectable. `just ci` walks each commit from the base branch to
+#    HEAD and checks it individually, falling back to the working
+#    tree when there are no new commits (pushes to main).
 
 name: CI
 
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          # Full history so ci-each can walk the PR's commits.
+          # Full history so just ci can walk the branch's commits.
           fetch-depth: 0
       - uses: extractions/setup-just@v3
 
@@ -69,16 +69,6 @@ jobs:
             target
             .cache
           key: cargo-${{ hashFiles('build.Containerfile') }}-${{ hashFiles('Cargo.lock') }}
-
-      # Walk the PR's commits oldest to newest before checking the
-      # merge ref. Sequential checkouts share the target dir, so each
-      # commit after the first is an incremental build.
-      - name: Check each PR commit
-        if: github.event_name == 'pull_request'
-        run: >
-          just ci-each
-          ${{ github.event.pull_request.base.sha }}
-          ${{ github.event.pull_request.head.sha }}
 
       - run: just ci
 

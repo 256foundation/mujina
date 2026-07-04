@@ -55,26 +55,37 @@ in-container *args: build-image
         {{BUILD_IMAGE}}:{{BUILD_TAG}} \
         just {{args}}
 
+# Check every commit from base to HEAD individually inside the build
+# toolchain container, or the working tree when there are no new
+# commits. The default base prefers a remote named upstream over
+# origin and uses that remote's default branch.
 # The CI pipeline. This is what GitHub Actions runs.
 [group('ci')]
-ci: (in-container "checks")
-
-# Run the CI pipeline on each commit in base..head individually
-[group('ci')]
-ci-each base="origin/main" head="HEAD":
+ci base="auto":
     #!/usr/bin/env bash
     set -euo pipefail
+    base="{{base}}"
+    if [ "$base" = "auto" ]; then
+        remote=$(git remote | grep -qx upstream && echo upstream || echo origin)
+        base=$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" \
+            || echo "$remote/main")
+    fi
+    commits=$(git rev-list --reverse "$base"..HEAD)
+    if [ -z "$commits" ]; then
+        exec just in-container checks
+    fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
-        echo "error: working tree dirty; commit or stash first" >&2
+        echo "error: working tree dirty; commit or stash first, or run" >&2
+        echo "'just in-container checks' to check only the working tree" >&2
         exit 1
     fi
     orig=$(git rev-parse --abbrev-ref HEAD)
     [ "$orig" = "HEAD" ] && orig=$(git rev-parse HEAD)
     trap 'git checkout --quiet "$orig"' EXIT
-    for sha in $(git rev-list --reverse {{base}}..{{head}}); do
+    for sha in $commits; do
         echo "::group::$(git log --oneline --no-decorate -1 "$sha")"
         git checkout --quiet "$sha"
-        just ci
+        just in-container checks
         echo "::endgroup::"
     done
 

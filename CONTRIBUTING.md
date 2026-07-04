@@ -139,27 +139,26 @@ This runs `cargo fmt --check`, `cargo clippy`, and `cargo test`
 using your local Rust toolchain.
 
 Pull requests are gated on CI that runs inside a Podman container
-with a pinned Rust toolchain. If `just checks` passes locally but
-CI fails (or vice versa), reproduce the CI environment with:
+with a pinned Rust toolchain, and it checks every commit on the
+branch individually, not just the branch tip (see Atomic Commits
+below for why). Run the same thing locally with:
 
 ```bash
 just ci
 ```
 
-This builds a toolchain container from `build.Containerfile` and
-runs `just checks` inside it. Podman is required for this step but
-not for regular development.
+This checks out each commit after the upstream default branch in
+turn, runs `just checks` inside a toolchain container built from
+`build.Containerfile`, and returns to your original branch when
+done. Podman is required for this step but not for regular
+development.
 
-Pull request CI goes one step further and checks every commit
-individually, not just the branch tip (see Atomic Commits below
-for why). Run the same per-commit walk locally with:
+To check only the working tree in the CI container, for example
+when `just checks` passes locally but CI fails:
 
 ```bash
-just ci-each upstream/main
+just in-container checks
 ```
-
-This checks out each commit after `upstream/main` in turn, runs
-`just ci` on it, and returns to your original branch when done.
 
 ### Documenting Known Bugs with `#[should_panic]`
 
@@ -283,7 +282,7 @@ Fixes: #234
 2. Check that every commit still passes, since rebasing can break
    an intermediate commit even when the branch tip is fine:
    ```bash
-   just ci-each upstream/main
+   just ci
    ```
 
 3. Push your branch to your fork:
