@@ -27,6 +27,7 @@ use crate::{
             self, Register, Response,
             command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
             register::{ChipId, ChipModel, MidstateConfig, RegisterAddress},
+            response::RegisterResponse,
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
@@ -573,10 +574,10 @@ async fn discover_chips(
         tokio::select! {
             response = reader.next() => {
                 match response {
-                    Some(Ok(Response::ReadRegister {
+                    Some(Ok(Response::ReadRegister(RegisterResponse {
                         chip_address: _,
                         register: Register::ChipId(ChipId { model, core_count, address }),
-                    })) => {
+                    }))) => {
                         let chip_id = model.id_bytes();
                         debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
                                      model, chip_id[0], chip_id[1]);
