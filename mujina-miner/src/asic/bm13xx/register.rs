@@ -406,6 +406,67 @@ impl fmt::Display for Log2Difficulty {
     }
 }
 
+/// Miscellaneous control (0x18).
+///
+/// Gates the chip's nonce reporting. A fresh chip powers on with
+/// all report enables clear and cannot report a nonce.
+///
+/// - bits 31-28: report enables, one section of the core array
+///   per bit
+/// - bits 27-16: unexplained
+/// - bits 15-0: 0xC100 out of reset; every observed write sets
+///   them to 0xC100
+#[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiscControl {
+    /// Report enables, one section of the core array per element;
+    /// element 0 holds register bit 28, element 3 register bit 31.
+    report_enables: [bool; 4],
+    /// Undecoded bits 27-16, held in place.
+    #[debug("{unexplained:#010x}")]
+    unexplained: u32,
+    /// Low half word, 0xC100 out of reset.
+    #[debug("{power_on:#06x}")]
+    power_on: u16,
+}
+
+impl MiscControl {
+    /// Returns the value factory firmware writes during bring-up
+    /// to switch nonce reporting on ("open core" in the
+    /// references).
+    pub fn reporting_enabled(model: ChipModel) -> Self {
+        let report_enables = match model {
+            ChipModel::BM1362 => [true, true, false, true],
+            _ => [true; 4],
+        };
+        Self {
+            report_enables,
+            unexplained: 0,
+            power_on: 0xC100,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let mut value = self.unexplained | self.power_on as u32;
+        for (i, enabled) in self.report_enables.iter().enumerate() {
+            value |= (*enabled as u32) << (28 + i);
+        }
+        dst.put_u32(value);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let value = u32::from_be_bytes(bytes);
+        let mut report_enables = [false; 4];
+        for (i, enabled) in report_enables.iter_mut().enumerate() {
+            *enabled = value >> (28 + i) & 1 == 1;
+        }
+        Self {
+            report_enables,
+            unexplained: value & 0x0fff_0000,
+            power_on: (value & 0xffff) as u16,
+        }
+    }
+}
+
 /// UART baud rate configuration
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UartBaud {
@@ -815,7 +876,6 @@ macro_rules! raw_u32_register {
 }
 
 raw_u32_register! {
-    MiscControl,
     UartRelay,
     Pll3Parameter,
     MiscSettings,
@@ -1176,6 +1236,24 @@ mod soft_reset_control_tests {
     fn core_reset() {
         round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
         round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
+    }
+}
+
+#[cfg(test)]
+mod misc_control_tests {
+    use super::*;
+
+    fn round_trip(original: MiscControl) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(MiscControl::decode(bytes), original);
+    }
+
+    #[test]
+    fn reporting_enabled() {
+        round_trip(MiscControl::reporting_enabled(ChipModel::BM1362));
+        round_trip(MiscControl::reporting_enabled(ChipModel::BM1370));
     }
 }
 
