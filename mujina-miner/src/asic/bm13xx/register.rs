@@ -504,6 +504,63 @@ impl UartBaud {
     }
 }
 
+/// UART relay control (0x2C).
+///
+/// Holds a relay enable for each serial direction and a gap
+/// count that sets a wait. Relay and gap count are names from the
+/// references. The wait most likely applies to the response line,
+/// which every chip shares to reach the host; REFERENCE.md argues
+/// the interpretation under The Serial Chain.
+///
+/// - bits 31-16: gap count
+/// - bits 15-2: zero in every capture
+/// - bit 1: relay the response line, toward the host
+/// - bit 0: relay the command line, toward the next chip
+#[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UartRelay {
+    /// Relay timing parameter for the domain; units unknown.
+    pub gap_count: u16,
+    /// Undecoded bits 15-2, zero in every capture, held in place.
+    #[debug("{unexplained:#010x}")]
+    pub unexplained: u32,
+    /// Relay the response line (toward the host).
+    pub response_relay: bool,
+    /// Relay the command line (toward the next chip).
+    pub command_relay: bool,
+}
+
+impl UartRelay {
+    /// Returns the value written to domain-boundary chips: both
+    /// directions relayed, with the domain's gap count. The only
+    /// shape observed in captured traffic.
+    pub fn domain_boundary(gap_count: u16) -> Self {
+        Self {
+            gap_count,
+            unexplained: 0,
+            response_relay: true,
+            command_relay: true,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let word = (self.gap_count as u32) << 16
+            | self.unexplained
+            | (self.response_relay as u32) << 1
+            | self.command_relay as u32;
+        dst.put_u32(word);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let word = u32::from_be_bytes(bytes);
+        Self {
+            gap_count: (word >> 16) as u16,
+            unexplained: word & 0xfffc,
+            response_relay: word >> 1 & 1 == 1,
+            command_relay: word & 1 == 1,
+        }
+    }
+}
+
 /// A command posted to the core mailbox (0x3C).
 ///
 /// The mailbox gives indirect access to a small register space
@@ -876,7 +933,6 @@ macro_rules! raw_u32_register {
 }
 
 raw_u32_register! {
-    UartRelay,
     Pll3Parameter,
     MiscSettings,
 }
@@ -1279,6 +1335,33 @@ mod analog_mux_tests {
         round_trip(AnalogMux {
             diode_select: 0xf,
             unexplained: 0x1234_5670,
+        });
+    }
+}
+
+#[cfg(test)]
+mod uart_relay_tests {
+    use super::*;
+
+    fn round_trip(original: UartRelay) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(UartRelay::decode(bytes), original);
+    }
+
+    #[test]
+    fn domain_boundary() {
+        round_trip(UartRelay::domain_boundary(0x4f));
+    }
+
+    #[test]
+    fn from_literal_fields() {
+        round_trip(UartRelay {
+            gap_count: 0xffff,
+            unexplained: 0x5554,
+            response_relay: false,
+            command_relay: true,
         });
     }
 }
