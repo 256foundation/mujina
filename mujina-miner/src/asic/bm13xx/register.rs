@@ -479,6 +479,58 @@ impl UartBaud {
     }
 }
 
+/// UART relay control (0x2C).
+///
+/// The first and last chip of each voltage domain relay the
+/// serial lines onward to the neighboring domain. The gap count
+/// carries its name from the references; it times the relay, but
+/// what gap it counts, and in what units, is unknown. Captures
+/// give each domain its own value, stepping by 5 per domain and
+/// growing toward the host.
+///
+/// - bit 0: relay the command line, toward the next chip
+/// - bit 1: relay the response line, toward the host
+/// - bits 2-15: reserved
+/// - bits 16-31: gap count
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UartRelay {
+    /// Relay timing parameter for the domain; units unknown.
+    pub gap_count: u16,
+    /// Relay the response line (toward the host).
+    pub response_relay: bool,
+    /// Relay the command line (toward the next chip).
+    pub command_relay: bool,
+}
+
+impl UartRelay {
+    /// Returns the value written to domain-boundary chips: both
+    /// directions relayed, with the domain's gap count. The only
+    /// shape observed in captured traffic.
+    pub fn domain_boundary(gap_count: u16) -> Self {
+        Self {
+            gap_count,
+            response_relay: true,
+            command_relay: true,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let word = (self.gap_count as u32) << 16
+            | (self.response_relay as u32) << 1
+            | self.command_relay as u32;
+        dst.put_u32(word);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let word = u32::from_be_bytes(bytes);
+        Self {
+            gap_count: (word >> 16) as u16,
+            response_relay: word >> 1 & 1 == 1,
+            command_relay: word & 1 == 1,
+        }
+    }
+}
+
 /// A command posted to the core mailbox (0x3C).
 ///
 /// The mailbox gives indirect access to a small register space
@@ -828,7 +880,6 @@ macro_rules! raw_u32_register {
 }
 
 raw_u32_register! {
-    UartRelay,
     Pll3Parameter,
     MiscSettings,
 }
@@ -1228,6 +1279,32 @@ mod analog_mux_tests {
     #[test]
     fn from_literal_field() {
         round_trip(AnalogMux { diode_select: 0xf });
+    }
+}
+
+#[cfg(test)]
+mod uart_relay_tests {
+    use super::*;
+
+    fn round_trip(original: UartRelay) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(UartRelay::decode(bytes), original);
+    }
+
+    #[test]
+    fn domain_boundary() {
+        round_trip(UartRelay::domain_boundary(0x4f));
+    }
+
+    #[test]
+    fn from_literal_fields() {
+        round_trip(UartRelay {
+            gap_count: 0xffff,
+            response_relay: false,
+            command_relay: true,
+        });
     }
 }
 

@@ -365,7 +365,7 @@ mod tests {
     use super::super::register::{
         AnalogMux, ChipId, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty,
         MidstateConfig, MiscControl, NonceRange, Register, RegisterAddress, SoftResetControl,
-        TicketMask,
+        TicketMask, UartRelay,
     };
     use super::*;
     use crate::asic::bm13xx::crc::crc16;
@@ -545,6 +545,20 @@ mod tests {
         assert_frame_eq(
             RegisterCommand::SetChipAddress(SetChipAddress { chip_address: 0x04 }),
             &[0x55, 0xaa, 0x40, 0x05, 0x04, 0x00, 0x03],
+        );
+    }
+
+    #[test]
+    fn write_uart_relay_from_capture() {
+        // From S21 Pro capture: TX: 55 AA 41 09 78 2C 00 13 00 03 19
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Chip(0x78),
+                register: Register::UartRelay(UartRelay::domain_boundary(0x13)),
+            }),
+            &[
+                0x55, 0xaa, 0x41, 0x09, 0x78, 0x2c, 0x00, 0x13, 0x00, 0x03, 0x19,
+            ],
         );
     }
 

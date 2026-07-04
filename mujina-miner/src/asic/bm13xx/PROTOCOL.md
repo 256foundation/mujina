@@ -496,10 +496,20 @@ high byte varies:
 - BM1370: 0xF000C100 (S21 Pro) or 0xFF0FC100 (S21)
 
 #### 0x2C - UART_RELAY
-Controls UART signal relay in multi-chip chains (4 bytes):
-- Used on first and last chips in each domain
-- Format appears to encode domain boundaries
-- Example values from S21 Pro: 0x00130003, 0x00180003, etc.
+Turns the first and last chip of each voltage domain into a relay
+for the serial lines, carrying them onward to the neighboring
+domain. The word pairs two relay-enable bits, one per direction,
+with a gap count; the bit layout lives on the typed register in
+the code. The gap count times the relay, but what gap it counts
+is not established: plausibly idle time between relayed frames,
+in the usual serial sense of "gap", but neither units nor
+mechanism is documented anywhere.
+
+In the S21 Pro capture every domain-boundary chip relays both
+directions, and each domain gets its own gap count, stepping by 5
+per domain from 0x13 at the far end of the chain to 0x4F nearest
+the host. The S19j Pro capture never writes this register;
+BM1362 boards may not need the relay.
 
 #### 0x3C - CORE_MAILBOX
 Indirect access to a small register space inside each core. The
