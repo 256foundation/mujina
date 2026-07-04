@@ -508,10 +508,24 @@ mod tests {
         assert_frame_eq(
             RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::MiscControl(MiscControl(0x00C100F0)),
+                register: Register::MiscControl(MiscControl::operational(ChipModel::BM1370)),
             }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x18, 0xf0, 0x00, 0xc1, 0x00, 0x04,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_misc_control_bm1362_from_capture() {
+        // From S19j Pro capture: TX: 55 AA 51 09 00 18 B0 00 C1 00 14
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::MiscControl(MiscControl::operational(ChipModel::BM1362)),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x18, 0xb0, 0x00, 0xc1, 0x00, 0x14,
             ],
         );
     }

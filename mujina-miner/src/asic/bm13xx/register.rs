@@ -406,6 +406,42 @@ impl fmt::Display for Log2Difficulty {
     }
 }
 
+/// Miscellaneous control (0x18).
+///
+/// Chip-level control bits. The layout shifts between generations
+/// (BM1397 kept its baud divider here; later generations moved
+/// baud configuration to the fast UART register) and most bits
+/// carry only unexplained names in the references, so the value
+/// stays opaque.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MiscControl(pub u32);
+
+impl MiscControl {
+    /// Returns the value factory firmware writes during bring-up,
+    /// broadcast and per chip. The low half word is conserved
+    /// across models; the high byte is model-specific.
+    pub fn operational(model: ChipModel) -> Self {
+        match model {
+            ChipModel::BM1362 => Self(0xB000_C100),
+            _ => Self(0xF000_C100),
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.0);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self(u32::from_be_bytes(bytes))
+    }
+}
+
+impl fmt::Debug for MiscControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MiscControl({:#010x})", self.0)
+    }
+}
+
 /// UART baud rate configuration
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UartBaud {
@@ -792,7 +828,6 @@ macro_rules! raw_u32_register {
 }
 
 raw_u32_register! {
-    MiscControl,
     UartRelay,
     Pll3Parameter,
     MiscSettings,
@@ -1152,6 +1187,24 @@ mod soft_reset_control_tests {
     fn core_reset() {
         round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
         round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
+    }
+}
+
+#[cfg(test)]
+mod misc_control_tests {
+    use super::*;
+
+    fn round_trip(original: MiscControl) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(MiscControl::decode(bytes), original);
+    }
+
+    #[test]
+    fn operational() {
+        round_trip(MiscControl::operational(ChipModel::BM1362));
+        round_trip(MiscControl::operational(ChipModel::BM1370));
     }
 }
 

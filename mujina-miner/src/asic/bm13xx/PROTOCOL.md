@@ -480,15 +480,20 @@ hash, not just a byte-reversed one, so the mask must match
 that representation.
 
 #### 0x18 - MISC_CONTROL
-UART and GPIO pin configuration (32-bit register, documented in BM1366):
-- **Reset value**: `0x0000C100`
-- **Upper 16 bits (0xC100)**: Always preserved across implementations
-- **Lower 16 bits**: Chip-specific configuration
-- Common values:
-  - BM1362: `0x00C100B0` (both broadcast and per-chip)
-  - BM1366/68: `0x00C10FFF` broadcast, `0x00C100F0` per-chip
-  - BM1370: `0x00C100F0` (S21 Pro) or `0x00C10FFF` (S21)
-- Lower bytes likely control UART pin routing and GPIO functions
+Chip-level control bits. The layout shifts between generations
+(BM1397 kept its baud divider here; later generations moved baud
+configuration to register 0x28) and most bits carry only
+unexplained names in the references, so the code keeps the value
+opaque.
+
+Factory firmware writes one model-specific value during
+bring-up, broadcast and per chip. The low half word 0xC100,
+matching the BM1366 reset value, is conserved everywhere; the
+high byte varies:
+
+- BM1362: 0xB000C100
+- BM1366/68: 0xFF0FC100 broadcast, 0xF000C100 per chip
+- BM1370: 0xF000C100 (S21 Pro) or 0xFF0FC100 (S21)
 
 #### 0x2C - UART_RELAY
 Controls UART signal relay in multi-chip chains (4 bytes):
