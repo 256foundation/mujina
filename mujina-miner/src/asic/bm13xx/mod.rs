@@ -8,6 +8,7 @@ pub mod chip_config;
 pub mod codec;
 pub mod command;
 pub mod crc;
+pub mod driver;
 pub mod error;
 pub mod reader;
 pub mod register;

@@ -15,7 +15,7 @@ use super::error::ProtocolError;
 use crate::types::Difficulty;
 
 /// Register addresses on the wire.
-#[derive(FromRepr, Copy, Clone, Debug)]
+#[derive(FromRepr, Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RegisterAddress {
     ChipId = 0x00,
@@ -35,7 +35,7 @@ pub enum RegisterAddress {
 }
 
 /// A register with its typed payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     ChipId(ChipId),
     PllDivider(PllDivider),
