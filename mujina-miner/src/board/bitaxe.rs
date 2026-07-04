@@ -26,7 +26,7 @@ use crate::{
         bm13xx::{
             self, Register, Response,
             command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
-            register::{ChipId, MidstateConfig, RegisterAddress},
+            register::{ChipId, ChipModel, MidstateConfig, RegisterAddress},
             thread::BM13xxThread,
         },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
@@ -97,8 +97,9 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
     let (data_reader, data_writer, _data_control) = data_stream.split();
     let tracing_reader = TracingReader::new(data_reader, "Data");
-    let mut data_reader = FramedRead::new(tracing_reader, bm13xx::FrameCodec);
-    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec);
+    let mut data_reader =
+        FramedRead::new(tracing_reader, bm13xx::FrameCodec::new(ChipModel::BM1370));
+    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
 
     // Get reset pin
     const ASIC_RESET_PIN: u8 = 0;

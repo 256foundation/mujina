@@ -7,7 +7,7 @@ use bitvec::prelude::*;
 use bytes::{Buf, BytesMut};
 use strum::FromRepr;
 
-use super::register::{Register, RegisterAddress};
+use super::register::{ChipModel, Register, RegisterAddress};
 use crate::asic::bm13xx::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 
@@ -28,7 +28,10 @@ pub enum Response {
 }
 
 impl Response {
-    pub(super) fn decode(bytes: &mut BytesMut) -> Result<Response, ProtocolError> {
+    pub(super) fn decode(
+        bytes: &mut BytesMut,
+        model: ChipModel,
+    ) -> Result<Response, ProtocolError> {
         let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
         let type_repr = type_and_crc[5..].load::<u8>();
 
@@ -56,7 +59,7 @@ impl Response {
                 }
             }
             Some(ResponseType::Nonce) => {
-                // BM1370 nonce response format (11 bytes total, including preamble):
+                // Nonce response format (11 bytes total, including preamble):
                 // Already consumed: preamble (2 bytes)
                 // Remaining: nonce(4) + midstate_num(1) + result_header(1) + version(2) + crc(1)
                 let nonce = bytes.get_u32_le();
@@ -69,10 +72,21 @@ impl Response {
                 let version = GeneralPurposeBits::from(version_bytes);
                 // CRC already consumed
 
-                // Extract job_id and subcore_id from result_header
-                // job_id is a 4-bit field (0-15) at bits 7-4 of result_header
-                let job_id = (result_header >> 4) & 0x0f;
-                let subcore_id = result_header & 0x0f;
+                // The result header packs the job id above the subcore
+                // id, split per model: BM1362 and BM1366 use a 5-bit
+                // job id with a 3-bit subcore id, BM1370 a 4-bit job
+                // id with a 4-bit subcore id. Captures verify the
+                // BM1362 and BM1370 splits. No capture covers the
+                // BM1366; it gets the BM1362 split because a
+                // reference driver decodes both identically. The
+                // match is deliberately exhaustive: a new model does
+                // not compile until its split is decided here.
+                let (job_id, subcore_id) = match model {
+                    ChipModel::BM1362 | ChipModel::BM1366 => {
+                        (result_header >> 3, result_header & 0x07)
+                    }
+                    ChipModel::BM1370 => ((result_header >> 4) & 0x0f, result_header & 0x0f),
+                };
 
                 Ok(Response::Nonce {
                     nonce,
@@ -116,7 +130,7 @@ mod tests {
 
     #[test]
     fn decoder_with_exact_frame_size() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Exactly 11 bytes - a complete frame
         let mut buf = BytesMut::new();
@@ -137,7 +151,8 @@ mod tests {
         let wire = &[
             0xaa, 0x55, 0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
         ];
-        let response = decode_frame(wire).expect("decode_frame should return Some for valid frame");
+        let response = decode_frame(wire, ChipModel::BM1370)
+            .expect("decode_frame should return Some for valid frame");
 
         let Response::ReadRegister {
             chip_address,
@@ -163,9 +178,9 @@ mod tests {
         assert_eq!(address, 0x00);
     }
 
-    fn decode_frame(frame: &[u8]) -> Option<Response> {
+    fn decode_frame(frame: &[u8], model: ChipModel) -> Option<Response> {
         let mut buf = BytesMut::from(frame);
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(model);
         codec.decode(&mut buf).expect("Failed to decode frame")
     }
 
@@ -176,7 +191,7 @@ mod tests {
         // Response::decode expects
         let mut buf = BytesMut::from(&[0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..]);
 
-        let result = Response::decode(&mut buf);
+        let result = Response::decode(&mut buf, ChipModel::BM1370);
 
         assert!(matches!(
             result,
@@ -190,7 +205,8 @@ mod tests {
         let wire = &[
             0xaa, 0x55, 0x18, 0x00, 0xa6, 0x40, 0x02, 0x99, 0x22, 0xf9, 0x91,
         ];
-        let response = decode_frame(wire).expect("decode_frame should return Some for valid frame");
+        let response = decode_frame(wire, ChipModel::BM1370)
+            .expect("decode_frame should return Some for valid frame");
 
         let Response::Nonce {
             nonce,
@@ -252,8 +268,8 @@ mod tests {
         ];
 
         for (wire, exp_nonce, exp_midstate, exp_job_id, exp_subcore, exp_version) in test_cases {
-            let response =
-                decode_frame(wire).expect("decode_frame should return Some for valid frame");
+            let response = decode_frame(wire, ChipModel::BM1370)
+                .expect("decode_frame should return Some for valid frame");
 
             let Response::Nonce {
                 nonce,
@@ -275,8 +291,39 @@ mod tests {
     }
 
     #[test]
+    fn decode_nonce_response_from_s19jpro_capture() {
+        // From S19 J Pro capture: RX: AA 55 81 C9 77 D0 00 F2 7C 3E 89
+        let wire = &[
+            0xaa, 0x55, 0x81, 0xc9, 0x77, 0xd0, 0x00, 0xf2, 0x7c, 0x3e, 0x89,
+        ];
+        let response = decode_frame(wire, ChipModel::BM1362)
+            .expect("decode_frame should return Some for valid frame");
+
+        let Response::Nonce {
+            nonce,
+            job_id,
+            midstate_num,
+            version,
+            subcore_id,
+        } = response
+        else {
+            panic!("Expected nonce response");
+        };
+
+        assert_eq!(nonce, 0xd077c981);
+        assert_eq!(midstate_num, 0x00);
+
+        // Result header 0xf2: job_id 30 needs the 5-bit split; the
+        // BM1370 packing cannot represent it
+        assert_eq!(job_id, 30);
+        assert_eq!(subcore_id, 2);
+
+        assert_eq!(version, GeneralPurposeBits::new([0x7c, 0x3e]));
+    }
+
+    #[test]
     fn decoder_handles_partial_frames() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Test with incomplete frame (less than 11 bytes)
         let mut buf = BytesMut::new();
@@ -296,7 +343,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_corrupted_crc() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Valid frame with corrupted CRC (last byte)
         let mut buf = BytesMut::new();
@@ -315,7 +362,7 @@ mod tests {
 
     #[test]
     fn decoder_finds_frame_after_garbage() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Garbage bytes followed by valid frame
         let mut buf = BytesMut::new();
@@ -337,7 +384,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_false_start() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Frame that starts with 0xAA but not followed by 0x55
         let mut buf = BytesMut::new();
@@ -377,7 +424,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_back_to_back_frames() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Two valid frames back-to-back
         let mut buf = BytesMut::new();
@@ -403,7 +450,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_real_s21_pro_frames() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Real frames from S21 Pro capture
         let frames = vec![
@@ -433,7 +480,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_stream_with_lost_bytes() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Simulate a stream where some bytes in the middle are lost
         let mut buf = BytesMut::new();
@@ -461,7 +508,7 @@ mod tests {
 
     #[test]
     fn decoder_handles_mid_frame_start() {
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Start reading in the middle of a frame
         let mut buf = BytesMut::new();
@@ -500,7 +547,7 @@ mod tests {
     #[test]
     fn decoder_validates_real_register_responses() {
         // Test all register read responses are handled correctly
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
 
         // Standard chip detection response
         let mut buf = BytesMut::new();
@@ -526,8 +573,8 @@ mod tests {
         use crate::asic::bm13xx::test_data::esp_miner_job;
 
         // Decode nonce response from hardware capture and verify against test data
-        let response =
-            decode_frame(&esp_miner_job::wire_rx::FRAME).expect("Should decode valid frame");
+        let response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
+            .expect("Should decode valid frame");
 
         let Response::Nonce {
             nonce,
@@ -585,7 +632,7 @@ mod tests {
             version: *esp_miner_job::notify::VERSION,
         };
 
-        let mut codec = FrameCodec;
+        let mut codec = FrameCodec::new(ChipModel::BM1370);
         let mut tx_frame = BytesMut::new();
         codec
             .encode(JobCommand::JobFull(job.clone()), &mut tx_frame)
@@ -596,8 +643,8 @@ mod tests {
         // length-byte comment in JobFullFormat::encode.
         assert_eq!(&tx_frame[4..86], &esp_miner_job::wire_tx::FRAME[4..86]);
 
-        let rx_response =
-            decode_frame(&esp_miner_job::wire_rx::FRAME).expect("Should decode RX frame");
+        let rx_response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
+            .expect("Should decode RX frame");
 
         let Response::Nonce {
             nonce,
