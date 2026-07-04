@@ -394,7 +394,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::AnalogMux(AnalogMux(0x02000000)),
+            register: Register::AnalogMux(AnalogMux::bring_up(ChipModel::BM1370)),
         }))
         .await?;
     chip_commands

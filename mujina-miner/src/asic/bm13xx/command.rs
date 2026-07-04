@@ -363,8 +363,9 @@ mod tests {
 
     use super::super::codec::FrameCodec;
     use super::super::register::{
-        ChipId, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty, MidstateConfig,
-        MiscControl, NonceRange, Register, RegisterAddress, SoftResetControl, TicketMask,
+        AnalogMux, ChipId, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty,
+        MidstateConfig, MiscControl, NonceRange, Register, RegisterAddress, SoftResetControl,
+        TicketMask,
     };
     use super::*;
     use crate::asic::bm13xx::crc::crc16;
@@ -469,6 +470,34 @@ mod tests {
             }),
             &[
                 0x55, 0xaa, 0x41, 0x09, 0x00, 0xa8, 0x00, 0x00, 0x00, 0x02, 0x03,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_analog_mux_from_capture() {
+        // From S21 Pro capture: TX: 55 AA 51 09 00 54 00 00 00 02 18
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AnalogMux(AnalogMux::bring_up(ChipModel::BM1370)),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x54, 0x00, 0x00, 0x00, 0x02, 0x18,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_analog_mux_bm1362_from_capture() {
+        // From S19j Pro capture: TX: 55 AA 51 09 00 54 00 00 00 03 1D
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::AnalogMux(AnalogMux::bring_up(ChipModel::BM1362)),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x54, 0x00, 0x00, 0x00, 0x03, 0x1d,
             ],
         );
     }

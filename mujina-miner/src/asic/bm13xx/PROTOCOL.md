@@ -515,10 +515,11 @@ repeated per chip with core enable appended:
 - 0x0D unnamed: 0xEE (BM1370, written after mining configuration)
 
 #### 0x54 - ANALOG_MUX
-Controls analog multiplexer, possibly for temperature sensing:
-- BM1370: Write value 0x00000002
-- BM1362: Write value 0x00000003
-- Purpose not fully documented by manufacturer
+Selects which analog signal the chip routes onto its analog mux
+output, rumored to feed the temperature diode. A small select
+field in the low bits is the whole payload; see the typed
+register in the code. Bring-up writes select 3 on BM1362 and 2 on
+BM1370. What each selection connects is not documented anywhere.
 
 #### 0x58 - IO_DRIVER_STRENGTH
 Sets the drive strength of each chip output pin. Each output has a

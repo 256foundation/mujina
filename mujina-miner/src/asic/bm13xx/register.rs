@@ -540,6 +540,42 @@ impl fmt::Debug for CoreCommand {
     }
 }
 
+/// Analog mux control (0x54).
+///
+/// Selects which analog signal the chip routes onto its analog
+/// mux output, rumored to feed the temperature diode. Bring-up
+/// writes select 3 on BM1362 and 2 on BM1370; what each selection
+/// connects is undocumented.
+///
+/// - bits 0-3: diode select
+/// - bits 4-31: reserved
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalogMux {
+    /// Analog signal selected onto the mux output.
+    pub diode_select: u8,
+}
+
+impl AnalogMux {
+    /// Returns the selection factory firmware makes during
+    /// bring-up; each model selects a different input.
+    pub fn bring_up(model: ChipModel) -> Self {
+        match model {
+            ChipModel::BM1362 => Self { diode_select: 0x3 },
+            _ => Self { diode_select: 0x2 },
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.diode_select as u32 & 0xf);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        Self {
+            diode_select: (u32::from_be_bytes(bytes) & 0xf) as u8,
+        }
+    }
+}
+
 /// Drive strength of each chip output pin.
 ///
 /// Each output has a 4-bit drive strength. Factory firmware runs
@@ -758,7 +794,6 @@ macro_rules! raw_u32_register {
 raw_u32_register! {
     MiscControl,
     UartRelay,
-    AnalogMux,
     Pll3Parameter,
     MiscSettings,
 }
@@ -1117,6 +1152,29 @@ mod soft_reset_control_tests {
     fn core_reset() {
         round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
         round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
+    }
+}
+
+#[cfg(test)]
+mod analog_mux_tests {
+    use super::*;
+
+    fn round_trip(original: AnalogMux) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(AnalogMux::decode(bytes), original);
+    }
+
+    #[test]
+    fn bring_up() {
+        round_trip(AnalogMux::bring_up(ChipModel::BM1362));
+        round_trip(AnalogMux::bring_up(ChipModel::BM1370));
+    }
+
+    #[test]
+    fn from_literal_field() {
+        round_trip(AnalogMux { diode_select: 0xf });
     }
 }
 
