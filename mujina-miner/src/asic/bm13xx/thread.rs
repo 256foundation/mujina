@@ -22,8 +22,9 @@ use super::command::{
     SetChipAddress, SinkError, WriteRegister,
 };
 use super::register::{
-    AnalogMux, ChipModel, Core, IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl,
-    MiscSettings, NonceRange, PllDivider, Register, SoftResetControl, TicketMask,
+    AnalogMux, ChipModel, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty,
+    MidstateConfig, MiscControl, MiscSettings, NonceRange, PllDivider, Register, SoftResetControl,
+    TicketMask,
 };
 use super::response::Response;
 use crate::{
@@ -318,13 +319,16 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::Core(Core(0x8000_8B00)),
+            register: Register::CoreMailbox(CoreCommand::write_all(
+                CoreRegister::ClockSelectBM1368,
+                0x00,
+            )),
         }))
         .await?;
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::Core(Core(0x8000_800C)),
+            register: Register::CoreMailbox(CoreCommand::write_all(CoreRegister::ClockDelay, 0x0C)),
         }))
         .await?;
 
@@ -362,19 +366,22 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
-            register: Register::Core(Core(0x8000_8B00)),
+            register: Register::CoreMailbox(CoreCommand::write_all(
+                CoreRegister::ClockSelectBM1368,
+                0x00,
+            )),
         }))
         .await?;
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
-            register: Register::Core(Core(0x8000_800C)),
+            register: Register::CoreMailbox(CoreCommand::write_all(CoreRegister::ClockDelay, 0x0C)),
         }))
         .await?;
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
-            register: Register::Core(Core(0x8000_82AA)),
+            register: Register::CoreMailbox(CoreCommand::write_all(CoreRegister::CoreEnable, 0xAA)),
         }))
         .await?;
 
@@ -400,7 +407,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::Core(Core(0x8000_8DEE)),
+            register: Register::CoreMailbox(CoreCommand::nonce_bin_overflow(true)),
         }))
         .await?;
 
