@@ -25,7 +25,7 @@ use super::register::{
     AnalogMux, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty, MidstateConfig,
     MiscControl, MiscSettings, NonceRange, PllDivider, Register, SoftResetControl, TicketMask,
 };
-use super::response::Response;
+use super::response::{NonceResponse, RegisterResponse, Response};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -773,7 +773,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                 match result {
                     Ok(response) => {
                         match response {
-                            Response::Nonce { nonce, job_id, version, midstate_num, subcore_id } => {
+                            Response::Nonce(NonceResponse { nonce, job_id, version, midstate_num, subcore_id }) => {
                                 // Look up the task for this job_id
                                 if let Some(task) = chip_jobs.get(job_id) {
                                     let template = task.template.as_ref();
@@ -860,7 +860,7 @@ async fn bm13xx_thread_actor<R, W, E>(
                                 let _ = (midstate_num, subcore_id); // Unused for now
                             }
 
-                            Response::ReadRegister { chip_address, register } => {
+                            Response::ReadRegister(RegisterResponse { chip_address, register }) => {
                                 trace!(chip_address = %format!("0x{:02x}", chip_address), register = ?register, "Register read response");
                             }
                         }

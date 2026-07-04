@@ -12,19 +12,26 @@ use crate::asic::bm13xx::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum Response {
-    ReadRegister {
-        chip_address: u8,
-        register: Register,
-    },
-    Nonce {
-        nonce: u32,
-        job_id: u8,
-        midstate_num: u8,
-        version: GeneralPurposeBits,
-        subcore_id: u8,
-    },
+    ReadRegister(RegisterResponse),
+    Nonce(NonceResponse),
+}
+
+/// Reply to a register read.
+#[derive(Debug)]
+pub struct RegisterResponse {
+    pub chip_address: u8,
+    pub register: Register,
+}
+
+/// Nonce report from a chip that found passing work.
+#[derive(Debug)]
+pub struct NonceResponse {
+    pub nonce: u32,
+    pub job_id: u8,
+    pub midstate_num: u8,
+    pub version: GeneralPurposeBits,
+    pub subcore_id: u8,
 }
 
 impl Response {
@@ -50,10 +57,10 @@ impl Response {
 
                 if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
                     let register = Register::decode(register_address, value)?;
-                    Ok(Response::ReadRegister {
+                    Ok(Response::ReadRegister(RegisterResponse {
                         chip_address,
                         register,
-                    })
+                    }))
                 } else {
                     Err(ProtocolError::InvalidRegisterAddress(register_address_repr))
                 }
@@ -88,13 +95,13 @@ impl Response {
                     ChipModel::BM1370 => ((result_header >> 4) & 0x0f, result_header & 0x0f),
                 };
 
-                Ok(Response::Nonce {
+                Ok(Response::Nonce(NonceResponse {
                     nonce,
                     job_id,
                     midstate_num,
                     version,
                     subcore_id,
-                })
+                }))
             }
             None => Err(ProtocolError::InvalidResponseType(type_repr)),
         }
@@ -154,10 +161,10 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1370)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::ReadRegister {
+        let Response::ReadRegister(RegisterResponse {
             chip_address,
             register,
-        } = response
+        }) = response
         else {
             panic!("Expected ReadRegister response, got {:?}", response);
         };
@@ -208,13 +215,13 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1370)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
             midstate_num,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
@@ -271,13 +278,13 @@ mod tests {
             let response = decode_frame(wire, ChipModel::BM1370)
                 .expect("decode_frame should return Some for valid frame");
 
-            let Response::Nonce {
+            let Response::Nonce(NonceResponse {
                 nonce,
                 job_id,
                 midstate_num,
                 version,
                 subcore_id,
-            } = response
+            }) = response
             else {
                 panic!("Expected nonce response");
             };
@@ -299,13 +306,13 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1362)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
             midstate_num,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
@@ -411,7 +418,7 @@ mod tests {
         // Third decode should succeed
         let result = codec.decode(&mut buf);
         match result {
-            Ok(Some(Response::ReadRegister { .. })) => {} // Success
+            Ok(Some(Response::ReadRegister(_))) => {} // Success
             Ok(Some(other)) => panic!("Expected ReadRegister, got {:?}", other),
             Ok(None) => panic!(
                 "Expected Some, got None. Buffer len: {}, contents: {:02x?}",
@@ -439,12 +446,12 @@ mod tests {
 
         // Decode first frame
         let result1 = codec.decode(&mut buf).unwrap();
-        assert!(matches!(result1, Some(Response::ReadRegister { .. })));
+        assert!(matches!(result1, Some(Response::ReadRegister(_))));
         assert_eq!(buf.len(), 11, "Should have second frame remaining");
 
         // Decode second frame
         let result2 = codec.decode(&mut buf).unwrap();
-        assert!(matches!(result2, Some(Response::Nonce { .. })));
+        assert!(matches!(result2, Some(Response::Nonce(_))));
         assert_eq!(buf.len(), 0, "Buffer should be empty");
     }
 
@@ -472,7 +479,7 @@ mod tests {
             let result = codec.decode(&mut buf).unwrap();
             assert!(result.is_some(), "Should decode real S21 Pro frame");
             assert!(
-                matches!(result, Some(Response::Nonce { .. })),
+                matches!(result, Some(Response::Nonce(_))),
                 "Should be nonce response"
             );
         }
@@ -498,7 +505,7 @@ mod tests {
         for _ in 0..20 {
             // Try up to 20 times
             if let Some(response) = codec.decode(&mut buf).unwrap() {
-                assert!(matches!(response, Response::Nonce { .. }));
+                assert!(matches!(response, Response::Nonce(_)));
                 found_valid = true;
                 break;
             }
@@ -539,7 +546,7 @@ mod tests {
             "Should find valid frame after partial data"
         );
         assert!(
-            matches!(result, Some(Response::Nonce { .. })),
+            matches!(result, Some(Response::Nonce(_))),
             "Should be nonce response"
         );
     }
@@ -557,10 +564,10 @@ mod tests {
 
         let response = codec.decode(&mut buf).unwrap().unwrap();
         match response {
-            Response::ReadRegister {
+            Response::ReadRegister(RegisterResponse {
                 chip_address,
                 register,
-            } => {
+            }) => {
                 assert_eq!(chip_address, 0x00);
                 assert!(matches!(register, Register::ChipId { .. }));
             }
@@ -576,13 +583,13 @@ mod tests {
         let response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
             .expect("Should decode valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
             midstate_num,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
@@ -646,12 +653,12 @@ mod tests {
         let rx_response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
             .expect("Should decode RX frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id: rx_job_id,
             version: version_rolling,
             ..
-        } = rx_response
+        }) = rx_response
         else {
             panic!("Expected Nonce response");
         };
