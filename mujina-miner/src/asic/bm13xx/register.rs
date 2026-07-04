@@ -556,6 +556,56 @@ pub enum CoreRegister {
     Unknown(u8),
 }
 
+/// Analog mux control (0x54).
+///
+/// Selects which analog signal the chip routes onto its analog
+/// mux output. Select 2 routes the temperature diode to the
+/// output, where an external sensor reads it (seen on the
+/// BM1370). Firmware writes select 3 when it is not reading the
+/// diode (seen on the BM1362 and BM1370). No source names what
+/// the other selects connect, and the mapping may differ by
+/// model.
+///
+/// - bits 31-4: zero in every capture
+/// - bits 3-0: diode select
+#[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalogMux {
+    /// Analog signal selected onto the mux output.
+    pub diode_select: u8,
+    /// Undecoded bits 31-4, zero in every capture, held in place.
+    #[debug("{unexplained:#010x}")]
+    pub unexplained: u32,
+}
+
+impl AnalogMux {
+    /// Returns the selection factory firmware makes during
+    /// bring-up; each model selects a different input.
+    pub fn bring_up(model: ChipModel) -> Self {
+        match model {
+            ChipModel::BM1362 => Self {
+                diode_select: 0x3,
+                unexplained: 0,
+            },
+            _ => Self {
+                diode_select: 0x2,
+                unexplained: 0,
+            },
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        dst.put_u32(self.unexplained | self.diode_select as u32 & 0xf);
+    }
+
+    pub fn decode(bytes: [u8; 4]) -> Self {
+        let value = u32::from_be_bytes(bytes);
+        Self {
+            diode_select: (value & 0xf) as u8,
+            unexplained: value & !0xf,
+        }
+    }
+}
+
 /// Drive strength of each chip output pin.
 ///
 /// Each output has a 4-bit drive strength. Factory firmware runs
@@ -767,7 +817,6 @@ macro_rules! raw_u32_register {
 raw_u32_register! {
     MiscControl,
     UartRelay,
-    AnalogMux,
     Pll3Parameter,
     MiscSettings,
 }
@@ -1127,6 +1176,32 @@ mod soft_reset_control_tests {
     fn core_reset() {
         round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
         round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
+    }
+}
+
+#[cfg(test)]
+mod analog_mux_tests {
+    use super::*;
+
+    fn round_trip(original: AnalogMux) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(AnalogMux::decode(bytes), original);
+    }
+
+    #[test]
+    fn bring_up() {
+        round_trip(AnalogMux::bring_up(ChipModel::BM1362));
+        round_trip(AnalogMux::bring_up(ChipModel::BM1370));
+    }
+
+    #[test]
+    fn from_literal_field() {
+        round_trip(AnalogMux {
+            diode_select: 0xf,
+            unexplained: 0x1234_5670,
+        });
     }
 }
 
