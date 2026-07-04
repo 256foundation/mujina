@@ -12,19 +12,28 @@ use crate::asic::bm13xx::error::ProtocolError;
 use crate::job_source::GeneralPurposeBits;
 
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum Response {
-    ReadRegister {
-        chip_address: u8,
-        register: Register,
-    },
-    Nonce {
-        nonce: u32,
-        job_id: u8,
-        midstate_num: u8,
-        version: GeneralPurposeBits,
-        subcore_id: u8,
-    },
+    ReadRegister(RegisterResponse),
+    Nonce(NonceResponse),
+}
+
+/// Reply to a register read.
+#[derive(Debug)]
+pub struct RegisterResponse {
+    pub chip_address: u8,
+    pub register: Register,
+}
+
+/// Nonce report from a chip that found passing work.
+#[derive(Debug)]
+pub struct NonceResponse {
+    pub nonce: u32,
+    pub job_id: u8,
+    /// Difficulty above the reporting threshold, in half bits on
+    /// the log2 scale; reference code calls the byte Midstate_Num.
+    pub excess_difficulty: u8,
+    pub version: GeneralPurposeBits,
+    pub subcore_id: u8,
 }
 
 impl Response {
@@ -50,10 +59,10 @@ impl Response {
 
                 if let Ok(register_address) = RegisterAddress::try_from(register_address_repr) {
                     let register = Register::decode(register_address, value)?;
-                    Ok(Response::ReadRegister {
+                    Ok(Response::ReadRegister(RegisterResponse {
                         chip_address,
                         register,
-                    })
+                    }))
                 } else {
                     Err(ProtocolError::InvalidRegisterAddress(register_address_repr))
                 }
@@ -61,9 +70,9 @@ impl Response {
             Some(ResponseType::Nonce) => {
                 // Nonce response format (11 bytes total, including preamble):
                 // Already consumed: preamble (2 bytes)
-                // Remaining: nonce(4) + midstate_num(1) + result_header(1) + version(2) + crc(1)
+                // Remaining: nonce(4) + excess_difficulty(1) + result_header(1) + version(2) + crc(1)
                 let nonce = bytes.get_u32_le();
-                let midstate_num = bytes.get_u8();
+                let excess_difficulty = bytes.get_u8();
                 let result_header = bytes.get_u8();
 
                 // Version rolling field: 2 bytes, big-endian
@@ -88,13 +97,13 @@ impl Response {
                     ChipModel::BM1370 => ((result_header >> 4) & 0x0f, result_header & 0x0f),
                 };
 
-                Ok(Response::Nonce {
+                Ok(Response::Nonce(NonceResponse {
                     nonce,
                     job_id,
-                    midstate_num,
+                    excess_difficulty,
                     version,
                     subcore_id,
-                })
+                }))
             }
             None => Err(ProtocolError::InvalidResponseType(type_repr)),
         }
@@ -154,10 +163,10 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1370)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::ReadRegister {
+        let Response::ReadRegister(RegisterResponse {
             chip_address,
             register,
-        } = response
+        }) = response
         else {
             panic!("Expected ReadRegister response, got {:?}", response);
         };
@@ -208,20 +217,20 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1370)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
-            midstate_num,
+            excess_difficulty,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
 
         // From protocol doc: nonce 0x40A60018 -> Main core 32, nonce value 0x00A60018
         assert_eq!(nonce, 0x40a60018);
-        assert_eq!(midstate_num, 0x02);
+        assert_eq!(excess_difficulty, 0x02);
 
         // Result header: 0x99 -> bits[7:4]=9 (job_id), bits[3:0]=9 (subcore_id)
         assert_eq!(job_id, 9);
@@ -267,23 +276,23 @@ mod tests {
             ),
         ];
 
-        for (wire, exp_nonce, exp_midstate, exp_job_id, exp_subcore, exp_version) in test_cases {
+        for (wire, exp_nonce, exp_excess, exp_job_id, exp_subcore, exp_version) in test_cases {
             let response = decode_frame(wire, ChipModel::BM1370)
                 .expect("decode_frame should return Some for valid frame");
 
-            let Response::Nonce {
+            let Response::Nonce(NonceResponse {
                 nonce,
                 job_id,
-                midstate_num,
+                excess_difficulty,
                 version,
                 subcore_id,
-            } = response
+            }) = response
             else {
                 panic!("Expected nonce response");
             };
 
             assert_eq!(nonce, exp_nonce);
-            assert_eq!(midstate_num, exp_midstate);
+            assert_eq!(excess_difficulty, exp_excess);
             assert_eq!(job_id, exp_job_id);
             assert_eq!(subcore_id, exp_subcore);
             assert_eq!(version, exp_version);
@@ -299,19 +308,19 @@ mod tests {
         let response = decode_frame(wire, ChipModel::BM1362)
             .expect("decode_frame should return Some for valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
-            midstate_num,
+            excess_difficulty,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
 
         assert_eq!(nonce, 0xd077c981);
-        assert_eq!(midstate_num, 0x00);
+        assert_eq!(excess_difficulty, 0x00);
 
         // Result header 0xf2: job_id 30 needs the 5-bit split; the
         // BM1370 packing cannot represent it
@@ -411,7 +420,7 @@ mod tests {
         // Third decode should succeed
         let result = codec.decode(&mut buf);
         match result {
-            Ok(Some(Response::ReadRegister { .. })) => {} // Success
+            Ok(Some(Response::ReadRegister(_))) => {} // Success
             Ok(Some(other)) => panic!("Expected ReadRegister, got {:?}", other),
             Ok(None) => panic!(
                 "Expected Some, got None. Buffer len: {}, contents: {:02x?}",
@@ -439,12 +448,12 @@ mod tests {
 
         // Decode first frame
         let result1 = codec.decode(&mut buf).unwrap();
-        assert!(matches!(result1, Some(Response::ReadRegister { .. })));
+        assert!(matches!(result1, Some(Response::ReadRegister(_))));
         assert_eq!(buf.len(), 11, "Should have second frame remaining");
 
         // Decode second frame
         let result2 = codec.decode(&mut buf).unwrap();
-        assert!(matches!(result2, Some(Response::Nonce { .. })));
+        assert!(matches!(result2, Some(Response::Nonce(_))));
         assert_eq!(buf.len(), 0, "Buffer should be empty");
     }
 
@@ -472,7 +481,7 @@ mod tests {
             let result = codec.decode(&mut buf).unwrap();
             assert!(result.is_some(), "Should decode real S21 Pro frame");
             assert!(
-                matches!(result, Some(Response::Nonce { .. })),
+                matches!(result, Some(Response::Nonce(_))),
                 "Should be nonce response"
             );
         }
@@ -498,7 +507,7 @@ mod tests {
         for _ in 0..20 {
             // Try up to 20 times
             if let Some(response) = codec.decode(&mut buf).unwrap() {
-                assert!(matches!(response, Response::Nonce { .. }));
+                assert!(matches!(response, Response::Nonce(_)));
                 found_valid = true;
                 break;
             }
@@ -539,7 +548,7 @@ mod tests {
             "Should find valid frame after partial data"
         );
         assert!(
-            matches!(result, Some(Response::Nonce { .. })),
+            matches!(result, Some(Response::Nonce(_))),
             "Should be nonce response"
         );
     }
@@ -557,10 +566,10 @@ mod tests {
 
         let response = codec.decode(&mut buf).unwrap().unwrap();
         match response {
-            Response::ReadRegister {
+            Response::ReadRegister(RegisterResponse {
                 chip_address,
                 register,
-            } => {
+            }) => {
                 assert_eq!(chip_address, 0x00);
                 assert!(matches!(register, Register::ChipId { .. }));
             }
@@ -576,20 +585,20 @@ mod tests {
         let response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
             .expect("Should decode valid frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id,
-            midstate_num,
+            excess_difficulty,
             version,
             subcore_id,
-        } = response
+        }) = response
         else {
             panic!("Expected nonce response");
         };
 
         // Verify all fields match test data
         assert_eq!(nonce, *esp_miner_job::wire_rx::NONCE);
-        assert_eq!(midstate_num, *esp_miner_job::wire_rx::MIDSTATE_NUM);
+        assert_eq!(excess_difficulty, *esp_miner_job::wire_rx::MIDSTATE_NUM);
         assert_eq!(job_id, *esp_miner_job::wire_rx::JOB_ID);
         assert_eq!(subcore_id, *esp_miner_job::wire_rx::SUBCORE_ID);
         // VERSION_ROLLING_FIELD is u16, convert to big-endian bytes
@@ -646,12 +655,12 @@ mod tests {
         let rx_response = decode_frame(&esp_miner_job::wire_rx::FRAME, ChipModel::BM1370)
             .expect("Should decode RX frame");
 
-        let Response::Nonce {
+        let Response::Nonce(NonceResponse {
             nonce,
             job_id: rx_job_id,
             version: version_rolling,
             ..
-        } = rx_response
+        }) = rx_response
         else {
             panic!("Expected Nonce response");
         };
