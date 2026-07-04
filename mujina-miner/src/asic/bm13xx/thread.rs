@@ -297,7 +297,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::MiscControl(MiscControl(0x00C100F0)),
+            register: Register::MiscControl(MiscControl::reporting_enabled(ChipModel::BM1370)),
         }))
         .await?;
 
@@ -360,7 +360,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Chip(0x00),
-            register: Register::MiscControl(MiscControl(0x00C100F0)),
+            register: Register::MiscControl(MiscControl::reporting_enabled(ChipModel::BM1370)),
         }))
         .await?;
     chip_commands
