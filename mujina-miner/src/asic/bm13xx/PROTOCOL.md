@@ -384,7 +384,7 @@ Key registers used across BM13xx chips:
 | 0x18 | MISC_CONTROL | UART settings and GPIO pin configuration |
 | 0x28 | UART_BAUD | UART baud rate configuration |
 | 0x2C | UART_RELAY | UART relay configuration (multi-chip chains) |
-| 0x3C | CORE_REGISTER | Core configuration and control |
+| 0x3C | CORE_MAILBOX | Command mailbox for per-core registers |
 | 0x54 | ANALOG_MUX | Analog mux control (rumored to control temp diode) |
 | 0x58 | IO_DRIVER_STRENGTH | IO driver strength configuration |
 | 0x68 | PLL3_PARAMETER | PLL3 configuration (multi-chip chains) |
@@ -496,19 +496,23 @@ Controls UART signal relay in multi-chip chains (4 bytes):
 - Format appears to encode domain boundaries
 - Example values from S21 Pro: 0x00130003, 0x00180003, etc.
 
-#### 0x3C - CORE_REGISTER
-Indirect access to core registers (documented in BM1397):
-- **Format**: Upper 16 bits = core register address, Lower 16 bits = value
-- **Bit 31**: Always set (0x80) in observed implementations
-- Initialization requires 2-3 sequential writes with chip-specific magic values:
+#### 0x3C - CORE_MAILBOX
+Indirect access to a small register space inside each core. The
+32-bit word posted to the mailbox names a core register, carries
+a value, and addresses one core or all of them. The word's bit
+layout lives on the typed register in the code. Every observed
+command is a broadcast write; nothing in the captures reads a
+core register or addresses an individual core.
 
-**Broadcast sequence** (2 writes):
-- BM1362: `0x80008540`, `0x80008008`
-- BM1366: `0x80008540`, `0x80008020`
-- BM1368/70: `0x80008B00`, `0x8000800C` or `0x80008018`
+Core registers written during bring-up, first broadcast, then
+repeated per chip with core enable appended:
 
-**Per-chip sequence** (adds 3rd write):
-- All chips add: `0x800082AA` as final write
+- 0x00 clock delay: 0x08 (BM1362), 0x20 (BM1366), 0x0C or 0x18
+  (BM1368/70)
+- 0x02 core enable: 0xAA on every model, per-chip pass only
+- 0x05 clock select: 0x40 (BM1362, BM1366)
+- 0x0B overlap monitor: 0x00 (BM1368/70)
+- 0x0D unnamed: 0xEE (BM1370, written after mining configuration)
 
 #### 0x54 - ANALOG_MUX
 Controls analog multiplexer, possibly for temperature sensing:

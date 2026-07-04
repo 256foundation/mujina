@@ -24,7 +24,7 @@ pub enum RegisterAddress {
     MiscControl = 0x18,
     UartBaud = 0x28,
     UartRelay = 0x2C,
-    Core = 0x3C,
+    CoreMailbox = 0x3C,
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
     Pll3Parameter = 0x68,
@@ -43,7 +43,7 @@ pub enum Register {
     MiscControl(MiscControl),
     UartBaud(UartBaud),
     UartRelay(UartRelay),
-    Core(Core),
+    CoreMailbox(CoreCommand),
     AnalogMux(AnalogMux),
     IoDriverStrength(IoDriverStrength),
     Pll3Parameter(Pll3Parameter),
@@ -62,7 +62,7 @@ impl Register {
             RegisterAddress::MiscControl => Register::MiscControl(MiscControl::decode(bytes)),
             RegisterAddress::UartBaud => Register::UartBaud(UartBaud::decode(bytes)),
             RegisterAddress::UartRelay => Register::UartRelay(UartRelay::decode(bytes)),
-            RegisterAddress::Core => Register::Core(Core::decode(bytes)),
+            RegisterAddress::CoreMailbox => Register::CoreMailbox(CoreCommand::decode(bytes)),
             RegisterAddress::AnalogMux => Register::AnalogMux(AnalogMux::decode(bytes)),
             RegisterAddress::IoDriverStrength => {
                 Register::IoDriverStrength(IoDriverStrength::decode(bytes))
@@ -87,7 +87,7 @@ impl Register {
             Register::MiscControl(_) => RegisterAddress::MiscControl,
             Register::UartBaud(_) => RegisterAddress::UartBaud,
             Register::UartRelay(_) => RegisterAddress::UartRelay,
-            Register::Core(_) => RegisterAddress::Core,
+            Register::CoreMailbox(_) => RegisterAddress::CoreMailbox,
             Register::AnalogMux(_) => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
             Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
@@ -106,7 +106,7 @@ impl Register {
             Register::MiscControl(r) => r.encode(dst),
             Register::UartBaud(r) => r.encode(dst),
             Register::UartRelay(r) => r.encode(dst),
-            Register::Core(r) => r.encode(dst),
+            Register::CoreMailbox(r) => r.encode(dst),
             Register::AnalogMux(r) => r.encode(dst),
             Register::IoDriverStrength(r) => r.encode(dst),
             Register::Pll3Parameter(r) => r.encode(dst),
@@ -443,16 +443,100 @@ impl UartBaud {
     }
 }
 
-/// Transmitted big-endian, unlike the other raw-u32 registers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Core(pub u32);
+/// A command posted to the core mailbox (0x3C).
+///
+/// The mailbox gives indirect access to a small register space
+/// inside each core. The 32-bit word posted to it names a core
+/// register, carries a value, and addresses one core or all of
+/// them.
+///
+/// - bits 0-7: value written to or read from the core register
+/// - bits 8-12: core register id
+/// - bit 13: reserved
+/// - bit 14: read done
+/// - bit 15: write enable, clear on reads
+/// - bits 16-23: core id, ignored when addressing all cores
+/// - bits 24-30: num, zero in every observation
+/// - bit 31: address all cores
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CoreCommand {
+    /// Address all cores rather than the one in `core_id`.
+    pub all: bool,
+    /// Zero in every observation.
+    pub num: u8,
+    /// Core addressed when `all` is clear.
+    pub core_id: u8,
+    /// Write the value; clear on reads.
+    pub write: bool,
+    /// Read done.
+    pub rd_done: bool,
+    /// Core register id.
+    pub reg: u8,
+    /// Value written to or read from the core register.
+    pub value: u8,
+}
 
-impl Core {
-    pub fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u32(self.0);
+impl CoreCommand {
+    /// Clock delay control register id.
+    pub const CLOCK_DELAY: u8 = 0x00;
+    /// Core enable register id.
+    pub const CORE_ENABLE: u8 = 0x02;
+    /// Clock select register id.
+    pub const CLOCK_SELECT: u8 = 0x05;
+    /// Overlap monitor register id.
+    pub const OVERLAP_MONITOR: u8 = 0x0B;
+
+    /// Returns a write of one core register, broadcast to every
+    /// core of the addressed chip. The only command shape observed
+    /// in captured traffic.
+    pub fn write_all(reg: u8, value: u8) -> Self {
+        Self {
+            all: true,
+            num: 0,
+            core_id: 0,
+            write: true,
+            rd_done: false,
+            reg,
+            value,
+        }
     }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let word = (self.all as u32) << 31
+            | (self.num as u32 & 0x7f) << 24
+            | (self.core_id as u32) << 16
+            | (self.write as u32) << 15
+            | (self.rd_done as u32) << 14
+            | (self.reg as u32 & 0x1f) << 8
+            | self.value as u32;
+        dst.put_u32(word);
+    }
+
     pub fn decode(bytes: [u8; 4]) -> Self {
-        Self(u32::from_be_bytes(bytes))
+        let word = u32::from_be_bytes(bytes);
+        Self {
+            all: word >> 31 & 1 == 1,
+            num: (word >> 24 & 0x7f) as u8,
+            core_id: (word >> 16 & 0xff) as u8,
+            write: word >> 15 & 1 == 1,
+            rd_done: word >> 14 & 1 == 1,
+            reg: (word >> 8 & 0x1f) as u8,
+            value: (word & 0xff) as u8,
+        }
+    }
+}
+
+impl fmt::Debug for CoreCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreCommand")
+            .field("all", &self.all)
+            .field("num", &self.num)
+            .field("core_id", &self.core_id)
+            .field("write", &self.write)
+            .field("rd_done", &self.rd_done)
+            .field("reg", &format_args!("{:#04x}", self.reg))
+            .field("value", &format_args!("{:#04x}", self.value))
+            .finish()
     }
 }
 
@@ -1033,5 +1117,35 @@ mod soft_reset_control_tests {
     fn core_reset() {
         round_trip(SoftResetControl::core_reset(ChipModel::BM1362));
         round_trip(SoftResetControl::core_reset(ChipModel::BM1370));
+    }
+}
+
+#[cfg(test)]
+mod core_command_tests {
+    use super::*;
+
+    fn round_trip(original: CoreCommand) {
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let bytes: [u8; 4] = buf[..].try_into().unwrap();
+        assert_eq!(CoreCommand::decode(bytes), original);
+    }
+
+    #[test]
+    fn write_all() {
+        round_trip(CoreCommand::write_all(CoreCommand::CORE_ENABLE, 0xaa));
+    }
+
+    #[test]
+    fn from_literal_fields() {
+        round_trip(CoreCommand {
+            all: false,
+            num: 0x55,
+            core_id: 0xc3,
+            write: false,
+            rd_done: true,
+            reg: 0x1f,
+            value: 0xee,
+        });
     }
 }

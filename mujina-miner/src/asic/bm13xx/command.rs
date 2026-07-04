@@ -363,8 +363,8 @@ mod tests {
 
     use super::super::codec::FrameCodec;
     use super::super::register::{
-        ChipId, ChipModel, Core, IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl,
-        NonceRange, Register, RegisterAddress, SoftResetControl, TicketMask,
+        ChipId, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty, MidstateConfig,
+        MiscControl, NonceRange, Register, RegisterAddress, SoftResetControl, TicketMask,
     };
     use super::*;
     use crate::asic::bm13xx::crc::crc16;
@@ -506,17 +506,35 @@ mod tests {
     }
 
     #[test]
-    fn write_core_register_sequence() {
+    fn write_core_command_from_capture() {
         // From Bitaxe capture: TX: 55 AA 51 09 00 3C 80 00 8B 00 12
-        // Core register uses big-endian encoding
         assert_frame_eq(
             RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                // Big-endian: produces bytes 80 00 8B 00
-                register: Register::Core(Core(0x80008B00)),
+                register: Register::CoreMailbox(CoreCommand::write_all(
+                    CoreCommand::OVERLAP_MONITOR,
+                    0x00,
+                )),
             }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x3c, 0x80, 0x00, 0x8b, 0x00, 0x12,
+            ],
+        );
+    }
+
+    #[test]
+    fn write_core_command_bm1362_from_capture() {
+        // From S19j Pro capture: TX: 55 AA 51 09 00 3C 80 00 85 40 0C
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::CoreMailbox(CoreCommand::write_all(
+                    CoreCommand::CLOCK_SELECT,
+                    0x40,
+                )),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x3c, 0x80, 0x00, 0x85, 0x40, 0x0c,
             ],
         );
     }
