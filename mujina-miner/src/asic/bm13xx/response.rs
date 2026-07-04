@@ -46,7 +46,7 @@ impl Response {
                 let register_address_repr = bytes.get_u8();
 
                 if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
-                    let register = Register::decode(register_address, value);
+                    let register = Register::decode(register_address, value)?;
                     Ok(Response::ReadRegister {
                         chip_address,
                         register,
@@ -167,6 +167,21 @@ mod tests {
         let mut buf = BytesMut::from(frame);
         let mut codec = FrameCodec;
         codec.decode(&mut buf).expect("Failed to decode frame")
+    }
+
+    #[test]
+    fn reject_register_response_with_unknown_chip_id() {
+        // A ChipId register read response whose id bytes match no
+        // supported model; body only, preamble stripped as
+        // Response::decode expects
+        let mut buf = BytesMut::from(&[0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00][..]);
+
+        let result = Response::decode(&mut buf);
+
+        assert!(matches!(
+            result,
+            Err(ProtocolError::UnknownChipId([0x12, 0x34]))
+        ));
     }
 
     #[test]

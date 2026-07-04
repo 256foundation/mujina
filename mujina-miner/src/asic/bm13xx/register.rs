@@ -11,6 +11,7 @@ use std::fmt;
 use strum::FromRepr;
 
 use super::chip_config::CRYSTAL_MHZ;
+use super::error::ProtocolError;
 use crate::types::Difficulty;
 
 /// Register addresses on the wire.
@@ -53,9 +54,9 @@ pub enum Register {
 }
 
 impl Register {
-    pub fn decode(address: RegisterAddress, bytes: [u8; 4]) -> Register {
-        match address {
-            RegisterAddress::ChipId => Register::ChipId(ChipId::decode(bytes)),
+    pub fn decode(address: RegisterAddress, bytes: [u8; 4]) -> Result<Register, ProtocolError> {
+        Ok(match address {
+            RegisterAddress::ChipId => Register::ChipId(ChipId::decode(bytes)?),
             RegisterAddress::PllDivider => Register::PllDivider(PllDivider::decode(bytes)),
             RegisterAddress::NonceRange => Register::NonceRange(NonceRange::decode(bytes)),
             RegisterAddress::TicketMask => Register::TicketMask(TicketMask::decode(bytes)),
@@ -75,7 +76,7 @@ impl Register {
                 Register::SoftResetControl(SoftResetControl::decode(bytes))
             }
             RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings::decode(bytes)),
-        }
+        })
     }
 
     pub(super) fn address(&self) -> RegisterAddress {
@@ -131,16 +132,21 @@ impl ChipId {
         dst.put_u8(self.core_count);
         dst.put_u8(self.address);
     }
-    pub fn decode(bytes: [u8; 4]) -> Self {
-        Self {
-            model: ChipModel::from([bytes[0], bytes[1]]),
+    pub fn decode(bytes: [u8; 4]) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            model: ChipModel::try_from([bytes[0], bytes[1]])?,
             core_count: bytes[2],
             address: bytes[3],
-        }
+        })
     }
 }
 
-/// Known chip models in the BM13xx family.
+/// Chip models the BM13xx stack supports.
+///
+/// Deliberately closed: every variant must have decided protocol
+/// behavior (nonce packing, PLL bounds), so an unrecognized chip id
+/// fails to decode rather than carrying an id the rest of the stack
+/// cannot act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChipModel {
     /// BM1362 - Used in Antminer S19 J Pro (126 chips)
@@ -151,10 +157,6 @@ pub enum ChipModel {
     /// BM1370 - Used in Bitaxe Gamma and Antminer S21 Pro
     /// ~2,040 hash engines organized as 128 domains of ~16 engines each
     BM1370,
-    /// BM1397 - Previous generation chip
-    BM1397,
-    /// Unknown chip model with raw ID bytes.
-    Unknown([u8; 2]),
 }
 
 impl ChipModel {
@@ -164,8 +166,6 @@ impl ChipModel {
             Self::BM1362 => [0x13, 0x62],
             Self::BM1366 => [0x13, 0x66],
             Self::BM1370 => [0x13, 0x70],
-            Self::BM1397 => [0x13, 0x97],
-            Self::Unknown(bytes) => *bytes,
         }
     }
 
@@ -178,14 +178,15 @@ impl ChipModel {
     }
 }
 
-impl From<[u8; 2]> for ChipModel {
-    fn from(bytes: [u8; 2]) -> Self {
+impl TryFrom<[u8; 2]> for ChipModel {
+    type Error = ProtocolError;
+
+    fn try_from(bytes: [u8; 2]) -> Result<Self, Self::Error> {
         match bytes {
-            [0x13, 0x62] => Self::BM1362,
-            [0x13, 0x66] => Self::BM1366,
-            [0x13, 0x70] => Self::BM1370,
-            [0x13, 0x97] => Self::BM1397,
-            _ => Self::Unknown(bytes),
+            [0x13, 0x62] => Ok(Self::BM1362),
+            [0x13, 0x66] => Ok(Self::BM1366),
+            [0x13, 0x70] => Ok(Self::BM1370),
+            _ => Err(ProtocolError::UnknownChipId(bytes)),
         }
     }
 }
@@ -1035,7 +1036,7 @@ mod chip_id_tests {
         let mut buf = BytesMut::new();
         original.encode(&mut buf);
         let bytes: [u8; 4] = buf[..].try_into().unwrap();
-        assert_eq!(ChipId::decode(bytes), original);
+        assert_eq!(ChipId::decode(bytes).unwrap(), original);
     }
 
     #[test]
@@ -1048,12 +1049,11 @@ mod chip_id_tests {
     }
 
     #[test]
-    fn unknown_model() {
-        round_trip(ChipId {
-            model: ChipModel::Unknown([0x12, 0x34]),
-            core_count: 0,
-            address: 0x00,
-        });
+    fn reject_unknown_id() {
+        assert!(matches!(
+            ChipId::decode([0x12, 0x34, 0x00, 0x00]),
+            Err(ProtocolError::UnknownChipId([0x12, 0x34]))
+        ));
     }
 }
 
