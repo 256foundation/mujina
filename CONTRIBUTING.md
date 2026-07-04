@@ -150,6 +150,17 @@ This builds a toolchain container from `build.Containerfile` and
 runs `just checks` inside it. Podman is required for this step but
 not for regular development.
 
+Pull request CI goes one step further and checks every commit
+individually, not just the branch tip (see Atomic Commits below
+for why). Run the same per-commit walk locally with:
+
+```bash
+just ci-each upstream/main
+```
+
+This checks out each commit after `upstream/main` in turn, runs
+`just ci` on it, and returns to your original branch when done.
+
 ### Documenting Known Bugs with `#[should_panic]`
 
 When a bug is found in already-pushed code, we sometimes add a
@@ -173,7 +184,7 @@ fn descriptive_name() {
 #### Atomic Commits
 
 Each commit should be exactly one logical change, and the tree
-should build and pass tests after every commit. This matters for
+should pass `just checks` after every commit. This matters for
 three reasons:
 
 - **Revertability.** If a commit introduces a regression, `git
@@ -184,6 +195,10 @@ three reasons:
   at once.
 - **Reviewability.** Small, focused commits are easier to review
   and reason about than large ones that do several things.
+
+CI enforces this: pull request CI runs the full pipeline on each
+commit in the PR, so an intermediate commit that fails checks
+fails the PR even when the branch tip passes.
 
 A good test: if you need "and" in the subject line, you probably
 have two commits.
@@ -265,9 +280,10 @@ Fixes: #234
    git rebase upstream/main
    ```
 
-2. Run checks to make sure everything still passes:
+2. Check that every commit still passes, since rebasing can break
+   an intermediate commit even when the branch tip is fine:
    ```bash
-   just checks
+   just ci-each upstream/main
    ```
 
 3. Push your branch to your fork:
