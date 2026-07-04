@@ -59,6 +59,25 @@ in-container *args: build-image
 [group('ci')]
 ci: (in-container "checks")
 
+# Run the CI pipeline on each commit in base..head individually
+[group('ci')]
+ci-each base="origin/main" head="HEAD":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "error: working tree dirty; commit or stash first" >&2
+        exit 1
+    fi
+    orig=$(git rev-parse --abbrev-ref HEAD)
+    [ "$orig" = "HEAD" ] && orig=$(git rev-parse HEAD)
+    trap 'git checkout --quiet "$orig"' EXIT
+    for sha in $(git rev-list --reverse {{base}}..{{head}}); do
+        echo "::group::$(git log --oneline --no-decorate -1 "$sha")"
+        git checkout --quiet "$sha"
+        just ci
+        echo "::endgroup::"
+    done
+
 [group('container')]
 container-build tag=`git rev-parse --abbrev-ref HEAD`:
     podman build -t mujina-minerd:{{tag}} -f Containerfile .
