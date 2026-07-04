@@ -11,6 +11,7 @@ pub mod crc;
 pub mod error;
 pub mod reader;
 pub mod register;
+pub mod register_client;
 pub mod response;
 pub mod thread;
 pub mod topology;
