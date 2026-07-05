@@ -112,33 +112,54 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     time::sleep(Duration::from_millis(500)).await;
 
-    // Release ASIC from reset for discovery
+    // Release ASIC from reset for discovery. The BM1370 needs time to boot
+    // its UART before it will answer; give it the same ~500ms the reference
+    // Bitaxe firmware allows rather than a marginal 200ms.
     debug!("De-asserting ASIC nRST");
     reset_pin.write(PinValue::High).await?;
 
-    time::sleep(Duration::from_millis(200)).await;
+    time::sleep(Duration::from_millis(500)).await;
 
-    // Version mask and chip discovery
-    debug!("Sending version mask configuration (3 times)");
-    for i in 1..=3 {
-        trace!("Version mask send {}/3", i);
-        let version_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        data_writer
-            .send(version_cmd)
-            .await
-            .context("failed to send config command")?;
-        time::sleep(Duration::from_millis(5)).await;
+    // Version mask + chip discovery, retried a few times. A cold ASIC can
+    // miss the first round if its UART is not fully up, so re-send the
+    // version mask and re-run discovery until chips answer rather than
+    // failing the whole board on a single silent window.
+    const DISCOVERY_ATTEMPTS: usize = 5;
+    let mut chip_infos = Vec::new();
+    for attempt in 1..=DISCOVERY_ATTEMPTS {
+        debug!("Sending version mask configuration (3 times)");
+        for i in 1..=3 {
+            trace!("Version mask send {}/3", i);
+            let version_cmd = Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::VersionMask(
+                    bm13xx::protocol::VersionMask::full_rolling(),
+                ),
+            };
+            data_writer
+                .send(version_cmd)
+                .await
+                .context("failed to send config command")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        match discover_chips(&mut data_reader, &mut data_writer).await {
+            Ok(chips) => {
+                chip_infos = chips;
+                break;
+            }
+            Err(e) if attempt < DISCOVERY_ATTEMPTS => {
+                warn!(
+                    "Chip discovery attempt {attempt}/{DISCOVERY_ATTEMPTS} failed: {e}; retrying"
+                );
+                time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
-
-    time::sleep(Duration::from_millis(10)).await;
-
-    let chip_infos = discover_chips(&mut data_reader, &mut data_writer).await?;
 
     debug!(count = chip_infos.len(), "Discovered chips");
 
