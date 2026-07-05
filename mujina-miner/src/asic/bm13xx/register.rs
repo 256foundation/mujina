@@ -20,7 +20,7 @@ use crate::types::Difficulty;
 pub enum RegisterAddress {
     ChipId = 0x00,
     PllDivider = 0x08,
-    NonceRange = 0x10,
+    HashCountingNumber = 0x10,
     TicketMask = 0x14,
     MiscControl = 0x18,
     UartBaud = 0x28,
@@ -39,7 +39,7 @@ pub enum RegisterAddress {
 pub enum Register {
     ChipId(ChipId),
     PllDivider(PllDivider),
-    NonceRange(NonceRange),
+    HashCountingNumber(HashCountingNumber),
     TicketMask(TicketMask),
     MiscControl(MiscControl),
     UartBaud(UartBaud),
@@ -58,7 +58,9 @@ impl Register {
         Ok(match address {
             RegisterAddress::ChipId => Register::ChipId(ChipId::decode(bytes)?),
             RegisterAddress::PllDivider => Register::PllDivider(PllDivider::decode(bytes)),
-            RegisterAddress::NonceRange => Register::NonceRange(NonceRange::decode(bytes)),
+            RegisterAddress::HashCountingNumber => {
+                Register::HashCountingNumber(HashCountingNumber::decode(bytes))
+            }
             RegisterAddress::TicketMask => Register::TicketMask(TicketMask::decode(bytes)),
             RegisterAddress::MiscControl => Register::MiscControl(MiscControl::decode(bytes)),
             RegisterAddress::UartBaud => Register::UartBaud(UartBaud::decode(bytes)),
@@ -83,7 +85,7 @@ impl Register {
         match self {
             Register::ChipId(_) => RegisterAddress::ChipId,
             Register::PllDivider(_) => RegisterAddress::PllDivider,
-            Register::NonceRange(_) => RegisterAddress::NonceRange,
+            Register::HashCountingNumber(_) => RegisterAddress::HashCountingNumber,
             Register::TicketMask(_) => RegisterAddress::TicketMask,
             Register::MiscControl(_) => RegisterAddress::MiscControl,
             Register::UartBaud(_) => RegisterAddress::UartBaud,
@@ -102,7 +104,7 @@ impl Register {
         match self {
             Register::ChipId(r) => r.encode(dst),
             Register::PllDivider(r) => r.encode(dst),
-            Register::NonceRange(r) => r.encode(dst),
+            Register::HashCountingNumber(r) => r.encode(dst),
             Register::TicketMask(r) => r.encode(dst),
             Register::MiscControl(r) => r.encode(dst),
             Register::UartBaud(r) => r.encode(dst),
@@ -248,62 +250,39 @@ impl PllDivider {
     }
 }
 
-/// Nonce range configuration for work distribution.
+/// Hash counting number, the per-version nonce iteration limit.
 ///
-/// NOTE: We store this as a byte array rather than interpreting it as a u32
-/// because the exact bit-level interpretation is still being reverse-engineered.
-/// The values below are empirically observed from production hardware.
+/// Limits how many nonce iterations each core performs before the
+/// chip advances to the next rolled version and restarts the sweep.
+/// Zero halts hashing. Stock firmware writes a per-model calibrated
+/// value that scales inversely with frequency; see PROTOCOL.md for
+/// the known values and the search-space theory.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NonceRange {
-    /// Raw bytes as sent over the wire
-    bytes: [u8; 4],
+pub struct HashCountingNumber {
+    value: u32,
 }
 
-impl NonceRange {
-    // Nonce range values for different chain lengths (captured from hardware)
-    const SINGLE_CHIP: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
-    const SMALL_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x1f]; // 2-8 chips
-    const MEDIUM_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x0f]; // 9-16 chips
-    const LARGE_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x07]; // 17-32 chips
-    const XLARGE_CHAIN: [u8; 4] = [0xff, 0xff, 0xff, 0x03]; // 33-64 chips
-    const S21_PRO: [u8; 4] = [0x00, 0x00, 0x1e, 0xb5]; // 65-128 chips (empirical)
-    const DEFAULT_LARGE: [u8; 4] = [0xff, 0xff, 0xff, 0x01]; // >128 chips
-
-    /// Create config for single chip (full range)
-    pub fn single_chip() -> Self {
-        Self {
-            bytes: Self::SINGLE_CHIP,
-        }
-    }
-
-    /// Create config for multi-chip chain
-    pub fn multi_chip(chain_length: usize) -> Self {
-        let bytes = match chain_length {
-            1 => Self::SINGLE_CHIP,
-            2..=8 => Self::SMALL_CHAIN,
-            9..=16 => Self::MEDIUM_CHAIN,
-            17..=32 => Self::LARGE_CHAIN,
-            33..=64 => Self::XLARGE_CHAIN,
-            65..=128 => Self::S21_PRO,
-            _ => Self::DEFAULT_LARGE,
-        };
-        Self { bytes }
-    }
-
-    /// Create config from raw 32-bit value (little-endian)
-    /// Used for exact configuration from protocol captures
-    pub fn from_raw(value: u32) -> Self {
-        Self {
-            bytes: value.to_le_bytes(),
-        }
-    }
-
+impl HashCountingNumber {
     pub fn encode(&self, dst: &mut BytesMut) {
-        dst.put_slice(&self.bytes);
+        dst.put_u32(self.value);
     }
 
     pub fn decode(bytes: [u8; 4]) -> Self {
-        Self { bytes }
+        Self {
+            value: u32::from_be_bytes(bytes),
+        }
+    }
+}
+
+impl From<u32> for HashCountingNumber {
+    fn from(value: u32) -> Self {
+        Self { value }
+    }
+}
+
+impl From<HashCountingNumber> for u32 {
+    fn from(hcn: HashCountingNumber) -> Self {
+        hcn.value
     }
 }
 
@@ -1110,29 +1089,23 @@ mod pll_divider_tests {
 }
 
 #[cfg(test)]
-mod nonce_range_tests {
+mod hash_counting_number_tests {
     use super::*;
 
-    fn round_trip(original: NonceRange) {
+    #[test]
+    fn round_trip() {
+        let original = HashCountingNumber::from(0x1EB5);
         let mut buf = BytesMut::new();
         original.encode(&mut buf);
         let bytes: [u8; 4] = buf[..].try_into().unwrap();
-        assert_eq!(NonceRange::decode(bytes), original);
+        assert_eq!(HashCountingNumber::decode(bytes), original);
     }
 
     #[test]
-    fn single_chip() {
-        round_trip(NonceRange::single_chip());
-    }
-
-    #[test]
-    fn multi_chip() {
-        round_trip(NonceRange::multi_chip(16));
-    }
-
-    #[test]
-    fn from_raw() {
-        round_trip(NonceRange::from_raw(0xdeadbeef));
+    fn encodes_big_endian() {
+        let mut buf = BytesMut::new();
+        HashCountingNumber::from(0x00001EB5).encode(&mut buf);
+        assert_eq!(&buf[..], &[0x00, 0x00, 0x1E, 0xB5]);
     }
 }
 

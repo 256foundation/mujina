@@ -379,7 +379,7 @@ Key registers used across BM13xx chips:
 |----------|------|-------------|
 | 0x00 | CHIP_ID | Chip identification and configuration |
 | 0x08 | PLL_DIVIDER | Frequency control registers for hash clock |
-| 0x10 | NONCE_RANGE | Controls nonce search range per core |
+| 0x10 | HASH_COUNTING_NUMBER | Controls nonce search range per core |
 | 0x14 | TICKET_MASK | Difficulty mask for share submission |
 | 0x18 | MISC_CONTROL | UART settings and GPIO pin configuration |
 | 0x28 | UART_BAUD | UART baud rate configuration |
@@ -414,7 +414,7 @@ Controls the hash frequency through PLL configuration:
 - Byte 2: REF_DIV (reference divider)
 - Byte 3: POST_DIV flags (bit 1 = fixed to 1)
 
-#### 0x10 - NONCE_RANGE
+#### 0x10 - HASH_COUNTING_NUMBER
 Controls nonce search space distribution (format not fully documented):
 - Affects how chips divide the 32-bit nonce space
 - Different values used for different chip counts
@@ -669,7 +669,7 @@ Undocumented miscellaneous settings register:
    - BM1362: Different rate (0x00003011)
 
 7. **Final Configuration**
-   - Set NONCE_RANGE (0x10) based on chip count
+   - Set HASH_COUNTING_NUMBER (0x10) based on chip count
    - Configure remaining registers
    - Begin frequency ramping
 
@@ -720,9 +720,9 @@ chain)
 #### Nonce Space Partitioning
 The 32-bit nonce space (4.3 billion values) is automatically divided:
 
-1. **Between Chips**: Based on chip address and NONCE_RANGE register
+1. **Between Chips**: Based on chip address and HASH_COUNTING_NUMBER register
    - Chip address influences which nonces are searched
-   - NONCE_RANGE register (0x10) further controls distribution
+   - HASH_COUNTING_NUMBER register (0x10) further controls distribution
    - No explicit range assignment needed from software
 
 2. **Between Cores**: Within each chip
@@ -734,9 +734,9 @@ The 32-bit nonce space (4.3 billion values) is automatically divided:
    - Bits 24-0: Actual nonce value searched
    - Total: 2,048 parallel searches per chip
 
-#### NONCE_RANGE Register Configuration
+#### HASH_COUNTING_NUMBER Register Configuration
 
-The NONCE_RANGE register (0x10) uses empirically-determined values to optimize 
+The HASH_COUNTING_NUMBER register (0x10) uses empirically-determined values to optimize
 nonce distribution. See discussion at: https://github.com/bitaxeorg/ESP-Miner/pull/167
 
 **Known Values (4-byte little-endian):**

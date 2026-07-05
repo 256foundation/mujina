@@ -363,8 +363,8 @@ mod tests {
 
     use super::super::codec::FrameCodec;
     use super::super::register::{
-        AnalogMux, ChipId, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty,
-        MidstateConfig, MiscControl, NonceRange, Register, RegisterAddress, SoftResetControl,
+        AnalogMux, ChipId, ChipModel, CoreCommand, HashCountingNumber, IoDriverStrength,
+        Log2Difficulty, MidstateConfig, MiscControl, Register, RegisterAddress, SoftResetControl,
         TicketMask, UartRelay,
     };
     use super::*;
@@ -613,15 +613,26 @@ mod tests {
     }
 
     #[test]
-    fn write_nonce_range_from_capture() {
+    fn write_hash_counting_number_from_capture() {
         // From S21 Pro capture: TX: 55 AA 51 09 00 10 00 00 1E B5 0F
         assert_frame_eq(
             RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::NonceRange(NonceRange::multi_chip(65)),
+                register: Register::HashCountingNumber(HashCountingNumber::from(0x1EB5)),
             }),
             &[
                 0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x1e, 0xb5, 0x0f,
+            ],
+        );
+
+        // From S19 J Pro capture: TX: 55 AA 51 09 00 10 00 00 13 81 08
+        assert_frame_eq(
+            RegisterCommand::WriteRegister(WriteRegister {
+                destination: Destination::Broadcast,
+                register: Register::HashCountingNumber(HashCountingNumber::from(0x1381)),
+            }),
+            &[
+                0x55, 0xaa, 0x51, 0x09, 0x00, 0x10, 0x00, 0x00, 0x13, 0x81, 0x08,
             ],
         );
     }

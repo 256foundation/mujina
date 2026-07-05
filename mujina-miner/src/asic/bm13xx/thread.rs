@@ -22,8 +22,8 @@ use super::command::{
     SetChipAddress, WriteRegister,
 };
 use super::register::{
-    AnalogMux, ChipModel, CoreCommand, IoDriverStrength, Log2Difficulty, MidstateConfig,
-    MiscControl, MiscSettings, NonceRange, PllDivider, Register, SoftResetControl, TicketMask,
+    AnalogMux, ChipModel, CoreCommand, HashCountingNumber, IoDriverStrength, Log2Difficulty,
+    MidstateConfig, MiscControl, MiscSettings, PllDivider, Register, SoftResetControl, TicketMask,
 };
 use super::response::{NonceResponse, RegisterResponse, Response};
 use crate::{
@@ -434,11 +434,12 @@ where
 
     debug!("Frequency ramping complete");
 
-    // Final configuration
+    // Final configuration. The hash counting number is the BM1370
+    // factory value observed in captures.
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::NonceRange(NonceRange::from_raw(0xB51E0000)),
+            register: Register::HashCountingNumber(HashCountingNumber::from(0x1EB5)),
         }))
         .await?;
     chip_commands
