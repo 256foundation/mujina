@@ -5,6 +5,7 @@
 
 use std::env;
 
+#[cfg(unix)]
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -281,18 +282,28 @@ impl Daemon {
         info!("Started.");
         info!("For debugging, set RUST_LOG=mujina_miner=debug or trace.");
 
-        // Install signal handlers
-        let mut sigint = unix::signal(SignalKind::interrupt())?;
-        let mut sigterm = unix::signal(SignalKind::terminate())?;
+        // Wait for shutdown signal (platform-specific).
+        #[cfg(unix)]
+        {
+            // Install Unix signal handlers.
+            let mut sigint = unix::signal(SignalKind::interrupt())?;
+            let mut sigterm = unix::signal(SignalKind::terminate())?;
 
-        // Wait for shutdown signal
-        tokio::select! {
-            _ = sigint.recv() => {
-                info!("Received SIGINT.");
-            },
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM.");
-            },
+            tokio::select! {
+                _ = sigint.recv() => {
+                    info!("Received SIGINT.");
+                },
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM.");
+                },
+            }
+        }
+
+        // Windows has no SIGTERM; Ctrl-C is the graceful-shutdown signal.
+        #[cfg(windows)]
+        {
+            tokio::signal::ctrl_c().await?;
+            info!("Received Ctrl-C.");
         }
 
         // Initiate shutdown

@@ -50,20 +50,21 @@ use crate::{
     types::Temperature,
 };
 
-use super::{
-    BackplaneConnector, BoardInfo,
-    pattern::{Match, StringMatch},
-};
+use super::{BackplaneConnector, BoardInfo, pattern::Match};
 
 // Register this board type with the inventory system
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
+            // Match by VID:PID (c0de:cafe for bitaxe-raw firmware). Windows
+            // reports a generic "Microsoft" manufacturer for CDC ACM devices
+            // instead of the real "OSMU"/"Bitaxe" strings, so string matching
+            // fails there; VID:PID is stable across platforms.
+            vid: Match::Specific(0xc0de),
+            pid: Match::Specific(0xcafe),
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            manufacturer: Match::Any,
+            product: Match::Any,
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
