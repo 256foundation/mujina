@@ -216,6 +216,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
+        frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -410,6 +411,7 @@ impl Bitaxe {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
+            frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,
