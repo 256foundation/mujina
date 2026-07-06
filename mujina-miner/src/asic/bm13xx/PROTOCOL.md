@@ -13,6 +13,9 @@ progresses and we gain experience with multi-chip systems.
 ## Sources
 
 - ESP-miner BM1370 implementation
+- ESP-miner nonce space work:
+  https://github.com/bitaxeorg/ESP-Miner/pull/420 and the
+  experiments in https://github.com/skot/ESP-Miner/pull/167
 - CGMiner driver implementations
 - Emberone-miner BM1362 implementation
 - BM1397 documentation: https://github.com/skot/BM1397
@@ -379,7 +382,8 @@ Key registers used across BM13xx chips:
 |----------|------|-------------|
 | 0x00 | CHIP_ID | Chip identification and configuration |
 | 0x08 | PLL_DIVIDER | Frequency control registers for hash clock |
-| 0x10 | HASH_COUNTING_NUMBER | Controls nonce search range per core |
+| 0x0C | CHIP_NONCE_OFFSET | Explicit per-chip nonce space placement |
+| 0x10 | HASH_COUNTING_NUMBER | Nonce iterations per rolled version |
 | 0x14 | TICKET_MASK | Difficulty mask for share submission |
 | 0x18 | MISC_CONTROL | UART settings and GPIO pin configuration |
 | 0x28 | UART_BAUD | UART baud rate configuration |
@@ -414,11 +418,24 @@ Controls the hash frequency through PLL configuration:
 - Byte 2: REF_DIV (reference divider)
 - Byte 3: POST_DIV flags (bit 1 = fixed to 1)
 
+#### 0x0C - CHIP_NONCE_OFFSET
+Places a chip's share of the nonce space explicitly. The wire value
+sets bit 31 as an enable flag and carries a 16-bit offset in the low
+bytes. Only the S21 Pro capture writes it: per chip, after the first
+job, with offsets stepping by roughly 0xFFFF / 65 across the 65-chip
+chain. The S19 J Pro capture never writes it despite its 126-chip
+chain, so chip-address-based placement alone evidently suffices
+there. Not yet modeled by mujina.
+
 #### 0x10 - HASH_COUNTING_NUMBER
-Controls nonce search space distribution (format not fully documented):
-- Affects how chips divide the 32-bit nonce space
-- Different values used for different chip counts
-- Mechanism remains partially understood through empirical testing
+Limits how long each core sweeps nonces before the chip advances
+to the next rolled versions and re-sweeps the same window. Zero
+halts hashing entirely. The proper value
+follows from the topology
+and the hash frequency: each core's share of the nonce space,
+scaled inversely by frequency. Observed stock firmwares approximate
+it with per-model constants. See Search Space Distribution below
+for the theory, formula, and known values.
 
 #### 0x14 - TICKET_MASK (Nonce Reporting Filter)
 
@@ -634,6 +651,12 @@ Undocumented miscellaneous settings register:
    - Gradually increase to target
    - Use register 0x08 for PLL control
 
+5. **Start Mining**
+   - Write HASH_COUNTING_NUMBER (0x10); the value follows from the
+     topology and final frequency (see Search Space Distribution)
+   - Enable version rolling (0xA4)
+   - Send the first job
+
 ### Multi-Chip Initialization (e.g., S21 Pro, S19 J Pro)
 
 1. **Chain Reset and Discovery**
@@ -668,10 +691,18 @@ Undocumented miscellaneous settings register:
    - BM1370: 3Mbaud (0x00003001)
    - BM1362: Different rate (0x00003011)
 
-7. **Final Configuration**
-   - Set HASH_COUNTING_NUMBER (0x10) based on chip count
-   - Configure remaining registers
-   - Begin frequency ramping
+7. **Frequency Ramp and Start Mining**
+   - Ramp frequency in steps via register 0x08
+   - Write HASH_COUNTING_NUMBER (0x10); the value follows from the
+     topology and final frequency (see Search Space Distribution)
+   - Enable version rolling (0xA4)
+   - Send the first job
+
+Both captures place the HASH_COUNTING_NUMBER write after the
+frequency ramp and immediately before the version-rolling enable.
+That position follows from what the register does: it paces version
+rolling, and its value depends on the topology and the final
+frequency.
 
 ## Domain Management in Multi-Chip Chains
 
@@ -702,110 +733,644 @@ Domain 2: Chips 0x14-0x1C (relay: 0x00450003)
 
 ## Key Implementation Details
 
-### Job Distribution Across Multiple Chips
+### Search Space Distribution
 
-In multi-chip mining systems, job distribution works as follows:
+A job is broadcast once and every chip in the chain works on it.
+Nothing in the job assigns ranges; the job's starting-nonce field is
+always zero. The chips carve up the search space themselves, using
+their identities and a handful of registers. This section explains
+that machinery level by level: first the space itself, then the
+hierarchy that parallelizes it, then the registers that place and
+pace the sweep.
 
-#### Chip Addressing
-- Each chip in a chain is assigned a unique 8-bit address during initialization
-- Addresses are typically spaced evenly (e.g., 0, 4, 8, 12... for a 64-chip 
-chain)
-- The address determines which portion of the nonce space each chip searches
+#### The Search Space
 
-#### Job Broadcasting
-- **The same job is sent to ALL chips in the chain**
-- Single broadcast command propagates through the entire chain
-- Each chip automatically works on a different portion of the nonce space
+For one job, a version-rolling BM13xx chip searches two dimensions:
 
-#### Nonce Space Partitioning
-The 32-bit nonce space (4.3 billion values) is automatically divided:
+- the 32-bit nonce field, 2^32 candidates, and
+- the 16 rollable version bits (AsicBoost, BIP320), 2^16 variants,
+  generated inside the chip once version rolling is enabled via
+  MIDSTATE_CONFIG (0xA4).
 
-1. **Between Chips**: Based on chip address and HASH_COUNTING_NUMBER register
-   - Chip address influences which nonces are searched
-   - HASH_COUNTING_NUMBER register (0x10) further controls distribution
-   - No explicit range assignment needed from software
+Together that is 2^48 candidate headers per job. The chips need the
+second dimension: a BM1370 at 600 MHz hashes about 1.2 TH/s and
+would exhaust the bare nonce space in under 4 ms. Version rolling
+stretches that to about four minutes for the full 2^48, which is
+what lets a chip stay busy on one job while the host prepares the
+next. The host can extend the space further by rolling ntime or the
+extranonce, but that happens outside the chip; this section covers
+only what the chip does on its own.
 
-2. **Between Cores**: Within each chip
-   - Core ID encoded in upper nonce bits (typically bits 24-31)
-   - Each core searches ~33.5 million nonces (4.3B / 128 cores)
+A chip rarely gets that space to itself, though. Outside of
+single-chip boards like the Bitaxe, chips share a serial bus in
+chains of dozens or more, every one of them hearing the same
+broadcast job. The space has to be divided among the chips, and
+then again inside each chip among its cores and sub-cores. That
+division is the machinery of the rest of this section.
 
-3. **Example**: BM1370 with 128 cores x 16 sub-cores
-   - Bits 31-25: Main core ID (128 cores)
-   - Bits 24-0: Actual nonce value searched
-   - Total: 2,048 parallel searches per chip
+#### The Parallel Hierarchy
 
-#### HASH_COUNTING_NUMBER Register Configuration
+A hashboard is a chain of chips, each chip an array of cores, each
+core a group of sub-cores (some references say "big cores" and
+"small cores"). The BM1370 has 128 cores of 16 sub-cores, 2,048
+hashing units. Each level of the hierarchy takes a dimension of the
+search space:
 
-The HASH_COUNTING_NUMBER register (0x10) uses empirically-determined values to optimize
-nonce distribution. See discussion at: https://github.com/bitaxeorg/ESP-Miner/pull/167
+- **Sub-cores share their core's nonce range and differ by
+  version.** With version rolling enabled, the chip hands each of a
+  core's sub-cores its own rolled version as a precomputed midstate,
+  so one pass over the core's nonce range tests 16 versions at once
+  on a BM1370. Working through all 2^16 versions takes 4,096 such
+  passes in series
+  (https://github.com/bitaxeorg/ESP-Miner/pull/420).
+- **Cores partition the nonce space by its top bits.** Each core
+  owns the slice of nonces whose top bits equal its core ID and
+  counts through the remaining bits. The width of that ID field
+  follows the model's core count: the BM1370's 128 cores make it
+  7 bits wide (bits 31-25), leaving each core a 2^25 slice. The
+  arrangement shows in the results: every nonce a core reports
+  carries its ID in those top bits (see Nonce Response).
+- **Chips offset where their search starts.** The chip address
+  seeds each chip's placement within the nonce space, below the
+  core ID bits. Newer stock firmware can also place a chip
+  explicitly with CHIP_NONCE_OFFSET (0x0C). The next section works
+  through the details.
 
-**Known Values (4-byte little-endian):**
-- 1 chip: `0x00001EB5` (Bitaxe single BM1370)
-- 65 chips: `0x00001EB5` (S21 Pro - same as single chip!)
-- 77 chips: `0x0000115A` (S19k Pro - from ESP-miner)
-- 110 chips: `0x0000141C` (S19XP Stock - from ESP-miner)
-- 110 chips: `0x00001446` (S19XP Luxos - from ESP-miner)
-- 126 chips: `0x00001381` (S19 J Pro BM1362)
-- Full range: `0x000F0000` (experimental, searches full 32-bit space?)
+#### The Nonce as Bit Fields
 
-**How It Likely Works:**
-While the exact mechanism is undocumented, analysis suggests:
-- The value may define a stride/increment for nonce searching
-- Combined with chip address to ensure non-overlapping ranges
-- Smaller values for more chips ensure better coverage
-- Values appear carefully chosen to minimize gaps in search space
+At the top of the nonce the layout is exact across the family: the
+core ID occupies the top bits, and the field's width follows the
+model's core count. The widths below are the BM1370's:
 
-**Example Theory:**
-With register value 0x00001EB5 (7,861 decimal):
-- Chip might test nonces at intervals of 7,861
-- Starting offset based on chip address
-- Ensures even distribution without collision
+```
+ 31        25 24                          0
++------------+----------------------------+
+|  core ID   |  per-core nonce counter    |
+|  (7 bits)  |  (25 bits, 2^25 values)    |
++------------+----------------------------+
+```
 
-Note: The ESP-miner source notes this register is "still a bit of a mystery" 
-and values are determined through empirical testing rather than documentation.
-Multi-chip configurations may require different values than those listed.
+For example, the response documented under Nonce Response carries
+nonce `0x40A60018`: its top seven bits are `0100000`, core 32, and
+the remaining 25 bits, `0x00A60018`, are where that core's counter
+stood. Every nonce core 32 ever returns carries those same top
+bits.
 
-#### Starting Nonce Field
-- Always set to 0x00000000 in practice
-- Hardware automatically offsets based on chip/core addressing
-- Software doesn't need to manually partition the nonce space
+On a model with a different core count, only the widths move. A
+BM1366 has 112 cores, and seven bits is still the smallest ID
+field that can tell 112 cores apart. But a 7-bit field has 128
+possible values, and only 112 of them name a real core. Nonces
+whose top bits spell one of the 16 missing IDs have no core that
+begins its sweep there. This is also why the coverage arithmetic
+later in this section divides by 128 rather than 112: the hardware
+partitions the space by bit pattern, so each core's slice is 1/128
+of the space whether or not every pattern has a core behind it.
 
-#### Practical Example: 4-Chip Chain
-Consider a 4-chip BM1370 chain mining a block:
-1. **Job sent**: Same job broadcast to all 4 chips
-2. **Chip addresses**: 0x00, 0x40, 0x80, 0xC0 (64 apart)
-3. **Nonce space division**:
-   - Chip 0: Searches nonces where certain bits = 0x00
-   - Chip 1: Searches nonces where certain bits = 0x40
-   - Chip 2: Searches nonces where certain bits = 0x80
-   - Chip 3: Searches nonces where certain bits = 0xC0
-4. **Total parallel operations**: 4 chips x ~2,040 cores = ~8,160
-simultaneous searches
+The core ID field explains how the cores of one chip divide the
+space among themselves. The next question is what keeps separate
+chips apart: where in the nonce space does each chip start
+counting? Two mechanisms set the starting point:
+
+- **The chip address seeds it.** Each chip begins its sweep at a
+  position derived from its address, so the chips of a chain start
+  spread across the nonce space. Every capture we have assigns
+  addresses at interval two, for 65-, 77-, and 126-chip chains
+  alike, so the interval evidently does not derive from the chain
+  length.
+- **CHIP_NONCE_OFFSET (0x0C) sets it explicitly.** Newer stock
+  firmware writes each chip a 16-bit offset instead of relying on
+  the address alone. The S21 Pro does this per chip after the
+  first job: its 65 chips receive offsets stepping by about
+  0xFFFF / 65 (chip 0 at 0x0000, the next at 0x03F1, up to 0xFC10
+  at the far end), spacing their starting points evenly.
+
+From its starting point, each core counts nonces upward.
+HASH_COUNTING_NUMBER (next section) sets how long it counts: when
+the deadline expires, the chip rolls the next batch of versions
+and the core sweeps the same span again under them. The register
+is neither a ceiling on the nonce's value nor a count of version
+rolls; it fixes the length of the sweep window that every version
+batch repeats. Two experimental facts pin down this
+restart-per-batch reading jointly with the register's units.
+First, values above a threshold produce duplicated nonces:
+exactly the behavior of a sweep running past the end of its slice
+and wrapping within one batch, and inexplicable for a counter
+that carried on across batches, which would revisit nothing until
+it had covered everything, at any value. Second, the
+trial-and-error full-range value (0x000F0000) is, read as a
+deadline in crystal ticks, just long enough for a BM1366 core to
+sweep its entire slice once per batch at that chip's operating
+frequencies; read as a raw nonce count it would cover under a
+tenth of a slice and the full-range observation would be
+impossible. Together the two observations favor tick units and
+restart-per-batch. A chip's coverage is therefore a start and a
+window: the address or offset sets where the sweep begins, and
+HASH_COUNTING_NUMBER sets how far every batch's sweep extends,
+permanently. What a too-small value leaves unswept stays unswept.
+
+**Address-seeded placement, concretely.** The S19 J Pro leans on
+addresses alone: 126 BM1362 chips, addresses 0x00 through 0xFA at
+interval two, and not one CHIP_NONCE_OFFSET write in its capture.
+An address is 8 bits, and with only even addresses assigned, its
+bit 0 is always zero. That leaves 7 meaningful bits, and
+experiments on a single BM1366
+(https://github.com/skot/ESP-Miner/pull/167) show they play two
+roles:
+
+```
+ chip address
+   7   6 5 4 3 2 1   0
+ +---+-------------+---+
+ | P |  position   | 0 |
+ +---+-------------+---+
+```
+
+P, the address's top bit, becomes bit 0 of every nonce the chip
+produces: chips with P = 0 return only even nonces, chips with
+P = 1 only odd ones. The six position bits select one of 64
+further placements within that parity, for 128 distinct placements
+in all.
+
+Where do the position bits land? A tempting model is that the
+address becomes a fixed field of the nonce, just as the core ID
+does at the top: mirrored into the bottom bits (address bit 7 at
+nonce bit 0), it would explain the parity split, and each chip's
+nonces would then be congruent, modulo 128, to its mirrored
+address.
+
+Our captures refute that model, and with it any model in which a
+chip holds a fixed 7-bit pattern in the nonce's low bits. The
+S19 J Pro capture contains 6,662 nonce responses, and their low 7
+bits take all 128 possible values, essentially uniformly. A
+126-chip chain of fixed low-bit fields would leave exactly two
+7-bit patterns unused, whatever the address-to-pattern mapping;
+the two patterns the mirror model forbids appear 107 times, right
+at the uniform-random rate (about 104 expected). The S21 Pro's
+7,902 responses show the same uniform low bits. The counters
+plainly run through the low bits, so the address must place a
+chip some other way, perhaps as an arithmetic starting offset
+rather than a preserved bit pattern.
+
+Nor does the address hide anywhere else in the nonce, for example
+in a field adjacent to the core ID. A 126-chip fixed field must
+leave exactly two patterns of its bit window unused, and a scan of
+every window of the S19 J Pro's nonces finds no window with that
+signature. The scan did surface real structure, but of a different
+kind: BM1362 nonces almost never set bit 7 (1% of responses), and
+bits 9-8 take the values 0, 1, and 2 in equal measure but 3 at a
+quarter rate, independent of the version field, the response
+header, and the neighboring bits. The BM1370's nonces show nothing
+similar (every bit unbiased, every window full). Whatever walks
+the BM1362's counters through the space skips most of the space's
+bit-7 half-blocks; the mechanism is unexplained, and since it
+appears uniformly across the whole chain it reflects chip
+architecture, not chain placement.
+
+Two tempting explanations for that structure fail against the
+data. Bit 7 pinned at zero looks like the mirror image of address
+bit 0, which is zero on every assigned address; but the BM1366
+chain dumps have equally even addresses and their bit 7 runs at
+42%, so the mirror is not the mechanism. A sweep truncated by job
+replacement (each new job cutting the walk short partway through
+the bits 9-8 cycle) predicts that the bits 9-8 value grows with a
+nonce's position within its job; measured against the capture's
+105 job boundaries, it is flat. The structure does grade across
+the family, though: the BM1366 chains show a milder version of
+the same depression (bits 7 through 9 all at 38-43%), the BM1362
+the extreme form, and the BM1370 none at all.
+
+One address bit does survive in the nonce, and it scales to whole
+chains. Two further chain dumps from the same experiment thread
+(77 and 110 BM1366 chips, address-placed, no explicit offsets)
+put nonce parity exactly where address-fixed parity predicts:
+17.3% odd against a predicted 16.9% (13 of 77 chips addressed at
+or above 0x80), and 42.0% against 41.8% (46 of 110). The
+S19 J Pro fits too: 49.0% odd against 49.2% predicted (62 of
+126). Numerically that means the counting steps in twos, but the
+hardware needs no adder that skips: picture the nonce assembled
+from fields, with bit 0 wired from the address's top bit and the
+counter occupying other bits. A counter never carries into a bit
+that is not part of the counter, so the transplanted bit holds
+with no special-casing at all. The working model is therefore a
+hybrid: the address's top bit is transplanted into nonce bit 0
+and held fixed, while the remaining address bits set an
+arithmetic starting offset for the counting. The S21 Pro breaks
+the pattern in a telling way: its parity is free (49.7% odd,
+where address-fixed parity would predict 1.5%, only one of its 65
+chips sitting at or above 0x80), which says CHIP_NONCE_OFFSET
+does not merely supplement address placement but replaces it.
+
+The arithmetic-offset reading also explains the one observation
+every bit-field model failed: an odd address overlapping both of
+its even neighbors. Sweeps that grow from starting points spaced
+K apart do exactly that when the sweep length lies between K and
+2K: even neighbors, 2K apart, stay disjoint, while an odd
+address, K from each, overlaps both. It even suggests why the
+S21 Pro bothers with explicit offsets at all: 65 chips at
+addresses 0x00 through 0x80 would crowd their implicit starting
+points into the lower half of the space, so the firmware
+respaces them evenly across it, while the S19 J Pro's 126 chips
+nearly fill the address range and its firmware writes no offsets.
+
+Chip attribution, however, stays out of reach: beyond that single
+parity bit, which chip found a nonce is not recoverable from the
+nonce. The response's midstate-number byte does not look like the
+chip identity either: across the capture its values halve in
+frequency with each increment, the signature of a difficulty
+count rather than an identifier (see Nonce Response).
+
+Reading a few chips of the S19 J Pro chain under the two-role
+scheme:
+
+| Chip | Address | P | Position | Placement                |
+|------|---------|---|----------|--------------------------|
+| 0    | 0x00    | 0 | 0        | even nonces, position 0  |
+| 1    | 0x02    | 0 | 1        | even nonces, position 1  |
+| 63   | 0x7E    | 0 | 63       | even nonces, position 63 |
+| 64   | 0x80    | 1 | 0        | odd nonces, position 0   |
+| 125  | 0xFA    | 1 | 61       | odd nonces, position 61  |
+
+The first 64 chips fill every even-nonce position; the remaining
+62 fill all but two odd-nonce positions (the unassigned addresses
+0xFC and 0xFE would be odd positions 62 and 63).
+
+**Explicit placement, concretely.** The S21 Pro's 65 BM1370 chips
+(128 cores each) finish their bring-up ramp at 593.75 MHz, and the
+capture then shows every chip receiving its own CHIP_NONCE_OFFSET,
+stepping by about 0xFFFF / 65:
+
+| Chip | Address | CHIP_NONCE_OFFSET | Sweep starts  |
+|------|---------|-------------------|---------------|
+| 0    | 0x00    | 0x0000            | at the bottom |
+| 1    | 0x02    | 0x03F1            | 1/65th in     |
+| 63   | 0x7E    | 0xF820            | 63/65ths in   |
+| 64   | 0x80    | 0xFC10            | 64/65ths in   |
+
+By the power-of-two arithmetic above, 65 chips round up to 128, so
+128 cores x 128 chips cut the space into 2^14 slices of
+2^32 / 2^14 = 2^18 nonces each. HASH_COUNTING_NUMBER then sets how
+much of its slice each core visits per batch of versions:
+
+| HASH_COUNTING_NUMBER | At 593.75 MHz                         |
+|----------------------|---------------------------------------|
+| 0                    | no hashing at all                     |
+| 0x158E (computed)    | the full 2^18 slice per version batch |
+| 0x1EB5 (factory)     | 1.4x the computed full value          |
+
+The computed row is the full-coverage formula from the next
+section: `2^32 / 128 / 128 * (25 / 593.75) * 0.5 = 0x158E`. That
+formula divides the space among 128 chip slots, 65 rounded up to
+a power of two. But this machine does not place its chips in
+power-of-two slots: its explicit offsets space the 65 chips
+evenly, at 0xFFFF / 65. Recompute full coverage with 65 as the
+divisor and it comes to 0x2A73 (10,867), of which the factory
+0x1EB5 covers 72%. Against the power-of-two basis the factory
+value would exceed full coverage by 42%, meaning duplicated work;
+the sensible reading is that explicitly placed chains slice the
+space by actual chip count.
+
+The cost of treating the value as a constant shows on the Bitaxe
+instead. Its firmware writes the same 0x1EB5, a value calibrated
+for a 65-chip machine, to a chain of one. With no chain to share
+it, each of the single chip's 128 cores owns a full 2^25 slice,
+and full coverage at the Bitaxe's roughly 500 MHz computes to
+about 0xC0000 (786,000 nonces per version batch). The inherited
+7,861 advances each version batch by about 1% of that, so the
+chip spends its time rolling versions over a sliver of the nonce
+space it could be sweeping.
+
+Fine print on the evidence behind all of this:
+
+- Only even chip addresses produce disjoint search ranges; an odd
+  address overlaps both of its even neighbors.
+- The nonce cap is real: with a factory HASH_COUNTING_NUMBER value
+  a chip looped its bounded slice and never wandered the full
+  range, while the experimental full-range value swept all of 2^32
+  from a single chip regardless of its address.
+- Our captures do not show how the explicit 16-bit offset maps
+  onto the per-core counter; a search for the S21 Pro's offset
+  stride across the nonce bit windows of its responses found no
+  alignment.
+- The parity finding is confirmed at chain scale on two BM1366
+  chains (77 and 110 chips) and is consistent with the BM1362
+  aggregate; the disjointness finding remains single-chip BM1366
+  evidence, and no per-chip experiment has run on a BM1362.
+
+#### HASH_COUNTING_NUMBER: Pacing the Sweep
+
+One question remains: how much of its nonce slice does a core sweep
+before the chip moves to the next batch of versions? That is what
+HASH_COUNTING_NUMBER sets. Each core sweeps nonces until the
+deadline expires; then the chip rolls the next versions and the
+core sweeps the same window again (the counter model in the
+placement discussion above).
+
+The consequences, measured on hardware in the experiments above:
+
+- Zero halts hashing: a zero-length window means no work at all.
+- Small values roll versions quickly but re-sweep the same short
+  window under every batch, leaving the rest of each slice
+  permanently unvisited.
+- 0x000F0000 covered the full 32-bit range on a single BM1366,
+  found by trial and error: the window that just spans a whole
+  slice.
+- Larger values still produce duplicated nonces: the sweep wraps
+  its slice within a single batch.
+
+Coverage matters when the job's search space is finite from the
+chip's point of view. Under Stratum v1 the host rolls the
+extranonce, so unswept nonce space costs nothing: every hash is
+still a fresh header. The host can also roll ntime, gaining a
+fresh space for each elapsed second. Under SV2 header-only mining
+there is no extranonce, so the nonce and version space, plus what
+ntime rolling the clock allows, is the entire per-job space;
+partial nonce coverage shrinks it below 2^48 and forces faster
+job turnover.
+
+#### Computing the Value
+
+ESP-Miner computes the register value for full nonce coverage
+(https://github.com/bitaxeorg/ESP-Miner/pull/420, merged; ported to
+NerdQAxePlus in
+https://github.com/shufps/ESP-Miner-NerdQAxePlus/pull/546):
+
+```
+cores_up = next_power_of_two(cores_per_chip)
+chips_up = next_power_of_two(chain_length)
+hcn      = (2^32 / cores_up / chips_up) * (25 / freq_mhz) * 0.5
+```
+
+The shape of the formula makes sense if the register is a deadline
+measured in crystal ticks. Each core owns a slice of the nonce
+space; that is the first factor, the space divided by the bit-field
+slots for cores and chips, rounded up to powers of two as a
+bit-field partition demands. The sweep of that slice runs on the
+hash clock, but the roll trigger apparently counts on the 25 MHz
+reference crystal, which is where `25 / freq_mhz` comes from: the
+same slice takes more crystal ticks to sweep when the hash clock
+is slower. Read that way,
+
+```
+slice      = 2^32 / cores_up / chips_up     nonces per core
+sweep time = (slice / 2) / hash clock       one full pass
+hcn        = sweep time * 25 MHz            the deadline, in ticks
+```
+
+and the formula's three factors fall out. The factor of a half is
+then the parity structure from the placement discussion: the
+counters step in twos, covering one parity only, so a complete
+pass over a slice takes `slice / 2` iterations. (An alternative
+reading puts the half in the pipeline, two hashes per clock; the
+arithmetic cannot distinguish them, and no source says.) All of
+this is inference; what is certain is the practical consequence
+of the frequency term: the value is only correct for the
+frequency it was computed at, and must be rewritten whenever the
+frequency changes.
+
+Rounding matters, and it must go down. The deadline has to fire
+before a core crosses the end of its slice: a value rounded up
+lets the sweep spill into the neighboring slice before the roll,
+duplicating work, while a value rounded down only leaves a
+sub-tick sliver unswept (one crystal tick spans a couple dozen
+nonce iterations at 600 MHz). The merged code floors by way of
+its integer cast.
+
+No intermediate factor needs rounding of its own, because nothing
+in the computation is irrational: the hash clock comes from the
+same crystal through the PLL, so `25 / freq_mhz` is exactly
+`refdiv * postdiv1 * postdiv2 / fbdiv`, and the whole value
+reduces to integer arithmetic with a single floor at the end:
+
+```
+hcn = floor(slice * refdiv * postdiv1 * postdiv2 / (2 * fbdiv))
+```
+
+Computing from the divider values costs nothing, floors exactly
+once, and uses the frequency the PLL actually achieves by
+construction, where a requested target can differ by a percent or
+so and, if the achieved clock lands faster, recreates exactly the
+overshoot the floor avoids. Float arithmetic on a megahertz value
+is also where stray off-by-ones come from: the S21 Pro's computed
+value is 0x158F if an intermediate division is rounded, 0x158E
+(5,518) computed exactly.
+
+Could these effects be what the correction terms in the wild are
+compensating? For the large scale factors, no: rounding error is
+a tick or two and PLL quantization a fraction of a percent, while
+the factory values imply factors of tens of percent (40% and 72%
+at the two capture points); those look like deliberate coverage
+policy. The BM1370's subtracted 268 is subtler. At the four-chip
+machine where it was calibrated, the full-coverage value is about
+171,000 ticks, and a typical PLL quantization error of 0.1% fast
+needs a margin of about 170 ticks, the same order as the
+constant, so a frequency-gap reading is plausible there. A
+frequency error demands a margin proportional to the value,
+though, and 268 is a constant. That is no strike against it in
+its home: the firmwares carrying it target machines of one to
+eight chips, never long chains, and within that envelope a
+constant tuned on one machine can be a serviceable empirical
+patch. (The one tension inside the envelope is the single-chip
+case, where 0.1% of the value is about a thousand ticks; either
+those machines' operating points quantize slow or exact, or they
+quietly duplicate a little.) The lesson is about transplanting
+it: the constant encodes one machine's measured exposure, not a
+law, and says nothing about long chains, where it would amount to
+five percent of the value, fifty times any plausible clock error.
+Computing exactly from the divider values retires the
+frequency-gap exposure entirely; whatever margin still proves
+necessary after that is a true per-roll cost, the version-roll
+latency reading of the erratum comment. Distinguishing the two
+takes a hardware experiment: compute the exact value, subtract
+nothing, and watch for duplicates.
+
+The deadline reading also explains why this is a register at all
+rather than a constant baked into the silicon: the right deadline
+depends on the chain length and on the ratio of hash clock to
+crystal, neither of which a chip can know by itself. The host
+knows both, computes the deadline, and programs it.
+
+Worked through for machines in this document:
+
+- **S21 Pro**: 65 chips of 128 cores at 593.75 MHz. Both counts
+  round to 128, so `slice = 2^32 / 128 / 128 = 2^18`, and
+  `2^18 * (25 / 593.75) * 0.5 = 0x158E`: the computed row of the
+  earlier table.
+- **A 12-chip BM1362 board at 525 MHz** (the EmberOne00's shape),
+  taking the fit-consistent 64 cores: 12 chips round to 16, so
+  `slice = 2^32 / 64 / 16 = 2^22`, and
+  `2^22 * (25 / 525) * 0.5 = 0x18618` (99,864). An order of
+  magnitude above every factory constant in the table below:
+  short chains need large values, which is exactly what reusing a
+  long-chain donor constant gets wrong.
+- **The same board at half the clock**, 262.5 MHz, needs double:
+  0x30C30 (199,728). Slower cores need a longer deadline to
+  finish the same slice.
+
+The BM1370 subtracts an empirically found error term of 2 x 134
+before use (a hardware erratum; duplicates appear otherwise).
+
+NerdQAxePlus previously drove this register as a "version rolling
+frequency" targeting a 25 kHz roll rate. Both views describe the
+same mechanism, since a nonce count per version at a given clock is
+a version roll rate. Notably, their 25 kHz value (about 7,864)
+lands within 0.04% of the S21 Pro factory default (7,861), which
+suggests the factory values encode a fixed version-roll rate.
+
+#### The Version Epoch
+
+The deadline reading yields a second derived quantity: the version
+epoch, how long a chip takes to roll through the entire 2^16
+version space. Each batch lasts exactly HASH_COUNTING_NUMBER
+crystal ticks of wall time, and each batch consumes one version
+per sub-core, so:
+
+```
+epoch = (2^16 / sub_cores_per_core) * hcn / 25 MHz
+```
+
+Frequency enters only through the programmed value, so the
+formula reads differently depending on how that value is managed.
+Operated correctly, with the value recomputed as 1/frequency per
+the full-coverage policy, a faster hash clock shortens every
+batch and the wheel turns proportionally faster while sweeping
+the same slice per batch. Only a stale register value pins the
+epoch while coverage drifts with the clock; that is a
+misconfiguration, not a mode, though it is exactly the state of a
+firmware that writes a constant and then lets the user change
+frequency. The factory epochs below therefore describe each
+machine at its designed operating point. Worked for the machines
+in this document, with sub-core counts from the ESP-Miner device
+tables (BM1366: 8 per core, BM1368 and BM1370: 16 per core; the
+BM1362 is hedged as 8, like its generation-mate):
+
+| Machine | Batches | Value | Epoch |
+|--------------------|-------|--------|--------|
+| Antminer S21       | 4,096 | 0x15A4 | 0.91 s |
+| Antminer S21 Pro   | 4,096 | 0x1EB5 | 1.29 s |
+| Antminer S19k Pro  | 8,192 | 0x115A | 1.46 s |
+| Antminer S19 J Pro | 8,192 | 0x1381 | 1.64 s |
+| Antminer S19 XP    | 8,192 | 0x151C | 1.77 s |
+
+The factory values, whatever their exact derivation, all set a
+version wheel that turns in about a second: near-constant epochs,
+with per-batch nonce coverage left to be whatever the machine's
+topology and clock make of it. That is the version-roll-rate
+reading of the factory constants made concrete, though the
+epochs cluster around a second rather than matching exactly.
+
+Two more consequences fall out. The Bitaxe, inheriting the S21
+Pro's value, rolls its versions on the same 1.29 s wheel; its
+deficit is coverage, not pace. And with the computed
+full-coverage value (838,860 at 500 MHz) its epoch stretches to
+4,096 * 838,860 / 25 MHz = 137 seconds, which is the same number
+The Search Space section reached by the other road: 2^47
+visitable header candidates (the parity structure halves the
+nominal 2^48) at 1.02 TH/s is 138 seconds. At full coverage, the
+epoch IS the time to try everything.
+
+Because every batch re-sweeps the same window (the counter model
+in the placement discussion), one epoch exhausts everything a
+chip will ever try against a job: after the wheel wraps, it
+re-treads identical headers until the job changes. The
+second-scale factory epochs are therefore a requirement, not a
+curiosity: firmware running factory values must refresh work at
+least that often or its chips duplicate their own work. The
+near-match between the factory epochs and a typical job-refresh
+cadence may be exactly the design rule the constants encode.
+
+#### Factory Values
+
+All observed factory values, from our captures and the catalog
+retained in the ESP-Miner sources:
+
+| Machine | Chip | Chain | Value |
+|---------|------|-------|-------|
+| Bitaxe Gamma (capture) | BM1370 | 1 | 0x1EB5 |
+| Antminer S21 Pro (capture) | BM1370 | 65 | 0x1EB5 |
+| Antminer S21 stock | BM1368 | | 0x15A4 |
+| Antminer S19 XP stock | BM1366 | 110 | 0x151C |
+| Antminer S19 XP Luxos | BM1366 | 110 | 0x1446 |
+| Antminer S19k Pro | BM1366 | 77 | 0x115A |
+| Antminer S19 J Pro (capture) | BM1362 | 126 | 0x1381 |
+| Full range (experiment) | BM1366 | 1 | 0x000F0000 |
+
+The Bitaxe writes the S21 Pro value because both carry the BM1370:
+in these firmwares the value is a per-model constant inherited from
+the donor machine's capture, not derived from the actual chain.
+
+#### What the Captures Determine
+
+Two capture points fix chain length, final frequency, and value all
+at once, and they adjudicate the formula:
+
+- **S19 J Pro**: 126 chips, final ramp 525 MHz, value 0x1381
+  (4,993). The value equals
+  `2^32 / 128 / 64 / 525 * 25 * 0.2 = 4,993.2` exactly, where 128
+  is the next power of two of 126 chips and 64 is a core count
+  consistent with the fit. In the formula's terms, stock covers
+  40% of full.
+- **S21 Pro**: 65 chips, final ramp 593.75 MHz, value 0x1EB5
+  (7,861). Divided among 128 power-of-two chip slots, the
+  formula's full-coverage value is 5,518, which the factory value
+  exceeds by 42%, an overshoot that would mean duplicated work.
+  Divided among the actual 65 chips it is 10,867, of which the
+  factory value is 72%. Since this machine spaces its chips
+  explicitly at 0xFFFF / 65, the actual-count basis is the
+  consistent one. The coherent reading of both capture points,
+  interpretation rather than proof: address-placed chains slice
+  the space by implicit power-of-two address slots, explicitly
+  placed chains by actual chip count.
+
+#### Open Questions
+
+- The register's true units: raw nonce count or reference-clock
+  ticks.
+- Stock firmware's exact arithmetic. The S19 J Pro's stock miner
+  binary computes this value in no reachable code, so the captures
+  are the ground truth for what stock machines write.
+- How chip address, CHIP_NONCE_OFFSET, and HASH_COUNTING_NUMBER
+  compose per model, and in particular how the BM1362 partitions a
+  126-chip chain when its stock firmware never writes
+  CHIP_NONCE_OFFSET.
+- Whether rewriting the value while work is in flight glitches the
+  search. References rewrite it only at mining-start boundaries and
+  on frequency changes.
 
 #### Multiple Hash Board Distribution
-When a mining system has multiple hash boards, the software MUST prevent 
-duplicate work:
+When a mining system has multiple hash boards, the software must
+prevent duplicate work across them. Boards can be separated along
+any header dimension the pool leaves to the miner:
 
-1. **Time-Based Work Distribution** (most common):
+1. **Extranonce Distribution**:
+   - Each board derives its jobs from a disjoint slice of the
+     extranonce2 space, so every board hashes a different merkle
+     root (this is mujina's approach)
+   - Needs the pool to grant enough extranonce2 room. Usually
+     ample under Stratum v1, but proxies that subdivide the
+     extranonce between downstream miners can leave little, and
+     SV2 header-only mining has no extranonce at all, which
+     forces one of the other dimensions
+
+2. **Time-Based Work Distribution**:
    - Each board receives work with a different `ntime` offset
    - Board 0: ntime + 0
    - Board 1: ntime + 1
    - Board 2: ntime + 2
    - This ensures each board searches a unique block variation
 
-2. **Work Registry**:
+3. **Work Registry**:
    - Software maintains a registry tracking which work is on which board
    - Each work assignment has a unique ID
    - Nonce responses are matched back to the correct work/board
 
-3. **Example**: Antminer S19 with 3 hash boards
+4. **Example**: Antminer S19 with 3 hash boards
    - Board 0: Works on block with ntime=X
    - Board 1: Works on block with ntime=X+1
    - Board 2: Works on block with ntime=X+2
    - Total: 3 boards x 76 chips x ~100 cores = ~23,000 parallel searches
    - Each searching a DIFFERENT block variation
 
-4. **No Wasted Work**:
+5. **No Wasted Work**:
    - Every hash calculation is unique across all boards
    - Software actively manages work distribution
    - Hardware (chips/cores) handle nonce space division within each board
