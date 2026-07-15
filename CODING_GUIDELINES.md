@@ -287,26 +287,26 @@ info!(voltage = %volts, "Voltage set");
 trace!(register = ?reg, "Register read");
 ```
 
-### RUST_LOG Filtering [L.filter](#L.filter)
+### Log Filtering [L.filter](#L.filter)
 
-The `RUST_LOG` environment variable provides powerful runtime filtering,
-which means you can log liberally without performance concerns:
+The `MUJINA_LOG` and `RUST_LOG` environment variables provide powerful
+runtime filtering, which means you can log liberally without
+performance concerns. `MUJINA_LOG` filters Mujina's own modules, named
+as the log output shows them; `RUST_LOG` has its usual Rust meaning
+and covers third-party crates:
 
 ```bash
-# Show only errors from all modules
-RUST_LOG=error cargo run
+# Debug for all of Mujina; third-party crates stay at warn
+MUJINA_LOG=debug cargo run
 
-# Show info and above for entire application
-RUST_LOG=info cargo run
+# Trace one module; the rest of Mujina stays at its info default
+MUJINA_LOG=asic::bm13xx=trace cargo run
 
-# Show trace logging for specific module, info for rest
-RUST_LOG=mujina_miner::asic::bm13xx=trace,info cargo run
+# Debug one module, trace another
+MUJINA_LOG=board::bitaxe=debug,peripheral::tps546=trace cargo run
 
-# Debug one module, trace another, warn for everything else
-RUST_LOG=mujina_miner::board::bitaxe=debug,mujina_miner::peripheral::tps546=trace,warn cargo run
-
-# Multiple specific modules at trace level
-RUST_LOG=mujina_miner::asic::bm13xx=trace,mujina_miner::board=trace cargo run
+# Trace a third-party crate; Mujina's defaults are unaffected
+RUST_LOG=nusb=trace cargo run
 ```
 
 Disabled log statements have **minimal runtime cost**---just a branch check

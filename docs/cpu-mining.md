@@ -88,7 +88,7 @@ synthetic work:
 ```bash
 MUJINA_CPUMINER_THREADS=2 \
 MUJINA_USB_DISABLE=1 \
-RUST_LOG=mujina_miner=debug \
+MUJINA_LOG=debug \
 cargo run
 ```
 

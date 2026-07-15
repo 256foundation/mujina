@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::{
-    filter::EnvFilter,
+    filter::{EnvFilter, LevelFilter},
     fmt::{
         FmtContext, FormatEvent, FormatFields,
         format::{DefaultFields, Writer as FmtWriter},
@@ -40,17 +40,66 @@ pub fn init() {
 /// Default log filter: WARN for third-party crates, INFO for ours.
 const DEFAULT_LOG_FILTER: &str = "warn,mujina_miner=info";
 
-/// Build an `EnvFilter` with our defaults, overridable by RUST_LOG.
-///
-/// EnvFilter has no API to add default per-target directives
-/// that RUST_LOG can override. Build a base string with our
-/// defaults and append RUST_LOG so its directives win.
+/// Build an `EnvFilter` from the defaults, RUST_LOG, and MUJINA_LOG.
 fn build_env_filter() -> EnvFilter {
-    let filter_str = match std::env::var("RUST_LOG") {
-        Ok(env) => format!("{DEFAULT_LOG_FILTER},{env}"),
-        Err(_) => DEFAULT_LOG_FILTER.to_string(),
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let mujina_log = std::env::var("MUJINA_LOG").ok();
+    filter_string(rust_log.as_deref(), mujina_log.as_deref())
+        .parse()
+        .expect("invalid directive in RUST_LOG or MUJINA_LOG")
+}
+
+/// Combine the built-in defaults, RUST_LOG, and MUJINA_LOG into one
+/// EnvFilter directive string.
+///
+/// RUST_LOG keeps its ecosystem meaning. A directive that names a
+/// target adds to the built-in defaults, so a third-party crate can
+/// be traced without repeating the defaults. A bare level
+/// takes full control of the filter, as it would in any Rust
+/// program; layered on the defaults it would lose to the more
+/// specific per-crate default and never reach this crate.
+///
+/// MUJINA_LOG holds directives for this crate alone, interpreted
+/// relative to the crate root: a bare level applies to the whole
+/// crate, and module names are written as the log output displays
+/// them, without the crate prefix. Its directives come last, and
+/// EnvFilter keeps the later of two directives for the same target,
+/// so MUJINA_LOG wins over RUST_LOG and the defaults.
+fn filter_string(rust_log: Option<&str>, mujina_log: Option<&str>) -> String {
+    let rust_log: Vec<&str> = elements(rust_log).collect();
+
+    let mut directives: Vec<String> = if rust_log.iter().any(|d| is_bare_level(d)) {
+        Vec::new()
+    } else {
+        vec![DEFAULT_LOG_FILTER.to_string()]
     };
-    filter_str.parse().unwrap()
+
+    directives.extend(rust_log.iter().map(|d| d.to_string()));
+
+    for directive in elements(mujina_log) {
+        if is_bare_level(directive) {
+            directives.push(format!("mujina_miner={directive}"));
+        } else {
+            directives.push(format!("mujina_miner::{directive}"));
+        }
+    }
+
+    directives.join(",")
+}
+
+/// Split a filter variable into its comma-separated elements,
+/// dropping empties.
+fn elements(var: Option<&str>) -> impl Iterator<Item = &str> {
+    var.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+}
+
+/// Report whether a directive is a bare level like `debug`, naming
+/// no target.
+fn is_bare_level(directive: &str) -> bool {
+    directive.parse::<LevelFilter>().is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -289,5 +338,137 @@ impl FormatTime for LocalTimer {
             ))
             .unwrap(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mujina's own directive within the built-in defaults.
+    fn default_mujina_directive() -> &'static str {
+        DEFAULT_LOG_FILTER
+            .split(',')
+            .find(|d| d.starts_with("mujina_miner="))
+            .expect("defaults contain a miner directive")
+    }
+
+    #[test]
+    fn no_variables_use_defaults() {
+        assert_eq!(filter_string(None, None), DEFAULT_LOG_FILTER);
+        assert_eq!(filter_string(Some(""), Some("")), DEFAULT_LOG_FILTER);
+    }
+
+    #[test]
+    fn bare_mujina_log_level_scopes_to_crate() {
+        assert_eq!(
+            filter_string(None, Some("trace")),
+            format!("{DEFAULT_LOG_FILTER},mujina_miner=trace")
+        );
+    }
+
+    #[test]
+    fn mujina_log_modules_get_crate_prefix() {
+        assert_eq!(
+            filter_string(None, Some("asic::bm13xx=trace,board=debug")),
+            format!(
+                "{DEFAULT_LOG_FILTER},mujina_miner::asic::bm13xx=trace,\
+                 mujina_miner::board=debug"
+            )
+        );
+    }
+
+    #[test]
+    fn named_rust_log_directive_adds_to_defaults() {
+        assert_eq!(
+            filter_string(Some("nusb=trace"), None),
+            format!("{DEFAULT_LOG_FILTER},nusb=trace")
+        );
+    }
+
+    #[test]
+    fn bare_rust_log_level_takes_full_control() {
+        assert_eq!(filter_string(Some("trace"), None), "trace");
+        assert_eq!(
+            filter_string(Some("debug,nusb=trace"), None),
+            "debug,nusb=trace"
+        );
+    }
+
+    #[test]
+    fn both_variables_combine() {
+        assert_eq!(
+            filter_string(Some("nusb=trace"), Some("debug")),
+            format!("{DEFAULT_LOG_FILTER},nusb=trace,mujina_miner=debug")
+        );
+        // A bare RUST_LOG level takes full control, and MUJINA_LOG
+        // still carves Mujina out of it.
+        assert_eq!(
+            filter_string(Some("trace"), Some("warn")),
+            "trace,mujina_miner=warn"
+        );
+    }
+
+    #[test]
+    fn results_parse_as_env_filters() {
+        let cases = [
+            (None, None),
+            (Some("trace"), None),
+            (Some("debug,nusb=trace,foo::bar=info"), None),
+            (None, Some("trace")),
+            (None, Some("asic::bm13xx=trace,info")),
+            (Some("nusb=trace"), Some("debug")),
+        ];
+        for (rust_log, mujina_log) in cases {
+            filter_string(rust_log, mujina_log)
+                .parse::<EnvFilter>()
+                .unwrap();
+        }
+    }
+
+    // A module directive coexists with the crate-wide default rather
+    // than replacing it: the rest of Mujina keeps its info default.
+    #[test]
+    fn module_directive_leaves_crate_default_intact() {
+        let filter: EnvFilter = filter_string(None, Some("asic::bm13xx=trace"))
+            .parse()
+            .unwrap();
+        let rendered = format!("{filter}");
+        assert!(rendered.contains(default_mujina_directive()), "{rendered}");
+        assert!(
+            rendered.contains("mujina_miner::asic::bm13xx=trace"),
+            "{rendered}"
+        );
+    }
+
+    // A bare level given alongside a module directive replaces the
+    // built-in crate default without disturbing the module directive.
+    #[test]
+    fn module_directive_and_bare_level_combine() {
+        let filter: EnvFilter = filter_string(None, Some("asic::bm13xx=trace,warn"))
+            .parse()
+            .unwrap();
+        let rendered = format!("{filter}");
+        assert!(rendered.contains("mujina_miner=warn"), "{rendered}");
+        assert!(!rendered.contains(default_mujina_directive()), "{rendered}");
+        assert!(
+            rendered.contains("mujina_miner::asic::bm13xx=trace"),
+            "{rendered}"
+        );
+    }
+
+    // The layering relies on EnvFilter keeping the later of two
+    // directives for the same target. Verify against the real
+    // EnvFilter so an upstream change breaks loudly, including a
+    // level quieter than the built-in default.
+    #[test]
+    fn mujina_log_wins_for_same_target() {
+        let filter: EnvFilter = filter_string(Some("mujina_miner=debug"), Some("error"))
+            .parse()
+            .unwrap();
+        let rendered = format!("{filter}");
+        assert!(rendered.contains("mujina_miner=error"), "{rendered}");
+        assert!(!rendered.contains(default_mujina_directive()), "{rendered}");
+        assert!(!rendered.contains("mujina_miner=debug"), "{rendered}");
     }
 }
