@@ -157,13 +157,26 @@ const GROUPS: &[EnvGroup] = &[
     },
     EnvGroup {
         title: "Logging",
-        vars: &[EnvVar {
-            name: "RUST_LOG",
-            summary: "Log filter in tracing-subscriber EnvFilter syntax, appended \
-                      after the built-in defaults so its directives win.",
-            default: Some("warn,mujina_miner=info"),
-            example: Some("mujina_miner=trace"),
-        }],
+        vars: &[
+            EnvVar {
+                name: "MUJINA_LOG",
+                summary: "Log filter for Mujina's own modules, overriding \
+                          RUST_LOG. Module names are written as the log output \
+                          shows them, without a crate prefix. A bare level like \
+                          'debug' applies to all of Mujina.",
+                default: None,
+                example: Some("asic::bm13xx=trace"),
+            },
+            EnvVar {
+                name: "RUST_LOG",
+                summary: "Log filter in tracing-subscriber EnvFilter syntax. \
+                          A directive that names a crate adds to the built-in \
+                          defaults; a bare level like 'debug' replaces them, \
+                          as in any Rust program.",
+                default: Some("warn,mujina_miner=info"),
+                example: Some("nusb=debug"),
+            },
+        ],
     },
 ];
 

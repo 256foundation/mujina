@@ -150,20 +150,29 @@ cargo run --bin mujina-minerd
 ### Controlling log output
 
 The default filter emits Mujina log entries at info level and
-third-party crates at warn. `RUST_LOG` directives are additive: set
-per-module levels to dig into specific subsystems without flooding the
-rest of the log.
+third-party crates at warn. Two environment variables adjust it.
+`MUJINA_LOG` filters Mujina's own modules, named exactly as the log
+output shows them, and a bare level applies to Mujina as a whole.
+`RUST_LOG` keeps its usual Rust meaning: a directive that names a
+crate adds to the defaults, and a bare level takes full control of
+the filter. `MUJINA_LOG` wins where the two overlap.
 
 ```bash
 # Default: info for Mujina, warn for third-party crates
 cargo run --bin mujina-minerd
 
+# Trace all of Mujina, third-party crates stay at warn
+MUJINA_LOG=trace cargo run --bin mujina-minerd
+
 # Trace the Stratum v1 client, everything else unchanged
-RUST_LOG=mujina_miner::stratum_v1=trace cargo run --bin mujina-minerd
+MUJINA_LOG=stratum_v1=trace cargo run --bin mujina-minerd
 
 # Debug Stratum v1 and trace BM13xx at the same time
-RUST_LOG=mujina_miner::stratum_v1=debug,mujina_miner::asic::bm13xx=trace \
+MUJINA_LOG=stratum_v1=debug,asic::bm13xx=trace \
   cargo run --bin mujina-minerd
+
+# Trace a third-party crate, Mujina's defaults unchanged
+RUST_LOG=nusb=trace cargo run --bin mujina-minerd
 ```
 
 Debug shows logical stages and summaries: chip initialization, jobs

@@ -279,7 +279,7 @@ impl Daemon {
         self.tracker.close();
 
         info!("Started.");
-        info!("For debugging, set RUST_LOG=mujina_miner=debug or trace.");
+        info!("For debugging, set MUJINA_LOG=debug or trace.");
 
         // Install signal handlers
         let mut sigint = unix::signal(SignalKind::interrupt())?;
