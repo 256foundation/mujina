@@ -102,7 +102,7 @@ fn is_bare_level(directive: &str) -> bool {
     directive.parse::<LevelFilter>().is_ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod journald {
     use std::env;
     use std::io;
@@ -176,7 +176,7 @@ mod journald {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 mod journald {
     pub fn try_init() -> bool {
         false
