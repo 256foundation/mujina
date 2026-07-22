@@ -14,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    board::bzm2::Bzm2RuntimeConfig,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -94,6 +95,22 @@ impl Daemon {
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
+
+        // Attach a configured BZM2 board before the backplane starts draining
+        // transport events, so its threads register ahead of the
+        // initial-enumeration-complete signal and count toward the startup
+        // hold.
+        if let Some(config) = Bzm2RuntimeConfig::from_env() {
+            info!(
+                serials = config.serial_paths.len(),
+                baud = config.baud_rate,
+                "BZM2 board enabled from configured serial paths"
+            );
+            backplane
+                .attach_configured_board("bzm2", config.device_id())
+                .await?;
+        }
+
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {

@@ -36,6 +36,24 @@ starting point:
   (twelve BM1362 ASICs): a sister project from the 256 Foundation. An
   open-source hashboard designed to be driven by open firmware.
 
+**Experimental**
+
+- **Intel BZM2 (Bonanza Mine 2) boards**: native Rust support for the
+  BZM2's 9-bit multidrop UART protocol with direct work dispatch, TDM
+  result handling, DTS/VS telemetry, PLL/DLL clock control, startup
+  calibration, and HTTP diagnostics. Targets the
+  [Satoshi Starter](https://github.com/Blockscale-Solutions/SatoshiStarter)
+  (1 ASIC) and related BZM2 board family. Functional and test-covered,
+  but board-specific bring-up is still maturing; not yet
+  production-ready. See [BZM2 docs](docs/bzm2/bzm2-port.md). Quick
+  start:
+
+  ```bash
+  MUJINA_BZM2_SERIAL="/dev/ttyUSB0" \
+  MUJINA_BZM2_BAUD="5000000" \
+  cargo run -p mujina-miner --bin mujina-minerd
+  ```
+
 **Near-term targets**
 
 - Installable images for the Antminer S19 series
@@ -221,6 +239,13 @@ GitHub.
 - [CPU Mining](docs/cpu-mining.md): the CPU backend in detail
 - [Container Image](docs/container.md): build and run Mujina as a
   container
+- [BZM2 Port](docs/bzm2/bzm2-port.md): Intel BZM2 driver architecture,
+  with the [tuning planner](docs/bzm2/bzm2-pnp.md) and
+  [opcode grounding](docs/bzm2/bzm2-opcode-grounding.md). Hardware
+  reference (pinout/ball map, electrical, UART/TDM protocol,
+  integration guide) lives in the maintained
+  [bzm2-hwref](https://github.com/Blockscale-Solutions/bzm2-hwref)
+  repository (CC-BY-SA)
 
 ### Protocols
 
@@ -251,6 +276,10 @@ GitHub.
   Foundation's first open-source Bitcoin mining hashboard
 - [Libreboard](https://github.com/256foundation/libreboard): 256
   Foundation's open-source mining control board
+- [Satoshi Starter](https://github.com/Blockscale-Solutions/SatoshiStarter):
+  open-source single-ASIC Intel BZM2 miner kit from Reckless Systems
+- [bitaxeBIRDS](https://github.com/bitaxeorg/bitaxeBIRDS): four-ASIC
+  Intel BZM2 board from the Bitaxe community
 
 ## License
 
