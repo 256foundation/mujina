@@ -158,7 +158,15 @@ impl TdmFrameParser {
             let asic = self.buffer[cursor];
             let opcode = self.buffer[cursor + 1];
 
-            if asic >= 100 {
+            // Resync heuristic: an id this large in the asic position is almost
+            // always line noise in the supported small-id chains, so skip it as
+            // a stray byte. DTS/VS frames are exempt: they carry the
+            // thermal-trip / voltage-fault bits that drive the protective
+            // shutdown and must never be silently dropped by an ad-hoc id bound
+            // (an operator can also legitimately push ids >= 100 via
+            // MUJINA_BZM2_ENUM_START_ID). A fault frame that reaches the handler
+            // is logged loudly there before any shutdown action is taken.
+            if asic >= 100 && opcode != OPCODE_UART_DTS_VS {
                 cursor += 1;
                 continue;
             }
@@ -678,6 +686,23 @@ mod tests {
         }
         match &parsed[1] {
             TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_keeps_dts_vs_trip_frame_from_high_asic_id() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen2);
+        // A Gen2 DTS/VS frame from asic id 100 with the thermal-trip bit set.
+        // The `asic >= 100` resync heuristic must NOT drop it: silently
+        // discarding it would disable over-temp protection for that device.
+        let parsed = parser.push(&[100, OPCODE_UART_DTS_VS, 0, 0, 0, 0, 0, 0, 0, 0x10]);
+        assert_eq!(parsed.len(), 1);
+        match &parsed[0] {
+            TdmFrame::DtsVs(TdmDtsVsFrame::Gen2(frame)) => {
+                assert_eq!(frame.asic, 100);
+                assert!(frame.thermal_trip_status);
+            }
             other => panic!("unexpected frame: {other:?}"),
         }
     }
