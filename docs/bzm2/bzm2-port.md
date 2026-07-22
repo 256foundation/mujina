@@ -4,10 +4,10 @@
 
 This port keeps BZM2 support inside Mujina rather than reviving the original split `cgminer` + `bzmd` process model.
 
-The legacy split looked like this:
+As unverified background, the legacy stack reportedly split responsibilities across two processes:
 
-- `cgminer` handled scheduling, pool interaction, and IPC to `bzmd`
-- `bzmd` owned UART transport, job fanout, result validation, and board-management glue
+- `cgminer` handling scheduling, pool interaction, and IPC to `bzmd`
+- `bzmd` owning UART transport, job fanout, result validation, and board-management glue
 
 In Mujina, those responsibilities map cleanly onto existing abstractions:
 
@@ -55,7 +55,7 @@ The BZM2 Mujina thread now reimplements the core legacy data path and the genera
   - `DTS_VS`
 - DTS/VS generation 1 and generation 2 frame decoding
 - live DTS/VS gen2 hardware-fault handling that shuts down the hash thread on thermal or voltage fault indications
-- reusable GPIO reset-line control through `AsicEnable`
+- reusable GPIO reset-line control through `GpioResetLine`/`FileGpioPin` in `board::power`
 - reusable TPS546 PMBus rail control through `VoltageRegulator`
 - reusable multi-rail bring-up and shutdown sequencing for single-rail, small-stack, and larger multi-stack designs
 - UART-register-based PLL diagnostic/control flow for divider programming, enable/disable, lock polling, and readback
@@ -81,8 +81,9 @@ Supported environment variables:
 - `MUJINA_BZM2_AUTO_ENUMERATE`: alternate name for the same setting
 - `MUJINA_BZM2_ENUM_START_ID`: first assigned runtime `ASIC_ID`, default `0`
 - `MUJINA_BZM2_ENUM_MAX_ASICS_PER_BUS`: comma-separated per-bus enumeration
-  ceilings, default `100` per bus unless calibration topology already provides
-  a larger configured count
+  ceilings, default `100` per bus unless `MUJINA_BZM2_ASICS_PER_BUS` provides a
+  configured topology (any bus count greater than `1`), which is then used as
+  the ceiling
 - `MUJINA_BZM2_ENABLE_BRINGUP`: enable startup and shutdown rail/reset
   sequencing
 - `MUJINA_BZM2_BRINGUP_ENABLE`: alternate name for the same setting
@@ -129,6 +130,17 @@ Supported environment variables:
 - `MUJINA_BZM2_BRINGUP_RELEASE_RESET_MS`: delay after reset release, default
   `25`
 
+The list above covers the core transport, enumeration, and bring-up settings
+only. The driver reads many more `MUJINA_BZM2_*` variables than are listed
+here, including calibration and PnP controls (for example
+`MUJINA_BZM2_CALIBRATE`, `MUJINA_BZM2_OPERATING_CLASS`, and
+`MUJINA_BZM2_PERFORMANCE_MODE`), runtime-retune tuning (for example
+`MUJINA_BZM2_RUNTIME_RETUNE`), engine discovery, and host telemetry file
+mappings (for example `MUJINA_BZM2_FAN_RPM_PATH` and
+`MUJINA_BZM2_BOARD_TEMP_PATH`). `mujina-miner/src/board/bzm2/config.rs` is the
+authoritative reference for the full variable set and its defaults, with the
+host telemetry file mappings in the adjacent `telemetry.rs`.
+
 Startup enumeration notes:
 
 - this mode is intended for fresh chains where ASICs still answer on the
@@ -153,9 +165,12 @@ Bring-up notes:
   applying an ambiguous setpoint
 - on board shutdown, the same plan is used in reverse order to assert reset and
   drive the configured rails back to `0`
-- the current implementation is still coarse-grained at the regulator layer:
-  it applies domain targets onto configured rails, but it does not yet perform
-  closed-loop voltage verification against live rail telemetry or runtime retune
+- the runtime monitor now performs closed-loop checks against live rail
+  telemetry: measured per-domain voltage is compared to the planner's domain
+  targets and thermal drift is tracked, and triggers that persist across
+  monitor polls flag a pending retune and demote the saved operating point's
+  validation state; an in-place mid-run recalibration is still not performed,
+  so a flagged retune takes effect at the next startup
 
 If the optional rail telemetry files are configured, the board monitor also
 publishes them into normal board state using stable names:
@@ -168,8 +183,8 @@ publishes them into normal board state using stable names:
 
 When Gen2 `DTS_VS` frames are present on the UART path, Mujina now surfaces ASIC-internal telemetry through the normal board API state:
 
-- `BoardState.temperatures`
-- `BoardState.powers`
+- `BoardTelemetry.temperatures`
+- `BoardTelemetry.powers`
 
 The values are named per serial bus and per ASIC so they can coexist with host-side sensor files:
 
@@ -211,7 +226,7 @@ The query path is exposed through the HTTP API:
 
 - `POST /api/v0/boards/{name}/bzm2/dts-vs-query`
 
-The query path runs through the live BZM2 hash-thread actor so UART ownership remains correct. Queried frames are converted through the same telemetry code path used for passive DTS/VS reporting, so the returned values land in normal `BoardState` telemetry.
+The query path runs through the live BZM2 hash-thread actor so UART ownership remains correct. Queried frames are converted through the same telemetry code path used for passive DTS/VS reporting, so the returned values land in normal `BoardTelemetry` telemetry.
 
 Example HTTP request:
 
@@ -236,7 +251,7 @@ This is useful when:
 
 The engine-discovery path runs through the live BZM2 hash-thread actor, just
 like the DTS/VS query path, so UART ownership stays correct. Successful scans
-update the live thread engine layout and `BoardState.asics` with:
+update the live thread engine layout and `BoardTelemetry.asics` with:
 
 - `id`
 - `thread_index`
@@ -260,7 +275,7 @@ curl -X POST http://127.0.0.1:3000/api/v0/boards/bzm2-0/bzm2/discover-engines \
   -d '{"thread_index":0,"asic":2,"tdm_prediv_raw":15,"tdm_counter":16,"timeout_ms":150}'
 ```
 
-The response returns the refreshed `BoardState`, including the updated
+The response returns the refreshed `BoardTelemetry`, including the updated
 `asics` topology entry for the queried ASIC.
 
 ## API Diagnostics
@@ -319,7 +334,8 @@ configuration alone.
 
 ## Design Boundary
 
-The legacy `bzmd` board-power path mixes three different concerns:
+As unverified background, the legacy `bzmd` board-power path reportedly mixes
+three different concerns:
 
 - genuinely reusable sequencing concepts
 - generic peripheral protocols like PMBus/I2C regulators and reset GPIOs
@@ -334,12 +350,16 @@ Ported into Mujina:
 - generic PMBus/TPS546 voltage control and telemetry adapters
 - ASIC-originated DTS/VS telemetry and fault handling
 
-Intentionally not ported verbatim:
+Intentionally not ported verbatim (the legacy file attributions below are
+unverified background, as recalled from the legacy stack):
 
-- Intel board MCU command protocol from `mcu.c`
-- hard-coded board GPIO numbering and sysfs reset pulses from `util.c` / `daemon.c`
-- platform CAN PSU control from `psu.c`
-- board-specific fan and ambient-sensor plumbing that depends on the original platform layout
+- the Intel board MCU command protocol, reportedly in `mcu.c`
+- hard-coded board GPIO numbering and sysfs reset pulses, reportedly in `util.c` / `daemon.c`
+- platform CAN PSU control, reportedly in `psu.c`
+- board-specific fan and ambient-sensor plumbing that depends on the original
+  platform layout; generic file-backed fan and ambient/board temperature
+  telemetry is now provided through the `MUJINA_BZM2_FAN_*` and `*_TEMP_PATH`
+  variables, so only the platform-specific plumbing remains unported
 
 Those pieces should only be added behind a concrete Mujina board implementation when the target hardware actually uses them.
 
@@ -349,7 +369,8 @@ Still not implemented from the broader legacy stack:
 
 - JTAG workflows from the standalone platform documents
 - JTAG-only PLL debug sequences that are not represented in the shipped UART code
-- calibration and autotuning state machines
+- in-place mid-run recalibration: retunes flagged by the runtime monitor take
+  effect at the next startup rather than being applied to a live board
 - full manufacturing and diagnostics RPC parity
   - beyond the current live API surface for:
     - `NOOP`
@@ -357,6 +378,8 @@ Still not implemented from the broader legacy stack:
     - register read/write
     - clock report
     - chain summary
+    - DTS/VS query
+    - engine discovery
 - any board-MCU protocol that is specific to one carrier or backplane design
 
 This port currently implements the opcode surface that is evidenced in the legacy shipping UART path and not an inferred JTAG control plane.

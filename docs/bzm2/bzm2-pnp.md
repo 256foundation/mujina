@@ -24,7 +24,10 @@ What it did not have was a native Mujina tuning planner for BZM2:
 
 ## Legacy `pnp.c` Behavior
 
-The original C implementation mixed:
+The following is background as recalled from the legacy design; it is
+unverified against the legacy source and is not normative for the Rust port.
+
+The original C implementation reportedly mixed:
 
 - calibration search policy
 - board and PSU policy
@@ -33,7 +36,7 @@ The original C implementation mixed:
 - per-engine pass-rate accounting
 - platform-specific data collection and file I/O
 
-The reusable algorithmic parts are:
+The reusable algorithmic parts, as recalled, are:
 
 - derive voltage, clock, and acceptance targets from operating class and performance mode
 - derive initial voltage and clock from site thermal conditions
@@ -58,8 +61,8 @@ Implemented:
   - StackTunedB
   - ExtendedHeadroom
   - ExtendedHeadroomB
-- search-space generation corresponding to the historical C sweep helper
-- site-temperature-aware initial voltage and clock planning corresponding to the historical C startup helper
+- search-space generation, modeled on the recalled legacy sweep behavior
+- site-temperature-aware initial voltage and clock planning, modeled on the recalled legacy startup behavior
 - saved operating point reuse vs. full retune decisions
 - domain-aware voltage planning using explicit voltage-domain offsets and guards
 - per-domain frequency planning using aggregated pass-rate, thermal, and power data
@@ -67,13 +70,15 @@ Implemented:
 
 ## Efficiency Model
 
-The planner is structured to scale cleanly from a single ASIC to large chains:
+The planner is structured to scale cleanly from a single ASIC to large chains.
+It runs a single domain-ordered pass that, for each voltage domain:
 
-- one pass to aggregate domain-level metrics
-- one pass to emit per-domain plans
-- one pass to emit per-ASIC adjustments
+- aggregates that domain's metrics
+- emits the domain-level plan
+- emits that domain's per-ASIC adjustments
 
-That keeps the planning work effectively linear in ASIC count for normal use.
+That is O(domains x ASICs) overall, which keeps the planning work effectively
+linear in ASIC count for the small domain counts on realistic hardware.
 
 For larger systems with multiple voltage domains, the planner prefers:
 
@@ -103,10 +108,15 @@ The planner is now wired into `Bzm2Board` startup so Mujina can:
   board can continuously evaluate whether the current operating point is still
   valid
 - automatically promote saved operating point state from `pending` to
-  `validated` after clean runtime sampling
-- automatically invalidate saved operating point profiles when persistent
-  runtime retune triggers fire, so restart replay will not reuse a known-bad
-  operating point
+  `validated` on the first monitor poll with no pending retune triggers
+- automatically demote saved operating point state back to `pending`, with the
+  trigger reasons recorded, when persistent runtime retune triggers fire
+
+Restart-safety note: a `pending` profile is still replayed on restart — replay
+compatibility only rejects profiles marked `invalidated`, and the current
+driver never writes `invalidated`. Correcting a suspect operating point across
+a restart therefore relies on the runtime retune triggers firing again once
+mining resumes. This gap is flagged for reviewers on the driver PR.
 
 Engine-capacity inputs now come from, in order:
 
