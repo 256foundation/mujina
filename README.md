@@ -240,11 +240,12 @@ GitHub.
 - [Container Image](docs/container.md): build and run Mujina as a
   container
 - [BZM2 Port](docs/bzm2/bzm2-port.md): Intel BZM2 driver architecture,
-  with the [tuning planner](docs/bzm2/bzm2-pnp.md),
-  [opcode grounding](docs/bzm2/bzm2-opcode-grounding.md),
-  [integration guide](docs/bzm2/blockscale-asic-integration-guide.md),
-  [UART protocol reference](docs/bzm2/blockscale-uart-protocol-reference.md),
-  and [reference roadmap](docs/bzm2/blockscale-reference-roadmap.md)
+  with the [tuning planner](docs/bzm2/bzm2-pnp.md) and
+  [opcode grounding](docs/bzm2/bzm2-opcode-grounding.md). Hardware
+  reference (pinout/ball map, electrical, UART/TDM protocol,
+  integration guide) lives in the maintained
+  [bzm2-hwref](https://github.com/Blockscale-Solutions/bzm2-hwref)
+  repository (CC-BY-SA)
 
 ### Protocols
 
