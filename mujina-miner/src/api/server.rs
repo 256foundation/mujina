@@ -166,7 +166,10 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
+            registry.push(BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 
@@ -361,5 +364,112 @@ mod tests {
         let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: &T,
+    ) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn set_fan_target_round_trips_board_command() {
+        use crate::api::commands::BoardCommand;
+        use crate::api_client::types::{Fan, SetFanTargetRequest};
+
+        let (miner_tx, miner_rx) = watch::channel(MinerTelemetry::default());
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "fan-board".into(),
+            model: "Test".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            telemetry_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx);
+
+        // Clone for the task; the original must stay alive or the registry
+        // prunes the board before the handler's post-command re-read.
+        let telemetry_tx_for_command = telemetry_tx.clone();
+        tokio::spawn(async move {
+            if let Some(BoardCommand::SetFanTarget {
+                board,
+                fan,
+                percent,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(board, "fan-board");
+                assert_eq!(fan, "fan0");
+                assert_eq!(percent, Some(75));
+                telemetry_tx_for_command.send_modify(|t| {
+                    t.fans.push(Fan {
+                        name: "fan0".into(),
+                        rpm: None,
+                        percent: None,
+                        target_percent: percent,
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "PATCH",
+            "/api/v0/boards/fan-board/fans/fan0",
+            &SetFanTargetRequest {
+                target_percent: Some(75),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
+        assert_eq!(board.fans[0].target_percent, Some(75));
+
+        // A board with no command channel answers 400.
+        let (_keep, no_cmd_rx) = watch::channel(BoardTelemetry {
+            name: "no-commands".into(),
+            model: "Test".into(),
+            ..Default::default()
+        });
+        let (miner_tx2, miner_rx2) = watch::channel(MinerTelemetry::default());
+        let (cmd_tx2, _cmd_rx2) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry2 = BoardRegistry::new();
+        registry2.push(BoardRegistration {
+            telemetry_rx: no_cmd_rx,
+            command_tx: None,
+        });
+        let router2 = build_router(miner_rx2, Arc::new(Mutex::new(registry2)), cmd_tx2);
+        let (status, _body) = post_json(
+            router2,
+            "PATCH",
+            "/api/v0/boards/no-commands/fans/fan0",
+            &SetFanTargetRequest {
+                target_percent: Some(50),
+            },
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        drop(miner_tx);
+        drop(miner_tx2);
+        drop(telemetry_tx);
     }
 }
