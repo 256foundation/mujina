@@ -109,14 +109,15 @@ The planner is now wired into `Bzm2Board` startup so Mujina can:
   valid
 - automatically promote saved operating point state from `pending` to
   `validated` on the first monitor poll with no pending retune triggers
-- automatically demote saved operating point state back to `pending`, with the
-  trigger reasons recorded, when persistent runtime retune triggers fire
+- automatically mark the saved operating point `invalidated`, with the trigger
+  reasons recorded and persisted, when persistent runtime retune triggers fire
 
-Restart-safety note: a `pending` profile is still replayed on restart — replay
-compatibility only rejects profiles marked `invalidated`, and the current
-driver never writes `invalidated`. Correcting a suspect operating point across
-a restart therefore relies on the runtime retune triggers firing again once
-mining resumes. This gap is flagged for reviewers on the driver PR.
+A saved operating point therefore starts `pending`, validates on the first
+clean monitor poll, and is invalidated in place when retune triggers persist
+past the trigger tracker's threshold. Replay compatibility rejects
+`invalidated` profiles, so a restart after persistent triggers falls back to
+live calibration instead of replaying a known-bad operating point, and the
+fresh calibration persists a new `pending` profile.
 
 Engine-capacity inputs now come from, in order:
 

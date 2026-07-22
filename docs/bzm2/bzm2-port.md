@@ -168,9 +168,10 @@ Bring-up notes:
 - the runtime monitor now performs closed-loop checks against live rail
   telemetry: measured per-domain voltage is compared to the planner's domain
   targets and thermal drift is tracked, and triggers that persist across
-  monitor polls flag a pending retune and demote the saved operating point's
-  validation state; an in-place mid-run recalibration is still not performed,
-  so a flagged retune takes effect at the next startup
+  monitor polls flag a pending retune and invalidate the saved operating
+  point; an in-place mid-run recalibration is still not performed, so a
+  flagged retune takes effect at the next startup, where the invalidated
+  profile is refused and the board recalibrates live
 
 If the optional rail telemetry files are configured, the board monitor also
 publishes them into normal board state using stable names:
