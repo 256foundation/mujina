@@ -930,11 +930,26 @@ async fn handle_dts_vs_frame(
                 "BZM2 DTS/VS gen2 telemetry frame"
             );
 
-            if frame.thermal_trip_status
-                || frame.thermal_fault
-                || frame.voltage_fault
-                || frame.voltage_shutdown_status
-            {
+            // Validity gate: a fault/trip bit is only authoritative when the
+            // sensor that produced it is enabled. All of the trip / fault /
+            // validity / enabled bits live in a single payload byte, so a
+            // stray or mis-framed frame can set one at random; acting on that
+            // unconditionally lets line noise on a shared bus force a permanent,
+            // unrecoverable shutdown (DoS-by-noise). The sensor-enable bits
+            // reflect host configuration (see `configure_dts_vs_stream`) and are
+            // set on every genuine frame, so a real over-temp still stops
+            // immediately -- no debounce, no delayed protection.
+            //
+            // Residual risk: the DTS/VS frame carries no checksum, so a single
+            // noise frame that happens to set BOTH the enable bit and a fault
+            // bit in the same byte can still trip. This gate removes the far
+            // more probable single-bit case; closing it fully would need a
+            // protocol-level integrity field the silicon does not provide.
+            let thermal_shutdown =
+                frame.thermal_enabled && (frame.thermal_trip_status || frame.thermal_fault);
+            let voltage_shutdown =
+                frame.voltage_enabled && (frame.voltage_fault || frame.voltage_shutdown_status);
+            if thermal_shutdown || voltage_shutdown {
                 warn!(
                     path = %config.serial_path,
                     asic = frame.asic,
@@ -1976,6 +1991,54 @@ mod tests {
             (snapshot.temperature_c.unwrap() - legacy_tune_code_to_temperature_c(0x07A9)).abs()
                 < 0.01
         );
+    }
+
+    #[tokio::test]
+    async fn gen2_dts_vs_unvalidated_trip_bit_does_not_shut_down() {
+        // A single noisy DTS/VS frame whose only meaningful content is a set
+        // thermal-trip bit, with the thermal sensor NOT enabled. This is line
+        // noise, not a credible over-temp, and must not take the thread
+        // permanently offline.
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
+        let status = Arc::new(RwLock::new(HashThreadStatus::default()));
+        let (event_tx, _event_rx) = tokio_mpsc::channel(4);
+
+        let mut parser = TdmFrameParser::new(protocol::DtsVsGeneration::Gen2);
+        let frame = match parser
+            .push(&[
+                0x00,
+                protocol::OPCODE_UART_DTS_VS,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x10,
+            ])
+            .into_iter()
+            .next()
+        {
+            Some(TdmFrame::DtsVs(frame)) => frame,
+            other => panic!("expected a DTS/VS frame, got {other:?}"),
+        };
+
+        // Premise: the trip bit decoded true, but the sensor is not enabled.
+        match frame {
+            TdmDtsVsFrame::Gen2(gen2) => {
+                assert!(gen2.thermal_trip_status);
+                assert!(!gen2.thermal_enabled);
+            }
+            other => panic!("expected a gen2 frame, got {other:?}"),
+        }
+
+        let should_shutdown = handle_dts_vs_frame(&frame, &config, &status, &event_tx).await;
+        assert!(
+            !should_shutdown,
+            "an unvalidated trip bit from a disabled sensor must not shut the thread down"
+        );
+        assert_eq!(status.read().unwrap().hardware_errors, 0);
     }
 
     #[tokio::test]
