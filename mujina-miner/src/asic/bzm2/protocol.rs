@@ -189,7 +189,15 @@ impl TdmFrameParser {
                 }
                 OPCODE_UART_READREG => {
                     let Some(&count) = self.expected_read_lengths.get(&asic) else {
-                        break;
+                        // No READREG was requested for this id, so these bytes are
+                        // stray/noise (the long-lived streaming parser never sets
+                        // an expected read length). Resync one byte forward like
+                        // the unknown-opcode arm instead of breaking: a bare
+                        // READREG-looking prefix sitting at cursor 0 would
+                        // otherwise wedge framing forever and grow `self.buffer`
+                        // without bound on every subsequent push.
+                        cursor += 1;
+                        continue;
                     };
                     if self.buffer.len().saturating_sub(cursor) < 2 + count {
                         break;
@@ -689,6 +697,34 @@ mod tests {
             other => panic!("unexpected frame: {other:?}"),
         }
         match &second[1] {
+            TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parser_bounds_buffer_and_recovers_on_readreg_without_pending_count() {
+        let mut parser = TdmFrameParser::new(DtsVsGeneration::Gen2);
+
+        // A READREG-looking prefix that never has a pending read length is pure
+        // line noise on the long-lived streaming parser. Before the fix this hit
+        // a no-count `break` at cursor 0, wedging framing and growing the buffer
+        // by two bytes on every push. Feed it many times and confirm the buffer
+        // stays bounded rather than accumulating ~2000 bytes.
+        for _ in 0..1000 {
+            assert!(parser.push(&[0x02, OPCODE_UART_READREG]).is_empty());
+        }
+        assert!(
+            parser.buffer.len() <= 4,
+            "buffer grew unbounded on malformed READREG noise: {} bytes",
+            parser.buffer.len()
+        );
+
+        // Framing is not wedged: a subsequent well-formed NOOP frame is still
+        // decoded once the noise resyncs forward.
+        let recovered = parser.push(&[0x05, OPCODE_UART_NOOP, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(recovered.len(), 1);
+        match &recovered[0] {
             TdmFrame::Noop(frame) => assert_eq!(frame.data, [0xaa, 0xbb, 0xcc]),
             other => panic!("unexpected frame: {other:?}"),
         }
