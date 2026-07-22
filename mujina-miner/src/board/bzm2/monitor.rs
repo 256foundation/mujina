@@ -444,9 +444,13 @@ fn reconcile_saved_operating_point_status(
         .unwrap_or_else(|e| e.into_inner());
 
     let desired = if tuning_state.retune_pending == Some(true) {
+        // Retune triggers only set retune_pending once they persist past the
+        // trigger tracker's threshold, so the operating point is known bad:
+        // invalidate it so startup replay refuses it and falls back to live
+        // calibration.
         guard.saved_operating_point.as_ref().map(|_| {
             (
-                Bzm2SavedOperatingPointStatus::Pending,
+                Bzm2SavedOperatingPointStatus::Invalidated,
                 tuning_state.retune_reasons.clone(),
             )
         })
@@ -1175,7 +1179,7 @@ mod tests {
         );
         assert_eq!(
             tuning.saved_operating_point_status,
-            Some(Bzm2SavedOperatingPointStatus::Pending)
+            Some(Bzm2SavedOperatingPointStatus::Invalidated)
         );
         assert_eq!(
             tuning.saved_operating_point_reasons,
@@ -1190,7 +1194,7 @@ mod tests {
         assert!(applied.saved_operating_point.is_some());
         assert_eq!(
             applied.saved_operating_point_status,
-            Some(Bzm2SavedOperatingPointStatus::Pending)
+            Some(Bzm2SavedOperatingPointStatus::Invalidated)
         );
 
         let stored = load_saved_operating_point_profile(Some(&profile_path))
@@ -1198,7 +1202,108 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored.persisted.unwrap().saved_operating_point_status,
-            Bzm2SavedOperatingPointStatus::Pending
+            Bzm2SavedOperatingPointStatus::Invalidated
+        );
+
+        let _ = fs::remove_file(profile_path);
+    }
+
+    #[test]
+    fn persistent_retune_triggers_invalidate_saved_operating_point() {
+        let mut calibration = Bzm2CalibrationConfig::default();
+        calibration.runtime_retune_persistence_polls = 2;
+        calibration.runtime_retune_thermal_c = 80.0;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let profile_path = std::env::temp_dir().join(format!(
+            "bzm2-persistent-invalidate-{}-{}.json",
+            std::process::id(),
+            unique
+        ));
+        calibration.profile_path = Some(profile_path.clone());
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 1,
+        }];
+        let saved_state = Bzm2SavedOperatingPoint {
+            board_voltage_mv: 17_500,
+            board_throughput_ths: 40.0,
+            per_domain_voltage_mv: BTreeMap::from([(0, 17_500)]),
+            per_asic_engine_topology: BTreeMap::new(),
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_100.0, 1_100.0])]),
+        };
+        let applied_state = Arc::new(Mutex::new(Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
+            per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
+            saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
+            saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
+            saved_operating_point_reasons: Vec::new(),
+        }));
+        let measurement_cache = Bzm2RuntimeMeasurementCache {
+            domain_measurements: BTreeMap::new(),
+            asic_measurements: BTreeMap::from([(
+                0,
+                Bzm2AsicMeasurement {
+                    asic_id: 0,
+                    temperature_c: Some(82.0),
+                    throughput_ths: Some(0.30),
+                    average_pass_rate: Some(0.97),
+                    pll_pass_rates: [Some(0.97), Some(0.97)],
+                },
+            )]),
+        };
+        let mut tracker = Bzm2RetuneTriggerTracker::default();
+        let tuning = Bzm2TuningState {
+            needs_retune: Some(true),
+            ..Default::default()
+        };
+
+        // First poll: the trigger fires but has not persisted; the saved
+        // point keeps its validated status.
+        let first = apply_runtime_retune_triggers(
+            tuning.clone(),
+            &calibration,
+            &measurement_cache,
+            &mut tracker,
+        );
+        assert_eq!(first.retune_pending, Some(false));
+        let first = reconcile_saved_operating_point_status(
+            first,
+            &calibration,
+            &bus_layouts,
+            &applied_state,
+        );
+        assert_eq!(
+            first.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Validated)
+        );
+
+        // Second poll: the trigger passes the persistence threshold; the
+        // saved point is invalidated and the invalidation is persisted.
+        let second =
+            apply_runtime_retune_triggers(tuning, &calibration, &measurement_cache, &mut tracker);
+        assert_eq!(second.retune_pending, Some(true));
+        let second = reconcile_saved_operating_point_status(
+            second,
+            &calibration,
+            &bus_layouts,
+            &applied_state,
+        );
+        assert_eq!(
+            second.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Invalidated)
+        );
+
+        let stored = load_saved_operating_point_profile(Some(&profile_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.persisted.unwrap().saved_operating_point_status,
+            Bzm2SavedOperatingPointStatus::Invalidated
         );
 
         let _ = fs::remove_file(profile_path);
