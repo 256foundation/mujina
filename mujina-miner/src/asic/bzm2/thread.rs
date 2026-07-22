@@ -1019,6 +1019,27 @@ async fn read_local_reg_u32(
     Ok(u32::from_le_bytes(bytes))
 }
 
+/// Bound for a single diagnostic UART read. The actor is one task, so a silent
+/// or short-answering chip must not wedge it (including a pending `Shutdown`) on
+/// an unbounded `read_exact`; on expiry the diagnostic fails instead of hanging.
+const DIAGNOSTIC_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn read_exact_diagnostic(
+    reader: &mut SerialReader,
+    buf: &mut [u8],
+) -> Result<(), HashThreadError> {
+    tokio::time::timeout(DIAGNOSTIC_READ_TIMEOUT, reader.read_exact(buf))
+        .await
+        .map_err(|_| {
+            HashThreadError::DiagnosticsFailed(format!(
+                "timed out after {} ms waiting for UART response",
+                DIAGNOSTIC_READ_TIMEOUT.as_millis()
+            ))
+        })?
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    Ok(())
+}
+
 async fn read_register(
     reader: &mut SerialReader,
     writer: &mut SerialWriter,
@@ -1039,10 +1060,7 @@ async fn read_register(
 
     let expected = count as usize + 2;
     let mut response = vec![0u8; expected];
-    reader
-        .read_exact(&mut response)
-        .await
-        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    read_exact_diagnostic(reader, &mut response).await?;
     validate_response_header(asic, OPCODE_UART_READREG, &response)?;
     Ok(response[2..].to_vec())
 }
@@ -1119,10 +1137,7 @@ async fn query_noop(
         .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
 
     let mut response = [0u8; 5];
-    reader
-        .read_exact(&mut response)
-        .await
-        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    read_exact_diagnostic(reader, &mut response).await?;
     validate_response_header(asic, OPCODE_UART_NOOP, &response)?;
     Ok(response[2..5].try_into().unwrap())
 }
@@ -1145,10 +1160,7 @@ async fn query_loopback(
 
     let expected = payload.len() + 2;
     let mut response = vec![0u8; expected];
-    reader
-        .read_exact(&mut response)
-        .await
-        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    read_exact_diagnostic(reader, &mut response).await?;
     validate_response_header(asic, OPCODE_UART_LOOPBACK, &response)?;
     Ok(response[2..].to_vec())
 }
@@ -2023,6 +2035,62 @@ mod tests {
             saw_fault_status,
             "thread should publish a final faulted status"
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_read_times_out_and_actor_stays_responsive() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (mut host_reader, mut host_writer, _host_control) = host_side.split();
+
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000);
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+
+        // Drain the initial status update so we know the actor is up.
+        let initial = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(initial, HashThreadEvent::StatusUpdate(_)));
+
+        // Host reads the NOOP request, replies with a single (short) byte, then
+        // goes silent. Without a bounded read the actor's read_exact would block
+        // forever, wedging every other command including Shutdown.
+        let emulator = tokio::spawn(async move {
+            let mut request = [0u8; 4];
+            host_reader.read_exact(&mut request).await.unwrap();
+            host_writer.write_all(&[0x02]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(host_writer);
+        });
+
+        // QueryNoop must resolve to an error within the diagnostic timeout.
+        let result = tokio::time::timeout(Duration::from_secs(4), handle.noop(2)).await;
+        assert!(result.is_ok(), "QueryNoop hung past the diagnostic timeout");
+        assert!(
+            result.unwrap().is_err(),
+            "QueryNoop should fail on a short, stalled response"
+        );
+
+        // The actor is still responsive: Shutdown is honored and the event
+        // stream closes.
+        handle.shutdown();
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "actor did not honor Shutdown after the diagnostic read timed out"
+        );
+
+        emulator.abort();
     }
 
     #[test]

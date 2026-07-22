@@ -397,7 +397,13 @@ impl Bzm2UartController {
                 break;
             }
             self.assign_default_asic_id(next_id).await?;
-            self.verify_noop_bz2(next_id).await?;
+            // Bound the post-assignment verify with the same probe timeout: a
+            // device that passed the timed probe on 0xfa but then fails to echo
+            // on its new id (it died, an id collision garbled the reply, or the
+            // assignment half-took) must not wedge enumeration — and board init
+            // with it — on an unbounded read_exact.
+            self.verify_noop_bz2_with_timeout(next_id, probe_timeout)
+                .await?;
             assigned.push(next_id);
         }
         Ok(assigned)
@@ -1067,6 +1073,67 @@ mod tests {
                 Bzm2EngineCoordinate::new(19, 10)
             ]
         );
+
+        emulator.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn enumerate_chain_bounds_post_assignment_verify() {
+        let pty = openpty(None, None).unwrap();
+        let master = pty.master;
+        let slave = pty.slave;
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let emulator = std::thread::spawn(move || {
+            let mut file = fs::File::from(master);
+
+            // First timed NOOP probe on the default id -> answer "BZ2" (ok).
+            let mut probe = [0u8; 4];
+            file.read_exact(&mut probe).unwrap();
+            assert_eq!(probe.to_vec(), encode_noop(DEFAULT_ASIC_ID));
+            file.write_all(&[DEFAULT_ASIC_ID, OPCODE_UART_NOOP, b'B', b'Z', b'2'])
+                .unwrap();
+            file.flush().unwrap();
+
+            // Accept the assign-id write...
+            let assign_len = encode_write_register(
+                DEFAULT_ASIC_ID,
+                NOTCH_REG,
+                LOCAL_REG_ASIC_ID,
+                &7u32.to_le_bytes(),
+            )
+            .len();
+            let mut assign = vec![0u8; assign_len];
+            file.read_exact(&mut assign).unwrap();
+
+            // ...then go silent for the post-assignment verify probe.
+            let mut verify = [0u8; 4];
+            let _ = file.read_exact(&mut verify);
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let stream = SerialStream::new(&serial_path, 5_000_000).unwrap();
+        let (reader, writer, _control) = stream.split();
+        let mut uart = Bzm2UartController::new(reader, writer);
+
+        // Without the post-assign timeout this call never returns; assert it
+        // completes with a bounded timeout error well inside the wall clock.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            uart.enumerate_chain_with_timeout(4, 7, Duration::from_millis(100)),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "enumerate_chain hung on the post-assign verify"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            Err(Bzm2UartError::NoopTimeout { asic: 7, .. })
+        ));
 
         emulator.join().unwrap();
     }
