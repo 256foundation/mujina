@@ -85,6 +85,43 @@ mod tests {
 }
 ```
 
+### Top-Down Ordering [S.topdown](#S.topdown)
+
+Order a module's items top down: public interface first,
+implementation after. A file then reads from its most important code
+to its least.
+
+This is a stylistic choice. Technically either order works, but Rust
+lets us do something we couldn't do in C and C++: order a file by
+importance instead of by dependency. A C function must be declared
+before it is called, so definitions come ahead of their callers unless
+the file repeats them as prototypes. Rust resolves items wherever they
+appear.
+
+- Public items come before private ones, in the types group and in
+  the functions group alike.
+- The module's main type comes before the supporting types that
+  appear in its signatures.
+- Among private items, callers come before callees.
+
+```rust
+pub struct Client { /* the subject of the module */ }
+
+impl Client {
+    pub fn new(/* ... */) -> Self { /* ... */ }
+    pub async fn run(/* ... */) { /* calls step() */ }
+
+    async fn step(/* ... */) { /* private, below its caller */ }
+}
+
+struct Pending { /* private supporting type */ }
+
+fn decode(/* ... */) { /* private helper, below what calls it */ }
+```
+
+S.mod fixes the order of the groups; this rule orders the items
+inside each one.
+
 ### Module Layout [S.modlayout](#S.modlayout)
 
 Choose between the two module-with-submodules layouts based on
