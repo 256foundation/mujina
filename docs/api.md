@@ -85,6 +85,18 @@ table is a summary and may not be exhaustive.
 | GET    | `/miner`     | Full state snapshot            |
 | PATCH  | `/miner`     | Update miner config (e.g. pause) |
 
+### Config
+
+| Method | Path      | Description                          |
+|--------|-----------|---------------------------------------|
+| GET    | `/config` | Current configuration tree, read-only |
+
+Read-only for now: this reflects the `MUJINA_POOL_*` environment
+variables (see the [top-level README](../README.md) for those).
+File-based config layers, writes, and persistence land in later
+increments. Pool passwords are never included in the response;
+`pool.password_set` only reports whether one is configured.
+
 ### Boards
 
 | Method | Path              | Description           |

@@ -20,6 +20,7 @@ use super::{
     v0,
 };
 use crate::api_client::types::MinerTelemetry;
+use crate::config::PoolConfig;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pub pool_config: Arc<Option<PoolConfig>>,
 }
 
 impl SharedState {
@@ -65,6 +67,7 @@ pub async fn serve(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pool_config: Arc<Option<PoolConfig>>,
 ) -> Result<()> {
     let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
 
@@ -79,7 +82,12 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        pool_config,
+    );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -110,11 +118,13 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pool_config: Arc<Option<PoolConfig>>,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
+        pool_config,
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -142,7 +152,7 @@ mod tests {
     use super::*;
     use crate::api::commands::SchedulerCommand;
     use crate::api::registry::BoardRegistration;
-    use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
+    use crate::api_client::types::{BoardTelemetry, MinerConfig, SourceTelemetry};
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -159,6 +169,14 @@ mod tests {
         miner_state: MinerTelemetry,
         board_states: Vec<BoardTelemetry>,
     ) -> TestFixtures {
+        build_test_router_with_pool_config(miner_state, board_states, None)
+    }
+
+    fn build_test_router_with_pool_config(
+        miner_state: MinerTelemetry,
+        board_states: Vec<BoardTelemetry>,
+        pool_config: Option<PoolConfig>,
+    ) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
 
@@ -171,7 +189,12 @@ mod tests {
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(
+                miner_rx,
+                Arc::new(Mutex::new(registry)),
+                cmd_tx,
+                Arc::new(pool_config),
+            ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
@@ -361,5 +384,41 @@ mod tests {
         let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn config_returns_null_pool_when_none_configured() {
+        let fixtures = build_test_router_with_pool_config(MinerTelemetry::default(), vec![], None);
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/config").await;
+        assert_eq!(status, 200);
+
+        let config: MinerConfig = serde_json::from_str(&body).unwrap();
+        assert!(config.pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn config_exposes_pool_without_password() {
+        let fixtures = build_test_router_with_pool_config(
+            MinerTelemetry::default(),
+            vec![],
+            Some(PoolConfig {
+                url: "stratum+tcp://pool.example:3333".into(),
+                username: "alice.worker1".into(),
+                password: "hunter2".into(),
+                password_set: true,
+            }),
+        );
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/config").await;
+        assert_eq!(status, 200);
+        assert!(
+            !body.contains("hunter2"),
+            "response must never echo the pool password: {body}"
+        );
+
+        let config: MinerConfig = serde_json::from_str(&body).unwrap();
+        let pool = config.pool.expect("pool should be present");
+        assert_eq!(pool.url, "stratum+tcp://pool.example:3333");
+        assert_eq!(pool.username, "alice.worker1");
+        assert!(pool.password_set);
     }
 }

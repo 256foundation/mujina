@@ -16,7 +16,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardTelemetry, MinerConfig, MinerPatchRequest, MinerTelemetry, PoolConfig, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -24,6 +24,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
     OpenApiRouter::new()
         .routes(routes!(health))
         .routes(routes!(get_miner, patch_miner))
+        .routes(routes!(get_config))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
         .routes(routes!(get_sources))
@@ -90,6 +91,34 @@ async fn patch_miner(
     }
 
     Ok(Json(state.miner_telemetry()))
+}
+
+/// Return the current configuration tree.
+///
+/// Read-only for now; writes and file-based config layers land in
+/// later increments.
+#[utoipa::path(
+    get,
+    path = "/config",
+    tag = "config",
+    responses(
+        (status = OK, description = "Current configuration tree", body = MinerConfig),
+    ),
+)]
+async fn get_config(State(state): State<SharedState>) -> Json<MinerConfig> {
+    Json(MinerConfig {
+        pool: (*state.pool_config).as_ref().map(PoolConfig::from),
+    })
+}
+
+impl From<&crate::config::PoolConfig> for PoolConfig {
+    fn from(pool: &crate::config::PoolConfig) -> Self {
+        Self {
+            url: pool.url.clone(),
+            username: pool.username.clone(),
+            password_set: pool.password_set,
+        }
+    }
 }
 
 /// Return all connected boards.

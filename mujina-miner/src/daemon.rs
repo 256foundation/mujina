@@ -4,6 +4,7 @@
 //! task management, signal handling, and graceful shutdown.
 
 use std::env;
+use std::sync::Arc;
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -112,11 +113,11 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        let config = Config::from_env();
+        let pool_config = Arc::new(Config::from_env().pool);
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Some(pool) = config.pool {
+        if let Some(pool) = (*pool_config).clone() {
             // Use Stratum v1 source
             let pool_url = pool.url;
             let stratum_config = StratumPoolConfig {
@@ -247,6 +248,7 @@ impl Daemon {
         // Start the API server
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
+            let pool_config = pool_config.clone();
             async move {
                 // ASCII 'M' (77) + 'U' (85) = 7785
                 const API_PORT: u16 = 7785;
@@ -263,6 +265,7 @@ impl Daemon {
                     miner_telemetry_rx,
                     board_reg_rx,
                     scheduler_cmd_tx,
+                    pool_config,
                 )
                 .await
                 {

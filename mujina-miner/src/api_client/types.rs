@@ -92,6 +92,23 @@ pub struct SetFanTargetRequest {
     pub target_percent: Option<u8>,
 }
 
+/// Configuration tree snapshot, read-only for now.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct MinerConfig {
+    pub pool: Option<PoolConfig>,
+}
+
+/// Pool configuration as exposed over the API.
+///
+/// The password is never echoed back; `password_set` only reports
+/// whether one is configured.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolConfig {
+    pub url: String,
+    pub username: String,
+    pub password_set: bool,
+}
+
 /// Job source telemetry.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct SourceTelemetry {
