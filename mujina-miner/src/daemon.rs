@@ -14,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    config::Config,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -111,23 +112,17 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        let config = Config::from_env();
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
+        if let Some(pool) = config.pool {
             // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
-
+            let pool_url = pool.url;
             let stratum_config = StratumPoolConfig {
                 url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
+                username: pool.username,
+                password: pool.password,
                 user_agent: "mujina-miner/0.1.0-alpha".to_string(),
             };
 
@@ -261,9 +256,9 @@ impl Daemon {
                     Ok(addr) => format!("{addr}:{API_PORT}"),
                     Err(_) => format!("127.0.0.1:{API_PORT}"),
                 };
-                let config = ApiConfig { bind_addr };
+                let api_config = ApiConfig { bind_addr };
                 if let Err(e) = api::serve(
-                    config,
+                    api_config,
                     shutdown,
                     miner_telemetry_rx,
                     board_reg_rx,
