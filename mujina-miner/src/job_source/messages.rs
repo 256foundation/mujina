@@ -139,6 +139,20 @@ pub enum SourceEvent {
     /// Scheduler should cancel all work from this source and wait for new job.
     /// Used during pool disconnection or when awaiting new block.
     ClearJobs,
+
+    /// Pool acknowledged acceptance of shares (SV2 only).
+    ///
+    /// `count` is the number of shares accepted, derived from the sequence
+    /// number range in `SubmitSharesSuccess`. SV1 has no per-batch ACK, so
+    /// this variant is only emitted by SV2 sources.
+    SharesAccepted(u32),
+
+    /// Pool rejected a share (SV2 only).
+    ///
+    /// Emitted on `SubmitSharesError`. Each error message from the pool
+    /// identifies a single rejected sequence number, so this event always
+    /// represents exactly one rejection.
+    SharesRejected,
 }
 
 /// Commands to sources (pull, coordinator-initiated).

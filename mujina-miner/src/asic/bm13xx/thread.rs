@@ -688,9 +688,10 @@ async fn bm13xx_thread_actor<R, W>(
                             chip_initialized = true;
                         }
 
-                        // Send initial job to chip
+                        // Send initial job to chip. current_task is committed only
+                        // after a successful send so a conversion failure doesn't
+                        // leave the ntime ticker with a broken task.
                         let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
                                 if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
@@ -708,6 +709,7 @@ async fn bm13xx_thread_actor<R, W>(
                                 continue;
                             }
                         }
+                        let old_task = current_task.replace(new_task.clone());
 
                         {
                             let mut s = status.write().unwrap();
@@ -741,9 +743,10 @@ async fn bm13xx_thread_actor<R, W>(
                         // Clear old jobs (old shares invalid)
                         chip_jobs.clear();
 
-                        // Send initial job to chip
+                        // Send initial job to chip. current_task is committed only
+                        // after a successful send so a conversion failure doesn't
+                        // leave the ntime ticker with a broken task.
                         let chip_job_id = chip_jobs.insert(new_task.clone());
-                        let old_task = current_task.replace(new_task.clone());
                         match task_to_job_full(&new_task, chip_job_id) {
                             Ok(job_data) => {
                                 if let Err(e) = chip_commands.send(protocol::Command::JobFull { job_data }).await {
@@ -761,6 +764,7 @@ async fn bm13xx_thread_actor<R, W>(
                                 continue;
                             }
                         }
+                        let old_task = current_task.replace(new_task.clone());
 
                         {
                             let mut s = status.write().unwrap();
@@ -1073,5 +1077,115 @@ mod tests {
             *esp_miner_job::wire_tx::PREV_BLOCKHASH
         );
         assert_eq!(result.merkle_root, *esp_miner_job::wire_tx::MERKLE_ROOT);
+    }
+
+    // Spawn a minimal actor backed by a no-op sink and an idle stream.
+    // Returns cmd_tx and the removal sender (must be kept alive for the actor
+    // to keep running; dropping it causes removal_rx.changed() to fire).
+    fn spawn_test_actor() -> (
+        mpsc::Sender<ThreadCommand>,
+        watch::Sender<ThreadRemovalSignal>,
+    ) {
+        use futures::{sink, stream};
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (evt_tx, _) = mpsc::channel(8);
+        let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+        tokio::spawn(bm13xx_thread_actor(
+            cmd_rx,
+            evt_tx,
+            removal_rx,
+            Arc::new(RwLock::new(HashThreadStatus::default())),
+            stream::pending::<Result<protocol::Response, std::io::Error>>(),
+            sink::drain(),
+            BoardPeripherals {
+                asic_enable: None,
+                voltage_regulator: None,
+            },
+        ));
+        (cmd_tx, removal_tx)
+    }
+
+    // A Computed-merkle-root task with no EN2 value; task_to_job_full returns Err
+    // immediately on it, making it a convenient trigger for the conversion-failure path.
+    fn broken_computed_task() -> HashTask {
+        use crate::asic::bm13xx::test_data::esp_miner_job;
+        use crate::job_source::{
+            Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate,
+            VersionTemplate,
+        };
+        let (share_tx, _) = mpsc::channel(1);
+        HashTask {
+            template: Arc::new(JobTemplate {
+                id: "broken".into(),
+                prev_blockhash: *esp_miner_job::wire_tx::PREV_BLOCKHASH,
+                version: VersionTemplate::new(
+                    *esp_miner_job::wire_tx::VERSION,
+                    GeneralPurposeBits::full(),
+                )
+                .unwrap(),
+                bits: *esp_miner_job::wire_tx::NBITS,
+                share_target: crate::types::Difficulty::from(1_u64).to_target(),
+                time: 0,
+                merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
+                    coinbase1: vec![],
+                    extranonce1: vec![],
+                    extranonce2_range: Extranonce2Range::new(4).unwrap(),
+                    extranonce2_size: 4,
+                    coinbase2: vec![],
+                    merkle_branches: vec![],
+                }),
+            }),
+            en2_range: None,
+            en2: None,
+            share_target: crate::types::Difficulty::from(1_u64).to_target(),
+            ntime: 0,
+            share_tx,
+        }
+    }
+
+    // Regression: a failed conversion must not commit current_task.
+    // GoIdle returns the current task; None means the broken task was never stored.
+    #[tokio::test(start_paused = true)]
+    async fn test_update_task_does_not_commit_on_conversion_failure() {
+        let (cmd_tx, _removal_tx) = spawn_test_actor();
+
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(ThreadCommand::UpdateTask {
+                new_task: broken_computed_task(),
+                response_tx: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap_err();
+
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(ThreadCommand::GoIdle { response_tx: tx })
+            .await
+            .unwrap();
+        assert!(rx.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_replace_task_does_not_commit_on_conversion_failure() {
+        let (cmd_tx, _removal_tx) = spawn_test_actor();
+
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(ThreadCommand::ReplaceTask {
+                new_task: broken_computed_task(),
+                response_tx: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap_err();
+
+        let (tx, rx) = oneshot::channel();
+        cmd_tx
+            .send(ThreadCommand::GoIdle { response_tx: tx })
+            .await
+            .unwrap();
+        assert!(rx.await.unwrap().unwrap().is_none());
     }
 }
