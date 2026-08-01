@@ -279,6 +279,59 @@ impl TdmResultParser {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bzm2EngineLayout {
+    active_coordinates: Vec<(u8, u8)>,
+    logical_ids_by_address: HashMap<u16, u16>,
+}
+
+impl Bzm2EngineLayout {
+    pub fn from_active_coordinates<I>(coords: I) -> Self
+    where
+        I: IntoIterator<Item = (u8, u8)>,
+    {
+        let mut active_coordinates = coords
+            .into_iter()
+            .filter(|(row, col)| *row < LOGICAL_ENGINE_ROWS && *col < LOGICAL_ENGINE_COLS)
+            .collect::<Vec<_>>();
+        active_coordinates.sort_by_key(|(row, col)| (*col, *row));
+        active_coordinates.dedup();
+
+        let logical_ids_by_address = active_coordinates
+            .iter()
+            .enumerate()
+            .map(|(logical_id, (row, col))| (logical_engine_address(*row, *col), logical_id as u16))
+            .collect();
+
+        Self {
+            active_coordinates,
+            logical_ids_by_address,
+        }
+    }
+
+    pub fn active_coordinates(&self) -> &[(u8, u8)] {
+        &self.active_coordinates
+    }
+
+    pub fn active_engine_count(&self) -> usize {
+        self.active_coordinates.len()
+    }
+
+    pub fn logical_engine_id(&self, row: u8, col: u8) -> Option<u16> {
+        self.logical_engine_id_from_address(logical_engine_address(row, col))
+    }
+
+    pub fn logical_engine_id_from_address(&self, engine_address: u16) -> Option<u16> {
+        self.logical_ids_by_address.get(&engine_address).copied()
+    }
+}
+
+impl Default for Bzm2EngineLayout {
+    fn default() -> Self {
+        Self::from_active_coordinates(default_engine_coordinates())
+    }
+}
+
 pub fn encode_write_register(asic: u8, engine_address: u16, offset: u8, value: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(7 + value.len());
     let header = ((asic as u32) << 24)
@@ -427,59 +480,6 @@ pub fn default_engine_coordinates() -> Vec<(u8, u8)> {
         }
     }
     coords
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bzm2EngineLayout {
-    active_coordinates: Vec<(u8, u8)>,
-    logical_ids_by_address: HashMap<u16, u16>,
-}
-
-impl Bzm2EngineLayout {
-    pub fn from_active_coordinates<I>(coords: I) -> Self
-    where
-        I: IntoIterator<Item = (u8, u8)>,
-    {
-        let mut active_coordinates = coords
-            .into_iter()
-            .filter(|(row, col)| *row < LOGICAL_ENGINE_ROWS && *col < LOGICAL_ENGINE_COLS)
-            .collect::<Vec<_>>();
-        active_coordinates.sort_by_key(|(row, col)| (*col, *row));
-        active_coordinates.dedup();
-
-        let logical_ids_by_address = active_coordinates
-            .iter()
-            .enumerate()
-            .map(|(logical_id, (row, col))| (logical_engine_address(*row, *col), logical_id as u16))
-            .collect();
-
-        Self {
-            active_coordinates,
-            logical_ids_by_address,
-        }
-    }
-
-    pub fn active_coordinates(&self) -> &[(u8, u8)] {
-        &self.active_coordinates
-    }
-
-    pub fn active_engine_count(&self) -> usize {
-        self.active_coordinates.len()
-    }
-
-    pub fn logical_engine_id(&self, row: u8, col: u8) -> Option<u16> {
-        self.logical_engine_id_from_address(logical_engine_address(row, col))
-    }
-
-    pub fn logical_engine_id_from_address(&self, engine_address: u16) -> Option<u16> {
-        self.logical_ids_by_address.get(&engine_address).copied()
-    }
-}
-
-impl Default for Bzm2EngineLayout {
-    fn default() -> Self {
-        Self::from_active_coordinates(default_engine_coordinates())
-    }
 }
 
 pub fn leading_zero_threshold(target: bitcoin::pow::Target) -> u8 {

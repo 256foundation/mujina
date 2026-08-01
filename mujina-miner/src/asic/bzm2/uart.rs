@@ -40,96 +40,6 @@ const VOLTAGE_SENSOR_CONVERSION_MODE: u8 = 1;
 const VOLTAGE_SENSOR_MODE: u8 = 0;
 const DISCOVERED_ENGINE_END_NONCE: u32 = 0xffff_fffe;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bzm2DtsVsConfig {
-    pub tdm_interval: u8,
-    pub thermal_trip_c: i32,
-    pub voltage_ch0_shutdown_mv: u32,
-    pub voltage_ch1_shutdown_mv: u32,
-}
-
-impl Default for Bzm2DtsVsConfig {
-    fn default() -> Self {
-        Self {
-            tdm_interval: 1,
-            thermal_trip_c: 115,
-            voltage_ch0_shutdown_mv: 500,
-            voltage_ch1_shutdown_mv: 500,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Bzm2UartError {
-    #[error("serial I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("short UART response: expected {expected} bytes, got {actual}")]
-    ShortResponse { expected: usize, actual: usize },
-
-    #[error(
-        "unexpected UART response header: expected asic {expected_asic:#x} opcode {expected_opcode:#x}, got asic {actual_asic:#x} opcode {actual_opcode:#x}"
-    )]
-    UnexpectedHeader {
-        expected_asic: u8,
-        expected_opcode: u8,
-        actual_asic: u8,
-        actual_opcode: u8,
-    },
-
-    #[error("unexpected NOOP payload from ASIC {asic:#x}: {data:02x?}")]
-    UnexpectedNoopPayload { asic: u8, data: [u8; 3] },
-
-    #[error("timed out waiting for NOOP response from ASIC {asic:#x} after {timeout_ms} ms")]
-    NoopTimeout { asic: u8, timeout_ms: u64 },
-
-    #[error("timed out waiting for DTS/VS frame from ASIC {asic:#x}")]
-    DtsVsTimeout { asic: u8 },
-
-    #[error(
-        "timed out waiting for TDM register response from ASIC {asic:#x} engine {engine_address:#05x} offset {offset:#04x}"
-    )]
-    TdmRegisterTimeout {
-        asic: u8,
-        engine_address: u16,
-        offset: u8,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Bzm2EngineCoordinate {
-    pub row: u8,
-    pub col: u8,
-    pub engine_address: u16,
-}
-
-impl Bzm2EngineCoordinate {
-    pub fn new(row: u8, col: u8) -> Self {
-        Self {
-            row,
-            col,
-            engine_address: logical_engine_address(row, col),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bzm2DiscoveredEngineMap {
-    pub asic: u8,
-    pub present: Vec<Bzm2EngineCoordinate>,
-    pub missing: Vec<Bzm2EngineCoordinate>,
-}
-
-impl Bzm2DiscoveredEngineMap {
-    pub fn present_count(&self) -> usize {
-        self.present.len()
-    }
-
-    pub fn missing_count(&self) -> usize {
-        self.missing.len()
-    }
-}
-
 /// Low-level BZM2 UART control surface.
 ///
 /// This controller wraps the legacy BZM2 UART framing in a small, explicit API.
@@ -529,6 +439,96 @@ impl Bzm2UartController {
     ) -> Result<TdmDtsVsFrame, Bzm2UartError> {
         self.enable_dts_vs(config).await?;
         read_dts_vs_frame_stream(&mut self.reader, generation, asic, timeout).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bzm2DtsVsConfig {
+    pub tdm_interval: u8,
+    pub thermal_trip_c: i32,
+    pub voltage_ch0_shutdown_mv: u32,
+    pub voltage_ch1_shutdown_mv: u32,
+}
+
+impl Default for Bzm2DtsVsConfig {
+    fn default() -> Self {
+        Self {
+            tdm_interval: 1,
+            thermal_trip_c: 115,
+            voltage_ch0_shutdown_mv: 500,
+            voltage_ch1_shutdown_mv: 500,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Bzm2UartError {
+    #[error("serial I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("short UART response: expected {expected} bytes, got {actual}")]
+    ShortResponse { expected: usize, actual: usize },
+
+    #[error(
+        "unexpected UART response header: expected asic {expected_asic:#x} opcode {expected_opcode:#x}, got asic {actual_asic:#x} opcode {actual_opcode:#x}"
+    )]
+    UnexpectedHeader {
+        expected_asic: u8,
+        expected_opcode: u8,
+        actual_asic: u8,
+        actual_opcode: u8,
+    },
+
+    #[error("unexpected NOOP payload from ASIC {asic:#x}: {data:02x?}")]
+    UnexpectedNoopPayload { asic: u8, data: [u8; 3] },
+
+    #[error("timed out waiting for NOOP response from ASIC {asic:#x} after {timeout_ms} ms")]
+    NoopTimeout { asic: u8, timeout_ms: u64 },
+
+    #[error("timed out waiting for DTS/VS frame from ASIC {asic:#x}")]
+    DtsVsTimeout { asic: u8 },
+
+    #[error(
+        "timed out waiting for TDM register response from ASIC {asic:#x} engine {engine_address:#05x} offset {offset:#04x}"
+    )]
+    TdmRegisterTimeout {
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Bzm2EngineCoordinate {
+    pub row: u8,
+    pub col: u8,
+    pub engine_address: u16,
+}
+
+impl Bzm2EngineCoordinate {
+    pub fn new(row: u8, col: u8) -> Self {
+        Self {
+            row,
+            col,
+            engine_address: logical_engine_address(row, col),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bzm2DiscoveredEngineMap {
+    pub asic: u8,
+    pub present: Vec<Bzm2EngineCoordinate>,
+    pub missing: Vec<Bzm2EngineCoordinate>,
+}
+
+impl Bzm2DiscoveredEngineMap {
+    pub fn present_count(&self) -> usize {
+        self.present.len()
+    }
+
+    pub fn missing_count(&self) -> usize {
+        self.missing.len()
     }
 }
 

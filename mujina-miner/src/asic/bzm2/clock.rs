@@ -32,220 +32,6 @@ const LOCAL_REG_CKDCCR_5_1: u8 = 0x61;
 const LOCAL_REG_CKDLLR_0_1: u8 = 0x62;
 const LOCAL_REG_CKDLLR_1_1: u8 = 0x63;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Bzm2ClockError {
-    #[error(transparent)]
-    Uart(#[from] Bzm2UartError),
-
-    #[error("invalid desired PLL frequency {0} MHz")]
-    InvalidFrequency(f32),
-
-    #[error("invalid PLL post divider {0}")]
-    InvalidPostDivider(u8),
-
-    #[error("unsupported DLL duty cycle {0}; supported values are 25, 50, 55, 60, 75")]
-    InvalidDllDutyCycle(u8),
-
-    #[error(
-        "PLL {pll:?} on ASIC {asic} did not lock before timeout; last enable value {last_enable:#x}"
-    )]
-    PllLockTimeout {
-        asic: u8,
-        pll: Bzm2Pll,
-        last_enable: u32,
-    },
-
-    #[error(
-        "DLL {dll:?} on ASIC {asic} did not lock before timeout; last control value {last_control:#x}"
-    )]
-    DllLockTimeout {
-        asic: u8,
-        dll: Bzm2Dll,
-        last_control: u8,
-    },
-
-    #[error("DLL {dll:?} on ASIC {asic} reported invalid fincon {fincon:#x}")]
-    InvalidDllFincon { asic: u8, dll: Bzm2Dll, fincon: u8 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bzm2Pll {
-    Pll0,
-    Pll1,
-}
-
-impl Bzm2Pll {
-    pub(crate) fn register_block(self) -> (u8, u8, u8, u8) {
-        match self {
-            Self::Pll0 => (
-                LOCAL_REG_PLL_POSTDIV,
-                LOCAL_REG_PLL_FBDIV,
-                LOCAL_REG_PLL_ENABLE,
-                LOCAL_REG_PLL_MISC,
-            ),
-            Self::Pll1 => (
-                LOCAL_REG_PLL1_POSTDIV,
-                LOCAL_REG_PLL1_FBDIV,
-                LOCAL_REG_PLL1_ENABLE,
-                LOCAL_REG_PLL1_MISC,
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bzm2Dll {
-    Dll0,
-    Dll1,
-}
-
-impl Bzm2Dll {
-    pub(crate) fn registers(self) -> (u8, u8, u8, u8, u8) {
-        match self {
-            Self::Dll0 => (
-                LOCAL_REG_CKDCCR_2_0,
-                LOCAL_REG_CKDCCR_3_0,
-                LOCAL_REG_CKDCCR_4_0,
-                LOCAL_REG_CKDCCR_5_0,
-                LOCAL_REG_CKDLLR_0_0,
-            ),
-            Self::Dll1 => (
-                LOCAL_REG_CKDCCR_2_1,
-                LOCAL_REG_CKDCCR_3_1,
-                LOCAL_REG_CKDCCR_4_1,
-                LOCAL_REG_CKDCCR_5_1,
-                LOCAL_REG_CKDLLR_0_1,
-            ),
-        }
-    }
-
-    pub(crate) fn fincon_register(self) -> u8 {
-        match self {
-            Self::Dll0 => LOCAL_REG_CKDLLR_1_0,
-            Self::Dll1 => LOCAL_REG_CKDLLR_1_1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bzm2PllConfig {
-    pub frequency_mhz: f32,
-    pub post1_divider: u8,
-    pub ref_divider: u8,
-    pub post2_divider: u8,
-    pub feedback_divider: u16,
-    pub packed_post_divider: u32,
-}
-
-impl Bzm2PllConfig {
-    pub fn from_target_frequency(
-        frequency_mhz: f32,
-        post1_divider: u8,
-    ) -> Result<Self, Bzm2ClockError> {
-        if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
-            return Err(Bzm2ClockError::InvalidFrequency(frequency_mhz));
-        }
-        if post1_divider > 7 {
-            return Err(Bzm2ClockError::InvalidPostDivider(post1_divider));
-        }
-
-        let feedback = REF_DIVIDER as f32
-            * (post1_divider as f32 + 1.0)
-            * (POST2_DIVIDER as f32 + 1.0)
-            * frequency_mhz
-            / REF_CLK_MHZ;
-        let feedback_divider = round_legacy(feedback);
-        let packed_post_divider = (1u32 << 12)
-            | ((POST2_DIVIDER as u32) << 9)
-            | ((post1_divider as u32) << 6)
-            | REF_DIVIDER as u32;
-
-        Ok(Self {
-            frequency_mhz,
-            post1_divider,
-            ref_divider: REF_DIVIDER,
-            post2_divider: POST2_DIVIDER,
-            feedback_divider,
-            packed_post_divider,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bzm2DllConfig {
-    pub duty_cycle: u8,
-    pub nde_dll: u8,
-    pub nde_clk: u8,
-    pub npi_clk: u8,
-    pub pibypb: u8,
-    pub dllfreeze: u8,
-}
-
-impl Bzm2DllConfig {
-    pub fn from_duty_cycle(duty_cycle: u8) -> Result<Self, Bzm2ClockError> {
-        let mut config = Self {
-            duty_cycle,
-            nde_dll: 0x1f,
-            nde_clk: 0x0f,
-            npi_clk: 0x0,
-            pibypb: 1,
-            dllfreeze: 0,
-        };
-
-        match duty_cycle {
-            50 => {}
-            75 => config.nde_clk = 0x17,
-            60 => {
-                config.nde_dll = 0x1d;
-                config.nde_clk = 0x11;
-            }
-            55 => {
-                config.nde_dll = 0x1d;
-                config.nde_clk = 0x0f;
-                config.npi_clk = 0x4;
-            }
-            25 => config.nde_clk = 0x07,
-            _ => return Err(Bzm2ClockError::InvalidDllDutyCycle(duty_cycle)),
-        }
-
-        Ok(config)
-    }
-
-    fn control2(self) -> u8 {
-        ((self.npi_clk & 0x7) << 3) | ((self.pibypb & 0x1) << 2) | ((self.dllfreeze & 0x1) << 1)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bzm2PllStatus {
-    pub pll: Bzm2Pll,
-    pub enable_register: u32,
-    pub misc_register: u32,
-    pub enabled: bool,
-    pub locked: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bzm2DllStatus {
-    pub dll: Bzm2Dll,
-    pub control2: u8,
-    pub control5: u8,
-    pub coarsecon: u8,
-    pub fincon: u8,
-    pub freeze_valid: bool,
-    pub locked: bool,
-    pub fincon_valid: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bzm2ClockDebugReport {
-    pub asic: u8,
-    pub pll0: Bzm2PllStatus,
-    pub pll1: Bzm2PllStatus,
-    pub dll0: Bzm2DllStatus,
-    pub dll1: Bzm2DllStatus,
-}
-
 pub struct Bzm2ClockController {
     uart: Bzm2UartController,
 }
@@ -547,6 +333,220 @@ impl Bzm2ClockController {
             dll1: self.read_dll_status(asic, Bzm2Dll::Dll1).await?,
         })
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Bzm2ClockError {
+    #[error(transparent)]
+    Uart(#[from] Bzm2UartError),
+
+    #[error("invalid desired PLL frequency {0} MHz")]
+    InvalidFrequency(f32),
+
+    #[error("invalid PLL post divider {0}")]
+    InvalidPostDivider(u8),
+
+    #[error("unsupported DLL duty cycle {0}; supported values are 25, 50, 55, 60, 75")]
+    InvalidDllDutyCycle(u8),
+
+    #[error(
+        "PLL {pll:?} on ASIC {asic} did not lock before timeout; last enable value {last_enable:#x}"
+    )]
+    PllLockTimeout {
+        asic: u8,
+        pll: Bzm2Pll,
+        last_enable: u32,
+    },
+
+    #[error(
+        "DLL {dll:?} on ASIC {asic} did not lock before timeout; last control value {last_control:#x}"
+    )]
+    DllLockTimeout {
+        asic: u8,
+        dll: Bzm2Dll,
+        last_control: u8,
+    },
+
+    #[error("DLL {dll:?} on ASIC {asic} reported invalid fincon {fincon:#x}")]
+    InvalidDllFincon { asic: u8, dll: Bzm2Dll, fincon: u8 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bzm2Pll {
+    Pll0,
+    Pll1,
+}
+
+impl Bzm2Pll {
+    pub(crate) fn register_block(self) -> (u8, u8, u8, u8) {
+        match self {
+            Self::Pll0 => (
+                LOCAL_REG_PLL_POSTDIV,
+                LOCAL_REG_PLL_FBDIV,
+                LOCAL_REG_PLL_ENABLE,
+                LOCAL_REG_PLL_MISC,
+            ),
+            Self::Pll1 => (
+                LOCAL_REG_PLL1_POSTDIV,
+                LOCAL_REG_PLL1_FBDIV,
+                LOCAL_REG_PLL1_ENABLE,
+                LOCAL_REG_PLL1_MISC,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bzm2Dll {
+    Dll0,
+    Dll1,
+}
+
+impl Bzm2Dll {
+    pub(crate) fn registers(self) -> (u8, u8, u8, u8, u8) {
+        match self {
+            Self::Dll0 => (
+                LOCAL_REG_CKDCCR_2_0,
+                LOCAL_REG_CKDCCR_3_0,
+                LOCAL_REG_CKDCCR_4_0,
+                LOCAL_REG_CKDCCR_5_0,
+                LOCAL_REG_CKDLLR_0_0,
+            ),
+            Self::Dll1 => (
+                LOCAL_REG_CKDCCR_2_1,
+                LOCAL_REG_CKDCCR_3_1,
+                LOCAL_REG_CKDCCR_4_1,
+                LOCAL_REG_CKDCCR_5_1,
+                LOCAL_REG_CKDLLR_0_1,
+            ),
+        }
+    }
+
+    pub(crate) fn fincon_register(self) -> u8 {
+        match self {
+            Self::Dll0 => LOCAL_REG_CKDLLR_1_0,
+            Self::Dll1 => LOCAL_REG_CKDLLR_1_1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bzm2PllConfig {
+    pub frequency_mhz: f32,
+    pub post1_divider: u8,
+    pub ref_divider: u8,
+    pub post2_divider: u8,
+    pub feedback_divider: u16,
+    pub packed_post_divider: u32,
+}
+
+impl Bzm2PllConfig {
+    pub fn from_target_frequency(
+        frequency_mhz: f32,
+        post1_divider: u8,
+    ) -> Result<Self, Bzm2ClockError> {
+        if !frequency_mhz.is_finite() || frequency_mhz <= 0.0 {
+            return Err(Bzm2ClockError::InvalidFrequency(frequency_mhz));
+        }
+        if post1_divider > 7 {
+            return Err(Bzm2ClockError::InvalidPostDivider(post1_divider));
+        }
+
+        let feedback = REF_DIVIDER as f32
+            * (post1_divider as f32 + 1.0)
+            * (POST2_DIVIDER as f32 + 1.0)
+            * frequency_mhz
+            / REF_CLK_MHZ;
+        let feedback_divider = round_legacy(feedback);
+        let packed_post_divider = (1u32 << 12)
+            | ((POST2_DIVIDER as u32) << 9)
+            | ((post1_divider as u32) << 6)
+            | REF_DIVIDER as u32;
+
+        Ok(Self {
+            frequency_mhz,
+            post1_divider,
+            ref_divider: REF_DIVIDER,
+            post2_divider: POST2_DIVIDER,
+            feedback_divider,
+            packed_post_divider,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bzm2DllConfig {
+    pub duty_cycle: u8,
+    pub nde_dll: u8,
+    pub nde_clk: u8,
+    pub npi_clk: u8,
+    pub pibypb: u8,
+    pub dllfreeze: u8,
+}
+
+impl Bzm2DllConfig {
+    pub fn from_duty_cycle(duty_cycle: u8) -> Result<Self, Bzm2ClockError> {
+        let mut config = Self {
+            duty_cycle,
+            nde_dll: 0x1f,
+            nde_clk: 0x0f,
+            npi_clk: 0x0,
+            pibypb: 1,
+            dllfreeze: 0,
+        };
+
+        match duty_cycle {
+            50 => {}
+            75 => config.nde_clk = 0x17,
+            60 => {
+                config.nde_dll = 0x1d;
+                config.nde_clk = 0x11;
+            }
+            55 => {
+                config.nde_dll = 0x1d;
+                config.nde_clk = 0x0f;
+                config.npi_clk = 0x4;
+            }
+            25 => config.nde_clk = 0x07,
+            _ => return Err(Bzm2ClockError::InvalidDllDutyCycle(duty_cycle)),
+        }
+
+        Ok(config)
+    }
+
+    fn control2(self) -> u8 {
+        ((self.npi_clk & 0x7) << 3) | ((self.pibypb & 0x1) << 2) | ((self.dllfreeze & 0x1) << 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bzm2PllStatus {
+    pub pll: Bzm2Pll,
+    pub enable_register: u32,
+    pub misc_register: u32,
+    pub enabled: bool,
+    pub locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bzm2DllStatus {
+    pub dll: Bzm2Dll,
+    pub control2: u8,
+    pub control5: u8,
+    pub coarsecon: u8,
+    pub fincon: u8,
+    pub freeze_valid: bool,
+    pub locked: bool,
+    pub fincon_valid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bzm2ClockDebugReport {
+    pub asic: u8,
+    pub pll0: Bzm2PllStatus,
+    pub pll1: Bzm2PllStatus,
+    pub dll0: Bzm2DllStatus,
+    pub dll1: Bzm2DllStatus,
 }
 
 pub(crate) fn fincon_is_valid(fincon: u8) -> bool {
