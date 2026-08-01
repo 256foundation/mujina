@@ -268,10 +268,6 @@ async fn query_bzm2_dts_vs(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-fn decode_hex_payload(raw: &str) -> Result<Vec<u8>, StatusCode> {
-    hex::decode(raw.trim()).map_err(|_| StatusCode::BAD_REQUEST)
-}
-
 /// Trigger a live BZM2 NOOP diagnostic through a board-owned UART thread.
 #[utoipa::path(
     post,
@@ -490,6 +486,10 @@ async fn write_bzm2_register(
     };
 
     Ok(Json(Bzm2RegisterWriteResponse { bytes_written }))
+}
+
+fn decode_hex_payload(raw: &str) -> Result<Vec<u8>, StatusCode> {
+    hex::decode(raw.trim()).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// Return a live BZM2 clock report through a board-owned UART thread.
