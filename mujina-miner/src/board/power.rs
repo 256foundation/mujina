@@ -14,6 +14,12 @@ use crate::{
     peripheral::tps546::Tps546,
 };
 
+#[async_trait]
+pub trait PowerRail: Send + Sync {
+    async fn initialize(&mut self) -> Result<()>;
+    async fn set_voltage(&mut self, volts: f32) -> Result<()>;
+    async fn telemetry(&mut self) -> Result<PowerRailTelemetry>;
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PowerRailTelemetry {
     pub vin_volts: f32,
@@ -21,13 +27,6 @@ pub struct PowerRailTelemetry {
     pub current_amps: f32,
     pub temperature_c: f32,
     pub power_watts: f32,
-}
-
-#[async_trait]
-pub trait PowerRail: Send + Sync {
-    async fn initialize(&mut self) -> Result<()>;
-    async fn set_voltage(&mut self, volts: f32) -> Result<()>;
-    async fn telemetry(&mut self) -> Result<PowerRailTelemetry>;
 }
 
 pub struct Tps546PowerRail<I2C> {
@@ -86,6 +85,16 @@ impl<PIN> GpioResetLine<PIN> {
         self.pin
     }
 
+    pub async fn pulse(&mut self, assert_for: Duration, settle_for: Duration) -> Result<()>
+    where
+        PIN: GpioPin,
+    {
+        self.drive(true).await?;
+        sleep(assert_for).await;
+        self.drive(false).await?;
+        sleep(settle_for).await;
+        Ok(())
+    }
     async fn drive(&mut self, asserted: bool) -> Result<()>
     where
         PIN: GpioPin,
@@ -98,16 +107,16 @@ impl<PIN> GpioResetLine<PIN> {
         self.pin.write(value).await?;
         Ok(())
     }
+}
 
-    pub async fn pulse(&mut self, assert_for: Duration, settle_for: Duration) -> Result<()>
-    where
-        PIN: GpioPin,
-    {
-        self.drive(true).await?;
-        sleep(assert_for).await;
-        self.drive(false).await?;
-        sleep(settle_for).await;
-        Ok(())
+#[async_trait]
+impl<PIN: GpioPin> AsicEnable for GpioResetLine<PIN> {
+    async fn enable(&mut self) -> Result<()> {
+        self.drive(false).await
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        self.drive(true).await
     }
 }
 
@@ -160,17 +169,6 @@ impl GpioPin for FileGpioPin {
     }
 }
 
-#[async_trait]
-impl<PIN: GpioPin> AsicEnable for GpioResetLine<PIN> {
-    async fn enable(&mut self) -> Result<()> {
-        self.drive(false).await
-    }
-
-    async fn disable(&mut self) -> Result<()> {
-        self.drive(true).await
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VoltageStackStep {
     pub rail_index: usize,
@@ -185,68 +183,6 @@ pub struct VoltageStackBringupPlan {
     pub post_power_delay: Duration,
     pub release_reset_delay: Duration,
     pub steps: Vec<VoltageStackStep>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FilePowerRail {
-    set_path: String,
-    write_scale: f32,
-    enable_path: Option<String>,
-    enable_value: Option<String>,
-}
-
-impl FilePowerRail {
-    pub fn new(path: impl Into<String>, write_scale: f32) -> Self {
-        Self {
-            set_path: path.into(),
-            write_scale,
-            enable_path: None,
-            enable_value: None,
-        }
-    }
-
-    pub fn with_enable(
-        mut self,
-        enable_path: impl Into<String>,
-        enable_value: impl Into<String>,
-    ) -> Self {
-        self.enable_path = Some(enable_path.into());
-        self.enable_value = Some(enable_value.into());
-        self
-    }
-
-    fn encode_voltage(&self, volts: f32) -> String {
-        if (self.write_scale - 1.0).abs() < f32::EPSILON {
-            format!("{volts:.6}")
-        } else {
-            format!("{}", (volts * self.write_scale).round() as i64)
-        }
-    }
-}
-
-#[async_trait]
-impl PowerRail for FilePowerRail {
-    async fn initialize(&mut self) -> Result<()> {
-        if let (Some(path), Some(value)) = (&self.enable_path, &self.enable_value) {
-            fs::write(path, value).await?;
-        }
-        Ok(())
-    }
-
-    async fn set_voltage(&mut self, volts: f32) -> Result<()> {
-        fs::write(&self.set_path, self.encode_voltage(volts)).await?;
-        Ok(())
-    }
-
-    async fn telemetry(&mut self) -> Result<PowerRailTelemetry> {
-        Ok(PowerRailTelemetry {
-            vin_volts: 0.0,
-            vout_volts: 0.0,
-            current_amps: 0.0,
-            temperature_c: 0.0,
-            power_watts: 0.0,
-        })
-    }
 }
 
 impl Default for VoltageStackBringupPlan {
@@ -318,6 +254,68 @@ impl VoltageStackBringupPlan {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilePowerRail {
+    set_path: String,
+    write_scale: f32,
+    enable_path: Option<String>,
+    enable_value: Option<String>,
+}
+
+impl FilePowerRail {
+    pub fn new(path: impl Into<String>, write_scale: f32) -> Self {
+        Self {
+            set_path: path.into(),
+            write_scale,
+            enable_path: None,
+            enable_value: None,
+        }
+    }
+
+    pub fn with_enable(
+        mut self,
+        enable_path: impl Into<String>,
+        enable_value: impl Into<String>,
+    ) -> Self {
+        self.enable_path = Some(enable_path.into());
+        self.enable_value = Some(enable_value.into());
+        self
+    }
+
+    fn encode_voltage(&self, volts: f32) -> String {
+        if (self.write_scale - 1.0).abs() < f32::EPSILON {
+            format!("{volts:.6}")
+        } else {
+            format!("{}", (volts * self.write_scale).round() as i64)
+        }
+    }
+}
+
+#[async_trait]
+impl PowerRail for FilePowerRail {
+    async fn initialize(&mut self) -> Result<()> {
+        if let (Some(path), Some(value)) = (&self.enable_path, &self.enable_value) {
+            fs::write(path, value).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_voltage(&mut self, volts: f32) -> Result<()> {
+        fs::write(&self.set_path, self.encode_voltage(volts)).await?;
+        Ok(())
+    }
+
+    async fn telemetry(&mut self) -> Result<PowerRailTelemetry> {
+        Ok(PowerRailTelemetry {
+            vin_volts: 0.0,
+            vout_volts: 0.0,
+            current_amps: 0.0,
+            temperature_c: 0.0,
+            power_watts: 0.0,
+        })
     }
 }
 
