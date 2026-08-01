@@ -36,6 +36,135 @@ use super::uart::{
     configure_dts_vs_stream, discover_engine_map_stream,
 };
 
+const RUNTIME_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5 * 60);
+// Legacy source treats rows 0-9 as the bottom stack (PLL0) and rows 10-19 as
+// the top stack (PLL1).
+const PLL_STACK_SPLIT_ROW: u8 = 10;
+const TIMESTAMP_COUNT_AUTO_CLOCK_UNGATE: u8 = 0x80;
+/// Bound for a single diagnostic UART read. The actor is one task, so a silent
+/// or short-answering chip must not wedge it (including a pending `Shutdown`) on
+/// an unbounded `read_exact`; on expiry the diagnostic fails instead of hanging.
+const DIAGNOSTIC_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub struct Bzm2Thread {
+    name: String,
+    command_tx: mpsc::Sender<ThreadCommand>,
+    event_rx: Option<mpsc::Receiver<HashThreadEvent>>,
+    capabilities: HashThreadCapabilities,
+    status: Arc<RwLock<HashThreadStatus>>,
+}
+
+impl Bzm2Thread {
+    pub fn new(
+        name: String,
+        reader: SerialReader,
+        writer: SerialWriter,
+        control: SerialControl,
+        config: Bzm2ThreadConfig,
+    ) -> Self {
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let status = Arc::new(RwLock::new(HashThreadStatus::default()));
+        let status_clone = Arc::clone(&status);
+
+        tokio::spawn(async move {
+            bzm2_thread_actor(
+                command_rx,
+                event_tx,
+                status_clone,
+                reader,
+                writer,
+                control,
+                config,
+            )
+            .await;
+        });
+
+        Self {
+            name,
+            command_tx,
+            event_rx: Some(event_rx),
+            capabilities: HashThreadCapabilities::default(),
+            status,
+        }
+    }
+
+    pub fn shutdown_handle(&self) -> Bzm2ThreadHandle {
+        Bzm2ThreadHandle {
+            command_tx: self.command_tx.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl HashThread for Bzm2Thread {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> &HashThreadCapabilities {
+        &self.capabilities
+    }
+
+    async fn configure(&mut self) -> anyhow::Result<()> {
+        self.command_tx
+            .send(ThreadCommand::Configure)
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        Ok(())
+    }
+
+    async fn update_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::UpdateTask {
+                new_task,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
+    }
+
+    async fn replace_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::ReplaceTask {
+                new_task,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
+    }
+
+    async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::GoIdle { response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
+    }
+
+    fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
+        self.event_rx.take()
+    }
+
+    fn status(&self) -> HashThreadStatus {
+        self.status.read().unwrap().clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Bzm2ThreadConfig {
     pub serial_path: String,
@@ -61,12 +190,6 @@ impl Bzm2ThreadConfig {
     }
 }
 
-const RUNTIME_MEASUREMENT_WINDOW: Duration = Duration::from_secs(5 * 60);
-// Legacy source treats rows 0-9 as the bottom stack (PLL0) and rows 10-19 as
-// the top stack (PLL1).
-const PLL_STACK_SPLIT_ROW: u8 = 10;
-const TIMESTAMP_COUNT_AUTO_CLOCK_UNGATE: u8 = 0x80;
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Bzm2PllRuntimeMetrics {
     pub throughput_hs: Option<u64>,
@@ -85,146 +208,6 @@ pub struct Bzm2AsicRuntimeMetrics {
 pub struct Bzm2ThreadRuntimeMetrics {
     pub throughput_hs: Option<u64>,
     pub asics: Vec<Bzm2AsicRuntimeMetrics>,
-}
-
-struct PllRuntimeMeasurement {
-    estimator: HashrateEstimator,
-    scheduler_share_count: u64,
-}
-
-impl PllRuntimeMeasurement {
-    fn new() -> Self {
-        Self {
-            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
-            scheduler_share_count: 0,
-        }
-    }
-
-    fn record_at(&mut self, at: Instant, work: Work) {
-        self.estimator.record_at(at, work);
-        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
-    }
-
-    fn snapshot_at(&mut self, now: Instant) -> Bzm2PllRuntimeMetrics {
-        Bzm2PllRuntimeMetrics {
-            throughput_hs: self
-                .estimator
-                .settled_hashrate()
-                .map(u64::from)
-                .or_else(|| {
-                    self.estimator
-                        .has_samples()
-                        .then(|| u64::from(self.estimator.hashrate_at(now)))
-                }),
-            scheduler_share_count: self.scheduler_share_count,
-        }
-    }
-}
-
-struct AsicRuntimeMeasurement {
-    estimator: HashrateEstimator,
-    scheduler_share_count: u64,
-    plls: [PllRuntimeMeasurement; 2],
-}
-
-impl AsicRuntimeMeasurement {
-    fn new() -> Self {
-        Self {
-            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
-            scheduler_share_count: 0,
-            plls: [PllRuntimeMeasurement::new(), PllRuntimeMeasurement::new()],
-        }
-    }
-
-    fn record_at(&mut self, at: Instant, pll_index: usize, work: Work) {
-        self.estimator.record_at(at, work);
-        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
-        self.plls[pll_index].record_at(at, work);
-    }
-
-    fn snapshot_at(&mut self, now: Instant, asic: u8) -> Bzm2AsicRuntimeMetrics {
-        Bzm2AsicRuntimeMetrics {
-            asic,
-            throughput_hs: self
-                .estimator
-                .settled_hashrate()
-                .map(u64::from)
-                .or_else(|| {
-                    self.estimator
-                        .has_samples()
-                        .then(|| u64::from(self.estimator.hashrate_at(now)))
-                }),
-            scheduler_share_count: self.scheduler_share_count,
-            plls: [self.plls[0].snapshot_at(now), self.plls[1].snapshot_at(now)],
-        }
-    }
-}
-
-struct ThreadRuntimeMeasurementState {
-    estimator: HashrateEstimator,
-    asics: BTreeMap<u8, AsicRuntimeMeasurement>,
-}
-
-impl ThreadRuntimeMeasurementState {
-    fn new() -> Self {
-        Self {
-            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
-            asics: BTreeMap::new(),
-        }
-    }
-
-    fn record_at(&mut self, at: Instant, asic: u8, row: u8, work: Work) {
-        let pll_index = pll_index_for_row(row);
-        self.estimator.record_at(at, work);
-        self.asics
-            .entry(asic)
-            .or_insert_with(AsicRuntimeMeasurement::new)
-            .record_at(at, pll_index, work);
-    }
-
-    fn snapshot_at(&mut self, now: Instant) -> Bzm2ThreadRuntimeMetrics {
-        Bzm2ThreadRuntimeMetrics {
-            throughput_hs: self
-                .estimator
-                .settled_hashrate()
-                .map(u64::from)
-                .or_else(|| {
-                    self.estimator
-                        .has_samples()
-                        .then(|| u64::from(self.estimator.hashrate_at(now)))
-                }),
-            asics: self
-                .asics
-                .iter_mut()
-                .map(|(&asic, measurement)| measurement.snapshot_at(now, asic))
-                .collect(),
-        }
-    }
-
-    fn current_hashrate(
-        &mut self,
-        now: Instant,
-        is_active: bool,
-        nominal_hashrate_ths: f64,
-    ) -> HashRate {
-        if !is_active {
-            return HashRate::default();
-        }
-
-        let measured = self.estimator.settled_hashrate().or_else(|| {
-            self.estimator
-                .has_samples()
-                .then(|| self.estimator.hashrate_at(now))
-        });
-        match measured {
-            Some(hashrate) if !hashrate.is_zero() => hashrate,
-            _ => HashRate::from_terahashes(nominal_hashrate_ths),
-        }
-    }
-}
-
-fn pll_index_for_row(row: u8) -> usize {
-    if row < PLL_STACK_SPLIT_ROW { 0 } else { 1 }
 }
 
 #[derive(Clone)]
@@ -369,6 +352,142 @@ impl Bzm2ThreadHandle {
     }
 }
 
+struct PllRuntimeMeasurement {
+    estimator: HashrateEstimator,
+    scheduler_share_count: u64,
+}
+
+impl PllRuntimeMeasurement {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            scheduler_share_count: 0,
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, work: Work) {
+        self.estimator.record_at(at, work);
+        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> Bzm2PllRuntimeMetrics {
+        Bzm2PllRuntimeMetrics {
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            scheduler_share_count: self.scheduler_share_count,
+        }
+    }
+}
+
+struct AsicRuntimeMeasurement {
+    estimator: HashrateEstimator,
+    scheduler_share_count: u64,
+    plls: [PllRuntimeMeasurement; 2],
+}
+
+impl AsicRuntimeMeasurement {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            scheduler_share_count: 0,
+            plls: [PllRuntimeMeasurement::new(), PllRuntimeMeasurement::new()],
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, pll_index: usize, work: Work) {
+        self.estimator.record_at(at, work);
+        self.scheduler_share_count = self.scheduler_share_count.saturating_add(1);
+        self.plls[pll_index].record_at(at, work);
+    }
+
+    fn snapshot_at(&mut self, now: Instant, asic: u8) -> Bzm2AsicRuntimeMetrics {
+        Bzm2AsicRuntimeMetrics {
+            asic,
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            scheduler_share_count: self.scheduler_share_count,
+            plls: [self.plls[0].snapshot_at(now), self.plls[1].snapshot_at(now)],
+        }
+    }
+}
+
+struct ThreadRuntimeMeasurementState {
+    estimator: HashrateEstimator,
+    asics: BTreeMap<u8, AsicRuntimeMeasurement>,
+}
+
+impl ThreadRuntimeMeasurementState {
+    fn new() -> Self {
+        Self {
+            estimator: HashrateEstimator::new(RUNTIME_MEASUREMENT_WINDOW),
+            asics: BTreeMap::new(),
+        }
+    }
+
+    fn record_at(&mut self, at: Instant, asic: u8, row: u8, work: Work) {
+        let pll_index = pll_index_for_row(row);
+        self.estimator.record_at(at, work);
+        self.asics
+            .entry(asic)
+            .or_insert_with(AsicRuntimeMeasurement::new)
+            .record_at(at, pll_index, work);
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> Bzm2ThreadRuntimeMetrics {
+        Bzm2ThreadRuntimeMetrics {
+            throughput_hs: self
+                .estimator
+                .settled_hashrate()
+                .map(u64::from)
+                .or_else(|| {
+                    self.estimator
+                        .has_samples()
+                        .then(|| u64::from(self.estimator.hashrate_at(now)))
+                }),
+            asics: self
+                .asics
+                .iter_mut()
+                .map(|(&asic, measurement)| measurement.snapshot_at(now, asic))
+                .collect(),
+        }
+    }
+
+    fn current_hashrate(
+        &mut self,
+        now: Instant,
+        is_active: bool,
+        nominal_hashrate_ths: f64,
+    ) -> HashRate {
+        if !is_active {
+            return HashRate::default();
+        }
+
+        let measured = self.estimator.settled_hashrate().or_else(|| {
+            self.estimator
+                .has_samples()
+                .then(|| self.estimator.hashrate_at(now))
+        });
+        match measured {
+            Some(hashrate) if !hashrate.is_zero() => hashrate,
+            _ => HashRate::from_terahashes(nominal_hashrate_ths),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum ThreadCommand {
     /// Declare expected hashrate and ready the thread for work
@@ -435,125 +554,6 @@ struct EngineDispatch {
     merkle_root: bitcoin::TxMerkleNode,
     versions: [bitcoin::block::Version; 4],
     base_sequence: u8,
-}
-
-pub struct Bzm2Thread {
-    name: String,
-    command_tx: mpsc::Sender<ThreadCommand>,
-    event_rx: Option<mpsc::Receiver<HashThreadEvent>>,
-    capabilities: HashThreadCapabilities,
-    status: Arc<RwLock<HashThreadStatus>>,
-}
-
-impl Bzm2Thread {
-    pub fn new(
-        name: String,
-        reader: SerialReader,
-        writer: SerialWriter,
-        control: SerialControl,
-        config: Bzm2ThreadConfig,
-    ) -> Self {
-        let (command_tx, command_rx) = mpsc::channel(16);
-        let (event_tx, event_rx) = mpsc::channel(64);
-        let status = Arc::new(RwLock::new(HashThreadStatus::default()));
-        let status_clone = Arc::clone(&status);
-
-        tokio::spawn(async move {
-            bzm2_thread_actor(
-                command_rx,
-                event_tx,
-                status_clone,
-                reader,
-                writer,
-                control,
-                config,
-            )
-            .await;
-        });
-
-        Self {
-            name,
-            command_tx,
-            event_rx: Some(event_rx),
-            capabilities: HashThreadCapabilities::default(),
-            status,
-        }
-    }
-
-    pub fn shutdown_handle(&self) -> Bzm2ThreadHandle {
-        Bzm2ThreadHandle {
-            command_tx: self.command_tx.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl HashThread for Bzm2Thread {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn capabilities(&self) -> &HashThreadCapabilities {
-        &self.capabilities
-    }
-
-    async fn configure(&mut self) -> anyhow::Result<()> {
-        self.command_tx
-            .send(ThreadCommand::Configure)
-            .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
-        Ok(())
-    }
-
-    async fn update_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ThreadCommand::UpdateTask {
-                new_task,
-                response_tx,
-            })
-            .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
-            .map_err(Into::into)
-    }
-
-    async fn replace_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ThreadCommand::ReplaceTask {
-                new_task,
-                response_tx,
-            })
-            .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
-            .map_err(Into::into)
-    }
-
-    async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(ThreadCommand::GoIdle { response_tx })
-            .await
-            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
-        response_rx
-            .await
-            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
-            .map_err(Into::into)
-    }
-
-    fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
-        self.event_rx.take()
-    }
-
-    fn status(&self) -> HashThreadStatus {
-        self.status.read().unwrap().clone()
-    }
 }
 
 async fn bzm2_thread_actor(
@@ -1034,27 +1034,6 @@ async fn read_local_reg_u32(
     Ok(u32::from_le_bytes(bytes))
 }
 
-/// Bound for a single diagnostic UART read. The actor is one task, so a silent
-/// or short-answering chip must not wedge it (including a pending `Shutdown`) on
-/// an unbounded `read_exact`; on expiry the diagnostic fails instead of hanging.
-const DIAGNOSTIC_READ_TIMEOUT: Duration = Duration::from_secs(2);
-
-async fn read_exact_diagnostic(
-    reader: &mut SerialReader,
-    buf: &mut [u8],
-) -> Result<(), HashThreadError> {
-    tokio::time::timeout(DIAGNOSTIC_READ_TIMEOUT, reader.read_exact(buf))
-        .await
-        .map_err(|_| {
-            HashThreadError::DiagnosticsFailed(format!(
-                "timed out after {} ms waiting for UART response",
-                DIAGNOSTIC_READ_TIMEOUT.as_millis()
-            ))
-        })?
-        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
-    Ok(())
-}
-
 async fn read_register(
     reader: &mut SerialReader,
     writer: &mut SerialWriter,
@@ -1178,6 +1157,22 @@ async fn query_loopback(
     read_exact_diagnostic(reader, &mut response).await?;
     validate_response_header(asic, OPCODE_UART_LOOPBACK, &response)?;
     Ok(response[2..].to_vec())
+}
+
+async fn read_exact_diagnostic(
+    reader: &mut SerialReader,
+    buf: &mut [u8],
+) -> Result<(), HashThreadError> {
+    tokio::time::timeout(DIAGNOSTIC_READ_TIMEOUT, reader.read_exact(buf))
+        .await
+        .map_err(|_| {
+            HashThreadError::DiagnosticsFailed(format!(
+                "timed out after {} ms waiting for UART response",
+                DIAGNOSTIC_READ_TIMEOUT.as_millis()
+            ))
+        })?
+        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()))?;
+    Ok(())
 }
 
 fn validate_response_header(
@@ -1674,6 +1669,10 @@ fn legacy_tune_code_to_temperature_c(tune_code: u16) -> f32 {
 fn legacy_tune_code_to_voltage_v(tune_code: u16) -> f32 {
     let resolution_power = 16384.0_f32;
     0.4 * 0.7067 * (6.0 * (tune_code as f32) / 16384.0 - 3.0 / resolution_power - 1.0)
+}
+
+fn pll_index_for_row(row: u8) -> usize {
+    if row < PLL_STACK_SPLIT_ROW { 0 } else { 1 }
 }
 
 #[cfg(all(test, unix))]
