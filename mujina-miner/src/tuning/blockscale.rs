@@ -35,193 +35,6 @@ const DEFAULT_FREQ_INCREASE_RATIO_LOW: f32 = 0.24;
 const DEFAULT_RECALIBRATE_THROUGHPUT_RATIO: f32 = 0.80;
 const NOMINAL_ACTIVE_ENGINE_COUNT: u16 = 236;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Bzm2PerformanceMode {
-    MaxThroughput,
-    Standard,
-    Efficiency,
-}
-
-impl Bzm2PerformanceMode {
-    fn pass_rate_range(self) -> f32 {
-        match self {
-            Self::MaxThroughput => ACCEPT_RATIO_BAND_MAX_THROUGHPUT,
-            Self::Standard => ACCEPT_RATIO_BAND_STANDARD,
-            Self::Efficiency => ACCEPT_RATIO_BAND_EFFICIENCY,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Bzm2OperatingClass {
-    Generic,
-    EarlyValidation,
-    ProductionValidation,
-    StackTunedA,
-    StackTunedB,
-    ExtendedHeadroom,
-    ExtendedHeadroomB,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Bzm2CalibrationMode {
-    pub sweep_strategy: bool,
-    pub sweep_voltage: bool,
-    pub sweep_frequency: bool,
-    pub sweep_pass_rate: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2CalibrationConstraints {
-    pub max_power_w: f32,
-    pub max_current_a: f32,
-    pub max_thermal_c: f32,
-    pub max_avg_thermal_c: f32,
-    pub freq_range_mhz: f32,
-    pub max_freq_range_mhz: f32,
-    pub recalibrate_throughput_ratio: f32,
-}
-
-impl Default for Bzm2CalibrationConstraints {
-    fn default() -> Self {
-        Self {
-            max_power_w: DEFAULT_POWER_THRESHOLD_W,
-            max_current_a: DEFAULT_CURRENT_THRESHOLD_A,
-            max_thermal_c: DEFAULT_THERMAL_THRESHOLD_C,
-            max_avg_thermal_c: DEFAULT_AVG_THERMAL_THRESHOLD_C,
-            freq_range_mhz: FREQ_RANGE_MHZ,
-            max_freq_range_mhz: MAX_FREQ_RANGE_MHZ,
-            recalibrate_throughput_ratio: DEFAULT_RECALIBRATE_THROUGHPUT_RATIO,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2CalibrationSweepRequest {
-    pub operating_class: Bzm2OperatingClass,
-    pub target_mode: Bzm2PerformanceMode,
-    pub mode: Bzm2CalibrationMode,
-    pub voltage_steps: u8,
-    pub frequency_steps: u8,
-    pub pass_rate_steps: u8,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Bzm2SavedOperatingPoint {
-    pub board_voltage_mv: u32,
-    pub board_throughput_ths: f32,
-    #[serde(default)]
-    pub per_domain_voltage_mv: BTreeMap<u16, u32>,
-    #[serde(default)]
-    pub per_asic_engine_topology: BTreeMap<u16, Bzm2SavedEngineTopology>,
-    pub per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Bzm2SavedEngineCoordinate {
-    pub row: u8,
-    pub col: u8,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Bzm2SavedEngineTopology {
-    #[serde(default)]
-    pub active_engine_count: u16,
-    #[serde(default)]
-    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2AsicTopology {
-    pub asic_id: u16,
-    pub domain_id: u16,
-    pub pll_count: usize,
-    pub alive: bool,
-    pub active_engine_count: u16,
-    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2VoltageDomain {
-    pub domain_id: u16,
-    pub asic_ids: Vec<u16>,
-    pub voltage_offset_mv: i32,
-    pub max_power_w: Option<f32>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Bzm2DomainMeasurement {
-    pub domain_id: u16,
-    pub measured_voltage_mv: Option<u32>,
-    pub measured_power_w: Option<f32>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Bzm2AsicMeasurement {
-    pub asic_id: u16,
-    pub temperature_c: Option<f32>,
-    pub throughput_ths: Option<f32>,
-    pub average_pass_rate: Option<f32>,
-    pub pll_pass_rates: [Option<f32>; 2],
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2BoardCalibrationInput {
-    pub operating_class: Bzm2OperatingClass,
-    pub site_temp_c: f32,
-    pub target_mode: Bzm2PerformanceMode,
-    pub mode: Bzm2CalibrationMode,
-    pub per_stack_clocking: bool,
-    pub voltage_domains: Vec<Bzm2VoltageDomain>,
-    pub asics: Vec<Bzm2AsicTopology>,
-    pub saved_operating_point: Option<Bzm2SavedOperatingPoint>,
-    pub domain_measurements: Vec<Bzm2DomainMeasurement>,
-    pub asic_measurements: Vec<Bzm2AsicMeasurement>,
-    pub constraints: Bzm2CalibrationConstraints,
-    pub force_retune: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2DomainPlan {
-    pub domain_id: u16,
-    pub voltage_mv: u32,
-    pub average_frequency_mhz: f32,
-    pub guarded: bool,
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2AsicPlan {
-    pub asic_id: u16,
-    pub domain_id: u16,
-    pub pll_frequencies_mhz: [f32; 2],
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2CalibrationPlan {
-    pub reuse_saved_operating_point: bool,
-    pub needs_retune: bool,
-    pub desired_voltage_mv: u32,
-    pub desired_clock_mhz: f32,
-    pub desired_accept_ratio: f32,
-    pub initial_voltage_mv: u32,
-    pub initial_frequency_mhz: f32,
-    pub freq_increase_threshold_mhz: f32,
-    pub search_space: Vec<Bzm2ParameterSet>,
-    pub domain_plans: Vec<Bzm2DomainPlan>,
-    pub asic_plans: Vec<Bzm2AsicPlan>,
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Bzm2ParameterSet {
-    pub mode: Bzm2PerformanceMode,
-    pub desired_voltage_mv: u32,
-    pub desired_clock_mhz: f32,
-    pub desired_accept_ratio: f32,
-}
-
 #[derive(Debug, Default)]
 pub struct Bzm2CalibrationPlanner;
 
@@ -558,6 +371,200 @@ impl Bzm2CalibrationPlanner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Bzm2PerformanceMode {
+    MaxThroughput,
+    Standard,
+    Efficiency,
+}
+
+impl Bzm2PerformanceMode {
+    fn pass_rate_range(self) -> f32 {
+        match self {
+            Self::MaxThroughput => ACCEPT_RATIO_BAND_MAX_THROUGHPUT,
+            Self::Standard => ACCEPT_RATIO_BAND_STANDARD,
+            Self::Efficiency => ACCEPT_RATIO_BAND_EFFICIENCY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bzm2OperatingClass {
+    Generic,
+    EarlyValidation,
+    ProductionValidation,
+    StackTunedA,
+    StackTunedB,
+    ExtendedHeadroom,
+    ExtendedHeadroomB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Bzm2CalibrationMode {
+    pub sweep_strategy: bool,
+    pub sweep_voltage: bool,
+    pub sweep_frequency: bool,
+    pub sweep_pass_rate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2CalibrationConstraints {
+    pub max_power_w: f32,
+    pub max_current_a: f32,
+    pub max_thermal_c: f32,
+    pub max_avg_thermal_c: f32,
+    pub freq_range_mhz: f32,
+    pub max_freq_range_mhz: f32,
+    pub recalibrate_throughput_ratio: f32,
+}
+
+impl Default for Bzm2CalibrationConstraints {
+    fn default() -> Self {
+        Self {
+            max_power_w: DEFAULT_POWER_THRESHOLD_W,
+            max_current_a: DEFAULT_CURRENT_THRESHOLD_A,
+            max_thermal_c: DEFAULT_THERMAL_THRESHOLD_C,
+            max_avg_thermal_c: DEFAULT_AVG_THERMAL_THRESHOLD_C,
+            freq_range_mhz: FREQ_RANGE_MHZ,
+            max_freq_range_mhz: MAX_FREQ_RANGE_MHZ,
+            recalibrate_throughput_ratio: DEFAULT_RECALIBRATE_THROUGHPUT_RATIO,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2CalibrationSweepRequest {
+    pub operating_class: Bzm2OperatingClass,
+    pub target_mode: Bzm2PerformanceMode,
+    pub mode: Bzm2CalibrationMode,
+    pub voltage_steps: u8,
+    pub frequency_steps: u8,
+    pub pass_rate_steps: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Bzm2SavedOperatingPoint {
+    pub board_voltage_mv: u32,
+    pub board_throughput_ths: f32,
+    #[serde(default)]
+    pub per_domain_voltage_mv: BTreeMap<u16, u32>,
+    #[serde(default)]
+    pub per_asic_engine_topology: BTreeMap<u16, Bzm2SavedEngineTopology>,
+    pub per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Bzm2SavedEngineCoordinate {
+    pub row: u8,
+    pub col: u8,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Bzm2SavedEngineTopology {
+    #[serde(default)]
+    pub active_engine_count: u16,
+    #[serde(default)]
+    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2AsicTopology {
+    pub asic_id: u16,
+    pub domain_id: u16,
+    pub pll_count: usize,
+    pub alive: bool,
+    pub active_engine_count: u16,
+    pub missing_engines: Vec<Bzm2SavedEngineCoordinate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2VoltageDomain {
+    pub domain_id: u16,
+    pub asic_ids: Vec<u16>,
+    pub voltage_offset_mv: i32,
+    pub max_power_w: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Bzm2DomainMeasurement {
+    pub domain_id: u16,
+    pub measured_voltage_mv: Option<u32>,
+    pub measured_power_w: Option<f32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Bzm2AsicMeasurement {
+    pub asic_id: u16,
+    pub temperature_c: Option<f32>,
+    pub throughput_ths: Option<f32>,
+    pub average_pass_rate: Option<f32>,
+    pub pll_pass_rates: [Option<f32>; 2],
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2BoardCalibrationInput {
+    pub operating_class: Bzm2OperatingClass,
+    pub site_temp_c: f32,
+    pub target_mode: Bzm2PerformanceMode,
+    pub mode: Bzm2CalibrationMode,
+    pub per_stack_clocking: bool,
+    pub voltage_domains: Vec<Bzm2VoltageDomain>,
+    pub asics: Vec<Bzm2AsicTopology>,
+    pub saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    pub domain_measurements: Vec<Bzm2DomainMeasurement>,
+    pub asic_measurements: Vec<Bzm2AsicMeasurement>,
+    pub constraints: Bzm2CalibrationConstraints,
+    pub force_retune: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2DomainPlan {
+    pub domain_id: u16,
+    pub voltage_mv: u32,
+    pub average_frequency_mhz: f32,
+    pub guarded: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2AsicPlan {
+    pub asic_id: u16,
+    pub domain_id: u16,
+    pub pll_frequencies_mhz: [f32; 2],
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2CalibrationPlan {
+    pub reuse_saved_operating_point: bool,
+    pub needs_retune: bool,
+    pub desired_voltage_mv: u32,
+    pub desired_clock_mhz: f32,
+    pub desired_accept_ratio: f32,
+    pub initial_voltage_mv: u32,
+    pub initial_frequency_mhz: f32,
+    pub freq_increase_threshold_mhz: f32,
+    pub search_space: Vec<Bzm2ParameterSet>,
+    pub domain_plans: Vec<Bzm2DomainPlan>,
+    pub asic_plans: Vec<Bzm2AsicPlan>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bzm2ParameterSet {
+    pub mode: Bzm2PerformanceMode,
+    pub desired_voltage_mv: u32,
+    pub desired_clock_mhz: f32,
+    pub desired_accept_ratio: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OperatingTarget {
+    voltage_mv: u32,
+    frequency_mhz: f32,
+    pass_rate: f32,
+}
+
 fn total_active_engine_count(asics: &[Bzm2AsicTopology]) -> u32 {
     asics
         .iter()
@@ -587,13 +594,6 @@ fn stored_total_active_engine_count(stored: &Bzm2SavedOperatingPoint, alive_asic
 
 fn normalize_throughput(throughput_ths: f32, active_engine_count: u32) -> f32 {
     throughput_ths / active_engine_count.max(1) as f32
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OperatingTarget {
-    voltage_mv: u32,
-    frequency_mhz: f32,
-    pass_rate: f32,
 }
 
 fn operating_targets(

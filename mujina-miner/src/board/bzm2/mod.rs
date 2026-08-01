@@ -45,42 +45,6 @@ inventory::submit! {
     }
 }
 
-async fn create_bzm2_board() -> AnyhowResult<BackplaneConnector> {
-    let config = Bzm2RuntimeConfig::from_env()
-        .ok_or_else(|| anyhow::anyhow!("BZM2 not configured (MUJINA_BZM2_SERIAL not set)"))?;
-
-    let serial = config.device_id();
-    let initial_state = BoardTelemetry {
-        name: serial.clone(),
-        model: "BZM2".into(),
-        serial: Some(serial),
-        ..Default::default()
-    };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
-    let (command_tx, command_rx) = mpsc::channel(16);
-
-    let mut board = Bzm2Board::new(config, telemetry_tx, command_rx);
-    let info = board.board_info();
-
-    // Bring-up, enumeration, calibration, and the monitor/command loops
-    // all happen here; the returned threads are ready for the scheduler.
-    let threads = board.create_hash_threads().await?;
-
-    let shutdown = Box::pin(async move {
-        if let Err(err) = board.shutdown().await {
-            warn!(error = %err, "BZM2 board shutdown reported an error");
-        }
-    });
-
-    Ok(BackplaneConnector {
-        info,
-        threads,
-        telemetry_rx,
-        command_tx: Some(command_tx),
-        shutdown: Some(shutdown),
-    })
-}
-
 /// Errors raised by BZM2 board bring-up and hardware control.
 #[derive(Debug)]
 pub enum BoardError {
@@ -343,6 +307,42 @@ impl HashThread for Bzm2ManagedThread {
         self.inner.status()
     }
 }
+async fn create_bzm2_board() -> AnyhowResult<BackplaneConnector> {
+    let config = Bzm2RuntimeConfig::from_env()
+        .ok_or_else(|| anyhow::anyhow!("BZM2 not configured (MUJINA_BZM2_SERIAL not set)"))?;
+
+    let serial = config.device_id();
+    let initial_state = BoardTelemetry {
+        name: serial.clone(),
+        model: "BZM2".into(),
+        serial: Some(serial),
+        ..Default::default()
+    };
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+    let (command_tx, command_rx) = mpsc::channel(16);
+
+    let mut board = Bzm2Board::new(config, telemetry_tx, command_rx);
+    let info = board.board_info();
+
+    // Bring-up, enumeration, calibration, and the monitor/command loops
+    // all happen here; the returned threads are ready for the scheduler.
+    let threads = board.create_hash_threads().await?;
+
+    let shutdown = Box::pin(async move {
+        if let Err(err) = board.shutdown().await {
+            warn!(error = %err, "BZM2 board shutdown reported an error");
+        }
+    });
+
+    Ok(BackplaneConnector {
+        info,
+        threads,
+        telemetry_rx,
+        command_tx: Some(command_tx),
+        shutdown: Some(shutdown),
+    })
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::bringup::Bzm2BringupConfig;

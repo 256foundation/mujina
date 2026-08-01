@@ -181,44 +181,6 @@ impl Bzm2BringupConfig {
         }
     }
 
-    fn build_rails(&self) -> Vec<FilePowerRail> {
-        self.rail_set_paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| {
-                let write_scale = *self
-                    .rail_write_scales
-                    .get(index)
-                    .or_else(|| self.rail_write_scales.last())
-                    .unwrap_or(&1.0);
-                let mut rail = FilePowerRail::new(path.clone(), write_scale);
-                if let Some(enable_path) = self
-                    .rail_enable_paths
-                    .get(index)
-                    .or_else(|| self.rail_enable_paths.last())
-                {
-                    let enable_value = self
-                        .rail_enable_values
-                        .get(index)
-                        .or_else(|| self.rail_enable_values.last())
-                        .cloned()
-                        .unwrap_or_else(|| "1".into());
-                    rail = rail.with_enable(enable_path.clone(), enable_value);
-                }
-                rail
-            })
-            .collect()
-    }
-
-    fn build_reset_line(&self) -> Option<GpioResetLine<FileGpioPin>> {
-        self.reset_path.as_ref().map(|path| {
-            GpioResetLine::new(
-                FileGpioPin::new(path.clone(), "1", "0"),
-                self.reset_active_low,
-            )
-        })
-    }
-
     pub(super) fn rail_index_for_domain(&self, domain_id: u16) -> Option<usize> {
         self.domain_rail_indices
             .get(domain_id as usize)
@@ -293,6 +255,43 @@ impl Bzm2BringupConfig {
             powers,
             trip_reason: None,
         }
+    }
+    fn build_rails(&self) -> Vec<FilePowerRail> {
+        self.rail_set_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let write_scale = *self
+                    .rail_write_scales
+                    .get(index)
+                    .or_else(|| self.rail_write_scales.last())
+                    .unwrap_or(&1.0);
+                let mut rail = FilePowerRail::new(path.clone(), write_scale);
+                if let Some(enable_path) = self
+                    .rail_enable_paths
+                    .get(index)
+                    .or_else(|| self.rail_enable_paths.last())
+                {
+                    let enable_value = self
+                        .rail_enable_values
+                        .get(index)
+                        .or_else(|| self.rail_enable_values.last())
+                        .cloned()
+                        .unwrap_or_else(|| "1".into());
+                    rail = rail.with_enable(enable_path.clone(), enable_value);
+                }
+                rail
+            })
+            .collect()
+    }
+
+    fn build_reset_line(&self) -> Option<GpioResetLine<FileGpioPin>> {
+        self.reset_path.as_ref().map(|path| {
+            GpioResetLine::new(
+                FileGpioPin::new(path.clone(), "1", "0"),
+                self.reset_active_low,
+            )
+        })
     }
 }
 

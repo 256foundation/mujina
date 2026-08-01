@@ -440,58 +440,6 @@ impl Bzm2Board {
     }
 }
 
-fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2BusLayout> {
-    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 1)
-}
-
-fn build_discovered_bus_layouts(
-    serial_paths: &[String],
-    asics_per_bus: &[u16],
-) -> Vec<Bzm2BusLayout> {
-    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 0)
-}
-
-fn build_bus_layouts_with_minimum(
-    serial_paths: &[String],
-    asics_per_bus: &[u16],
-    minimum_asic_count: u16,
-) -> Vec<Bzm2BusLayout> {
-    let mut next_asic = 0u16;
-    serial_paths
-        .iter()
-        .enumerate()
-        .map(|(index, path)| {
-            let asic_count = *asics_per_bus
-                .get(index)
-                .or_else(|| asics_per_bus.last())
-                .unwrap_or(&1)
-                .max(&minimum_asic_count);
-            let layout = Bzm2BusLayout {
-                serial_path: path.clone(),
-                asic_start: next_asic,
-                asic_count,
-            };
-            next_asic = next_asic.saturating_add(asic_count);
-            layout
-        })
-        .collect()
-}
-
-fn should_fallback_to_configured_bus_layouts(
-    discovered: &[Bzm2BusLayout],
-    configured: &[Bzm2BusLayout],
-) -> bool {
-    let discovered_total = discovered
-        .iter()
-        .map(|layout| layout.asic_count as usize)
-        .sum::<usize>();
-    let configured_total = configured
-        .iter()
-        .map(|layout| layout.asic_count as usize)
-        .sum::<usize>();
-    discovered_total == 0 && configured_total > 0
-}
-
 pub(super) fn build_voltage_domains(
     total_asics: u16,
     asics_per_domain: &[u16],
@@ -562,45 +510,6 @@ pub(super) fn default_saved_engine_topology() -> Bzm2SavedEngineTopology {
     }
 }
 
-fn saved_engine_topology_from_discovery(
-    discovery: &Bzm2DiscoveredEngineMap,
-) -> Bzm2SavedEngineTopology {
-    Bzm2SavedEngineTopology {
-        active_engine_count: discovery.present_count() as u16,
-        missing_engines: discovery
-            .missing
-            .iter()
-            .map(|coord| Bzm2SavedEngineCoordinate {
-                row: coord.row,
-                col: coord.col,
-            })
-            .collect(),
-    }
-}
-
-fn distribute_saved_throughput(
-    total_throughput_ths: f32,
-    asics: &[Bzm2AsicTopology],
-) -> BTreeMap<u16, f32> {
-    let total_active = asics
-        .iter()
-        .filter(|asic| asic.alive)
-        .map(|asic| asic.active_engine_count.max(1) as f32)
-        .sum::<f32>()
-        .max(1.0);
-
-    asics
-        .iter()
-        .filter(|asic| asic.alive)
-        .map(|asic| {
-            (
-                asic.asic_id,
-                total_throughput_ths * (asic.active_engine_count.max(1) as f32 / total_active),
-            )
-        })
-        .collect()
-}
-
 pub(super) fn store_applied_operating_state(
     state: &Arc<Mutex<Bzm2AppliedOperatingState>>,
     per_domain_voltage_mv: &BTreeMap<u16, u32>,
@@ -659,44 +568,6 @@ pub(super) fn load_saved_operating_point_profile(
         })
 }
 
-fn saved_operating_point_from_loaded_profile(
-    profile: &Bzm2LoadedCalibrationProfile,
-) -> Option<Bzm2SavedOperatingPoint> {
-    match profile.persisted.as_ref() {
-        Some(persisted)
-            if persisted.saved_operating_point_status
-                == Bzm2SavedOperatingPointStatus::Invalidated =>
-        {
-            None
-        }
-        _ => Some(profile.saved_state.clone()),
-    }
-}
-
-fn store_calibration_profile(
-    path: &Path,
-    profile: &Bzm2PersistedCalibrationProfile,
-) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "Failed to create calibration profile directory {}: {}",
-                parent.display(),
-                err
-            )
-        })?;
-    }
-    let raw = serde_json::to_string_pretty(profile)
-        .map_err(|err| format!("Failed to serialize calibration profile: {}", err))?;
-    fs::write(path, raw).map_err(|err| {
-        format!(
-            "Failed to write calibration profile {}: {}",
-            path.display(),
-            err
-        )
-    })
-}
-
 pub(super) fn store_saved_operating_point_status(
     path: &Path,
     calibration: &Bzm2CalibrationConfig,
@@ -753,6 +624,135 @@ fn estimate_planned_hashrate(
         (total_active / total_nominal).max(0.1)
     };
     nominal_board_hashrate * ratio.max(0.1) * active_engine_ratio
+}
+
+fn saved_operating_point_from_loaded_profile(
+    profile: &Bzm2LoadedCalibrationProfile,
+) -> Option<Bzm2SavedOperatingPoint> {
+    match profile.persisted.as_ref() {
+        Some(persisted)
+            if persisted.saved_operating_point_status
+                == Bzm2SavedOperatingPointStatus::Invalidated =>
+        {
+            None
+        }
+        _ => Some(profile.saved_state.clone()),
+    }
+}
+
+fn store_calibration_profile(
+    path: &Path,
+    profile: &Bzm2PersistedCalibrationProfile,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "Failed to create calibration profile directory {}: {}",
+                parent.display(),
+                err
+            )
+        })?;
+    }
+    let raw = serde_json::to_string_pretty(profile)
+        .map_err(|err| format!("Failed to serialize calibration profile: {}", err))?;
+    fs::write(path, raw).map_err(|err| {
+        format!(
+            "Failed to write calibration profile {}: {}",
+            path.display(),
+            err
+        )
+    })
+}
+
+fn saved_engine_topology_from_discovery(
+    discovery: &Bzm2DiscoveredEngineMap,
+) -> Bzm2SavedEngineTopology {
+    Bzm2SavedEngineTopology {
+        active_engine_count: discovery.present_count() as u16,
+        missing_engines: discovery
+            .missing
+            .iter()
+            .map(|coord| Bzm2SavedEngineCoordinate {
+                row: coord.row,
+                col: coord.col,
+            })
+            .collect(),
+    }
+}
+
+fn distribute_saved_throughput(
+    total_throughput_ths: f32,
+    asics: &[Bzm2AsicTopology],
+) -> BTreeMap<u16, f32> {
+    let total_active = asics
+        .iter()
+        .filter(|asic| asic.alive)
+        .map(|asic| asic.active_engine_count.max(1) as f32)
+        .sum::<f32>()
+        .max(1.0);
+
+    asics
+        .iter()
+        .filter(|asic| asic.alive)
+        .map(|asic| {
+            (
+                asic.asic_id,
+                total_throughput_ths * (asic.active_engine_count.max(1) as f32 / total_active),
+            )
+        })
+        .collect()
+}
+
+fn build_bus_layouts(serial_paths: &[String], asics_per_bus: &[u16]) -> Vec<Bzm2BusLayout> {
+    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 1)
+}
+
+fn build_discovered_bus_layouts(
+    serial_paths: &[String],
+    asics_per_bus: &[u16],
+) -> Vec<Bzm2BusLayout> {
+    build_bus_layouts_with_minimum(serial_paths, asics_per_bus, 0)
+}
+
+fn build_bus_layouts_with_minimum(
+    serial_paths: &[String],
+    asics_per_bus: &[u16],
+    minimum_asic_count: u16,
+) -> Vec<Bzm2BusLayout> {
+    let mut next_asic = 0u16;
+    serial_paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let asic_count = *asics_per_bus
+                .get(index)
+                .or_else(|| asics_per_bus.last())
+                .unwrap_or(&1)
+                .max(&minimum_asic_count);
+            let layout = Bzm2BusLayout {
+                serial_path: path.clone(),
+                asic_start: next_asic,
+                asic_count,
+            };
+            next_asic = next_asic.saturating_add(asic_count);
+            layout
+        })
+        .collect()
+}
+
+fn should_fallback_to_configured_bus_layouts(
+    discovered: &[Bzm2BusLayout],
+    configured: &[Bzm2BusLayout],
+) -> bool {
+    let discovered_total = discovered
+        .iter()
+        .map(|layout| layout.asic_count as usize)
+        .sum::<usize>();
+    let configured_total = configured
+        .iter()
+        .map(|layout| layout.asic_count as usize)
+        .sum::<usize>();
+    discovered_total == 0 && configured_total > 0
 }
 
 #[cfg(all(test, unix))]

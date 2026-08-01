@@ -325,38 +325,6 @@ pub(super) fn publish_saved_engine_topology(
     );
 }
 
-fn upsert_asic_state(
-    telemetry_tx: &watch::Sender<BoardTelemetry>,
-    thread_index: usize,
-    serial_path: &str,
-    asic_id: u8,
-    active_engine_count: u16,
-    missing_engines: Vec<EngineCoordinate>,
-) {
-    telemetry_tx.send_modify(|state| {
-        if let Some(asic) = state
-            .asics
-            .iter_mut()
-            .find(|asic| asic.thread_index == Some(thread_index) && asic.id == asic_id)
-        {
-            asic.serial_path = Some(serial_path.to_owned());
-            asic.discovered_engine_count = Some(active_engine_count);
-            asic.missing_engines = missing_engines.clone();
-        } else {
-            state.asics.push(AsicState {
-                id: asic_id,
-                thread_index: Some(thread_index),
-                serial_path: Some(serial_path.to_owned()),
-                discovered_engine_count: Some(active_engine_count),
-                missing_engines: missing_engines.clone(),
-            });
-        }
-        state
-            .asics
-            .sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
-    });
-}
-
 pub(super) fn merge_temperature_readings(
     existing: &mut Vec<TemperatureSensor>,
     updates: &[TemperatureSensor],
@@ -445,14 +413,6 @@ pub(super) fn snapshot_input_power(snapshot: &Bzm2TelemetrySnapshot) -> Option<f
         .and_then(|power| power.power_w)
 }
 
-fn parse_scaled_sensor_value(raw: &str, scale: f32) -> Option<f32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.parse::<f32>().ok().map(|value| value * scale)
-}
-
 pub(super) fn sensor_specs_from_env(
     paths_keys: &[&str],
     scales_keys: &[&str],
@@ -471,6 +431,46 @@ pub(super) fn sensor_specs_from_env(
                 .unwrap_or(&default_scale),
         })
         .collect()
+}
+
+fn parse_scaled_sensor_value(raw: &str, scale: f32) -> Option<f32> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<f32>().ok().map(|value| value * scale)
+}
+
+fn upsert_asic_state(
+    telemetry_tx: &watch::Sender<BoardTelemetry>,
+    thread_index: usize,
+    serial_path: &str,
+    asic_id: u8,
+    active_engine_count: u16,
+    missing_engines: Vec<EngineCoordinate>,
+) {
+    telemetry_tx.send_modify(|state| {
+        if let Some(asic) = state
+            .asics
+            .iter_mut()
+            .find(|asic| asic.thread_index == Some(thread_index) && asic.id == asic_id)
+        {
+            asic.serial_path = Some(serial_path.to_owned());
+            asic.discovered_engine_count = Some(active_engine_count);
+            asic.missing_engines = missing_engines.clone();
+        } else {
+            state.asics.push(AsicState {
+                id: asic_id,
+                thread_index: Some(thread_index),
+                serial_path: Some(serial_path.to_owned()),
+                discovered_engine_count: Some(active_engine_count),
+                missing_engines: missing_engines.clone(),
+            });
+        }
+        state
+            .asics
+            .sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
+    });
 }
 
 #[cfg(test)]
