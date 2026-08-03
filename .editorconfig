@@ -12,7 +12,7 @@ trim_trailing_whitespace = true
 
 # Markdown files
 [*.md]
-max_line_length = 79
+max_line_length = 72
 trim_trailing_whitespace = false
 
 # Rust files

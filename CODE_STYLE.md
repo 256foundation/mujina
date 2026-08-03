@@ -168,7 +168,14 @@ and the suppression is no longer needed, the compiler will warn about it.
 
 ### Markdown Files [D.md](#D.md)
 
-- Wrap lines at 79 characters (enforced by .editorconfig)
+- Wrap prose at 72 characters (enforced by .editorconfig), the
+  same width CONTRIBUTING.md sets for commit message bodies.
+  Typography puts a comfortable reading line at 45--75
+  characters, and 72 stays under 80 columns in a diff, under
+  git log's indent, and when quoted in review
+- Indent nested and continuation lines by 4 spaces
+- Tables, ASCII diagrams, fenced code blocks, and link definitions
+  may run wider; keep their alignment instead
 - Use hard line breaks, not soft wrapping
 - Use proper heading hierarchy (don't skip levels)
 - Include code examples where helpful
