@@ -36,6 +36,59 @@ pub struct NonceResponse {
     pub subcore_id: u8,
 }
 
+impl NonceResponse {
+    /// Returns the fields the chip packs into this nonce.
+    pub fn decompose(&self, model: ChipModel) -> NonceFields {
+        NonceFields::from_nonce(model, self.nonce)
+    }
+}
+
+/// The fields the chip packs into a nonce.
+///
+/// The chip's byte order is most significant byte first, the
+/// reverse of the block header's. [`NonceFields::from_nonce`]
+/// takes the header-order nonce and reads it in the chip's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceFields {
+    /// The BM1362 and BM1366 layout.
+    ///
+    /// - bits 31-25: core ID
+    /// - bits 24-18: the chip's assigned address, address bits 7-1
+    /// - bits 17-0: sweep counter
+    BM1362 {
+        core_id: u8,
+        /// The chip's whole assigned address, restored from the
+        /// field's seven bits (address bit 0 is always zero).
+        chip_address: u8,
+        counter: u32,
+    },
+    /// The BM1370 layout. No field names the chip; the nonce's
+    /// value falls in the slice of the chip that produced it.
+    ///
+    /// - bits 31-25: core ID
+    /// - bits 24-0: counter, seeded from CHIP_NONCE_OFFSET
+    BM1370 { core_id: u8, counter: u32 },
+}
+
+impl NonceFields {
+    /// Divides a header-order nonce into the chip's fields.
+    pub fn from_nonce(model: ChipModel, nonce: u32) -> Self {
+        let value = nonce.swap_bytes();
+        let core_id = (value >> 25) as u8;
+        match model {
+            ChipModel::BM1362 | ChipModel::BM1366 => Self::BM1362 {
+                core_id,
+                chip_address: (value >> 18 & 0x7f) as u8 * 2,
+                counter: value & 0x3ffff,
+            },
+            ChipModel::BM1370 => Self::BM1370 {
+                core_id,
+                counter: value & 0x1ff_ffff,
+            },
+        }
+    }
+}
+
 impl Response {
     pub(super) fn decode(
         bytes: &mut BytesMut,
@@ -228,7 +281,8 @@ mod tests {
             panic!("Expected nonce response");
         };
 
-        // From protocol doc: nonce 0x40A60018 -> Main core 32, nonce value 0x00A60018
+        // From the chip reference: wire bytes 18 00 A6 40 are the chip's
+        // value 0x1800A640; the decoder holds the header-order word
         assert_eq!(nonce, 0x40a60018);
         assert_eq!(excess_difficulty, 0x02);
 
@@ -239,9 +293,49 @@ mod tests {
         // Version
         assert_eq!(version, GeneralPurposeBits::new([0x22, 0xF9]));
 
-        // Verify main core extraction
-        let main_core = (nonce >> 25) & 0x7f;
-        assert_eq!(main_core, 32);
+        // The chip's fields, per the reference's worked example
+        assert_eq!(
+            NonceFields::from_nonce(ChipModel::BM1370, nonce),
+            NonceFields::BM1370 {
+                core_id: 12,
+                counter: 0xA640,
+            }
+        );
+    }
+
+    #[test]
+    fn nonce_fields_bm1362_worked_example() {
+        // From the chip reference's BM1362 example: wire bytes
+        // 6D B8 8E E1 deserialize to the header nonce 0xE18EB86D;
+        // the chip's value 0x6DB88EE1 names core 54 on chip 0xDC.
+        assert_eq!(
+            NonceFields::from_nonce(ChipModel::BM1362, 0xE18EB86D),
+            NonceFields::BM1362 {
+                core_id: 54,
+                chip_address: 0xDC,
+                counter: 0x08EE1,
+            }
+        );
+    }
+
+    #[test]
+    fn nonce_response_decompose_uses_model() {
+        // The chip reference's BM1370 example response, as the
+        // decoder returns it
+        let response = NonceResponse {
+            nonce: 0x40A60018,
+            job_id: 9,
+            excess_difficulty: 2,
+            version: GeneralPurposeBits::new([0x22, 0xF9]),
+            subcore_id: 9,
+        };
+        assert_eq!(
+            response.decompose(ChipModel::BM1370),
+            NonceFields::BM1370 {
+                core_id: 12,
+                counter: 0xA640,
+            }
+        );
     }
 
     #[test]
