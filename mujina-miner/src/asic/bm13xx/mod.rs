@@ -9,6 +9,8 @@ pub mod protocol;
 pub mod thread;
 
 #[cfg(test)]
+mod reference_tests;
+#[cfg(test)]
 pub mod test_data;
 
 // Re-export commonly used types
