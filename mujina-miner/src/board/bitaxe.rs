@@ -228,6 +228,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         info,
         threads,
         telemetry_rx,
+        command_tx: None,
         shutdown: Some(shutdown),
     })
 }
@@ -419,6 +420,7 @@ impl Bitaxe {
                 },
             ],
             threads: Vec::new(), // TODO: populate from hash thread telemetry
+            ..Default::default()
         });
 
         // Periodic log
