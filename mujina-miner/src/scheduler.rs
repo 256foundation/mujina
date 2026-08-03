@@ -634,6 +634,10 @@ impl Scheduler {
                 );
             }
 
+            HashThreadEvent::TelemetryUpdate(_) => {
+                trace!(thread = %thread_name, "Thread telemetry update");
+            }
+
             HashThreadEvent::ExpectedHashRate(rate) => {
                 let Some(entry) = self.threads.get_mut(thread_id) else {
                     return;
