@@ -33,6 +33,9 @@ pub struct BoardTelemetry {
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadTelemetry>,
+    /// Per-ASIC topology/diagnostics state (multi-ASIC boards only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asics: Vec<AsicState>,
 }
 
 /// Fan status.
@@ -72,6 +75,27 @@ pub struct ThreadTelemetry {
     /// Hashrate in hashes per second.
     pub hashrate: u64,
     pub is_active: bool,
+}
+
+/// Per-ASIC runtime topology or diagnostics state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct AsicState {
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered_engine_count: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_engines: Vec<EngineCoordinate>,
+}
+
+/// Physical engine coordinate on one ASIC.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct EngineCoordinate {
+    pub row: u8,
+    pub col: u8,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.
