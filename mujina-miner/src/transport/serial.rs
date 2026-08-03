@@ -120,16 +120,19 @@ struct SerialInner {
 }
 
 /// Reader half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialReader {
     inner: Arc<SerialInner>,
 }
 
 /// Writer half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialWriter {
     inner: Arc<SerialInner>,
 }
 
 /// Control handle for a split serial stream.
+#[derive(Clone)]
 pub struct SerialControl {
     inner: Arc<SerialInner>,
 }
