@@ -224,8 +224,9 @@ GitHub.
 
 ### Protocols
 
-- [BM13xx ASIC Protocol](mujina-miner/src/asic/bm13xx/PROTOCOL.md):
-  serial protocol for the BM13xx mining-chip family
+- [BM13xx Chip Reference](mujina-miner/src/asic/bm13xx/REFERENCE.md):
+  serial protocol, registers, and behavior of the BM13xx mining-chip
+  family
 - [Bitaxe-Raw Control Protocol](mujina-miner/src/mgmt_protocol/bitaxe_raw/PROTOCOL.md):
   management protocol for Bitaxe board peripherals
 

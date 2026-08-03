@@ -45,4 +45,4 @@ modules.
 - [Bitaxe Project](https://bitaxe.org)
 - [Bitaxe Gamma Hardware](https://github.com/bitaxeorg/bitaxeGamma)
 - [bitaxe-raw Firmware](https://github.com/bitaxeorg/bitaxe-raw)
-- [BM1370 Protocol Documentation](../asic/bm13xx/PROTOCOL.md)
+- [BM13xx Chip Reference](../asic/bm13xx/REFERENCE.md)
