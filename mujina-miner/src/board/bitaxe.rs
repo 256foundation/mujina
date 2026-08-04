@@ -50,20 +50,21 @@ use crate::{
     types::Temperature,
 };
 
-use super::{
-    BackplaneConnector, BoardInfo,
-    pattern::{Match, StringMatch},
-};
+use super::{BackplaneConnector, BoardInfo, pattern::Match};
 
 // Register this board type with the inventory system
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
+            // Match by VID:PID (c0de:cafe for bitaxe-raw firmware). Windows
+            // reports a generic "Microsoft" manufacturer for CDC ACM devices
+            // instead of the real "OSMU"/"Bitaxe" strings, so string matching
+            // fails there; VID:PID is stable across platforms.
+            vid: Match::Specific(0xc0de),
+            pid: Match::Specific(0xcafe),
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            manufacturer: Match::Any,
+            product: Match::Any,
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
@@ -111,33 +112,54 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     time::sleep(Duration::from_millis(500)).await;
 
-    // Release ASIC from reset for discovery
+    // Release ASIC from reset for discovery. The BM1370 needs time to boot
+    // its UART before it will answer; give it the same ~500ms the reference
+    // Bitaxe firmware allows rather than a marginal 200ms.
     debug!("De-asserting ASIC nRST");
     reset_pin.write(PinValue::High).await?;
 
-    time::sleep(Duration::from_millis(200)).await;
+    time::sleep(Duration::from_millis(500)).await;
 
-    // Version mask and chip discovery
-    debug!("Sending version mask configuration (3 times)");
-    for i in 1..=3 {
-        trace!("Version mask send {}/3", i);
-        let version_cmd = Command::WriteRegister {
-            broadcast: true,
-            chip_address: 0x00,
-            register: bm13xx::protocol::Register::VersionMask(
-                bm13xx::protocol::VersionMask::full_rolling(),
-            ),
-        };
-        data_writer
-            .send(version_cmd)
-            .await
-            .context("failed to send config command")?;
-        time::sleep(Duration::from_millis(5)).await;
+    // Version mask + chip discovery, retried a few times. A cold ASIC can
+    // miss the first round if its UART is not fully up, so re-send the
+    // version mask and re-run discovery until chips answer rather than
+    // failing the whole board on a single silent window.
+    const DISCOVERY_ATTEMPTS: usize = 5;
+    let mut chip_infos = Vec::new();
+    for attempt in 1..=DISCOVERY_ATTEMPTS {
+        debug!("Sending version mask configuration (3 times)");
+        for i in 1..=3 {
+            trace!("Version mask send {}/3", i);
+            let version_cmd = Command::WriteRegister {
+                broadcast: true,
+                chip_address: 0x00,
+                register: bm13xx::protocol::Register::VersionMask(
+                    bm13xx::protocol::VersionMask::full_rolling(),
+                ),
+            };
+            data_writer
+                .send(version_cmd)
+                .await
+                .context("failed to send config command")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        match discover_chips(&mut data_reader, &mut data_writer).await {
+            Ok(chips) => {
+                chip_infos = chips;
+                break;
+            }
+            Err(e) if attempt < DISCOVERY_ATTEMPTS => {
+                warn!(
+                    "Chip discovery attempt {attempt}/{DISCOVERY_ATTEMPTS} failed: {e}; retrying"
+                );
+                time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
-
-    time::sleep(Duration::from_millis(10)).await;
-
-    let chip_infos = discover_chips(&mut data_reader, &mut data_writer).await?;
 
     debug!(count = chip_infos.len(), "Discovered chips");
 
@@ -194,6 +216,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
         serial: serial.clone(),
+        frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -212,7 +235,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         board_name,
         board_model: "Bitaxe Gamma",
         board_serial: serial,
-        bad_thermal_count: 0,
+        over_temp_count: 0,
+        sensor_fault_count: 0,
         asic_enable: asic_enable_monitor,
     };
 
@@ -242,9 +266,14 @@ struct Bitaxe {
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
-    /// Consecutive bad thermal readings (I2C error, out-of-range, or
-    /// above emergency threshold). Triggers emergency shutdown.
-    bad_thermal_count: u32,
+    /// Consecutive readings at or above the emergency temperature.
+    /// Triggers a fast thermal shutdown.
+    over_temp_count: u32,
+    /// Consecutive cycles with no usable temperature reading (I2C
+    /// error or out-of-range value). Tolerated longer than a genuine
+    /// over-temp because it is usually a transient control-bus desync,
+    /// but still shuts the board down if the sensor stays unreadable.
+    sensor_fault_count: u32,
     asic_enable: BitaxeAsicEnable,
 }
 
@@ -284,15 +313,19 @@ impl Bitaxe {
     /// telemetry, and logs a periodic summary.
     ///
     /// Temperature readings fall into four categories:
-    /// - I2C errors or diode faults: no temperature available.
+    /// - I2C errors: no temperature available (usually a transient
+    ///   control-bus desync), increments the sensor-fault counter.
     /// - Out of plausible range (outside 0..120 C): implausible,
-    ///   treated as a bad reading.
-    /// - Above the emergency threshold: valid but dangerous.
-    /// - Normal: valid and safe, resets the bad-reading counter.
+    ///   also counted as a sensor fault.
+    /// - At or above the emergency threshold: valid but dangerous,
+    ///   increments the over-temperature counter.
+    /// - Normal: valid and safe, resets both counters.
     ///
-    /// Any category except normal increments a consecutive
-    /// bad-reading counter. After BAD_READING_LIMIT consecutive
-    /// bad readings, the board shuts down.
+    /// A genuine over-temperature trips a fast shutdown after
+    /// OVER_TEMP_LIMIT consecutive readings. An unreadable sensor is
+    /// tolerated for longer (SENSOR_FAULT_LIMIT) so a transient bus
+    /// glitch can re-sync, but still shuts down if it persists — we
+    /// cannot run the ASIC blind to its temperature.
     async fn monitor_tick(
         &mut self,
         tx: &watch::Sender<BoardTelemetry>,
@@ -325,7 +358,12 @@ impl Bitaxe {
         const EXPECTED_MIN_C: f32 = 0.0;
         const EXPECTED_MAX_C: f32 = 120.0;
         const EMERGENCY_TEMP_C: f32 = 80.0;
-        const BAD_READING_LIMIT: u32 = 3;
+        // Consecutive genuinely-dangerous readings before shutdown.
+        const OVER_TEMP_LIMIT: u32 = 3;
+        // Consecutive unreadable-sensor cycles before shutdown. At the
+        // ~2s monitor cadence this is ~20s, long enough for a transient
+        // I2C/control-bus desync to re-sync without nuking the board.
+        const SENSOR_FAULT_LIMIT: u32 = 10;
         // The EMC2101 measures temperature via a diode on the ASIC
         // die. When the ASIC comes out of reset, the resulting
         // electrical transient corrupts the first few ADC conversions.
@@ -339,47 +377,71 @@ impl Bitaxe {
         let asic_temp = if diode_ready {
             match raw_temp {
                 Ok(t) if !(EXPECTED_MIN_C..=EXPECTED_MAX_C).contains(&t) => {
-                    self.bad_thermal_count += 1;
+                    self.sensor_fault_count += 1;
                     trace!(temp_c = t, "Discarding out-of-range temperature reading");
                     None
                 }
                 Ok(t) if t >= EMERGENCY_TEMP_C => {
-                    self.bad_thermal_count += 1;
+                    self.over_temp_count += 1;
+                    self.sensor_fault_count = 0;
                     warn!(
                         temp_c = t,
-                        consecutive = self.bad_thermal_count,
+                        consecutive = self.over_temp_count,
                         "Temperature above emergency threshold"
                     );
                     Some(t)
                 }
                 Ok(t) => {
-                    self.bad_thermal_count = 0;
+                    self.over_temp_count = 0;
+                    self.sensor_fault_count = 0;
                     Some(t)
                 }
                 Err(e) => {
-                    self.bad_thermal_count += 1;
-                    warn!("Temperature read failed: {}", e);
+                    self.sensor_fault_count += 1;
+                    warn!(
+                        consecutive = self.sensor_fault_count,
+                        "Temperature read failed: {}", e
+                    );
                     None
                 }
             }
         } else {
-            self.bad_thermal_count = 0;
+            self.over_temp_count = 0;
+            self.sensor_fault_count = 0;
             None
         };
 
-        // Without reliable temperature readings we cannot operate
-        // safely. Shut down the board.
-        if self.bad_thermal_count >= BAD_READING_LIMIT {
+        // A sustained run of genuinely dangerous temperatures is a real
+        // thermal emergency: shut down fast.
+        if self.over_temp_count >= OVER_TEMP_LIMIT {
             error!(
-                consecutive = self.bad_thermal_count,
+                consecutive = self.over_temp_count,
                 "THERMAL EMERGENCY: shutting down board"
             );
             if let Err(e) = self.emc2101.set_fan_speed(Percent::FULL).await {
                 error!("Failed to set fan speed: {}", e);
             }
             bail!(
-                "thermal emergency after {} consecutive bad readings",
-                self.bad_thermal_count
+                "thermal emergency after {} consecutive over-temperature readings",
+                self.over_temp_count
+            );
+        }
+
+        // A missing temperature reading is usually a transient control-bus
+        // desync that re-syncs on its own. Tolerate a longer window, but
+        // still shut down if the sensor stays unreadable — we cannot run
+        // the ASIC blind to its temperature.
+        if self.sensor_fault_count >= SENSOR_FAULT_LIMIT {
+            error!(
+                consecutive = self.sensor_fault_count,
+                "Temperature sensor unreadable: shutting down board"
+            );
+            if let Err(e) = self.emc2101.set_fan_speed(Percent::FULL).await {
+                error!("Failed to set fan speed: {}", e);
+            }
+            bail!(
+                "temperature sensor unreadable after {} consecutive failed readings",
+                self.sensor_fault_count
             );
         }
 
@@ -388,6 +450,7 @@ impl Bitaxe {
             name: self.board_name.clone(),
             model: self.board_model.into(),
             serial: self.board_serial.clone(),
+            frequency_mhz: Some(bm13xx::thread::TARGET_FREQUENCY_MHZ),
             fans: vec![Fan {
                 name: "fan".into(),
                 rpm: fan_rpm,

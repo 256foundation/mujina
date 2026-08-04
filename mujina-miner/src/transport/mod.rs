@@ -8,6 +8,10 @@
 use anyhow::Result;
 
 pub mod cpu;
+#[cfg(not(windows))]
+pub mod serial;
+#[cfg(windows)]
+#[path = "serial_windows.rs"]
 pub mod serial;
 pub mod usb;
 
