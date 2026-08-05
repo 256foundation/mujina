@@ -7,16 +7,34 @@ use crate::stratum_v1::StratumV1PoolConfig;
 /// Root of the miner's configuration tree.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    pub pools: Vec<StratumV1PoolConfig>,
+    pub sources: Vec<SourceKind>,
 }
 
 impl Config {
     /// Read the configuration tree from environment variables.
     pub fn from_env() -> Self {
         Self {
-            pools: stratum_v1_pool_from_env().into_iter().collect(),
+            sources: stratum_v1_pool_from_env()
+                .into_iter()
+                .map(SourceKind::StratumV1)
+                .collect(),
         }
     }
+}
+
+/// What kind of job source this is.
+///
+/// Tagged by `kind` rather than assuming every source is a pool.
+/// "Source" is already the vocabulary the rest of the codebase uses
+/// for this concept (the `job_source` module, `SourceRegistration`,
+/// `SourceEvent`), and it covers more than pool connections: the dummy
+/// source used when none is configured, and, over time, other
+/// protocols (Stratum v2 and whatever comes after). `StratumV1` is the
+/// only variant today; adding a source kind means adding a variant
+/// here, not reshaping this one.
+#[derive(Debug, Clone)]
+pub enum SourceKind {
+    StratumV1(StratumV1PoolConfig),
 }
 
 /// Read Stratum v1 pool configuration from environment variables.
@@ -55,7 +73,7 @@ mod tests {
         unsafe { std::env::remove_var("MUJINA_POOL_URL") };
 
         let config = Config::from_env();
-        assert!(config.pools.is_empty());
+        assert!(config.sources.is_empty());
     }
 
     #[test]
@@ -68,11 +86,12 @@ mod tests {
             std::env::remove_var("MUJINA_POOL_PASS");
         }
 
-        let pools = Config::from_env().pools;
-        assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0].url, "stratum+tcp://pool.example:3333");
-        assert_eq!(pools[0].username, "mujina-testing");
-        assert_eq!(pools[0].password, None);
+        let sources = Config::from_env().sources;
+        assert_eq!(sources.len(), 1);
+        let SourceKind::StratumV1(pool) = &sources[0];
+        assert_eq!(pool.url, "stratum+tcp://pool.example:3333");
+        assert_eq!(pool.username, "mujina-testing");
+        assert_eq!(pool.password, None);
     }
 
     #[test]
@@ -85,9 +104,10 @@ mod tests {
             std::env::set_var("MUJINA_POOL_PASS", "hunter2");
         }
 
-        let pools = Config::from_env().pools;
-        assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0].username, "alice.worker1");
-        assert_eq!(pools[0].password, Some("hunter2".to_string()));
+        let sources = Config::from_env().sources;
+        assert_eq!(sources.len(), 1);
+        let SourceKind::StratumV1(pool) = &sources[0];
+        assert_eq!(pool.username, "alice.worker1");
+        assert_eq!(pool.password, Some("hunter2".to_string()));
     }
 }

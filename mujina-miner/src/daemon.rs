@@ -14,7 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
-    config::Config,
+    config::{Config, SourceKind},
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -112,7 +112,13 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        let pool_config = Config::from_env().pools.into_iter().next();
+        let pool_config = Config::from_env()
+            .sources
+            .into_iter()
+            .map(|s| match s {
+                SourceKind::StratumV1(pool) => pool,
+            })
+            .next();
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
