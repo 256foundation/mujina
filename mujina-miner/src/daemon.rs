@@ -115,7 +115,7 @@ impl Daemon {
         let pool_config = Config::from_env()
             .sources
             .into_iter()
-            .map(|s| match s {
+            .map(|s| match s.kind {
                 SourceKind::StratumV1(pool) => pool,
             })
             .next();

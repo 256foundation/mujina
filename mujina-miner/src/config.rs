@@ -7,7 +7,7 @@ use crate::stratum_v1::StratumV1PoolConfig;
 /// Root of the miner's configuration tree.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    pub sources: Vec<SourceKind>,
+    pub sources: Vec<SourceConfig>,
 }
 
 impl Config {
@@ -16,10 +16,22 @@ impl Config {
         Self {
             sources: stratum_v1_pool_from_env()
                 .into_iter()
-                .map(SourceKind::StratumV1)
+                .enumerate()
+                .map(|(i, pool)| SourceConfig {
+                    name: generated_name(i),
+                    kind: SourceKind::StratumV1(pool),
+                })
                 .collect(),
         }
     }
+}
+
+/// A configured job source.
+#[derive(Debug, Clone)]
+pub struct SourceConfig {
+    /// URL-friendly identifier, unique among sources.
+    pub name: String,
+    pub kind: SourceKind,
 }
 
 /// What kind of job source this is.
@@ -35,6 +47,16 @@ impl Config {
 #[derive(Debug, Clone)]
 pub enum SourceKind {
     StratumV1(StratumV1PoolConfig),
+}
+
+/// Derive a name for a source that has none configured explicitly.
+///
+/// Assigns letters by position (`a`, `b`, `c`, ...). Good enough while
+/// naming can't yet be set explicitly (e.g. per-source in a config file
+/// or env var); once it can, that name should take precedence and this
+/// should only apply to whatever's left unnamed.
+fn generated_name(index: usize) -> String {
+    char::from(b'a' + (index as u8 % 26)).to_string()
 }
 
 /// Read Stratum v1 pool configuration from environment variables.
@@ -88,7 +110,8 @@ mod tests {
 
         let sources = Config::from_env().sources;
         assert_eq!(sources.len(), 1);
-        let SourceKind::StratumV1(pool) = &sources[0];
+        assert_eq!(sources[0].name, "a");
+        let SourceKind::StratumV1(pool) = &sources[0].kind;
         assert_eq!(pool.url, "stratum+tcp://pool.example:3333");
         assert_eq!(pool.username, "mujina-testing");
         assert_eq!(pool.password, None);
@@ -106,7 +129,8 @@ mod tests {
 
         let sources = Config::from_env().sources;
         assert_eq!(sources.len(), 1);
-        let SourceKind::StratumV1(pool) = &sources[0];
+        assert_eq!(sources[0].name, "a");
+        let SourceKind::StratumV1(pool) = &sources[0].kind;
         assert_eq!(pool.username, "alice.worker1");
         assert_eq!(pool.password, Some("hunter2".to_string()));
     }
