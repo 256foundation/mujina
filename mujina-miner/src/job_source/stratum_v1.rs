@@ -761,7 +761,7 @@ mod tests {
         let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             username: "testworker".to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "test".to_string(),
             ..Default::default()
         };
@@ -1590,7 +1590,7 @@ mod tests {
         let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             username: "testworker".to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "test".to_string(),
             ..Default::default()
         };

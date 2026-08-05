@@ -122,7 +122,7 @@ impl Daemon {
             // Use Stratum v1 source
             let pool_user =
                 env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
+            let pool_pass = env::var("MUJINA_POOL_PASS").ok();
 
             let stratum_config = StratumV1PoolConfig {
                 url: pool_url.clone(),
