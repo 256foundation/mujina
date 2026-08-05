@@ -5,6 +5,9 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+use utoipa::ToSchema;
+
 use super::connection::{Connection, Transport};
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
@@ -15,8 +18,10 @@ use tokio_util::sync::CancellationToken;
 /// Pool connection configuration.
 ///
 /// `Debug` is hand-implemented to redact the password, since `Debug`
-/// output can end up in trace logs.
-#[derive(Clone)]
+/// output can end up in trace logs. `Serialize` is derived and does
+/// include it: the config API is how an operator inspects their own
+/// pool configuration.
+#[derive(Clone, Serialize, ToSchema)]
 pub struct StratumV1PoolConfig {
     /// Pool URL (stratum+tcp://host:port or host:port)
     pub url: String,

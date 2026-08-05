@@ -112,11 +112,12 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        let pool_config = Config::from_env()
+        let config = Config::from_env();
+        let pool_config = config
             .sources
-            .into_iter()
-            .map(|s| match s.kind {
-                SourceKind::StratumV1(pool) => pool,
+            .iter()
+            .map(|s| match &s.kind {
+                SourceKind::StratumV1(pool) => pool.clone(),
             })
             .next();
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
@@ -256,13 +257,14 @@ impl Daemon {
                     Ok(addr) => format!("{addr}:{API_PORT}"),
                     Err(_) => format!("127.0.0.1:{API_PORT}"),
                 };
-                let config = ApiConfig { bind_addr };
+                let api_config = ApiConfig { bind_addr };
                 if let Err(e) = api::serve(
-                    config,
+                    api_config,
                     shutdown,
                     miner_telemetry_rx,
                     board_reg_rx,
                     scheduler_cmd_tx,
+                    config,
                 )
                 .await
                 {

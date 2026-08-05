@@ -2,10 +2,13 @@
 //!
 //! Populated from environment variables.
 
+use serde::Serialize;
+use utoipa::ToSchema;
+
 use crate::stratum_v1::StratumV1PoolConfig;
 
 /// Root of the miner's configuration tree.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct Config {
     pub sources: Vec<SourceConfig>,
 }
@@ -27,10 +30,11 @@ impl Config {
 }
 
 /// A configured job source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SourceConfig {
     /// URL-friendly identifier, unique among sources.
     pub name: String,
+    #[serde(flatten)]
     pub kind: SourceKind,
 }
 
@@ -44,7 +48,8 @@ pub struct SourceConfig {
 /// protocols (Stratum v2 and whatever comes after). `StratumV1` is the
 /// only variant today; adding a source kind means adding a variant
 /// here, not reshaping this one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceKind {
     StratumV1(StratumV1PoolConfig),
 }
