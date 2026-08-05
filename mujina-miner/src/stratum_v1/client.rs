@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 /// Pool connection configuration.
 #[derive(Debug, Clone)]
-pub struct PoolConfig {
+pub struct StratumV1PoolConfig {
     /// Pool URL (stratum+tcp://host:port or host:port)
     pub url: String,
 
@@ -28,7 +28,7 @@ pub struct PoolConfig {
     pub user_agent: String,
 }
 
-impl Default for PoolConfig {
+impl Default for StratumV1PoolConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
@@ -49,7 +49,7 @@ impl Default for PoolConfig {
 /// we process notifications inline while waiting for responses.
 pub struct StratumV1Client {
     /// Pool configuration
-    config: PoolConfig,
+    config: StratumV1PoolConfig,
 
     /// Where to send events
     event_tx: mpsc::Sender<ClientEvent>,
@@ -91,7 +91,7 @@ struct ProtocolState {
 impl StratumV1Client {
     /// Create a new Stratum v1 client.
     pub fn new(
-        config: PoolConfig,
+        config: StratumV1PoolConfig,
         event_tx: mpsc::Sender<ClientEvent>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -108,7 +108,7 @@ impl StratumV1Client {
 
     /// Create a new Stratum v1 client with command channel.
     pub fn with_commands(
-        config: PoolConfig,
+        config: StratumV1PoolConfig,
         event_tx: mpsc::Sender<ClientEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
         shutdown: CancellationToken,
@@ -943,7 +943,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(100);
         let shutdown = CancellationToken::new();
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: format!("stratum+tcp://{}", pool_url),
             username: username.to_string(),
             password: "x".to_string(),
@@ -1105,7 +1105,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "test:3333".to_string(),
             username: "test".to_string(),
             password: "x".to_string(),

@@ -22,7 +22,7 @@ use crate::{
         stratum_v1::StratumV1Source,
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
-    stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
+    stratum_v1::{StratumV1PoolConfig, TcpConnector},
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -124,7 +124,7 @@ impl Daemon {
                 env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
             let pool_pass = env::var("MUJINA_POOL_PASS").unwrap_or_else(|_| "x".to_string());
 
-            let stratum_config = StratumPoolConfig {
+            let stratum_config = StratumV1PoolConfig {
                 url: pool_url.clone(),
                 username: pool_user,
                 password: pool_pass,
