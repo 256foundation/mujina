@@ -14,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    config::Config,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -22,7 +23,7 @@ use crate::{
         stratum_v1::StratumV1Source,
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
-    stratum_v1::{StratumV1PoolConfig, TcpConnector},
+    stratum_v1::TcpConnector,
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
@@ -111,25 +112,13 @@ impl Daemon {
         });
 
         // Create job source (Stratum v1 or Dummy)
-        // Controlled by environment variables:
-        // - MUJINA_POOL_URL: Pool address (e.g., stratum+tcp://localhost:3333)
-        // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
-        // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
+        let pool_config = Config::from_env().pools.into_iter().next();
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
         let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
 
-        if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
+        if let Some(stratum_config) = pool_config {
             // Use Stratum v1 source
-            let pool_user =
-                env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
-            let pool_pass = env::var("MUJINA_POOL_PASS").ok();
-
-            let stratum_config = StratumV1PoolConfig {
-                url: pool_url.clone(),
-                username: pool_user,
-                password: pool_pass,
-                user_agent: "mujina-miner/0.1.0-alpha".to_string(),
-            };
+            let pool_url = stratum_config.url.clone();
 
             // Optionally wrap with ForcedRateSource for testing
             if let Some(forced_rate_config) = ForcedRateConfig::from_env() {

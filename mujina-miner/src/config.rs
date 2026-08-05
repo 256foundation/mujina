@@ -1,101 +1,93 @@
-//! Configuration management for mujina-miner.
+//! Configuration tree for mujina-miner.
 //!
-//! This module handles loading and validating configuration from TOML files,
-//! environment variables, and command-line arguments. It supports hot-reload
-//! via file watching.
+//! Populated from environment variables.
 
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use crate::stratum_v1::StratumV1PoolConfig;
 
-/// Main configuration structure for the miner.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Root of the miner's configuration tree.
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Daemon configuration
-    pub daemon: DaemonConfig,
-
-    /// Pool configuration
-    pub pools: Vec<PoolConfig>,
-
-    /// Hardware configuration
-    pub hardware: HardwareConfig,
-
-    /// API server configuration
-    pub api: ApiConfig,
-}
-
-/// Daemon process configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DaemonConfig {
-    /// PID file location
-    pub pid_file: Option<PathBuf>,
-
-    /// Log level
-    pub log_level: String,
-
-    /// Use systemd notification
-    #[serde(default)]
-    pub systemd: bool,
-}
-
-/// Pool connection configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PoolConfig {
-    /// Pool URL (stratum+tcp://...)
-    pub url: String,
-
-    /// Worker name
-    pub worker: String,
-
-    /// Password (if required)
-    pub password: Option<String>,
-
-    /// Priority (lower is higher priority)
-    #[serde(default)]
-    pub priority: u32,
-}
-
-/// Hardware configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HardwareConfig {
-    /// Temperature limits
-    pub temp_limit: f32,
-
-    /// Fan control settings
-    pub fan_min_rpm: u32,
-    pub fan_max_rpm: u32,
-
-    /// Power limits
-    pub power_limit: Option<f32>,
-}
-
-/// API server configuration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ApiConfig {
-    /// Listen address
-    pub listen: String,
-
-    /// Enable TLS
-    #[serde(default)]
-    pub tls: bool,
-
-    /// TLS certificate path
-    pub cert_path: Option<PathBuf>,
-
-    /// TLS key path
-    pub key_path: Option<PathBuf>,
+    pub pools: Vec<StratumV1PoolConfig>,
 }
 
 impl Config {
-    /// Load configuration from the default location.
-    pub fn load() -> anyhow::Result<Self> {
-        // TODO: Implement config loading from /etc/mujina/mujina.toml
-        // and ~/.config/mujina/mujina.toml with proper merging
-        unimplemented!("Config loading not yet implemented")
+    /// Read the configuration tree from environment variables.
+    pub fn from_env() -> Self {
+        Self {
+            pools: stratum_v1_pool_from_env().into_iter().collect(),
+        }
+    }
+}
+
+/// Read Stratum v1 pool configuration from environment variables.
+///
+/// Returns `None` if `MUJINA_POOL_URL` is unset, in which case the
+/// caller should fall back to a dummy job source.
+///
+/// # Environment Variables
+///
+/// - `MUJINA_POOL_URL`: Pool address (e.g. stratum+tcp://host:3333)
+/// - `MUJINA_POOL_USER`: Worker username (default: "mujina-testing")
+/// - `MUJINA_POOL_PASS`: Worker password, if the pool requires one
+fn stratum_v1_pool_from_env() -> Option<StratumV1PoolConfig> {
+    let url = std::env::var("MUJINA_POOL_URL").ok()?;
+    let username =
+        std::env::var("MUJINA_POOL_USER").unwrap_or_else(|_| "mujina-testing".to_string());
+    let password = std::env::var("MUJINA_POOL_PASS").ok();
+
+    Some(StratumV1PoolConfig {
+        url,
+        username,
+        password,
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn from_env_returns_none_when_url_unset() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe { std::env::remove_var("MUJINA_POOL_URL") };
+
+        let config = Config::from_env();
+        assert!(config.pools.is_empty());
     }
 
-    /// Load configuration from a specific file.
-    pub fn load_from(_path: &Path) -> anyhow::Result<Self> {
-        // TODO: Implement TOML parsing
-        unimplemented!("Config loading not yet implemented")
+    #[test]
+    #[serial]
+    fn from_env_defaults_username_and_omits_password_when_unset() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_POOL_URL", "stratum+tcp://pool.example:3333");
+            std::env::remove_var("MUJINA_POOL_USER");
+            std::env::remove_var("MUJINA_POOL_PASS");
+        }
+
+        let pools = Config::from_env().pools;
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].url, "stratum+tcp://pool.example:3333");
+        assert_eq!(pools[0].username, "mujina-testing");
+        assert_eq!(pools[0].password, None);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_username_and_password_when_set() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_POOL_URL", "stratum+tcp://pool.example:3333");
+            std::env::set_var("MUJINA_POOL_USER", "alice.worker1");
+            std::env::set_var("MUJINA_POOL_PASS", "hunter2");
+        }
+
+        let pools = Config::from_env().pools;
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].username, "alice.worker1");
+        assert_eq!(pools[0].password, Some("hunter2".to_string()));
     }
 }
