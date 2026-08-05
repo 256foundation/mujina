@@ -5,6 +5,9 @@
 
 use std::time::Duration;
 
+use serde::Serialize;
+use utoipa::ToSchema;
+
 use super::connection::{Connection, Transport};
 use super::error::{StratumError, StratumResult};
 use super::messages::{ClientCommand, ClientEvent, JsonRpcMessage, SubmitParams};
@@ -13,29 +16,47 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Pool connection configuration.
-#[derive(Debug, Clone)]
-pub struct PoolConfig {
+///
+/// `Debug` is hand-implemented to redact the password, since `Debug`
+/// output can end up in trace logs. `Serialize` is derived and does
+/// include it: the config API is how an operator inspects their own
+/// pool configuration.
+#[derive(Clone, Serialize, ToSchema)]
+pub struct StratumV1PoolConfig {
     /// Pool URL (stratum+tcp://host:port or host:port)
     pub url: String,
 
     /// Worker username
     pub username: String,
 
-    /// Worker password
-    pub password: String,
+    /// Worker password, if the pool requires one. `None` means no
+    /// password was configured, distinct from an explicitly empty one;
+    /// callers that need a wire value default to "x" at send time.
+    pub password: Option<String>,
 
     /// User agent string
     pub user_agent: String,
 }
 
-impl Default for PoolConfig {
+impl Default for StratumV1PoolConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
             username: String::new(),
-            password: String::new(),
+            password: None,
             user_agent: "mujina-miner/0.1.0-alpha".to_string(),
         }
+    }
+}
+
+impl std::fmt::Debug for StratumV1PoolConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StratumV1PoolConfig")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("user_agent", &self.user_agent)
+            .finish()
     }
 }
 
@@ -49,7 +70,7 @@ impl Default for PoolConfig {
 /// we process notifications inline while waiting for responses.
 pub struct StratumV1Client {
     /// Pool configuration
-    config: PoolConfig,
+    config: StratumV1PoolConfig,
 
     /// Where to send events
     event_tx: mpsc::Sender<ClientEvent>,
@@ -91,7 +112,7 @@ struct ProtocolState {
 impl StratumV1Client {
     /// Create a new Stratum v1 client.
     pub fn new(
-        config: PoolConfig,
+        config: StratumV1PoolConfig,
         event_tx: mpsc::Sender<ClientEvent>,
         shutdown: CancellationToken,
     ) -> Self {
@@ -108,7 +129,7 @@ impl StratumV1Client {
 
     /// Create a new Stratum v1 client with command channel.
     pub fn with_commands(
-        config: PoolConfig,
+        config: StratumV1PoolConfig,
         event_tx: mpsc::Sender<ClientEvent>,
         command_rx: mpsc::Receiver<ClientCommand>,
         shutdown: CancellationToken,
@@ -364,7 +385,10 @@ impl StratumV1Client {
             .send_request(
                 conn,
                 "mining.authorize",
-                json!([&self.config.username, &self.config.password]),
+                json!([
+                    &self.config.username,
+                    self.config.password.as_deref().unwrap_or("x")
+                ]),
                 Duration::from_secs(30),
             )
             .await?;
@@ -943,10 +967,10 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(100);
         let shutdown = CancellationToken::new();
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: format!("stratum+tcp://{}", pool_url),
             username: username.to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "mujina-miner/0.1.0-test".to_string(),
         };
 
@@ -1105,10 +1129,10 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "test:3333".to_string(),
             username: "test".to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "test".to_string(),
         };
 
