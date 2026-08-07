@@ -12,6 +12,16 @@ use crate::tracing::prelude::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// How long the pool may go silent before the connection is recycled.
+///
+/// Pools normally send `mining.notify` at least as often as new blocks
+/// arrive (once every 10 minutes on average), so 20 minutes without any
+/// message means the connection is almost certainly dead but not yet
+/// detected as such by TCP, whose default keepalive probing takes hours.
+/// Reconnecting is cheap and bounds how long a dead connection can
+/// silently eat shares.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 /// Pool connection configuration.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -713,8 +723,19 @@ impl StratumV1Client {
         // Main event loop
         loop {
             tokio::select! {
-                // Read messages from pool
-                msg = conn.read_message() => {
+                // Read messages from pool, recycling the connection if the
+                // pool goes silent for too long (see POOL_IDLE_TIMEOUT).
+                msg = tokio::time::timeout(POOL_IDLE_TIMEOUT, conn.read_message()) => {
+                    let msg = match msg {
+                        Ok(msg) => msg,
+                        Err(_elapsed) => {
+                            warn!(
+                                idle_minutes = POOL_IDLE_TIMEOUT.as_secs() / 60,
+                                "No message from pool within the idle limit; reconnecting"
+                            );
+                            return Err(StratumError::Timeout);
+                        }
+                    };
                     match msg {
                         Ok(Some(msg)) => {
                             // Handle the message
@@ -799,6 +820,8 @@ mod tests {
     use crate::job_source::Extranonce2;
     use bitcoin::hashes::Hash;
     use tokio::time::{Duration, timeout};
+
+    use super::super::connection::MockTransportHandle;
 
     /// Integration test: Connect to public-pool.io and validate protocol.
     ///
@@ -1385,5 +1408,45 @@ mod tests {
             }
             _ => panic!("Expected ShareRejected, got {:?}", event),
         }
+    }
+
+    /// Answer the client's configure/subscribe/authorize requests over
+    /// the mock transport, completing the handshake.
+    async fn answer_handshake(handle: &mut MockTransportHandle) {
+        use serde_json::json;
+
+        for result in [
+            json!({"version-rolling": false}),
+            json!([[], "aabbccdd", 4]),
+            json!(true),
+        ] {
+            let msg = handle.recv().await;
+            handle.send(JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: Some(result),
+                error: None,
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_pool_recycles_connection() {
+        use super::super::connection::MockTransport;
+
+        // After the handshake the pool says nothing. With time paused,
+        // the runtime fast-forwards to the idle timeout, which must end
+        // the connection so the caller can reconnect.
+        let (client, _event_rx) = test_client();
+        let (transport, mut handle) = MockTransport::pair();
+
+        let client_task = tokio::spawn(async move { client.run_with_transport(transport).await });
+        answer_handshake(&mut handle).await;
+
+        let result = client_task.await.unwrap();
+        assert!(
+            matches!(result, Err(StratumError::Timeout)),
+            "expected idle timeout, got {:?}",
+            result,
+        );
     }
 }
