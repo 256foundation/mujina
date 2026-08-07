@@ -2,6 +2,15 @@
 //!
 //! Parses environment variables to configure the CPU mining backend.
 
+use crate::tracing::prelude::*;
+
+/// Upper bound on CPU mining threads.
+///
+/// The CPU backend exists for development and testing, so this is far
+/// above any real core count; the bound keeps a typo in
+/// `MUJINA_CPUMINER_THREADS` from spawning an absurd number of threads.
+const MAX_THREAD_COUNT: usize = 4096;
+
 /// CPU miner configuration parsed from environment variables.
 #[derive(Debug, Clone)]
 pub struct CpuMinerConfig {
@@ -27,9 +36,18 @@ impl CpuMinerConfig {
     /// - `MUJINA_CPUMINER_THREADS`: Number of threads (presence enables CPU mining)
     /// - `MUJINA_CPUMINER_DUTY`: Duty cycle % (default: 50, clamped to 1-100)
     pub fn from_env() -> Option<Self> {
-        let thread_count = std::env::var("MUJINA_CPUMINER_THREADS")
+        let thread_count: usize = std::env::var("MUJINA_CPUMINER_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())?;
+
+        if thread_count > MAX_THREAD_COUNT {
+            warn!(
+                requested = thread_count,
+                max = MAX_THREAD_COUNT,
+                "MUJINA_CPUMINER_THREADS clamped"
+            );
+        }
+        let thread_count = thread_count.min(MAX_THREAD_COUNT);
 
         let duty_percent = std::env::var("MUJINA_CPUMINER_DUTY")
             .ok()
@@ -81,5 +99,20 @@ mod tests {
         if let Some(config) = CpuMinerConfig::from_env() {
             assert_eq!(config.duty_percent, 1);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_thread_count_clamped_to_max() {
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe {
+            std::env::set_var("MUJINA_CPUMINER_THREADS", "100000");
+        }
+
+        let config = CpuMinerConfig::from_env().unwrap();
+        assert_eq!(config.thread_count, MAX_THREAD_COUNT);
+
+        // SAFETY: Test runs serially, no concurrent env access
+        unsafe { std::env::remove_var("MUJINA_CPUMINER_THREADS") };
     }
 }
