@@ -10,9 +10,25 @@ use async_trait::async_trait;
 use super::error::{StratumError, StratumResult};
 use super::messages::JsonRpcMessage;
 use crate::tracing::prelude::*;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+/// Maximum accepted length of a single Stratum message, in bytes.
+///
+/// A `mining.notify` is the largest legitimate message, and its size
+/// is dominated by the hex-encoded coinbase transaction, so this cap
+/// also bounds the coinbase a pool can deliver, about 31 KB
+/// serialized after the notify's fixed fields. A P2WPKH payout
+/// output serializes to 31 bytes and a P2TR output to 43, so that is
+/// room for 750--1000 payouts to miner addresses. Pools that pay
+/// miners in the coinbase send the largest coinbases observed;
+/// recent coinbases from the Ocean pool measure a few dozen outputs,
+/// about 2 KB (mempool.space, Aug 2026). The cap matters because
+/// the transport is plaintext and the peer untrusted. Without it, a
+/// peer that never terminates a line grows the read buffer until
+/// the daemon runs out of memory.
+const MAX_MESSAGE_LEN: usize = 64 * 1024;
 
 /// Message-level I/O for Stratum protocol.
 ///
@@ -88,15 +104,23 @@ impl Transport for Connection {
         loop {
             self.line_buf.clear();
 
-            let n = self
-                .reader
-                .read_line(&mut self.line_buf)
-                .await
-                .map_err(StratumError::Io)?;
+            // Bound the read so an unterminated line cannot grow the
+            // buffer without limit.
+            let n = {
+                let mut limited = (&mut self.reader).take(MAX_MESSAGE_LEN as u64 + 1);
+                limited
+                    .read_line(&mut self.line_buf)
+                    .await
+                    .map_err(StratumError::Io)?
+            };
 
             if n == 0 {
                 // EOF - connection closed
                 return Ok(None);
+            }
+
+            if self.line_buf.len() > MAX_MESSAGE_LEN {
+                return Err(StratumError::MessageTooLarge(MAX_MESSAGE_LEN));
             }
 
             let line = self.line_buf.trim();
@@ -307,5 +331,55 @@ mod tests {
         let response = conn.read_message().await.unwrap().unwrap();
         assert_eq!(response.id(), Some(1));
         assert_eq!(response.method(), Some("test.method"));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_message_rejected() {
+        // A peer that sends an unterminated over-limit line must not be
+        // able to grow the read buffer without bound.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // One byte past the limit, no newline anywhere.
+            socket
+                .write_all(&vec![b'a'; MAX_MESSAGE_LEN + 1])
+                .await
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut conn = Connection::new(stream);
+
+        let result = conn.read_message().await;
+        assert!(
+            matches!(result, Err(StratumError::MessageTooLarge(..))),
+            "expected MessageTooLarge, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_length_message_accepted() {
+        // A well-formed message of exactly the maximum length parses.
+        // Pad the method string so the line fills the cap exactly.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let template =
+                |method: &str| format!("{{\"id\":null,\"method\":\"{method}\",\"params\":[]}}\n");
+            let line = template(&"x".repeat(MAX_MESSAGE_LEN - template("").len()));
+            assert_eq!(line.len(), MAX_MESSAGE_LEN);
+            socket.write_all(line.as_bytes()).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut conn = Connection::new(stream);
+
+        let msg = conn.read_message().await.unwrap().unwrap();
+        assert!(msg.is_notification());
     }
 }

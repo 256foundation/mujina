@@ -17,6 +17,13 @@ pub enum StratumError {
     #[error("Invalid message format: {0}")]
     InvalidMessage(String),
 
+    /// Message from pool exceeded the maximum accepted length
+    ///
+    /// Always terminates the connection; the caller reconnects with
+    /// backoff.
+    #[error("Message exceeds {0}-byte limit")]
+    MessageTooLarge(usize),
+
     /// Pool returned an error response
     #[error("Pool error: {0}")]
     PoolError(String),
