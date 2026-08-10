@@ -55,7 +55,7 @@ jobs:
         id: image-cache
         with:
           path: /tmp/mujina-build.tar
-          key: build-image-${{ hashFiles('build.Containerfile', 'justfile') }}
+          key: build-image-${{ hashFiles('build.Containerfile', 'tools.just') }}
 
       - name: Load cached build image
         if: steps.image-cache.outputs.cache-hit == 'true'
