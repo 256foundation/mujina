@@ -16,6 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install just --version 1.40.0
+RUN cargo install --locked just --version 1.40.0
 
 WORKDIR /workspace
