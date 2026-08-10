@@ -21,6 +21,22 @@ test:
 run:
     cargo run --locked --bin mujina-minerd
 
+# Update all dependencies to the newest sufficiently aged versions
+[group('deps')]
+update-deps: (_require "cargo-cooldown")
+    cargo cooldown update
+
+# Bring Cargo.lock in line with Cargo.toml after a manifest edit
+[group('deps')]
+resolve-deps: (_require "cargo-cooldown")
+    cargo cooldown check
+
+[private]
+_require tool:
+    @command -v {{tool}} >/dev/null || { \
+        echo "error: {{tool}} is not installed; run 'just setup-tools'" >&2; \
+        exit 1; }
+
 BUILD_IMAGE := "mujina-build"
 # Tag with a content hash of the Containerfile so we can detect
 # staleness without rebuilding. This matters in CI where podman
@@ -104,3 +120,16 @@ setup-hooks:
     git config core.hooksPath .githooks
     @echo "Git hooks configured to use .githooks/"
     @ls .githooks/ | sed 's/^/  - /'
+
+# Install the cargo tools the recipes use. The recipe installs a
+# missing tool at the exact version named here, and leaves a tool
+# already on PATH alone, at whatever version it is. The build
+# container runs this recipe, so these versions decide what runs
+# in CI.
+[group('setup')]
+setup-tools:
+    @if command -v cargo-cooldown >/dev/null; then \
+        echo "cargo-cooldown already installed; using the system copy"; \
+    else \
+        cargo install --locked cargo-cooldown --version 0.3.4; \
+    fi
