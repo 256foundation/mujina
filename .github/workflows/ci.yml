@@ -37,11 +37,13 @@ jobs:
     name: just ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           # Full history so just ci can walk the branch's commits.
           fetch-depth: 0
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+        with:
+          just-version: "1.40.0"
 
       # Cache the build toolchain image as a portable tar archive.
       # Podman's overlay storage can't be cached directly (tar fails
@@ -49,7 +51,7 @@ jobs:
       # save/load. The cache key hashes the image inputs, the same
       # files BUILD_TAG in the justfile hashes, so that build-image
       # recognizes the loaded image and skips the build.
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         id: image-cache
         with:
           path: /tmp/mujina-build.tar
@@ -62,7 +64,7 @@ jobs:
       # Cache compiled dependencies and downloaded crates to speed
       # up builds. The key includes the toolchain (Containerfile)
       # so a compiler bump invalidates stale artifacts.
-      - uses: actions/cache@v5
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: |
             target

@@ -1,5 +1,5 @@
-# Stage 1: Build
-FROM docker.io/library/rust:bookworm AS builder
+# Stage 1: Build.
+FROM docker.io/library/rust:1.94-bookworm@sha256:b2fe2c0f26e0e1759752b6b2eb93b119d30a80b91304f5b18069b31ea73eaee8 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev-dev \
@@ -12,7 +12,7 @@ COPY . .
 RUN cargo build --release --locked --bin mujina-minerd
 
 # Stage 2: Runtime
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev1 \
