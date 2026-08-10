@@ -25,6 +25,19 @@ allow = [
     "Zlib",
 ]
 
+# unescaper declares "GPL-3.0/MIT", the pre-SPDX-2.0 slash form,
+# which cargo-deny cannot parse and warns about. State the
+# expression in valid SPDX. The hashes fix the crate's license
+# files, so a licensing change upstream fails the check instead
+# of passing silently. Delete when upstream fixes its metadata.
+[[licenses.clarify]]
+crate = "unescaper"
+expression = "GPL-3.0-only OR MIT"
+license-files = [
+    { path = "LICENSE-GPL3", hash = 0xe497def1 },
+    { path = "LICENSE-MIT", hash = 0xeb164a42 },
+]
+
 [bans]
 # Refuse wildcard version requirements. Every dependency must
 # name a range.
