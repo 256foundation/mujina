@@ -18,4 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN cargo install --locked just --version 1.40.0
 
+# Install the cargo tools the recipes use, at the versions the
+# justfile names. build.Containerfile comes along because just
+# hashes it when parsing the justfile.
+WORKDIR /setup
+COPY justfile build.Containerfile ./
+RUN just setup-tools
+
 WORKDIR /workspace

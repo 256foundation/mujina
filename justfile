@@ -13,9 +13,14 @@ lint:
 test:
     cargo test --locked
 
+# Check dependency sources, bans, and licenses against deny.toml
+[group('dev')]
+deny: (_require "cargo-deny")
+    cargo deny --locked check sources bans licenses
+
 # Run all checks (before commit, push, merge, release)
 [group('dev')]
-@checks: (fmt "--check") lint test
+@checks: (fmt "--check") lint test deny
 
 [group('dev')]
 run:
@@ -38,12 +43,13 @@ _require tool:
         exit 1; }
 
 BUILD_IMAGE := "mujina-build"
-# Tag with a content hash of the Containerfile so we can detect
+# Tag with a content hash of the image inputs so we can detect
 # staleness without rebuilding. This matters in CI where podman
 # save/load doesn't preserve layer cache---podman build would
 # rebuild from scratch even with a loaded image. The content-hash
-# tag lets `podman image exists` skip the build entirely.
-BUILD_TAG := `sha256sum build.Containerfile | cut -c1-12`
+# tag lets `podman image exists` skip the build entirely. The
+# justfile is an input because the image runs setup-tools.
+BUILD_TAG := `sha256sum build.Containerfile justfile | sha256sum | cut -c1-12`
 
 # Build the build toolchain image (skips if unchanged)
 [group('container')]
@@ -132,4 +138,9 @@ setup-tools:
         echo "cargo-cooldown already installed; using the system copy"; \
     else \
         cargo install --locked cargo-cooldown --version 0.3.4; \
+    fi
+    @if command -v cargo-deny >/dev/null; then \
+        echo "cargo-deny already installed; using the system copy"; \
+    else \
+        cargo install --locked cargo-deny --version 0.20.2; \
     fi

@@ -46,15 +46,14 @@ jobs:
       # Cache the build toolchain image as a portable tar archive.
       # Podman's overlay storage can't be cached directly (tar fails
       # on overlay whiteout files), so we round-trip through podman
-      # save/load. The cache key is the hash of build.Containerfile.
-      # The image is tagged with a short hash of the Containerfile so
-      # that build-image in the justfile recognizes it and skips the
-      # build.
+      # save/load. The cache key hashes the image inputs, the same
+      # files BUILD_TAG in the justfile hashes, so that build-image
+      # recognizes the loaded image and skips the build.
       - uses: actions/cache@v5
         id: image-cache
         with:
           path: /tmp/mujina-build.tar
-          key: build-image-${{ hashFiles('build.Containerfile') }}
+          key: build-image-${{ hashFiles('build.Containerfile', 'justfile') }}
 
       - name: Load cached build image
         if: steps.image-cache.outputs.cache-hit == 'true'
@@ -82,5 +81,5 @@ jobs:
       - name: Save build image for cache
         if: steps.image-cache.outputs.cache-hit != 'true'
         run: |
-          TAG=$(sha256sum build.Containerfile | cut -c1-12)
-          podman save -o /tmp/mujina-build.tar "mujina-build:$TAG"
+          podman save -o /tmp/mujina-build.tar \
+              "mujina-build:$(just --evaluate BUILD_TAG)"
