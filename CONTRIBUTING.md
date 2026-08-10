@@ -114,7 +114,14 @@ Hashimoto and contributors for the pattern!
    git remote add upstream \
        https://github.com/256foundation/mujina.git
    ```
-4. **Setup git hooks** (highly recommended):
+4. **Install the project's tool dependencies**:
+   ```bash
+   just setup-tools
+   ```
+   This installs the cargo tools the just recipes use, at the
+   versions they expect. A tool you already have installed is
+   left alone.
+5. **Setup git hooks** (highly recommended):
    ```bash
    just setup-hooks
    ```
@@ -124,7 +131,7 @@ Hashimoto and contributors for the pattern!
    ```bash
    git commit --no-verify
    ```
-5. Create a branch:
+6. Create a branch:
    ```bash
    git checkout -b fix-double-free-on-shutdown
    ```
@@ -168,6 +175,37 @@ when `just checks` passes locally but CI fails:
 ```bash
 just in-container checks
 ```
+
+### Updating Dependencies
+
+Dependency versions are locked in `Cargo.lock`, and every build
+passes `--locked`, so versions change only deliberately.
+
+After editing `Cargo.toml` (adding, removing, or re-ranging a
+dependency), run:
+
+```bash
+just resolve-deps
+```
+
+This picks versions for the dependencies you changed, writes
+them to `Cargo.lock`, and leaves every other locked version
+unchanged.
+
+To refresh all dependencies to the newest allowed versions:
+
+```bash
+just update-deps
+```
+
+Both commands refuse versions published less than seven days ago
+and automatically pick the newest older version instead (the
+cooldown in `cooldown.toml`). The cooldown defends against
+supply-chain attacks. Most malicious crate releases are caught
+and yanked within days of publication, and the wait keeps them
+out of `Cargo.lock`.
+
+Review the `Cargo.lock` diff and commit it like any other change.
 
 ### Documenting Known Bugs with `#[should_panic]`
 
