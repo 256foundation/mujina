@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY . .
 
-RUN cargo build --release --bin mujina-minerd
+RUN cargo build --release --locked --bin mujina-minerd
 
 # Stage 2: Runtime
 FROM docker.io/library/debian:bookworm-slim

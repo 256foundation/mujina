@@ -7,11 +7,11 @@ fmt *args:
 
 [group('dev')]
 lint:
-    cargo clippy --release -- -D warnings
+    cargo clippy --release --locked -- -D warnings
 
 [group('dev')]
 test:
-    cargo test
+    cargo test --locked
 
 # Run all checks (before commit, push, merge, release)
 [group('dev')]
@@ -19,7 +19,7 @@ test:
 
 [group('dev')]
 run:
-    cargo run --bin mujina-minerd
+    cargo run --locked --bin mujina-minerd
 
 BUILD_IMAGE := "mujina-build"
 # Tag with a content hash of the Containerfile so we can detect
