@@ -1,3 +1,5 @@
+import 'tools.just'
+
 _default:
     @just --list --unsorted
 
@@ -48,13 +50,15 @@ _require tool:
         exit 1; }
 
 BUILD_IMAGE := "mujina-build"
+# These files decide the build toolchain image's content. tools.just
+# qualifies because the image runs setup-tools from it.
+IMAGE_INPUTS := "build.Containerfile tools.just"
 # Tag with a content hash of the image inputs so we can detect
 # staleness without rebuilding. This matters in CI where podman
 # save/load doesn't preserve layer cache---podman build would
 # rebuild from scratch even with a loaded image. The content-hash
-# tag lets `podman image exists` skip the build entirely. The
-# justfile is an input because the image runs setup-tools.
-BUILD_TAG := `sha256sum build.Containerfile justfile | sha256sum | cut -c1-12`
+# tag lets `podman image exists` skip the build entirely.
+BUILD_TAG := shell('sha256sum ' + IMAGE_INPUTS + ' | sha256sum | cut -c1-12')
 
 # Build the build toolchain image (skips if unchanged)
 [group('container')]
@@ -131,21 +135,3 @@ setup-hooks:
     git config core.hooksPath .githooks
     @echo "Git hooks configured to use .githooks/"
     @ls .githooks/ | sed 's/^/  - /'
-
-# Install the cargo tools the recipes use. The recipe installs a
-# missing tool at the exact version named here, and leaves a tool
-# already on PATH alone, at whatever version it is. The build
-# container runs this recipe, so these versions decide what runs
-# in CI.
-[group('setup')]
-setup-tools:
-    @if command -v cargo-cooldown >/dev/null; then \
-        echo "cargo-cooldown already installed; using the system copy"; \
-    else \
-        cargo install --locked cargo-cooldown --version 0.3.4; \
-    fi
-    @if command -v cargo-deny >/dev/null; then \
-        echo "cargo-deny already installed; using the system copy"; \
-    else \
-        cargo install --locked cargo-deny --version 0.20.2; \
-    fi
