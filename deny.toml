@@ -29,6 +29,10 @@ allow = [
 # Refuse wildcard version requirements. Every dependency must
 # name a range.
 wildcards = "deny"
+# Duplicate crate versions arise when dependencies require
+# incompatible versions of a shared crate. Not actionable, so
+# don't warn. Use `cargo tree -d` to list them.
+multiple-versions = "allow"
 
 [sources]
 # Every dependency must come from crates.io.
