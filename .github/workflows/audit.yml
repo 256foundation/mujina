@@ -1,0 +1,83 @@
+# Check the locked dependencies against the RustSec advisory
+# database, daily rather than per pull request. A failed run
+# reports advisories as GitHub issues.
+
+name: Audit
+
+on:
+  schedule:
+    - cron: "13 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: just audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3.1.0
+        with:
+          just-version: "1.40.0"
+
+      # Reuse the build toolchain image cached by ci.yml (same
+      # key); build and save it only on a miss.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        id: image-cache
+        with:
+          path: /tmp/mujina-build.tar
+          key: build-image-${{ hashFiles('build.Containerfile', 'justfile') }}
+
+      - name: Load cached build image
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: podman load -i /tmp/mujina-build.tar
+
+      # Without pipefail, tee's exit code would mask a failed
+      # audit and the workflow would stay green.
+      - run: |
+          set -o pipefail
+          just in-container audit 2>&1 | tee audit.log
+
+      - name: Save build image for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          podman save -o /tmp/mujina-build.tar \
+              "mujina-build:$(just --evaluate BUILD_TAG)"
+
+      # File one issue per advisory. GitHub's own notice for a
+      # failed scheduled run mails only whoever last edited the
+      # cron line.
+      - name: Report failures as issues
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo="${{ github.repository }}"
+          run_url="${{ github.server_url }}/$repo/actions/runs/${{ github.run_id }}"
+          ids=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]+' audit.log \
+              | sort -u || true)
+          if [ -n "$ids" ]; then
+              for id in $ids; do
+                  num=$(gh issue list -R "$repo" --state open \
+                      --search "in:title $id" \
+                      --json number --jq '.[0].number // empty')
+                  if [ -z "$num" ]; then
+                      gh issue create -R "$repo" \
+                          --title "Dependency advisory $id" \
+                          --body "The scheduled audit found $id: https://rustsec.org/advisories/$id.html. Run: $run_url"
+                  fi
+              done
+          else
+              # The audit failed without naming an advisory, so the
+              # workflow itself is broken. One open catch-all issue.
+              num=$(gh issue list -R "$repo" --state open \
+                  --search 'in:title "Audit workflow failing"' \
+                  --json number --jq '.[0].number // empty')
+              if [ -z "$num" ]; then
+                  gh issue create -R "$repo" \
+                      --title "Audit workflow failing" \
+                      --body "The scheduled audit failed without reporting advisories. Run: $run_url"
+              fi
+          fi

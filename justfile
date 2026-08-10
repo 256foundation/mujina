@@ -18,6 +18,11 @@ test:
 deny: (_require "cargo-deny")
     cargo deny --locked check sources bans licenses
 
+# Check dependencies against the RustSec advisory database
+[group('dev')]
+audit: (_require "cargo-deny")
+    cargo deny --locked check advisories
+
 # Run all checks (before commit, push, merge, release)
 [group('dev')]
 @checks: (fmt "--check") lint test deny
