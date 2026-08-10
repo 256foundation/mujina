@@ -57,10 +57,20 @@ jobs:
         with:
           path: /tmp/mujina-build.tar
           key: build-image-${{ steps.image.outputs.tag }}
+          # On a key miss, fall back to the newest saved image.
+          # Useful for a PR that changes the image partway through
+          # its series: its new tag misses, while the commits from
+          # before the change still use the restored older image.
+          restore-keys: build-image-
 
+      # Test for the tar itself: cache-hit is true only on a
+      # full-key match, so gating on it would skip every fallback
+      # restore.
       - name: Load cached build image
-        if: steps.image-cache.outputs.cache-hit == 'true'
-        run: podman load -i /tmp/mujina-build.tar
+        run: |
+          if [ -f /tmp/mujina-build.tar ]; then
+              podman load -i /tmp/mujina-build.tar
+          fi
 
       # Cache compiled dependencies and downloaded crates to speed
       # up builds. The key includes the toolchain (Containerfile)
@@ -71,6 +81,9 @@ jobs:
             target
             .cache
           key: cargo-${{ hashFiles('build.Containerfile') }}-${{ hashFiles('Cargo.lock') }}
+          # A lock change builds on the previous artifacts instead
+          # of building from scratch.
+          restore-keys: cargo-${{ hashFiles('build.Containerfile') }}-
 
       - run: just ci
 
@@ -84,5 +97,8 @@ jobs:
       - name: Save build image for cache
         if: steps.image-cache.outputs.cache-hit != 'true'
         run: |
+          # A fallback restore leaves the old tar behind, and
+          # podman save refuses to overwrite an archive.
+          rm -f /tmp/mujina-build.tar
           podman save -o /tmp/mujina-build.tar \
               "mujina-build:${{ steps.image.outputs.tag }}"
