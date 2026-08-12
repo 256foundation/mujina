@@ -53,6 +53,25 @@ const SUGGEST_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// flapping pool that accepts and immediately drops.
 const STABLE_CONNECTION_THRESHOLD: Duration = Duration::from_secs(60);
 
+/// Initial delay before reconnecting after a dropped connection.
+/// Doubles on each failed attempt, jittered to [0.5, 1.0] of nominal.
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// Ceiling for the exponential reconnect backoff.
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// Maximum tolerated gap between jobs before the source recycles the
+/// connection.
+///
+/// Stratum defines no liveness; the job source judges pool health by
+/// the arrival of fresh work. A healthy pool sends fresh work every
+/// half minute or faster. A public-pool capture shows 6--36 s gaps
+/// between jobs, HydraPool notifies on every tick of its 10 s
+/// template poll, and cgminer has treated 90 seconds of silence as a
+/// dead pool for over a decade. Two minutes spans several refresh
+/// intervals.
+const MAX_JOB_GAP: Duration = Duration::from_secs(2 * 60);
+
 /// Exponential backoff for reconnection timing.
 ///
 /// Starts at `initial` and doubles after each call to `next_delay()`,
@@ -518,7 +537,7 @@ impl StratumV1Source {
         }
 
         // Phase 2: connect with automatic reconnection.
-        let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
+        let mut backoff = ExponentialBackoff::new(INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY);
 
         loop {
             // Reset per-connection state so a fresh handshake starts clean.
@@ -599,6 +618,9 @@ impl StratumV1Source {
         let client_handle = tokio::spawn(async move { client.run_with_transport(transport).await });
 
         // Main event loop
+
+        let mut gap_start = Instant::now();
+
         loop {
             // Copied out so the cooldown branch captures the value, not `self`.
             let cooldown_until = self.cooldown_until;
@@ -606,6 +628,9 @@ impl StratumV1Source {
                 event_opt = client_event_rx.recv() => {
                     match event_opt {
                         Some(event) => {
+                            if matches!(event, ClientEvent::NewJob(_)) {
+                                gap_start = Instant::now();
+                            }
                             if let Err(e) = self.handle_client_event(event).await {
                                 warn!(error = %e, "Error handling client event");
                             }
@@ -658,6 +683,15 @@ impl StratumV1Source {
                     self.flush_suggest(&client_command_tx).await;
                 }
 
+                _ = time::sleep_until(gap_start + MAX_JOB_GAP) => {
+                    warn!(
+                        gap_secs = MAX_JOB_GAP.as_secs(),
+                        "No job from pool within the gap limit; recycling the connection"
+                    );
+                    client_handle.abort();
+                    break;
+                }
+
                 _ = self.shutdown.cancelled() => {
                     return ConnectOutcome::Shutdown;
                 }
@@ -674,6 +708,11 @@ impl StratumV1Source {
                     warn!(error = %e, "Disconnected from pool");
                     ConnectOutcome::Disconnected
                 }
+            }
+            Err(join_err) if join_err.is_cancelled() => {
+                // The source killed the client; so it was an
+                // intentional disconnect, not a crash.
+                ConnectOutcome::Disconnected
             }
             Err(join_err) => {
                 ConnectOutcome::Fatal(anyhow::anyhow!("Client task panicked: {}", join_err))
@@ -1655,6 +1694,99 @@ mod tests {
         assert!(
             matches!(event, SourceEvent::ReplaceJob(ref t) if t.id == "job-2"),
             "expected ReplaceJob(job-2), got {event:?}",
+        );
+
+        shutdown.cancel();
+        source_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recycles_connection_after_job_silence() {
+        let (source, mut event_rx, command_tx, mock_tx, shutdown) = source_with_mock_transports();
+
+        let (transport1, mut handle1) = MockTransport::pair();
+        let (transport2, mut handle2) = MockTransport::pair();
+        mock_tx.send(transport1).await.unwrap();
+        mock_tx.send(transport2).await.unwrap();
+
+        let source_handle = tokio::spawn(source.run());
+
+        command_tx
+            .send(SourceCommand::UpdateHashRate(HashRate::from_gigahashes(
+                500.0,
+            )))
+            .await
+            .unwrap();
+
+        // First connection: handshake completes, then the pool sends
+        // difficulty updates but never a job.
+        do_handshake(&mut handle1).await;
+        handle1.send(JsonRpcMessage::notification(
+            "mining.set_difficulty",
+            json!([1024]),
+        ));
+
+        // Once MAX_JOB_GAP passes, the source kills the connection and
+        // clears jobs.
+        let event = event_rx.recv().await.unwrap();
+        assert!(
+            matches!(event, SourceEvent::ClearJobs),
+            "expected ClearJobs after job silence, got {event:?}",
+        );
+
+        // Advance past the first backoff; jitter caps it at
+        // INITIAL_RECONNECT_DELAY.
+        time::advance(INITIAL_RECONNECT_DELAY * 2).await;
+
+        // Second connection: handshake, receive a job.
+        do_handshake(&mut handle2).await;
+        handle2.send(job_notification("job-2"));
+
+        let event = event_rx.recv().await.unwrap();
+        assert!(
+            matches!(event, SourceEvent::ReplaceJob(ref t) if t.id == "job-2"),
+            "expected ReplaceJob(job-2) on the new connection, got {event:?}",
+        );
+
+        shutdown.cancel();
+        source_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_job_defers_recycling() {
+        let (source, mut event_rx, command_tx, mock_tx, shutdown) = source_with_mock_transports();
+
+        let (transport1, mut handle1) = MockTransport::pair();
+        mock_tx.send(transport1).await.unwrap();
+
+        let source_handle = tokio::spawn(source.run());
+
+        command_tx
+            .send(SourceCommand::UpdateHashRate(HashRate::from_gigahashes(
+                500.0,
+            )))
+            .await
+            .unwrap();
+
+        do_handshake(&mut handle1).await;
+
+        // A job three quarters of the way to the deadline restarts
+        // the gap clock.
+        time::advance(MAX_JOB_GAP * 3 / 4).await;
+        handle1.send(job_notification("job-1"));
+        let event = event_rx.recv().await.unwrap();
+        assert!(
+            matches!(event, SourceEvent::ReplaceJob(ref t) if t.id == "job-1"),
+            "expected ReplaceJob(job-1), got {event:?}",
+        );
+
+        // Half a gap later the original deadline has passed, but the
+        // gap runs from the job, so the connection survives.
+        time::advance(MAX_JOB_GAP / 2).await;
+        tokio::task::yield_now().await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "connection recycled despite a fresh job",
         );
 
         shutdown.cancel();
