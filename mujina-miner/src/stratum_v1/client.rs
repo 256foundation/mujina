@@ -333,11 +333,20 @@ impl StratumV1Client {
 
                 let extranonce2_size = arr[2].as_u64().ok_or_else(|| {
                     StratumError::InvalidMessage("extranonce2_size not a number".to_string())
-                })? as usize;
+                })?;
+
+                // Only 1-8 bytes are meaningful (see Extranonce2). Reject
+                // anything else here rather than letting a broken or
+                // hostile pool cause a silent truncation downstream.
+                if !(1..=8).contains(&extranonce2_size) {
+                    return Err(StratumError::SubscriptionFailed(format!(
+                        "extranonce2_size {extranonce2_size} outside supported range 1-8"
+                    )));
+                }
 
                 self.state = Some(ProtocolState {
                     extranonce1: extranonce1.to_string(),
-                    extranonce2_size,
+                    extranonce2_size: extranonce2_size as usize,
                     difficulty: None,
                     version_mask: authorized_mask,
                 });
@@ -1384,6 +1393,53 @@ mod tests {
                 assert_eq!(reason, "Pool returned false");
             }
             _ => panic!("Expected ShareRejected, got {:?}", event),
+        }
+    }
+
+    /// Drive `subscribe()` over a mock transport whose pool answers with
+    /// the given extranonce2_size, returning the result.
+    async fn subscribe_with_extranonce2_size(size: u64) -> (StratumResult<()>, StratumV1Client) {
+        use super::super::connection::MockTransport;
+        use serde_json::json;
+
+        let (mut client, _event_rx) = test_client();
+        let (mut transport, mut handle) = MockTransport::pair();
+
+        tokio::spawn(async move {
+            let msg = handle.recv().await;
+            handle.send(JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: Some(json!([[], "aabbccdd", size])),
+                error: None,
+            });
+        });
+
+        let result = client.subscribe(&mut transport, None).await;
+        (result, client)
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_rejects_out_of_range_extranonce2_size() {
+        // 0 and 9 are invalid outright; 264 would previously truncate to
+        // 8 via `as u8` and silently mine the wrong extranonce2 space.
+        for size in [0u64, 9, 264] {
+            let (result, _) = subscribe_with_extranonce2_size(size).await;
+            assert!(
+                matches!(result, Err(StratumError::SubscriptionFailed(_))),
+                "size {size}: expected SubscriptionFailed, got {result:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_accepts_valid_extranonce2_size() {
+        for size in [1u64, 4, 8] {
+            let (result, client) = subscribe_with_extranonce2_size(size).await;
+            assert!(result.is_ok(), "size {size}: {result:?}");
+            assert_eq!(
+                client.state.as_ref().unwrap().extranonce2_size,
+                size as usize,
+            );
         }
     }
 }

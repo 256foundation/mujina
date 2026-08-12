@@ -466,9 +466,18 @@ impl Scheduler {
             debug!(source = %source_name, "No eligible threads yet, job cached for later");
             return;
         }
-        let en2_slices = full_en2_range
-            .split(eligible.len())
-            .expect("Failed to split EN2 range among threads");
+        // A range too small to give every thread its own slice means a
+        // pathological pool-advertised extranonce2 size (or an absurd
+        // thread count); skip the job rather than panic.
+        let Some(en2_slices) = full_en2_range.split(eligible.len()) else {
+            error!(
+                source = %source_name,
+                threads = eligible.len(),
+                en2_values = full_en2_range.len(),
+                "Extranonce2 space too small to split across threads; skipping job"
+            );
+            return;
+        };
 
         for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
@@ -1170,6 +1179,7 @@ impl MiningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::hash_thread::{HashThreadCapabilities, HashThreadStatus};
     use crate::types::Difficulty;
 
     #[test]
@@ -1301,5 +1311,122 @@ mod tests {
         gate.record_enumeration_complete();
         gate.record_timeout();
         assert!(!gate.is_holding());
+    }
+
+    /// A HashThread that accepts any task and never produces work.
+    struct StubThread {
+        name: String,
+        capabilities: HashThreadCapabilities,
+        event_rx: Option<mpsc::Receiver<HashThreadEvent>>,
+    }
+
+    impl StubThread {
+        fn new(name: String) -> Self {
+            let (_tx, rx) = mpsc::channel(1);
+            Self {
+                name,
+                capabilities: HashThreadCapabilities::default(),
+                event_rx: Some(rx),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HashThread for StubThread {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> &HashThreadCapabilities {
+            &self.capabilities
+        }
+
+        async fn configure(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_task(&mut self, _task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            Ok(None)
+        }
+
+        async fn replace_task(&mut self, _task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            Ok(None)
+        }
+
+        async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
+            Ok(None)
+        }
+
+        fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
+            self.event_rx.take()
+        }
+
+        fn status(&self) -> HashThreadStatus {
+            HashThreadStatus::default()
+        }
+    }
+
+    /// A job whose extranonce2 space is smaller than the eligible thread
+    /// count cannot be split; the scheduler must skip it, not panic.
+    #[tokio::test]
+    async fn assign_job_skips_when_en2_space_smaller_than_thread_count() {
+        use crate::job_source::{
+            Extranonce2Range, GeneralPurposeBits, MerkleRootTemplate, VersionTemplate,
+        };
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{BlockHash, CompactTarget};
+
+        let mut scheduler = Scheduler::new();
+        let mut share_channels = ShareStream::new();
+
+        // 257 eligible threads against a 1-byte (256-value) EN2 space.
+        for i in 0..257 {
+            scheduler.threads.insert(ThreadEntry {
+                thread: Box::new(StubThread::new(format!("stub-{i}"))),
+                hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+                expected: Some(HashRate::from_megahashes(1.0)),
+            });
+        }
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let source_id = scheduler.sources.insert(SourceEntry {
+            name: "test".into(),
+            url: None,
+            command_tx,
+            last_job: None,
+            difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
+        });
+
+        let template = JobTemplate {
+            id: "job-1".into(),
+            prev_blockhash: BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                Version::from_consensus(0x20000000),
+                GeneralPurposeBits::none(),
+            )
+            .unwrap(),
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            share_target: Target::MAX,
+            time: 0,
+            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
+                coinbase1: vec![],
+                extranonce1: vec![],
+                extranonce2_range: Extranonce2Range::new(1).unwrap(),
+                coinbase2: vec![],
+                merkle_branches: vec![],
+            }),
+        };
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                template,
+                &mut share_channels,
+            )
+            .await;
+
+        assert!(scheduler.tasks.is_empty());
     }
 }
