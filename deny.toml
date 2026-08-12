@@ -51,3 +51,12 @@ multiple-versions = "allow"
 # Every dependency must come from crates.io.
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# Advisory exceptions for the audit recipe. Every entry names its
+# RUSTSEC id and the reason the advisory stays open.
+# paste is unmaintained with no fixed release. Its only path into
+# the tree is utoipa-axum, whose newest release still depends on
+# it. Delete this entry when utoipa-axum ships without paste.
+[[advisories.ignore]]
+id = "RUSTSEC-2024-0436"
+reason = "waiting on a paste-free utoipa-axum release"
