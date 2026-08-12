@@ -770,7 +770,8 @@ impl StratumV1Client {
                         ClientCommand::SubmitShare(params) => {
                             debug!(pool = %self.config.url, job_id = %params.job_id, "Submitting share");
                             if let Err(e) = self.submit(&mut conn, params).await {
-                                warn!(pool = %self.config.url, error = %e, "Failed to submit share");
+                                warn!(pool = %self.config.url, error = %e, "Share submission failed; disconnecting");
+                                return Err(e);
                             }
                             // Acceptance/rejection emitted via ShareAccepted/ShareRejected events
                         }
@@ -799,6 +800,8 @@ mod tests {
     use crate::job_source::Extranonce2;
     use bitcoin::hashes::Hash;
     use tokio::time::{Duration, timeout};
+
+    use super::super::connection::{MockTransport, MockTransportHandle};
 
     /// Integration test: Connect to public-pool.io and validate protocol.
     ///
@@ -1385,5 +1388,72 @@ mod tests {
             }
             _ => panic!("Expected ShareRejected, got {:?}", event),
         }
+    }
+
+    /// Completes the handshake by answering the client's configure,
+    /// subscribe, and authorize requests over the mock transport.
+    async fn answer_handshake(handle: &mut MockTransportHandle) {
+        use serde_json::json;
+
+        for result in [
+            json!({"version-rolling": false}),
+            json!([[], "aabbccdd", 4]),
+            json!(true),
+        ] {
+            let msg = handle.recv().await;
+            handle.send(JsonRpcMessage::Response {
+                id: msg.id().unwrap(),
+                result: Some(result),
+                error: None,
+            });
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_unanswered_submit_disconnects() {
+        // A share submission the pool never answers must end the
+        // connection so the source can reconnect.
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (command_tx, command_rx) = mpsc::channel(10);
+        let config = PoolConfig {
+            url: "test:3333".to_string(),
+            username: "test".to_string(),
+            password: "x".to_string(),
+            user_agent: "test".to_string(),
+        };
+        let client = StratumV1Client::with_commands(
+            config,
+            event_tx,
+            command_rx,
+            CancellationToken::new(),
+            None,
+        );
+
+        let (transport, mut handle) = MockTransport::pair();
+        let client_task = tokio::spawn(async move { client.run_with_transport(transport).await });
+        answer_handshake(&mut handle).await;
+
+        // The pool stays silent after this submission.
+        command_tx
+            .send(ClientCommand::SubmitShare(SubmitParams {
+                username: "test".to_string(),
+                job_id: "1".to_string(),
+                extranonce2: vec![0, 0, 0, 0],
+                ntime: 0,
+                nonce: 0,
+                version_bits: None,
+            }))
+            .await
+            .unwrap();
+
+        // The client disconnects by exiting with an error and dropping
+        // the transport; the error is non-fatal so the source knows to
+        // reconnect.
+        let err = timeout(Duration::from_secs(60), client_task)
+            .await
+            .expect("client did not disconnect within the guard timeout")
+            .unwrap()
+            .expect_err("client should disconnect");
+        assert!(!err.is_fatal(), "disconnect must be retryable: {:?}", err);
     }
 }
