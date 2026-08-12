@@ -33,10 +33,10 @@ audit: (_require "cargo-deny")
 run:
     cargo run --locked --bin mujina-minerd
 
-# Update all dependencies to the newest sufficiently aged versions
+# Update all dependencies, or only the named crates, to aged versions
 [group('deps')]
-update-deps: (_require "cargo-cooldown")
-    cargo cooldown update
+update-deps *crates: (_require "cargo-cooldown")
+    cargo cooldown update {{ prepend("-p ", crates) }}
 
 # Bring Cargo.lock in line with Cargo.toml after a manifest edit
 [group('deps')]
