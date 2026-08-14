@@ -21,8 +21,8 @@ use crate::tracing::prelude::*;
 use crate::types::{Difficulty, HashRate, ShareRate};
 
 use super::{
-    Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
-    SourceCommand, SourceEvent, VersionTemplate,
+    Extranonce2, Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind,
+    MerkleRootTemplate, Share, SourceCommand, SourceEvent, VersionTemplate,
 };
 
 /// Target share rate for suggest_difficulty: 20 shares/min (one every 3 sec).
@@ -243,6 +243,24 @@ impl StratumV1Source {
         let share_difficulty = state.share_difficulty.unwrap_or(Difficulty::from(1));
         let share_target = share_difficulty.to_target();
 
+        let merkle_root = MerkleRootKind::Computed(MerkleRootTemplate {
+            coinbase1: job.coinbase1,
+            extranonce1: state.extranonce1.clone(),
+            extranonce2_range,
+            coinbase2: job.coinbase2,
+            merkle_branches: job.merkle_branches,
+        });
+
+        // A coinbase that doesn't deserialize can never produce a valid
+        // merkle root, and threads that discover that on assignment fail
+        // silently. Reject the job here, where the error is visible.
+        if let MerkleRootKind::Computed(template) = &merkle_root {
+            let probe = Extranonce2::new(0, state.extranonce2_size as u8)?;
+            template
+                .compute_merkle_root(&probe)
+                .map_err(|e| anyhow::anyhow!("job coinbase does not parse: {e}"))?;
+        }
+
         Ok(JobTemplate {
             id: job.job_id,
             prev_blockhash: job.prev_hash,
@@ -250,13 +268,7 @@ impl StratumV1Source {
             bits: job.nbits,
             share_target,
             time: job.ntime,
-            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
-                coinbase1: job.coinbase1,
-                extranonce1: state.extranonce1.clone(),
-                extranonce2_range,
-                coinbase2: job.coinbase2,
-                merkle_branches: job.merkle_branches,
-            }),
+            merkle_root,
         })
     }
 
@@ -929,11 +941,15 @@ mod tests {
             None, // No version rolling
         );
 
+        // Coinbase halves that assemble with STRATUM_EXTRANONCE1 (4
+        // bytes) + 4 bytes of extranonce2 into a structure-valid
+        // 1-in/0-out transaction, as job_to_template now rejects
+        // coinbases that don't parse.
         let params = json!([
             "jobid",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "aa",
-            "bb",
+            format!("02000000{}{}ffffffff08", "01", "00".repeat(32)),
+            "ffffffff0000000000",
             [],
             "20000000",
             "1d00ffff",
@@ -964,11 +980,15 @@ mod tests {
             Some(VERSION_MASK),
         );
 
+        // Coinbase halves that assemble with STRATUM_EXTRANONCE1 (4
+        // bytes) + 4 bytes of extranonce2 into a structure-valid
+        // 1-in/0-out transaction, as job_to_template now rejects
+        // coinbases that don't parse.
         let params = json!([
             "jobid",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "aa",
-            "bb",
+            format!("02000000{}{}ffffffff08", "01", "00".repeat(32)),
+            "ffffffff0000000000",
             [],
             "20000000",
             "1d00ffff",
@@ -986,6 +1006,67 @@ mod tests {
             "Default difficulty should be ~1, got {}",
             share_difficulty_float
         );
+    }
+
+    /// A coinbase that hex-decodes but doesn't form a transaction must
+    /// fail template conversion, not reach the hash threads.
+    #[test]
+    fn test_job_to_template_rejects_unparseable_coinbase() {
+        let extranonce1 = hex::decode(STRATUM_EXTRANONCE1).unwrap();
+        let source = source_with_state(
+            extranonce1,
+            STRATUM_EXTRANONCE2_SIZE,
+            Some(POOL_SHARE_DIFFICULTY_INT),
+            Some(VERSION_MASK),
+        );
+
+        let params = json!([
+            "jobid",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "aa",
+            "bb",
+            [],
+            "20000000",
+            "1d00ffff",
+            "5a5a5a5a",
+            false
+        ]);
+
+        let job = JobNotification::from_stratum_params(params.as_array().unwrap()).unwrap();
+        let result = source.job_to_template(job);
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("coinbase")),
+            "expected coinbase parse error, got {result:?}",
+        );
+    }
+
+    /// The structure-valid coinbase used by the other tests passes the
+    /// parse check and yields a Computed merkle template.
+    #[test]
+    fn test_job_to_template_accepts_valid_coinbase() {
+        let extranonce1 = hex::decode(STRATUM_EXTRANONCE1).unwrap();
+        let source = source_with_state(
+            extranonce1,
+            STRATUM_EXTRANONCE2_SIZE,
+            Some(POOL_SHARE_DIFFICULTY_INT),
+            Some(VERSION_MASK),
+        );
+
+        let params = json!([
+            "jobid",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            format!("02000000{}{}ffffffff08", "01", "00".repeat(32)),
+            "ffffffff0000000000",
+            [],
+            "20000000",
+            "1d00ffff",
+            "5a5a5a5a",
+            false
+        ]);
+
+        let job = JobNotification::from_stratum_params(params.as_array().unwrap()).unwrap();
+        let template = source.job_to_template(job).unwrap();
+        assert!(matches!(template.merkle_root, MerkleRootKind::Computed(_)));
     }
 
     /// Test share_to_submit_params with real capture data.
@@ -1594,14 +1675,22 @@ mod tests {
     }
 
     /// Build a minimal mining.notify notification.
+    ///
+    /// The coinbase halves assemble with the extranonces from
+    /// `do_configure_and_subscribe` ("aabb" = 2 bytes + 4 bytes of
+    /// extranonce2) into a structure-valid 1-in/0-out transaction, as
+    /// job_to_template now rejects coinbases that don't parse.
     fn job_notification(job_id: &str) -> JsonRpcMessage {
+        // version(4) vin_count(1) prevhash(32) index(4) scriptlen(6) || sequence(4) vout_count(1) locktime(4)
+        let coinb1 = format!("02000000{}{}ffffffff06", "01", "00".repeat(32));
+        let coinb2 = "ffffffff0000000000";
         JsonRpcMessage::notification(
             "mining.notify",
             json!([
                 job_id,
                 "0000000000000000000000000000000000000000000000000000000000000000",
-                "aa",
-                "bb",
+                coinb1,
+                coinb2,
                 [],
                 "20000000",
                 "1d00ffff",
