@@ -51,6 +51,7 @@
 //! scheduler enforces it.
 
 // Submodules
+mod connection;
 pub mod dummy;
 mod extranonce2;
 pub mod forced_rate;
