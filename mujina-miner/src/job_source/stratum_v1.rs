@@ -4,9 +4,7 @@
 //! abstraction. It handles the conversion between Stratum protocol messages and
 //! the internal JobTemplate/Share types used by the scheduler.
 
-use std::collections::hash_map::RandomState;
 use std::future;
-use std::hash::{BuildHasher, Hasher};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,6 +18,7 @@ use crate::stratum_v1::{
 use crate::tracing::prelude::*;
 use crate::types::{Difficulty, HashRate, ShareRate};
 
+use super::reconnect::{ConnectOutcome, Reconnect, wait_for_hash_rate};
 use super::{
     ExtranonceRange, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
     SourceCommand, SourceEvent, VersionTemplate,
@@ -45,21 +44,6 @@ const UP_FACTOR: f64 = 1.5;
 /// costs at most one message per interval. A starting value, tune with use.
 const SUGGEST_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Minimum connection duration before backoff resets on disconnect.
-///
-/// If a connection was alive for at least this long, the next reconnect
-/// starts at the initial backoff (1 s). Shorter connections leave the
-/// backoff untouched, preventing tight reconnection loops against a
-/// flapping pool that accepts and immediately drops.
-const STABLE_CONNECTION_THRESHOLD: Duration = Duration::from_secs(60);
-
-/// Initial delay before reconnecting after a dropped connection.
-/// Doubles on each failed attempt, jittered to [0.5, 1.0] of nominal.
-const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
-
-/// Ceiling for the exponential reconnect backoff.
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
-
 /// Maximum tolerated gap between jobs before the source recycles the
 /// connection.
 ///
@@ -71,67 +55,6 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 /// dead pool for over a decade. Two minutes spans several refresh
 /// intervals.
 const MAX_JOB_GAP: Duration = Duration::from_secs(2 * 60);
-
-/// Exponential backoff for reconnection timing.
-///
-/// Starts at `initial` and doubles after each call to `next_delay()`,
-/// capping at `max`. Each returned delay is jittered to [0.5, 1.0] of
-/// the nominal value to avoid thundering-herd reconnections.
-struct ExponentialBackoff {
-    current: Duration,
-    initial: Duration,
-    max: Duration,
-    // Per-process jitter seed. RandomState is seeded from OS randomness
-    // at construction, so different processes produce different jitter
-    // even when reconnecting at the same wall-clock instant. This is
-    // the same approach tokio uses internally for jittered timeouts.
-    jitter_state: RandomState,
-    jitter_step: u64,
-}
-
-impl ExponentialBackoff {
-    fn new(initial: Duration, max: Duration) -> Self {
-        Self {
-            current: initial,
-            initial,
-            max,
-            jitter_state: RandomState::new(),
-            jitter_step: 0,
-        }
-    }
-
-    /// Return the next backoff delay (with jitter) and advance the state.
-    ///
-    /// The nominal delay (1s, 2s, 4s, ...) is scaled by a jitter factor
-    /// in [0.5, 1.0] to spread out reconnection attempts across miners.
-    fn next_delay(&mut self) -> Duration {
-        let nominal = self.current;
-        self.current = (self.current * 2).min(self.max);
-
-        let mut hasher = self.jitter_state.build_hasher();
-        hasher.write_u64(self.jitter_step);
-        self.jitter_step = self.jitter_step.wrapping_add(1);
-        let hash = hasher.finish();
-        let jitter = 0.5 + (hash as f64 / u64::MAX as f64) * 0.5;
-
-        nominal.mul_f64(jitter)
-    }
-
-    /// Reset backoff to the initial delay.
-    fn reset(&mut self) {
-        self.current = self.initial;
-    }
-}
-
-/// Outcome of a single connection attempt.
-enum ConnectOutcome {
-    /// Graceful shutdown requested.
-    Shutdown,
-    /// Connection lost; retry after backoff.
-    Disconnected,
-    /// Unrecoverable error (e.g. auth failure); stop retrying.
-    Fatal(anyhow::Error),
-}
 
 /// Stratum v1 job source.
 ///
@@ -514,30 +437,13 @@ impl StratumV1Source {
         info!(pool = %self.config.url, "Waiting for hash threads before connecting");
 
         // Phase 1: wait until hash threads are available before connecting.
-        // Drain commands; only UpdateHashRate matters here.
-        loop {
-            tokio::select! {
-                Some(cmd) = self.command_rx.recv() => {
-                    match cmd {
-                        SourceCommand::UpdateHashRate(rate) => {
-                            self.expected_hashrate = rate;
-                            if !rate.is_zero() {
-                                break;
-                            }
-                        }
-                        SourceCommand::SubmitShare(_) => {
-                            // No connection yet, drop silently.
-                        }
-                    }
-                }
-                _ = self.shutdown.cancelled() => {
-                    return Ok(());
-                }
-            }
-        }
+        let Some(rate) = wait_for_hash_rate(&mut self.command_rx, &self.shutdown).await else {
+            return Ok(());
+        };
+        self.expected_hashrate = rate;
 
         // Phase 2: connect with automatic reconnection.
-        let mut backoff = ExponentialBackoff::new(INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY);
+        let mut reconnect = Reconnect::new();
 
         loop {
             // Reset per-connection state so a fresh handshake starts clean.
@@ -546,7 +452,7 @@ impl StratumV1Source {
 
             info!(pool = %self.config.url, "Connecting to pool");
 
-            let connected_at = Instant::now();
+            reconnect.attempt();
             match self.connect_and_run().await {
                 ConnectOutcome::Shutdown => return Ok(()),
                 ConnectOutcome::Fatal(e) => {
@@ -554,20 +460,15 @@ impl StratumV1Source {
                     return Err(e);
                 }
                 ConnectOutcome::Disconnected => {
-                    // Invalidate stale work from the dead connection.
-                    if let Err(e) = self.event_tx.send(SourceEvent::ClearJobs).await {
-                        warn!(error = %e, "Failed to send ClearJobs");
-                    }
-                    if connected_at.elapsed() >= STABLE_CONNECTION_THRESHOLD {
-                        backoff.reset();
-                    }
-                    let delay = backoff.next_delay();
-                    info!(
-                        pool = %self.config.url,
-                        delay_secs = delay.as_secs_f64(),
-                        "Reconnecting after backoff"
-                    );
-                    if self.backoff_wait(delay).await {
+                    if reconnect
+                        .wait_after_disconnect(
+                            &self.event_tx,
+                            &mut self.command_rx,
+                            &self.shutdown,
+                            &mut self.expected_hashrate,
+                        )
+                        .await
+                    {
                         return Ok(());
                     }
                 }
@@ -719,35 +620,6 @@ impl StratumV1Source {
             }
         }
     }
-
-    /// Wait for the given duration, draining commands in the meantime.
-    ///
-    /// Returns `true` if shutdown was requested during the wait.
-    async fn backoff_wait(&mut self, delay: Duration) -> bool {
-        let sleep = tokio::time::sleep(delay);
-        tokio::pin!(sleep);
-
-        loop {
-            tokio::select! {
-                _ = &mut sleep => {
-                    return false;
-                }
-                Some(cmd) = self.command_rx.recv() => {
-                    match cmd {
-                        SourceCommand::UpdateHashRate(rate) => {
-                            self.expected_hashrate = rate;
-                        }
-                        SourceCommand::SubmitShare(_) => {
-                            // No connection, drop silently.
-                        }
-                    }
-                }
-                _ = self.shutdown.cancelled() => {
-                    return true;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -759,6 +631,7 @@ mod tests {
     };
     use crate::asic::bm13xx::test_data::stratum_json;
     use crate::job_source::Extranonce;
+    use crate::job_source::reconnect::INITIAL_RECONNECT_DELAY;
     use crate::stratum_v1::{
         JobNotification, JsonRpcMessage, MockConnector, MockTransport, MockTransportHandle,
         StratumResult, Transport,
@@ -1476,58 +1349,6 @@ mod tests {
             client_rx.try_recv().is_err(),
             "should not suggest with zero hashrate"
         );
-    }
-
-    #[test]
-    fn backoff_doubles_each_step() {
-        let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
-
-        let d1 = backoff.next_delay();
-        let d2 = backoff.next_delay();
-        let d3 = backoff.next_delay();
-
-        // Nominal sequence is 1s, 2s, 4s. With jitter in [0.5, 1.0],
-        // each delay is at least half the nominal value.
-        assert!(d1 >= Duration::from_millis(500), "d1={d1:?}");
-        assert!(d1 < Duration::from_secs(1), "d1={d1:?}");
-
-        assert!(d2 >= Duration::from_secs(1), "d2={d2:?}");
-        assert!(d2 < Duration::from_secs(2), "d2={d2:?}");
-
-        assert!(d3 >= Duration::from_secs(2), "d3={d3:?}");
-        assert!(d3 < Duration::from_secs(4), "d3={d3:?}");
-    }
-
-    #[test]
-    fn backoff_caps_at_max() {
-        let mut backoff = ExponentialBackoff::new(Duration::from_secs(32), Duration::from_secs(60));
-
-        let _d1 = backoff.next_delay(); // consumes 32s nominal
-        let d2 = backoff.next_delay(); // nominal capped at 60s
-
-        assert!(d2 >= Duration::from_secs(30), "d2={d2:?}");
-        assert!(d2 < Duration::from_secs(60), "d2={d2:?}");
-
-        // Further calls stay at max
-        let d3 = backoff.next_delay();
-        assert!(d3 >= Duration::from_secs(30), "d3={d3:?}");
-        assert!(d3 < Duration::from_secs(60), "d3={d3:?}");
-    }
-
-    #[test]
-    fn backoff_reset_restores_initial() {
-        let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
-
-        // Advance past initial
-        let _ = backoff.next_delay();
-        let _ = backoff.next_delay();
-        let _ = backoff.next_delay();
-
-        backoff.reset();
-
-        let d = backoff.next_delay();
-        assert!(d >= Duration::from_millis(500), "d={d:?}");
-        assert!(d < Duration::from_secs(1), "d={d:?}");
     }
 
     // ---- reconnection integration tests ----
