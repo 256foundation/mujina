@@ -1860,11 +1860,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fatal_error_stops_retrying() {
+    async fn authorization_failure_retries() {
         let (source, _event_rx, command_tx, mock_tx, _shutdown) = source_with_mock_transports();
 
-        let (transport, mut handle) = MockTransport::pair();
-        mock_tx.send(transport).await.unwrap();
+        let (transport1, mut handle1) = MockTransport::pair();
+        let (transport2, mut handle2) = MockTransport::pair();
+        mock_tx.send(transport1).await.unwrap();
+        mock_tx.send(transport2).await.unwrap();
 
         let source_handle = tokio::spawn(source.run());
 
@@ -1875,19 +1877,26 @@ mod tests {
             .await
             .unwrap();
 
-        do_configure_and_subscribe(&mut handle).await;
+        do_configure_and_subscribe(&mut handle1).await;
 
-        // mining.authorize -- reject
-        let msg = handle.recv().await;
-        handle.send(JsonRpcMessage::Response {
+        // mining.authorize -- rejected. Not fatal: the source backs off
+        // and tries again instead of exiting.
+        let msg = handle1.recv().await;
+        handle1.send(JsonRpcMessage::Response {
             id: msg.id().unwrap(),
             result: Some(json!(false)),
             error: None,
         });
 
-        // Source should return Err (fatal, no reconnect).
-        let result = source_handle.await.unwrap();
-        assert!(result.is_err(), "expected fatal error, got Ok");
+        // Advance past the backoff; a second connection must arrive.
+        // The timeout turns "no retry" into a clean test failure
+        // instead of a hang.
+        time::advance(Duration::from_secs(2)).await;
+        time::timeout(Duration::from_secs(5), do_handshake(&mut handle2))
+            .await
+            .expect("source must reconnect after an authorization failure");
+
+        drop(source_handle);
     }
 
     #[tokio::test(start_paused = true)]

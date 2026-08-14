@@ -64,17 +64,29 @@ pub enum StratumError {
 impl StratumError {
     /// Whether this error is unrecoverable and should not be retried.
     ///
-    /// Authorization failures and invalid URLs are fatal---wrong
-    /// credentials and malformed addresses won't fix themselves.
-    /// Everything else (network errors, timeouts, subscription
-    /// failures from overloaded pools) may resolve on retry.
+    /// Only invalid URLs are fatal---a malformed address won't fix
+    /// itself. Everything else, including authorization failures, is
+    /// retried with backoff: stratum is unencrypted, so a "rejected"
+    /// authorize may come from a MITM or a transient pool error rather
+    /// than from truly wrong credentials, and giving up would let a
+    /// single forged packet halt mining until a manual restart.
     pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            StratumError::AuthorizationFailed(_) | StratumError::InvalidUrl(_)
-        )
+        matches!(self, StratumError::InvalidUrl(_))
     }
 }
 
 /// Convenient Result type for Stratum operations.
 pub type StratumResult<T> = Result<T, StratumError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_invalid_urls_are_fatal() {
+        assert!(StratumError::InvalidUrl("x".into()).is_fatal());
+        assert!(!StratumError::AuthorizationFailed("x".into()).is_fatal());
+        assert!(!StratumError::Disconnected.is_fatal());
+        assert!(!StratumError::Timeout.is_fatal());
+    }
+}
