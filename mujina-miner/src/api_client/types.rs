@@ -29,6 +29,9 @@ pub struct BoardTelemetry {
     pub name: String,
     pub model: String,
     pub serial: Option<String>,
+    /// ASIC hash clock in MHz, or null if the board does not report one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<f32>,
     pub fans: Vec<Fan>,
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,

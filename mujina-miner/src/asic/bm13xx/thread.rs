@@ -27,6 +27,10 @@ use crate::{
     types::{Difficulty, HashRate, ShareRate},
 };
 
+/// Target hash clock the chip is ramped to during initialization, in MHz.
+/// Boards report this as their operating frequency in telemetry.
+pub const TARGET_FREQUENCY_MHZ: f32 = 525.0;
+
 /// Tracks tasks sent to chip hardware, indexed by chip_job_id.
 ///
 /// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
@@ -435,9 +439,9 @@ where
     )
     .await?;
 
-    // Frequency ramping (56.25 MHz -> 525 MHz)
-    debug!("Ramping frequency from 56.25 MHz to 525 MHz");
-    let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+    // Frequency ramping (56.25 MHz -> target)
+    debug!("Ramping frequency from 56.25 MHz to {TARGET_FREQUENCY_MHZ} MHz");
+    let frequency_steps = generate_frequency_ramp_steps(56.25, TARGET_FREQUENCY_MHZ, 6.25);
 
     for (i, pll_config) in frequency_steps.iter().enumerate() {
         send_reg(chip_commands, true, Register::PllDivider(*pll_config))

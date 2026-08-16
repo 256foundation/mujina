@@ -37,11 +37,9 @@ utoipa-axum = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-nix = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
-rustix = { workspace = true }
 slotmap = { workspace = true }
 num-traits = { workspace = true }
 ruint = "1.17.0"
@@ -53,6 +51,20 @@ io-kit-sys = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
 udev = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Enable UsbPortInfo.interface so Windows serial discovery can order COM
+# ports by USB interface number (interface 0 = control). See
+# transport/usb/windows.rs.
+serialport = { version = "4", features = ["usbportinfo-interface"] }
+# nusb's Windows backend offloads blocking USB syscalls to the async runtime,
+# so it needs the `tokio` feature to be awaited (Linux uses native async and
+# does not require this).
+nusb = { workspace = true, features = ["tokio"] }
 
 [[bin]]
 name = "mujina-minerd"
