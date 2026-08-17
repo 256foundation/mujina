@@ -51,6 +51,7 @@
 //! scheduler enforces it.
 
 // Submodules
+mod connection;
 pub mod dummy;
 mod extranonce2;
 pub mod forced_rate;
@@ -58,6 +59,7 @@ pub(crate) mod job;
 mod merkle;
 mod messages;
 pub mod stratum_v1;
+pub mod stratum_v2;
 pub mod test_blocks;
 mod version;
 

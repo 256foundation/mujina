@@ -1,2 +1,4 @@
 /target/
 /.cache/
+# Bitcoin Core + SV2 template provider binaries downloaded by integration_tests_sv2 on first run
+/mujina-miner/template-provider/

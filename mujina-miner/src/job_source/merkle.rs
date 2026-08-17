@@ -52,8 +52,17 @@ pub struct MerkleRootTemplate {
     /// Extranonce2 range defining the available rolling space.
     ///
     /// The caller will create an iterator from this range to generate different
-    /// extranonce2 values for unique block headers.
+    /// extranonce2 values for unique block headers. The range's `size` field is
+    /// the counter width (1–8 bytes, capped by `u64`).
     pub extranonce2_range: Extranonce2Range,
+
+    /// Full extranonce2 allocation in bytes (≥ `extranonce2_range.size`).
+    /// Full extranonce2 byte length as negotiated with the pool (SV2 spec's
+    /// `extranonce_size`). When this exceeds the 8-byte u64 counter width,
+    /// the remaining bytes are zero-padded in both coinbase insertion and
+    /// `SubmitSharesExtended.extranonce`. For SV1/non-SV2 sources this always
+    /// equals `extranonce2_range.size`.
+    pub extranonce2_size: u8,
 
     /// Second part of coinbase transaction (after extranonces).
     pub coinbase2: Vec<u8>,
@@ -79,7 +88,14 @@ impl MerkleRootTemplate {
         let mut coinbase_bytes = Vec::new();
         coinbase_bytes.extend_from_slice(&self.coinbase1);
         coinbase_bytes.extend_from_slice(&self.extranonce1);
-        extranonce2.extend_vec(&mut coinbase_bytes);
+        // Write counter bytes then zero-pad to the pool's full extranonce2_size.
+        // Per the SV2 spec, SubmitSharesExtended.extranonce MUST fill exactly
+        // `extranonce_size` bytes; when the pool allocates more than 8 bytes the
+        // u64 counter covers the first 1–8 bytes and the remainder is zeroed.
+        let mut en2_bytes = Vec::new();
+        extranonce2.extend_vec(&mut en2_bytes);
+        en2_bytes.resize(self.extranonce2_size as usize, 0);
+        coinbase_bytes.extend_from_slice(&en2_bytes);
         coinbase_bytes.extend_from_slice(&self.coinbase2);
 
         // Parse and compute coinbase txid
@@ -110,10 +126,12 @@ mod tests {
         let extranonce2 = *block_881423::EXTRANONCE2;
 
         // Construct a template from golden values
+        let en2_size = extranonce2.size();
         let template = MerkleRootTemplate {
             coinbase1: block_881423::coinbase1_bytes().to_vec(),
             extranonce1: block_881423::extranonce1_bytes().to_vec(),
-            extranonce2_range: Extranonce2Range::new(extranonce2.size()).unwrap(),
+            extranonce2_range: Extranonce2Range::new(en2_size).unwrap(),
+            extranonce2_size: en2_size,
             coinbase2: block_881423::coinbase2_bytes().to_vec(),
             merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
         };
