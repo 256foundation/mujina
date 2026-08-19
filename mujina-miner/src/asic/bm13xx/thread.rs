@@ -389,7 +389,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::AdcCtrl1(AdcCtrl1(0x80440000)),
+            register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
         }))
         .await?;
     chip_commands
@@ -401,7 +401,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::AdcCtrl1(AdcCtrl1(0x80440000)),
+            register: Register::AdcCtrl1(AdcCtrl1::bring_up()),
         }))
         .await?;
     chip_commands

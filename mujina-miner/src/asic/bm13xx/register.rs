@@ -881,32 +881,49 @@ impl SoftResetControl {
     }
 }
 
-// Placeholder newtypes for registers whose bit layout is not yet
-// decomposed. Each wraps a raw u32 written little-endian to the wire.
-macro_rules! raw_u32_register {
+// Newtypes for registers no source decomposes into bit fields. Each
+// holds its four wire bytes verbatim, so a value in code reads the
+// same as it does in a capture.
+macro_rules! opaque_register {
     ($($(#[$meta:meta])* $name:ident),* $(,)?) => {
         $(
             $(#[$meta])*
-            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-            pub struct $name(pub u32);
+            #[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
+            pub struct $name(#[debug("{}", _0.map(|b| format!("{b:02X}")).join(" "))] pub [u8; 4]);
 
             impl $name {
                 pub fn encode(&self, dst: &mut BytesMut) {
-                    dst.put_u32_le(self.0);
+                    dst.put_slice(&self.0);
                 }
                 pub fn decode(bytes: [u8; 4]) -> Self {
-                    Self(u32::from_le_bytes(bytes))
+                    Self(bytes)
                 }
             }
         )*
     };
 }
 
-raw_u32_register! {
+opaque_register! {
     /// Ring-oscillator pad disable (0x68).
     RingOscPadDisable,
     /// On-die ADC control (0xB9).
     AdcCtrl1,
+}
+
+impl RingOscPadDisable {
+    /// Returns the fixed guard pattern, the register's only
+    /// observed value.
+    pub fn guard_pattern() -> Self {
+        Self([0x5A, 0xA5, 0x5A, 0xA5])
+    }
+}
+
+impl AdcCtrl1 {
+    /// Returns the bring-up value from the Bitaxe capture, written
+    /// once before and once after the analog mux select.
+    pub fn bring_up() -> Self {
+        Self([0x00, 0x00, 0x44, 0x80])
+    }
 }
 
 /// Reverse bits within a single byte (bit 0 swaps with bit 7, etc.).
