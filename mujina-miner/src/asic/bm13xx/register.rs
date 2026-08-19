@@ -28,10 +28,10 @@ pub enum RegisterAddress {
     CoreMailbox = 0x3C,
     AnalogMux = 0x54,
     IoDriverStrength = 0x58,
-    Pll3Parameter = 0x68,
+    RingOscPadDisable = 0x68,
     MidstateConfig = 0xA4,
     SoftResetControl = 0xA8,
-    MiscSettings = 0xB9,
+    AdcCtrl1 = 0xB9,
 }
 
 /// A register with its typed payload.
@@ -47,10 +47,10 @@ pub enum Register {
     CoreMailbox(CoreCommand),
     AnalogMux(AnalogMux),
     IoDriverStrength(IoDriverStrength),
-    Pll3Parameter(Pll3Parameter),
+    RingOscPadDisable(RingOscPadDisable),
     MidstateConfig(MidstateConfig),
     SoftResetControl(SoftResetControl),
-    MiscSettings(MiscSettings),
+    AdcCtrl1(AdcCtrl1),
 }
 
 impl Register {
@@ -70,14 +70,16 @@ impl Register {
             RegisterAddress::IoDriverStrength => {
                 Register::IoDriverStrength(IoDriverStrength::decode(bytes))
             }
-            RegisterAddress::Pll3Parameter => Register::Pll3Parameter(Pll3Parameter::decode(bytes)),
+            RegisterAddress::RingOscPadDisable => {
+                Register::RingOscPadDisable(RingOscPadDisable::decode(bytes))
+            }
             RegisterAddress::MidstateConfig => {
                 Register::MidstateConfig(MidstateConfig::decode(bytes))
             }
             RegisterAddress::SoftResetControl => {
                 Register::SoftResetControl(SoftResetControl::decode(bytes))
             }
-            RegisterAddress::MiscSettings => Register::MiscSettings(MiscSettings::decode(bytes)),
+            RegisterAddress::AdcCtrl1 => Register::AdcCtrl1(AdcCtrl1::decode(bytes)),
         })
     }
 
@@ -93,10 +95,10 @@ impl Register {
             Register::CoreMailbox(_) => RegisterAddress::CoreMailbox,
             Register::AnalogMux(_) => RegisterAddress::AnalogMux,
             Register::IoDriverStrength(_) => RegisterAddress::IoDriverStrength,
-            Register::Pll3Parameter(_) => RegisterAddress::Pll3Parameter,
+            Register::RingOscPadDisable(_) => RegisterAddress::RingOscPadDisable,
             Register::MidstateConfig(_) => RegisterAddress::MidstateConfig,
             Register::SoftResetControl(_) => RegisterAddress::SoftResetControl,
-            Register::MiscSettings(_) => RegisterAddress::MiscSettings,
+            Register::AdcCtrl1(_) => RegisterAddress::AdcCtrl1,
         }
     }
 
@@ -112,10 +114,10 @@ impl Register {
             Register::CoreMailbox(r) => r.encode(dst),
             Register::AnalogMux(r) => r.encode(dst),
             Register::IoDriverStrength(r) => r.encode(dst),
-            Register::Pll3Parameter(r) => r.encode(dst),
+            Register::RingOscPadDisable(r) => r.encode(dst),
             Register::MidstateConfig(r) => r.encode(dst),
             Register::SoftResetControl(r) => r.encode(dst),
-            Register::MiscSettings(r) => r.encode(dst),
+            Register::AdcCtrl1(r) => r.encode(dst),
         }
     }
 }
@@ -901,8 +903,10 @@ macro_rules! raw_u32_register {
 }
 
 raw_u32_register! {
-    Pll3Parameter,
-    MiscSettings,
+    /// Ring-oscillator pad disable (0x68).
+    RingOscPadDisable,
+    /// On-die ADC control (0xB9).
+    AdcCtrl1,
 }
 
 /// Reverse bits within a single byte (bit 0 swaps with bit 7, etc.).
