@@ -22,8 +22,8 @@ use super::command::{
     SetChipAddress, SinkError, WriteRegister,
 };
 use super::register::{
-    AnalogMux, ChipModel, CoreCommand, CoreRegister, HashCountingNumber, IoDriverStrength,
-    Log2Difficulty, MidstateConfig, MiscControl, MiscSettings, PllDivider, Register,
+    AdcCtrl1, AnalogMux, ChipModel, CoreCommand, CoreRegister, HashCountingNumber,
+    IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl, PllDivider, Register,
     SoftResetControl, TicketMask,
 };
 use super::response::{NonceResponse, RegisterResponse, Response};
@@ -389,7 +389,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::MiscSettings(MiscSettings(0x80440000)),
+            register: Register::AdcCtrl1(AdcCtrl1(0x80440000)),
         }))
         .await?;
     chip_commands
@@ -401,7 +401,7 @@ where
     chip_commands
         .send(RegisterCommand::WriteRegister(WriteRegister {
             destination: Destination::Broadcast,
-            register: Register::MiscSettings(MiscSettings(0x80440000)),
+            register: Register::AdcCtrl1(AdcCtrl1(0x80440000)),
         }))
         .await?;
     chip_commands
