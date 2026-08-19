@@ -437,39 +437,63 @@ impl MiscControl {
     }
 }
 
-/// UART baud rate configuration
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UartBaud {
-    /// 115200 baud
-    Baud115200,
-    /// 1 Mbaud
-    Baud1M,
-    /// 3 Mbaud (common for multi-chip)
-    Baud3M,
-    /// Custom baud rate with raw register value
-    Custom(u32),
+/// UART baud rate (0x28).
+///
+/// Sets the serial link's baud rate with a clock divider:
+/// baud = 25 MHz / (8 x (divider + 1)). The register resets to
+/// divider 26, 115,740 baud; the host raises the rate once during
+/// bring-up by writing a smaller divider.
+///
+/// - bit 28: set by BM1362-generation firmware and cleared by
+///   BM1370-generation firmware, for the same resulting rate; its
+///   function is unknown
+/// - bits 27-16: 0x130 in the reset value and in every observed
+///   write; unexplained
+/// - bits 15-8: the divider
+///
+/// Bits 31-29 and 7-0 are zero in every observation.
+#[derive(derive_more::Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UartBaud {
+    /// Baud rate divider: baud = 25 MHz / (8 x (divider + 1)).
+    pub divider: u8,
+    /// Unknown-function bit 28; firmware generations disagree on it.
+    pub bit28: bool,
+    /// Undecoded bits, held in place: bits 27-16 hold 0x130 in
+    /// every observation, bits 31-29 and 7-0 zero.
+    #[debug("{unexplained:#010x}")]
+    pub unexplained: u32,
 }
 
 impl UartBaud {
-    pub fn encode(&self, dst: &mut BytesMut) {
-        let value = match self {
-            // From esp-miner BM1370/BM1366/BM1368 default baud config
-            UartBaud::Baud115200 => 0x00000271,
-            // From esp-miner BM1370_set_max_baud/BM1366_set_max_baud/BM1368_set_max_baud
-            // All three chips use identical register value for 1Mbaud
-            UartBaud::Baud1M => 0x00023011,
-            // From S21 Pro captures (BM1370 multi-chip chains)
-            UartBaud::Baud3M => 0x00003001,
-            UartBaud::Custom(val) => *val,
-        };
-        dst.put_u32_le(value);
+    /// Returns the register selecting the representable baud rate
+    /// nearest `target`, following observed firmware, which picks
+    /// the nearest rate even when it is above the target. Bit 28
+    /// is clear and the unexplained bits hold their observed value.
+    pub fn for_baud(target: u32) -> Self {
+        let steps = (CRYSTAL_MHZ * 1_000_000.0 / (8.0 * target as f32)).round() as u8;
+        Self {
+            divider: steps.saturating_sub(1),
+            bit28: false,
+            unexplained: 0x0130_0000,
+        }
     }
+
+    /// Returns the baud rate the divider selects.
+    pub fn baud(&self) -> u32 {
+        (CRYSTAL_MHZ * 1_000_000.0 / (8.0 * (self.divider as f32 + 1.0))) as u32
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        let value = (self.bit28 as u32) << 28 | self.unexplained | (self.divider as u32) << 8;
+        dst.put_u32(value);
+    }
+
     pub fn decode(bytes: [u8; 4]) -> Self {
-        match u32::from_le_bytes(bytes) {
-            0x00000271 => UartBaud::Baud115200,
-            0x00000130 => UartBaud::Baud1M,
-            0x00003001 => UartBaud::Baud3M,
-            other => UartBaud::Custom(other),
+        let value = u32::from_be_bytes(bytes);
+        Self {
+            divider: (value >> 8) as u8,
+            bit28: value >> 28 & 1 == 1,
+            unexplained: value & 0xefff_00ff,
         }
     }
 }
@@ -740,8 +764,6 @@ impl IoDriverStrength {
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
-        // Unlike most registers, captures show this register's value
-        // big-endian on the wire: 0x0001F111 is sent as 00 01 F1 11.
         let value = self.unexplained
             | (self.response_out as u32) << 16
             | (self.clock_out as u32) << 12
@@ -1175,36 +1197,50 @@ mod hash_counting_number_tests {
 mod uart_baud_tests {
     use super::*;
 
-    fn round_trip(original: UartBaud) {
+    // Observed values from REFERENCE.md's UART_BAUD table.
+    const RESET: [u8; 4] = [0x01, 0x30, 0x1A, 0x00];
+    const BITAXE_1M: [u8; 4] = [0x11, 0x30, 0x02, 0x00];
+    const S19J_PRO_3M: [u8; 4] = [0x11, 0x30, 0x00, 0x00];
+    const S21_PRO_3M: [u8; 4] = [0x01, 0x30, 0x00, 0x00];
+
+    #[test]
+    fn observed_values_round_trip() {
+        for bytes in [RESET, BITAXE_1M, S19J_PRO_3M, S21_PRO_3M] {
+            let mut buf = BytesMut::new();
+            UartBaud::decode(bytes).encode(&mut buf);
+            assert_eq!(&buf[..], &bytes);
+        }
+    }
+
+    #[test]
+    fn decodes_reset_value() {
+        let reg = UartBaud::decode(RESET);
+        assert_eq!(reg.divider, 26);
+        assert!(!reg.bit28);
+        assert_eq!(reg.unexplained, 0x0130_0000);
+    }
+
+    #[test]
+    fn derives_baud_from_divider() {
+        assert_eq!(UartBaud::decode(RESET).baud(), 115_740);
+        assert_eq!(UartBaud::decode(BITAXE_1M).baud(), 1_041_666);
+        assert_eq!(UartBaud::decode(S21_PRO_3M).baud(), 3_125_000);
+    }
+
+    #[test]
+    fn solves_divider_for_target_rate() {
+        // The targets pick the dividers the captures show, above
+        // the target when the nearest representable rate is above.
+        assert_eq!(UartBaud::for_baud(115_200).divider, 26);
+        assert_eq!(UartBaud::for_baud(1_000_000).divider, 2);
+        assert_eq!(UartBaud::for_baud(3_000_000).divider, 0);
+    }
+
+    #[test]
+    fn target_rate_encodes_reset_value() {
         let mut buf = BytesMut::new();
-        original.encode(&mut buf);
-        let bytes: [u8; 4] = buf[..].try_into().unwrap();
-        assert_eq!(UartBaud::decode(bytes), original);
-    }
-
-    #[test]
-    fn baud_115200() {
-        round_trip(UartBaud::Baud115200);
-    }
-
-    #[test]
-    #[should_panic]
-    fn baud_1m() {
-        // Currently fails: encode emits 0x00023011 but decode
-        // matches 0x00000130 for Baud1M, so the round-trip
-        // collapses to Custom. Drop #[should_panic] once the
-        // constants are reconciled.
-        round_trip(UartBaud::Baud1M);
-    }
-
-    #[test]
-    fn baud_3m() {
-        round_trip(UartBaud::Baud3M);
-    }
-
-    #[test]
-    fn custom_value() {
-        round_trip(UartBaud::Custom(0xdeadbeef));
+        UartBaud::for_baud(115_200).encode(&mut buf);
+        assert_eq!(&buf[..], &RESET);
     }
 }
 

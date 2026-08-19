@@ -113,7 +113,7 @@ where
         register_address: RegisterAddress,
     ) -> Result<Vec<RegisterResponse>, RegisterClientError<SinkError<W>>> {
         // Collection ends after this long with no new reply. At
-        // 115200 baud a reply frame lasts about a millisecond, so
+        // 115,740 baud a reply frame lasts about a millisecond, so
         // this window dominates any plausible gap between chips
         // relaying their replies down the chain.
         const QUIET_WINDOW: Duration = Duration::from_millis(500);
