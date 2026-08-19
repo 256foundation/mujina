@@ -129,7 +129,7 @@ impl Response {
                 let result_header = bytes.get_u8();
 
                 // Version rolling field: 2 bytes, big-endian
-                // Occupies bits 13-28 of block version when shifted left 13
+                // Occupies bits 28-13 of block version when shifted left 13
                 let version_bytes = [bytes.get_u8(), bytes.get_u8()];
                 let version = GeneralPurposeBits::from(version_bytes);
                 // CRC already consumed
