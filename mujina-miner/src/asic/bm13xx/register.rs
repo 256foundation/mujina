@@ -122,24 +122,27 @@ impl Register {
     }
 }
 
-/// Chip model + core count + assigned chain address.
+/// Chip identification (0x00): the model, an unknown byte, and the
+/// assigned chain address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChipId {
     pub model: ChipModel,
-    pub core_count: u8,
+    /// Unknown byte; reads 0x00 on the BM1370 and 0x03 on the
+    /// BM1362.
+    pub unknown: u8,
     pub address: u8,
 }
 
 impl ChipId {
     pub fn encode(&self, dst: &mut BytesMut) {
         dst.put_slice(&self.model.id_bytes());
-        dst.put_u8(self.core_count);
+        dst.put_u8(self.unknown);
         dst.put_u8(self.address);
     }
     pub fn decode(bytes: [u8; 4]) -> Result<Self, ProtocolError> {
         Ok(Self {
             model: ChipModel::try_from([bytes[0], bytes[1]])?,
-            core_count: bytes[2],
+            unknown: bytes[2],
             address: bytes[3],
         })
     }
@@ -1106,7 +1109,7 @@ mod chip_id_tests {
     fn known_model() {
         round_trip(ChipId {
             model: ChipModel::BM1362,
-            core_count: 80,
+            unknown: 0x03,
             address: 0x42,
         });
     }
