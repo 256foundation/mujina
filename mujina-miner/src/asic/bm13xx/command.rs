@@ -407,7 +407,7 @@ mod tests {
                 destination: Destination::Chip(0x01),
                 register: Register::ChipId(ChipId {
                     model: ChipModel::BM1370,
-                    core_count: 0x00,
+                    unknown: 0x00,
                     address: 0x01,
                 }),
             }),

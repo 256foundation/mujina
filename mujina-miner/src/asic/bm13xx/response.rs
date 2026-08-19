@@ -228,7 +228,7 @@ mod tests {
 
         let Register::ChipId(ChipId {
             model,
-            core_count,
+            unknown,
             address,
         }) = register
         else {
@@ -236,7 +236,7 @@ mod tests {
         };
 
         assert_eq!(model, ChipModel::BM1370);
-        assert_eq!(core_count, 0x00);
+        assert_eq!(unknown, 0x00);
         assert_eq!(address, 0x00);
     }
 

@@ -114,7 +114,7 @@ mod tests {
             chip_address,
             register: Register::ChipId(ChipId {
                 model: ChipModel::BM1370,
-                core_count: 0,
+                unknown: 0,
                 address: chip_address,
             }),
         }))

@@ -576,7 +576,7 @@ async fn discover_chips(
                 match response {
                     Some(Ok(Response::ReadRegister(RegisterResponse {
                         chip_address: _,
-                        register: Register::ChipId(ChipId { model, core_count, address }),
+                        register: Register::ChipId(ChipId { model, unknown, address }),
                     }))) => {
                         let chip_id = model.id_bytes();
                         debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
@@ -584,7 +584,7 @@ async fn discover_chips(
 
                         chip_infos.push(ChipInfo {
                             chip_id,
-                            core_count: core_count.into(),
+                            core_count: unknown.into(),
                             address,
                             supports_version_rolling: true,
                         });
