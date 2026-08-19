@@ -83,7 +83,7 @@ pub struct SetChipAddress {
 
 impl SetChipAddress {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Command,
             broadcast: false,
             cmd: Cmd::SetChipAddress,
@@ -101,7 +101,7 @@ pub struct ChainInactive;
 
 impl ChainInactive {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Command,
             broadcast: true,
             cmd: Cmd::ChainInactive,
@@ -122,7 +122,7 @@ pub struct ReadRegister {
 
 impl ReadRegister {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Command,
             broadcast: self.destination.is_broadcast(),
             cmd: Cmd::ReadRegister,
@@ -143,7 +143,7 @@ pub struct WriteRegister {
 
 impl WriteRegister {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Command,
             broadcast: self.destination.is_broadcast(),
             cmd: Cmd::WriteRegisterOrJob,
@@ -183,7 +183,7 @@ pub struct JobFullFormat {
 
 impl JobFullFormat {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Job,
             broadcast: false,
             cmd: Cmd::WriteRegisterOrJob,
@@ -241,7 +241,7 @@ pub struct JobMidstateFormat {
 
 impl JobMidstateFormat {
     fn encode(&self, dst: &mut BytesMut) {
-        CommandFlags {
+        TypeFlags {
             kind: Kind::Job,
             broadcast: false,
             cmd: Cmd::WriteRegisterOrJob,
@@ -332,14 +332,15 @@ pub fn hash_from_wire_bytes(wire_bytes: &[u8; 32]) -> [u8; 32] {
     hash
 }
 
-/// Flag byte at the start of every TX frame.
-struct CommandFlags {
+/// Type/Flags byte, the third byte of every command frame, after
+/// the preamble.
+struct TypeFlags {
     kind: Kind,
     broadcast: bool,
     cmd: Cmd,
 }
 
-impl CommandFlags {
+impl TypeFlags {
     fn encode(&self, dst: &mut BytesMut) {
         let mut byte = 0u8;
         let field = byte.view_bits_mut::<Lsb0>();
