@@ -22,7 +22,6 @@ use tokio_util::{
 use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
-        ChipInfo,
         bm13xx::{
             self, Register, Response,
             command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
@@ -139,21 +138,16 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     time::sleep(Duration::from_millis(10)).await;
 
-    let chip_infos = discover_chips(&mut data_reader, &mut data_writer).await?;
+    let chips = discover_chips(&mut data_reader, &mut data_writer).await?;
 
-    debug!(count = chip_infos.len(), "Discovered chips");
+    debug!(count = chips.len(), "Discovered chips");
 
-    // Verify expected BM1370 chip
-    const EXPECTED_CHIP_ID: [u8; 2] = [0x13, 0x70];
-    if let Some(first_chip) = chip_infos.first()
-        && first_chip.chip_id != EXPECTED_CHIP_ID
+    if let Some(first_chip) = chips.first()
+        && first_chip.model != ChipModel::BM1370
     {
         bail!(
-            "wrong chip type for Bitaxe Gamma: expected BM1370 ({:02x}{:02x}), found {:02x}{:02x}",
-            EXPECTED_CHIP_ID[0],
-            EXPECTED_CHIP_ID[1],
-            first_chip.chip_id[0],
-            first_chip.chip_id[1]
+            "wrong chip type for Bitaxe Gamma: expected BM1370, found {:?}",
+            first_chip.model
         );
     }
 
@@ -187,7 +181,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     );
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
-    debug!("Bitaxe board initialized with {} chips", chip_infos.len());
+    debug!("Bitaxe board initialized with {} chips", chips.len());
 
     // Telemetry channel seeded with board identity
     let serial = device.serial_number.clone();
@@ -555,7 +549,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 async fn discover_chips(
     reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-) -> Result<Vec<ChipInfo>> {
+) -> Result<Vec<ChipId>> {
     let discover_cmd = RegisterCommand::ReadRegister(ReadRegister {
         destination: Destination::Broadcast,
         register_address: RegisterAddress::ChipId,
@@ -566,7 +560,7 @@ async fn discover_chips(
         .await
         .context("failed to send chip discovery command")?;
 
-    let mut chip_infos = Vec::new();
+    let mut chips = Vec::new();
     let timeout = Duration::from_millis(500);
     let deadline = Instant::now() + timeout;
 
@@ -576,18 +570,11 @@ async fn discover_chips(
                 match response {
                     Some(Ok(Response::ReadRegister(RegisterResponse {
                         chip_address: _,
-                        register: Register::ChipId(ChipId { model, unknown, address }),
+                        register: Register::ChipId(chip_id),
                     }))) => {
-                        let chip_id = model.id_bytes();
-                        debug!("Discovered chip {:?} ({:02x}{:02x}) at address {address}",
-                                     model, chip_id[0], chip_id[1]);
-
-                        chip_infos.push(ChipInfo {
-                            chip_id,
-                            core_count: unknown.into(),
-                            address,
-                            supports_version_rolling: true,
-                        });
+                        debug!("Discovered chip {:?} at address {}",
+                                     chip_id.model, chip_id.address);
+                        chips.push(chip_id);
                     }
                     Some(Ok(_)) => {
                         warn!("Unexpected response during chip discovery");
@@ -604,10 +591,10 @@ async fn discover_chips(
         }
     }
 
-    if chip_infos.is_empty() {
+    if chips.is_empty() {
         bail!("no chips discovered");
     }
-    Ok(chip_infos)
+    Ok(chips)
 }
 
 /// GPIO-based ASIC reset control that records when the ASIC was
