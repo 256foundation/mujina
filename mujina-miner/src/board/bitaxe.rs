@@ -38,7 +38,7 @@ use crate::{
     },
     peripheral::{
         emc2101::{Emc2101, Percent},
-        tps546::{Tps546, Tps546Config},
+        tps546::{Tps546, Tps546Config, Tps546Regulator},
     },
     tracing::prelude::*,
     transport::{
@@ -103,6 +103,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let monitor_handle =
         device.spawn_monitor(board_name, thread_shutdown_tx, telemetry_tx, cancel.clone());
 
+    let voltage_regulator = Tps546Regulator::new(device.regulator.clone());
+
     // The hash thread takes the data port and the reset control
     let BitaxeDevice {
         data_reader,
@@ -113,7 +115,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let peripherals = BoardPeripherals {
         asic_enable: Some(Box::new(asic_enable)),
-        voltage_regulator: None,
+        voltage_regulator: Some(Box::new(voltage_regulator)),
     };
 
     let thread = BM13xxThread::new(
@@ -590,7 +592,6 @@ impl AsicEnable for BitaxeAsicEnable {
         Ok(())
     }
 }
-
 /// A wrapper around AsyncRead that traces raw bytes as they're read.
 struct TracingReader<R> {
     inner: R,
