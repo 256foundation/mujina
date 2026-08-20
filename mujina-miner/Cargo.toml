@@ -21,10 +21,10 @@ crc_all = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 inventory = { workspace = true }
+num_enum = { workspace = true }
 nusb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-strum = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }

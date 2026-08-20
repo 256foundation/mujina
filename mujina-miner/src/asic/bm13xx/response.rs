@@ -5,7 +5,7 @@
 
 use bitvec::prelude::*;
 use bytes::{Buf, BytesMut};
-use strum::FromRepr;
+use num_enum::TryFromPrimitive;
 
 use super::register::{Register, RegisterAddress};
 use crate::asic::bm13xx::error::ProtocolError;
@@ -32,7 +32,7 @@ impl Response {
         let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
         let type_repr = type_and_crc[5..].load::<u8>();
 
-        match ResponseType::from_repr(type_repr) {
+        match ResponseType::try_from(type_repr).ok() {
             Some(ResponseType::ReadRegister) => {
                 let value_bytes = bytes.split_to(4);
                 let value: [u8; 4] =
@@ -45,7 +45,7 @@ impl Response {
                 let chip_address = bytes.get_u8();
                 let register_address_repr = bytes.get_u8();
 
-                if let Some(register_address) = RegisterAddress::from_repr(register_address_repr) {
+                if let Ok(register_address) = RegisterAddress::try_from(register_address_repr) {
                     let register = Register::decode(register_address, value);
                     Ok(Response::ReadRegister {
                         chip_address,
@@ -87,7 +87,7 @@ impl Response {
     }
 }
 
-#[derive(FromRepr)]
+#[derive(TryFromPrimitive)]
 #[repr(u8)]
 enum ResponseType {
     ReadRegister = 0,
