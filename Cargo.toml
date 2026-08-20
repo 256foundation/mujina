@@ -40,7 +40,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["time", "local-time", "env-filter"] }
-nix = { version = "0.29", features = ["fs", "ioctl", "term"] }
+nix = { version = "0.29", features = ["fs", "ioctl", "term", "signal"] }
 num-traits = "0.2"
 parking_lot = "0.12"
 regex = "1.10"
