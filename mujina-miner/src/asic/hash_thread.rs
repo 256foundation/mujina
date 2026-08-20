@@ -37,6 +37,7 @@ use bitcoin::pow::Target;
 use tokio::sync::mpsc;
 
 use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};
+use crate::peripheral::regulator::VoltageRegulator;
 use crate::types::HashRate;
 use bitcoin::pow::Work;
 
@@ -124,15 +125,6 @@ pub trait AsicEnable: Send + Sync {
 
     /// Disable the ASIC (put it in a safe, non-hashing state).
     async fn disable(&mut self) -> Result<()>;
-}
-
-/// Voltage regulator control for ASIC core voltage.
-///
-/// Hash threads may use this to adjust voltage for tuning.
-#[async_trait]
-pub trait VoltageRegulator: Send + Sync {
-    /// Set output voltage in volts.
-    async fn set_voltage(&mut self, volts: f32) -> Result<()>;
 }
 
 /// Hardware interfaces provided by the board to the hash thread.
