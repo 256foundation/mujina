@@ -12,6 +12,7 @@ mod hash_rate;
 mod hashrate_estimator;
 mod share_rate;
 mod temperature;
+mod voltage;
 
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ pub use hash_rate::HashRate;
 pub use hashrate_estimator::HashrateEstimator;
 pub use share_rate::ShareRate;
 pub use temperature::Temperature;
+pub use voltage::Voltage;
 
 /// Calculate expected time between shares at given difficulty and hashrate.
 ///
