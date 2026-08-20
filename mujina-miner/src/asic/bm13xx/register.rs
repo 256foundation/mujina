@@ -192,8 +192,16 @@ impl From<ChipModel> for [u8; 2] {
 /// PLL configuration for frequency control.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PllDivider {
-    /// VCO control flag (0x40 for low VCO, 0x50 for high VCO).
-    pub flag: u8,
+    /// PLL lock report (LOCKED, bit 31). Written 0; the chip
+    /// answers 1 once the PLL locks.
+    pub locked: bool,
+    /// PLL enable (PLLEN, bit 30). 1 in every captured write.
+    pub pll_en: bool,
+    /// PLL bypass (BYPASS, bit 29). 0 in every captured write.
+    pub bypass: bool,
+    /// VCO range select (VCOSEL, bit 28), derived from the
+    /// dividers.
+    pub vco_sel: VcoSel,
     /// Feedback divider.
     pub fb_div: u8,
     /// Reference divider (typically 1 or 2).
@@ -203,20 +211,22 @@ pub struct PllDivider {
 }
 
 impl PllDivider {
-    /// Builds a [`PllDivider`] with `flag` derived from the dividers.
+    /// Builds an enabled [`PllDivider`] with `vco_sel` derived from
+    /// the dividers.
     pub fn new(fb_div: u8, ref_div: u8, post_div: u8) -> Self {
-        const VCO_FLAG_THRESHOLD_MHZ: f32 = 2400.0;
-        const PLL_FLAG_HIGH_VCO: u8 = 0x50;
-        const PLL_FLAG_LOW_VCO: u8 = 0x40;
+        const VCO_SEL_THRESHOLD_MHZ: f32 = 2400.0;
 
         let vco_mhz = fb_div as f32 * CRYSTAL_MHZ / ref_div as f32;
-        let flag = if vco_mhz >= VCO_FLAG_THRESHOLD_MHZ {
-            PLL_FLAG_HIGH_VCO
+        let vco_sel = if vco_mhz >= VCO_SEL_THRESHOLD_MHZ {
+            VcoSel::High
         } else {
-            PLL_FLAG_LOW_VCO
+            VcoSel::Low
         };
         Self {
-            flag,
+            locked: false,
+            pll_en: true,
+            bypass: false,
+            vco_sel,
             fb_div,
             ref_div,
             post_div,
@@ -224,7 +234,11 @@ impl PllDivider {
     }
 
     pub fn encode(&self, dst: &mut BytesMut) {
-        dst.put_u8(self.flag);
+        let flags = (self.locked as u8) << 7
+            | (self.pll_en as u8) << 6
+            | (self.bypass as u8) << 5
+            | ((self.vco_sel == VcoSel::High) as u8) << 4;
+        dst.put_u8(flags);
         dst.put_u8(self.fb_div);
         dst.put_u8(self.ref_div);
         dst.put_u8(self.post_div);
@@ -232,12 +246,28 @@ impl PllDivider {
 
     pub fn decode(bytes: [u8; 4]) -> Self {
         Self {
-            flag: bytes[0],
+            locked: bytes[0] & 0x80 != 0,
+            pll_en: bytes[0] & 0x40 != 0,
+            bypass: bytes[0] & 0x20 != 0,
+            vco_sel: if bytes[0] & 0x10 != 0 {
+                VcoSel::High
+            } else {
+                VcoSel::Low
+            },
             fb_div: bytes[1],
             ref_div: bytes[2],
             post_div: bytes[3],
         }
     }
+}
+
+/// VCO range select (VCOSEL), bit 28 of PLL_DIVIDER (0x08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcoSel {
+    /// VCO below 2400 MHz.
+    Low,
+    /// VCO at or above 2400 MHz.
+    High,
 }
 
 /// Hash counting number (0x10), the nonce sweep deadline.
@@ -1142,7 +1172,10 @@ mod pll_divider_tests {
     #[test]
     fn from_literal_fields() {
         round_trip(PllDivider {
-            flag: 0x40,
+            locked: false,
+            pll_en: true,
+            bypass: false,
+            vco_sel: VcoSel::Low,
             fb_div: 0x68,
             ref_div: 0x01,
             post_div: 0x33,
@@ -1150,24 +1183,24 @@ mod pll_divider_tests {
     }
 
     #[test]
-    fn new_picks_flag_from_resulting_vco() {
+    fn new_picks_vco_sel_from_resulting_vco() {
         // VCO = fb_div * crystal / ref_div. Pick targets across the
-        // boundary, back-derive fb_div, and assert the flag matches
-        // the bracket. The threshold rule is `>=`, so a target that
-        // hits the boundary exactly picks the high flag.
+        // boundary, back-derive fb_div, and assert the select bit
+        // matches the bracket. The threshold rule is `>=`, so a
+        // target that hits the boundary exactly picks the high range.
         const REF_DIV: u8 = 2;
         let fb_div_for = |vco_mhz: f32| (vco_mhz * REF_DIV as f32 / CRYSTAL_MHZ) as u8;
 
         let cases = [
-            (2000.0, 0x40u8), // below
-            (2400.0, 0x50),   // at threshold (>= picks high)
-            (2800.0, 0x50),   // above
+            (2000.0, VcoSel::Low),  // below
+            (2400.0, VcoSel::High), // at threshold (>= picks high)
+            (2800.0, VcoSel::High), // above
         ];
-        for (target_vco, expected_flag) in cases {
+        for (target_vco, expected_vco_sel) in cases {
             let fb_div = fb_div_for(target_vco);
             assert_eq!(
-                PllDivider::new(fb_div, REF_DIV, 0).flag,
-                expected_flag,
+                PllDivider::new(fb_div, REF_DIV, 0).vco_sel,
+                expected_vco_sel,
                 "target VCO {} MHz",
                 target_vco,
             );
