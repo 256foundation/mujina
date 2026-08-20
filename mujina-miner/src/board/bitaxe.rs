@@ -1,6 +1,5 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::sink::SinkExt;
 use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
@@ -14,7 +13,6 @@ use tokio::{
     time::{self, Instant, MissedTickBehavior},
 };
 use tokio_serial::SerialPortBuilderExt;
-use tokio_stream::StreamExt;
 use tokio_util::{
     codec::{FramedRead, FramedWrite},
     sync::CancellationToken,
@@ -23,13 +21,7 @@ use tokio_util::{
 use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
-        bm13xx::{
-            self, Register, Response,
-            command::{Destination, ReadRegister, RegisterCommand, WriteRegister},
-            register::{ChipId, ChipModel, MidstateConfig, RegisterAddress},
-            response::RegisterResponse,
-            thread::BM13xxThread,
-        },
+        bm13xx::{self, register::ChipModel, thread::BM13xxThread},
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -178,17 +170,17 @@ impl BitaxeDevice {
             SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
         let (data_reader, data_writer, _data_control) = data_stream.split();
         let tracing_reader = TracingReader::new(data_reader, "Data");
-        let mut data_reader =
+        let data_reader =
             FramedRead::new(tracing_reader, bm13xx::FrameCodec::new(ChipModel::BM1370));
-        let mut data_writer =
-            FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
+        let data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
 
         // Get reset pin
         const ASIC_RESET_PIN: u8 = 0;
         let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
         let mut reset_pin = gpio_controller.pin(ASIC_RESET_PIN).await?;
 
-        // Hold ASIC in reset during power configuration
+        // Hold ASIC in reset; the hash thread releases it at first
+        // task assignment
         reset_pin.write(PinValue::Low).await?;
 
         // Initialize peripherals
@@ -196,47 +188,6 @@ impl BitaxeDevice {
 
         let emc2101 = Arc::new(Mutex::new(init_fan_controller(i2c.clone()).await?));
         let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
-
-        time::sleep(Duration::from_millis(500)).await;
-
-        // Release ASIC from reset for discovery
-        debug!("De-asserting ASIC nRST");
-        reset_pin.write(PinValue::High).await?;
-
-        time::sleep(Duration::from_millis(200)).await;
-
-        // Version mask and chip discovery
-        debug!("Sending version mask configuration (3 times)");
-        for _ in 1..=3 {
-            data_writer
-                .send(RegisterCommand::WriteRegister(WriteRegister {
-                    destination: Destination::Broadcast,
-                    register: Register::MidstateConfig(MidstateConfig::full_rolling()),
-                }))
-                .await
-                .context("failed to send config command")?;
-            time::sleep(Duration::from_millis(5)).await;
-        }
-
-        time::sleep(Duration::from_millis(10)).await;
-
-        let chips = discover_chips(&mut data_reader, &mut data_writer).await?;
-
-        debug!(count = chips.len(), "Discovered chips");
-
-        if let Some(first_chip) = chips.first()
-            && first_chip.model != ChipModel::BM1370
-        {
-            bail!(
-                "wrong chip type for Bitaxe Gamma: expected BM1370, found {:?}",
-                first_chip.model
-            );
-        }
-
-        // Put chip back in reset before handing off to hash thread
-        reset_pin.write(PinValue::Low).await?;
-
-        debug!("Bitaxe board initialized with {} chips", chips.len());
 
         let asic_enable = BitaxeAsicEnable {
             nrst_pin: reset_pin,
@@ -592,57 +543,6 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     }
 
     Ok(tps546)
-}
-
-async fn discover_chips(
-    reader: &mut FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
-    writer: &mut FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-) -> Result<Vec<ChipId>> {
-    let discover_cmd = RegisterCommand::ReadRegister(ReadRegister {
-        destination: Destination::Broadcast,
-        register_address: RegisterAddress::ChipId,
-    });
-
-    writer
-        .send(discover_cmd)
-        .await
-        .context("failed to send chip discovery command")?;
-
-    let mut chips = Vec::new();
-    let timeout = Duration::from_millis(500);
-    let deadline = Instant::now() + timeout;
-
-    while Instant::now() < deadline {
-        tokio::select! {
-            response = reader.next() => {
-                match response {
-                    Some(Ok(Response::ReadRegister(RegisterResponse {
-                        chip_address: _,
-                        register: Register::ChipId(chip_id),
-                    }))) => {
-                        debug!("Discovered chip {:?} at address {}",
-                                     chip_id.model, chip_id.address);
-                        chips.push(chip_id);
-                    }
-                    Some(Ok(_)) => {
-                        warn!("Unexpected response during chip discovery");
-                    }
-                    Some(Err(e)) => {
-                        error!("Error during chip discovery: {e}");
-                    }
-                    None => break,
-                }
-            }
-            _ = time::sleep_until(deadline) => {
-                break;
-            }
-        }
-    }
-
-    if chips.is_empty() {
-        bail!("no chips discovered");
-    }
-    Ok(chips)
 }
 
 /// GPIO-based ASIC reset control that records when the ASIC was
