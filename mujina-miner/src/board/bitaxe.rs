@@ -78,94 +78,23 @@ inventory::submit! {
 
 /// Create a Bitaxe board from USB device info.
 async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
-    let serial_ports = device.get_serial_ports(2).await?;
-
-    debug!(
-        serial = ?device.serial_number,
-        control = %serial_ports[0],
-        data = %serial_ports[1],
-        "Opening Bitaxe Gamma serial ports"
-    );
-
-    // Open control port, create management channel and I2C bus
-    let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
-    let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
-    let mut i2c = BitaxeRawI2c::new(control_channel.clone());
-
-    // Open data port for chip communication
-    let data_stream =
-        SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
-    let (data_reader, data_writer, _data_control) = data_stream.split();
-    let tracing_reader = TracingReader::new(data_reader, "Data");
-    let mut data_reader =
-        FramedRead::new(tracing_reader, bm13xx::FrameCodec::new(ChipModel::BM1370));
-    let mut data_writer = FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
-
-    // Get reset pin
-    const ASIC_RESET_PIN: u8 = 0;
-    let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
-    let mut reset_pin = gpio_controller.pin(ASIC_RESET_PIN).await?;
-
-    // Hold ASIC in reset during power configuration
-    reset_pin.write(PinValue::Low).await?;
-
-    // Initialize peripherals
-    i2c.set_frequency(100_000).await?;
-
-    let emc2101 = init_fan_controller(i2c.clone()).await?;
-    let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
-
-    time::sleep(Duration::from_millis(500)).await;
-
-    // Release ASIC from reset for discovery
-    debug!("De-asserting ASIC nRST");
-    reset_pin.write(PinValue::High).await?;
-
-    time::sleep(Duration::from_millis(200)).await;
-
-    // Version mask and chip discovery
-    debug!("Sending version mask configuration (3 times)");
-    for _ in 1..=3 {
-        data_writer
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Broadcast,
-                register: Register::MidstateConfig(MidstateConfig::full_rolling()),
-            }))
-            .await
-            .context("failed to send config command")?;
-        time::sleep(Duration::from_millis(5)).await;
-    }
-
-    time::sleep(Duration::from_millis(10)).await;
-
-    let chips = discover_chips(&mut data_reader, &mut data_writer).await?;
-
-    debug!(count = chips.len(), "Discovered chips");
-
-    if let Some(first_chip) = chips.first()
-        && first_chip.model != ChipModel::BM1370
-    {
-        bail!(
-            "wrong chip type for Bitaxe Gamma: expected BM1370, found {:?}",
-            first_chip.model
-        );
-    }
-
-    // Put chip back in reset before handing off to hash thread
-    reset_pin.write(PinValue::Low).await?;
+    let BitaxeDevice {
+        data_reader,
+        data_writer,
+        emc2101,
+        regulator,
+        asic_enable,
+        serial_number,
+    } = BitaxeDevice::attach(device).await?;
 
     // Create hash thread
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
 
-    let thread_name = match &device.serial_number {
+    let thread_name = match &serial_number {
         Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
         None => "Bitaxe-Gamma".to_string(),
     };
 
-    let asic_enable = BitaxeAsicEnable {
-        nrst_pin: reset_pin,
-        enabled_since: Arc::new(StdMutex::new(None)),
-    };
     let asic_enable_monitor = asic_enable.clone();
     let peripherals = BoardPeripherals {
         asic_enable: Some(Box::new(asic_enable)),
@@ -181,15 +110,12 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     );
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
 
-    debug!("Bitaxe board initialized with {} chips", chips.len());
-
     // Telemetry channel seeded with board identity
-    let serial = device.serial_number.clone();
-    let board_name = format!("bitaxe-{}", serial.as_deref().unwrap_or("unknown"));
+    let board_name = format!("bitaxe-{}", serial_number.as_deref().unwrap_or("unknown"));
     let initial_state = BoardTelemetry {
         name: board_name.clone(),
         model: "Bitaxe Gamma".into(),
-        serial: serial.clone(),
+        serial: serial_number.clone(),
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
@@ -197,7 +123,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let info = BoardInfo {
         model: "Bitaxe Gamma".to_string(),
         firmware_version: Some("bitaxe-raw".to_string()),
-        serial_number: device.serial_number.clone(),
+        serial_number: serial_number.clone(),
     };
 
     // Assemble internal state and spawn the board monitor
@@ -207,7 +133,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         thread_shutdown: thread_shutdown_tx,
         board_name,
         board_model: "Bitaxe Gamma",
-        board_serial: serial,
+        board_serial: serial_number,
         bad_thermal_count: 0,
         asic_enable: asic_enable_monitor,
     };
@@ -226,6 +152,114 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         telemetry_rx,
         shutdown: Some(shutdown),
     })
+}
+
+/// The assembled hardware of one Bitaxe Gamma board.
+struct BitaxeDevice {
+    data_reader: FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
+    data_writer: FramedWrite<SerialWriter, bm13xx::FrameCodec>,
+    emc2101: Emc2101<BitaxeRawI2c>,
+    regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
+    asic_enable: BitaxeAsicEnable,
+    serial_number: Option<String>,
+}
+
+impl BitaxeDevice {
+    /// Claims the USB device and assembles the board's hardware.
+    async fn attach(device: UsbDeviceInfo) -> Result<Self> {
+        let serial_ports = device.get_serial_ports(2).await?;
+
+        debug!(
+            serial = ?device.serial_number,
+            control = %serial_ports[0],
+            data = %serial_ports[1],
+            "Opening Bitaxe Gamma serial ports"
+        );
+
+        // Open control port, create management channel and I2C bus
+        let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
+        let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
+        let mut i2c = BitaxeRawI2c::new(control_channel.clone());
+
+        // Open data port for chip communication
+        let data_stream =
+            SerialStream::new(&serial_ports[1], 115200).context("failed to open data port")?;
+        let (data_reader, data_writer, _data_control) = data_stream.split();
+        let tracing_reader = TracingReader::new(data_reader, "Data");
+        let mut data_reader =
+            FramedRead::new(tracing_reader, bm13xx::FrameCodec::new(ChipModel::BM1370));
+        let mut data_writer =
+            FramedWrite::new(data_writer, bm13xx::FrameCodec::new(ChipModel::BM1370));
+
+        // Get reset pin
+        const ASIC_RESET_PIN: u8 = 0;
+        let mut gpio_controller = BitaxeRawGpioController::new(control_channel);
+        let mut reset_pin = gpio_controller.pin(ASIC_RESET_PIN).await?;
+
+        // Hold ASIC in reset during power configuration
+        reset_pin.write(PinValue::Low).await?;
+
+        // Initialize peripherals
+        i2c.set_frequency(100_000).await?;
+
+        let emc2101 = init_fan_controller(i2c.clone()).await?;
+        let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
+
+        time::sleep(Duration::from_millis(500)).await;
+
+        // Release ASIC from reset for discovery
+        debug!("De-asserting ASIC nRST");
+        reset_pin.write(PinValue::High).await?;
+
+        time::sleep(Duration::from_millis(200)).await;
+
+        // Version mask and chip discovery
+        debug!("Sending version mask configuration (3 times)");
+        for _ in 1..=3 {
+            data_writer
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination: Destination::Broadcast,
+                    register: Register::MidstateConfig(MidstateConfig::full_rolling()),
+                }))
+                .await
+                .context("failed to send config command")?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        time::sleep(Duration::from_millis(10)).await;
+
+        let chips = discover_chips(&mut data_reader, &mut data_writer).await?;
+
+        debug!(count = chips.len(), "Discovered chips");
+
+        if let Some(first_chip) = chips.first()
+            && first_chip.model != ChipModel::BM1370
+        {
+            bail!(
+                "wrong chip type for Bitaxe Gamma: expected BM1370, found {:?}",
+                first_chip.model
+            );
+        }
+
+        // Put chip back in reset before handing off to hash thread
+        reset_pin.write(PinValue::Low).await?;
+
+        debug!("Bitaxe board initialized with {} chips", chips.len());
+
+        let asic_enable = BitaxeAsicEnable {
+            nrst_pin: reset_pin,
+            enabled_since: Arc::new(StdMutex::new(None)),
+        };
+
+        Ok(Self {
+            data_reader,
+            data_writer,
+            emc2101,
+            regulator,
+            asic_enable,
+            serial_number: device.serial_number,
+        })
+    }
 }
 
 /// Internal state owned by the board monitor task.
