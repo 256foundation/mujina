@@ -5,12 +5,18 @@
 //!
 //! Datasheet: <https://www.ti.com/lit/ds/symlink/tps546d24a.pdf>
 
+use std::sync::Arc;
+
 use crate::tracing::prelude::*;
 use anyhow::{Result, bail};
+use async_trait::async_trait;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use super::pmbus::{self, PmbusCommand, StatusDecoder, VoutMode, linear11};
+use super::regulator::VoltageRegulator;
 use crate::hw_trait::I2c;
+use crate::types::Voltage;
 
 /// Constants for TPS546 device identification
 pub mod constants {
@@ -513,6 +519,13 @@ impl<I2C: I2c> Tps546<I2C> {
         Ok(())
     }
 
+    /// Reads the target voltage (VOUT_COMMAND), independent of the
+    /// output state.
+    pub async fn get_vout_target(&mut self) -> Result<f32> {
+        let value = self.read_word(PmbusCommand::VoutCommand).await?;
+        self.decode_voltage(value).await
+    }
+
     /// Enables the output (OPERATION = ON).
     ///
     /// Fails unless the command reads back from the device.
@@ -529,6 +542,12 @@ impl<I2C: I2c> Tps546<I2C> {
         self.write_operation(pmbus::Operation::OffImmediate).await?;
         debug!("Output disabled");
         Ok(())
+    }
+
+    /// Whether the output is commanded on (OPERATION bit 7).
+    pub async fn output_enabled(&mut self) -> Result<bool> {
+        let op = self.read_byte(PmbusCommand::Operation).await?;
+        Ok(op & pmbus::Operation::On.as_u8() != 0)
     }
 
     /// Writes OPERATION and confirms the device accepted it.
@@ -1251,5 +1270,44 @@ impl<I2C: I2c> Tps546<I2C> {
     async fn decode_voltage(&mut self, value: u16) -> Result<f32> {
         let vout_mode = VoutMode::new(self.get_vout_mode().await?);
         Ok(vout_mode.decode_linear16(value))
+    }
+}
+
+/// Consumer handle on a shared TPS546.
+pub struct Tps546Regulator<I2C: I2c> {
+    tps546: Arc<Mutex<Tps546<I2C>>>,
+}
+
+impl<I2C: I2c> Tps546Regulator<I2C> {
+    pub fn new(tps546: Arc<Mutex<Tps546<I2C>>>) -> Self {
+        Self { tps546 }
+    }
+}
+
+#[async_trait]
+impl<I2C: I2c + Send> VoltageRegulator for Tps546Regulator<I2C> {
+    async fn enable(&mut self) -> Result<()> {
+        self.tps546.lock().await.enable_output().await
+    }
+
+    async fn disable(&mut self) -> Result<()> {
+        self.tps546.lock().await.disable_output().await
+    }
+
+    async fn is_enabled(&mut self) -> Result<bool> {
+        self.tps546.lock().await.output_enabled().await
+    }
+
+    async fn set_voltage(&mut self, voltage: Voltage) -> Result<()> {
+        self.tps546
+            .lock()
+            .await
+            .set_vout_target(voltage.volts())
+            .await
+    }
+
+    async fn get_voltage(&mut self) -> Result<Voltage> {
+        let volts = self.tps546.lock().await.get_vout_target().await?;
+        Ok(Voltage::from_volts(volts))
     }
 }
