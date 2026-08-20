@@ -7,13 +7,13 @@
 
 use bitcoin::pow::Work;
 use bytes::{BufMut, BytesMut};
+use num_enum::TryFromPrimitive;
 use std::fmt;
-use strum::FromRepr;
 
 use crate::types::Difficulty;
 
 /// Register addresses on the wire.
-#[derive(FromRepr, Copy, Clone, Debug)]
+#[derive(TryFromPrimitive, Copy, Clone, Debug)]
 #[repr(u8)]
 pub enum RegisterAddress {
     ChipId = 0x00,
