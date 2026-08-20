@@ -10,6 +10,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, ReadBuf},
     sync::{Mutex, watch},
+    task::JoinHandle,
     time::{self, Instant, MissedTickBehavior},
 };
 use tokio_serial::SerialPortBuilderExt;
@@ -78,24 +79,46 @@ inventory::submit! {
 
 /// Create a Bitaxe board from USB device info.
 async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
-    let BitaxeDevice {
-        data_reader,
-        data_writer,
-        emc2101,
-        regulator,
-        asic_enable,
-        serial_number,
-    } = BitaxeDevice::attach(device).await?;
+    let device = BitaxeDevice::attach(device).await?;
 
-    // Create hash thread
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
 
-    let thread_name = match &serial_number {
+    let thread_name = match &device.serial_number {
         Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
         None => "Bitaxe-Gamma".to_string(),
     };
 
-    let asic_enable_monitor = asic_enable.clone();
+    // Telemetry channel seeded with board identity
+    let board_name = format!(
+        "bitaxe-{}",
+        device.serial_number.as_deref().unwrap_or("unknown")
+    );
+    let initial_state = BoardTelemetry {
+        name: board_name.clone(),
+        model: "Bitaxe Gamma".into(),
+        serial: device.serial_number.clone(),
+        ..Default::default()
+    };
+    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+
+    let info = BoardInfo {
+        model: "Bitaxe Gamma".to_string(),
+        firmware_version: Some("bitaxe-raw".to_string()),
+        serial_number: device.serial_number.clone(),
+    };
+
+    let cancel = CancellationToken::new();
+    let monitor_handle =
+        device.spawn_monitor(board_name, thread_shutdown_tx, telemetry_tx, cancel.clone());
+
+    // The hash thread takes the data port and the reset control
+    let BitaxeDevice {
+        data_reader,
+        data_writer,
+        asic_enable,
+        ..
+    } = device;
+
     let peripherals = BoardPeripherals {
         asic_enable: Some(Box::new(asic_enable)),
         voltage_regulator: None,
@@ -109,37 +132,6 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         thread_shutdown_rx,
     );
     let threads: Vec<Box<dyn HashThread>> = vec![Box::new(thread)];
-
-    // Telemetry channel seeded with board identity
-    let board_name = format!("bitaxe-{}", serial_number.as_deref().unwrap_or("unknown"));
-    let initial_state = BoardTelemetry {
-        name: board_name.clone(),
-        model: "Bitaxe Gamma".into(),
-        serial: serial_number.clone(),
-        ..Default::default()
-    };
-    let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
-
-    let info = BoardInfo {
-        model: "Bitaxe Gamma".to_string(),
-        firmware_version: Some("bitaxe-raw".to_string()),
-        serial_number: serial_number.clone(),
-    };
-
-    // Assemble internal state and spawn the board monitor
-    let bitaxe = Bitaxe {
-        emc2101,
-        regulator,
-        thread_shutdown: thread_shutdown_tx,
-        board_name,
-        board_model: "Bitaxe Gamma",
-        board_serial: serial_number,
-        bad_thermal_count: 0,
-        asic_enable: asic_enable_monitor,
-    };
-
-    let cancel = CancellationToken::new();
-    let monitor_handle = tokio::spawn(bitaxe.run_monitor(telemetry_tx, cancel.clone()));
 
     let shutdown = Box::pin(async move {
         cancel.cancel();
@@ -158,7 +150,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 struct BitaxeDevice {
     data_reader: FramedRead<TracingReader<SerialReader>, bm13xx::FrameCodec>,
     data_writer: FramedWrite<SerialWriter, bm13xx::FrameCodec>,
-    emc2101: Emc2101<BitaxeRawI2c>,
+    emc2101: Arc<Mutex<Emc2101<BitaxeRawI2c>>>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
     asic_enable: BitaxeAsicEnable,
     serial_number: Option<String>,
@@ -202,7 +194,7 @@ impl BitaxeDevice {
         // Initialize peripherals
         i2c.set_frequency(100_000).await?;
 
-        let emc2101 = init_fan_controller(i2c.clone()).await?;
+        let emc2101 = Arc::new(Mutex::new(init_fan_controller(i2c.clone()).await?));
         let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
 
         time::sleep(Duration::from_millis(500)).await;
@@ -260,13 +252,34 @@ impl BitaxeDevice {
             serial_number: device.serial_number,
         })
     }
+
+    /// Spawns the board monitor task.
+    fn spawn_monitor(
+        &self,
+        board_name: String,
+        thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+        telemetry_tx: watch::Sender<BoardTelemetry>,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        let monitor = BitaxeMonitor {
+            emc2101: self.emc2101.clone(),
+            regulator: self.regulator.clone(),
+            thread_shutdown,
+            board_name,
+            board_model: "Bitaxe Gamma",
+            board_serial: self.serial_number.clone(),
+            bad_thermal_count: 0,
+            asic_enable: self.asic_enable.clone(),
+        };
+        tokio::spawn(monitor.run(telemetry_tx, cancel))
+    }
 }
 
 /// Internal state owned by the board monitor task.
 ///
-/// The factory assembles this and moves it into `run_monitor()`.
-struct Bitaxe {
-    emc2101: Emc2101<BitaxeRawI2c>,
+/// The device assembles this and moves it into the spawned task.
+struct BitaxeMonitor {
+    emc2101: Arc<Mutex<Emc2101<BitaxeRawI2c>>>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
     thread_shutdown: watch::Sender<ThreadRemovalSignal>,
     board_name: String,
@@ -278,12 +291,8 @@ struct Bitaxe {
     asic_enable: BitaxeAsicEnable,
 }
 
-impl Bitaxe {
-    async fn run_monitor(
-        mut self,
-        telemetry_tx: watch::Sender<BoardTelemetry>,
-        cancel: CancellationToken,
-    ) {
+impl BitaxeMonitor {
+    async fn run(mut self, telemetry_tx: watch::Sender<BoardTelemetry>, cancel: CancellationToken) {
         let mut tick = time::interval(Duration::from_secs(2));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_log = Instant::now();
@@ -299,7 +308,7 @@ impl Bitaxe {
                 }
                 _ = cancel.cancelled() => {
                     self.shutdown().await;
-                    if let Err(e) = self.emc2101.set_fan_speed(Percent::new_clamped(25)).await {
+                    if let Err(e) = self.emc2101.lock().await.set_fan_speed(Percent::new_clamped(25)).await {
                         warn!("Failed to reduce fan speed: {}", e);
                     }
                     return;
@@ -329,9 +338,14 @@ impl Bitaxe {
         last_log: &mut Instant,
     ) -> Result<()> {
         // Read all sensors in one pass
-        let raw_temp = self.emc2101.get_external_temperature().await;
-        let fan_percent = self.emc2101.get_fan_speed().await.ok().map(u8::from);
-        let fan_rpm = self.emc2101.get_rpm().await.ok();
+        let (raw_temp, fan_percent, fan_rpm) = {
+            let mut fan = self.emc2101.lock().await;
+            (
+                fan.get_external_temperature().await,
+                fan.get_fan_speed().await.ok().map(u8::from),
+                fan.get_rpm().await.ok(),
+            )
+        };
 
         let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
             let mut reg = self.regulator.lock().await;
@@ -404,7 +418,7 @@ impl Bitaxe {
                 consecutive = self.bad_thermal_count,
                 "THERMAL EMERGENCY: shutting down board"
             );
-            if let Err(e) = self.emc2101.set_fan_speed(Percent::FULL).await {
+            if let Err(e) = self.emc2101.lock().await.set_fan_speed(Percent::FULL).await {
                 error!("Failed to set fan speed: {}", e);
             }
             bail!(
