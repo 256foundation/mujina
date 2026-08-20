@@ -310,13 +310,14 @@ impl From<HashCountingNumber> for u32 {
 }
 
 /// Ticket mask controlling ASIC nonce reporting
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(derive_more::Debug, Clone, Copy, PartialEq)]
 pub struct TicketMask {
-    // Number of additional zero bits required in the bit-reversed hash,
-    // beyond the base 32 bits. The chip always requires bits 0-31 of the
-    // bit-reversed hash to be zero. This parameter adds bits 32..(32+zero_bits)
-    // that must also be zero.
-    zero_bits: u8,
+    // Mask of additional zero bits required in the bit-reversed
+    // hash, beyond the base 32 bits the chip always requires. Held
+    // as the mask word rather than a count so a readback of a
+    // non-contiguous mask round-trips instead of normalizing.
+    #[debug("{mask:#010x}")]
+    mask: u32,
 }
 
 impl TicketMask {
@@ -326,24 +327,21 @@ impl TicketMask {
     /// of extra zero bits the chip requires beyond its hardwired
     /// difficulty-1 gate.
     pub const fn new(difficulty: Log2Difficulty) -> Self {
-        Self {
-            zero_bits: difficulty.exponent(),
-        }
+        let zero_bits = difficulty.exponent();
+        let mask = if zero_bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << zero_bits) - 1
+        };
+        Self { mask }
     }
 
     /// Encode ticket mask to wire format bytes
     pub fn to_wire_bytes(&self) -> [u8; 4] {
-        if self.zero_bits == 0 {
-            return [0, 0, 0, 0];
-        }
-
-        // Create mask value: 2^zero_bits - 1
-        let mask_value = (1u32 << self.zero_bits) - 1;
-
         // Encode to wire format with bit-reversal and byte-reversal
         let mut bytes = [0u8; 4];
         for i in 0..4 {
-            let byte = ((mask_value >> (8 * i)) & 0xFF) as u8;
+            let byte = ((self.mask >> (8 * i)) & 0xFF) as u8;
             bytes[3 - i] = reverse_bits(byte);
         }
 
@@ -355,9 +353,9 @@ impl TicketMask {
     }
 
     pub fn decode(bytes: [u8; 4]) -> Self {
-        let mask_value = decode_ticket_mask_bytes(&bytes);
-        let zero_bits = mask_value.count_ones() as u8;
-        Self { zero_bits }
+        Self {
+            mask: decode_ticket_mask_bytes(&bytes),
+        }
     }
 }
 
@@ -1084,6 +1082,16 @@ mod ticket_mask_tests {
         let diff = Log2Difficulty::from_difficulty(Difficulty::from(1_u64));
         let bytes = TicketMask::new(diff).to_wire_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn non_contiguous_mask_round_trips() {
+        // No capture shows such a readback, but decode must keep
+        // the mask as received, not normalize it to a bit count.
+        let bytes = [0x12, 0x34, 0x56, 0x78];
+        let mut buf = BytesMut::new();
+        TicketMask::decode(bytes).encode(&mut buf);
+        assert_eq!(&buf[..], &bytes);
     }
 
     #[test]
