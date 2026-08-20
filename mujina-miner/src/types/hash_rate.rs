@@ -17,22 +17,22 @@ use std::time::Duration;
 /// Stored as u64, covering up to ~18.4 EH/s. Constructors from
 /// f64 (e.g., `from_terahashes`) saturate to `u64::MAX` for
 /// out-of-range values.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct HashRate(pub u64);
 
 impl HashRate {
     /// Create from megahashes per second
-    pub fn from_megahashes(mh: f64) -> Self {
+    pub const fn from_megahashes(mh: f64) -> Self {
         Self((mh * 1_000_000.0) as u64)
     }
 
     /// Create from gigahashes per second
-    pub fn from_gigahashes(gh: f64) -> Self {
+    pub const fn from_gigahashes(gh: f64) -> Self {
         Self((gh * 1_000_000_000.0) as u64)
     }
 
     /// Create from terahashes per second
-    pub fn from_terahashes(th: f64) -> Self {
+    pub const fn from_terahashes(th: f64) -> Self {
         Self((th * 1_000_000_000_000.0) as u64)
     }
 
