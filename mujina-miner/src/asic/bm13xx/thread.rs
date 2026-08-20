@@ -903,30 +903,31 @@ async fn bm13xx_thread_actor<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::bm13xx::register::VcoSel;
 
     #[test]
     fn test_pll_calculations_match_reference() {
         // Test cases from the Bitaxe Gamma protocol capture
-        // Format: (freq_mhz, expected_flag, expected_fb_div, expected_ref_div, expected_post_div)
+        // Format: (freq_mhz, expected_vco_sel, expected_fb_div, expected_ref_div, expected_post_div)
         let test_cases = vec![
-            (62.50, 0x50, 0xD2, 0x02, 0x65),
-            (68.75, 0x50, 0xE7, 0x02, 0x65),
-            (75.00, 0x50, 0xD2, 0x02, 0x64),
-            (81.25, 0x50, 0xE4, 0x02, 0x64),
-            (87.50, 0x50, 0xC4, 0x02, 0x63),
-            (93.75, 0x50, 0xD2, 0x02, 0x63),
-            (100.00, 0x50, 0xE0, 0x02, 0x63),
-            (525.00, 0x50, 0xD2, 0x02, 0x40),
+            (62.50, VcoSel::High, 0xD2, 0x02, 0x65),
+            (68.75, VcoSel::High, 0xE7, 0x02, 0x65),
+            (75.00, VcoSel::High, 0xD2, 0x02, 0x64),
+            (81.25, VcoSel::High, 0xE4, 0x02, 0x64),
+            (87.50, VcoSel::High, 0xC4, 0x02, 0x63),
+            (93.75, VcoSel::High, 0xD2, 0x02, 0x63),
+            (100.00, VcoSel::High, 0xE0, 0x02, 0x63),
+            (525.00, VcoSel::High, 0xD2, 0x02, 0x40),
         ];
 
-        for (freq_mhz, expected_flag, expected_fb, expected_ref, expected_post) in test_cases {
+        for (freq_mhz, expected_vco_sel, expected_fb, expected_ref, expected_post) in test_cases {
             let config = calculate_pll_for_frequency(freq_mhz)
                 .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
 
             assert_eq!(
-                config.flag, expected_flag,
-                "Flag mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_flag, config.flag
+                config.vco_sel, expected_vco_sel,
+                "VCO select mismatch for {} MHz",
+                freq_mhz
             );
             assert_eq!(
                 config.fb_div, expected_fb,
@@ -989,12 +990,20 @@ mod tests {
 
     #[test]
     fn test_pll_flag_setting() {
-        // Flag is 0x50 when VCO frequency >= 2400 MHz, 0x40 otherwise
+        // The VCO select is High when VCO frequency >= 2400 MHz
         let low_freq = calculate_pll_for_frequency(100.0).unwrap();
-        assert_eq!(low_freq.flag, 0x50, "Should have 0x50 flag for 100 MHz");
+        assert_eq!(
+            low_freq.vco_sel,
+            VcoSel::High,
+            "high-VCO select for 100 MHz"
+        );
 
         let high_freq = calculate_pll_for_frequency(525.0).unwrap();
-        assert_eq!(high_freq.flag, 0x50, "Should have 0x50 flag for 525 MHz");
+        assert_eq!(
+            high_freq.vco_sel,
+            VcoSel::High,
+            "high-VCO select for 525 MHz"
+        );
     }
 
     #[test]
