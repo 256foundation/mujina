@@ -1,7 +1,5 @@
 //! CRC validation utilities for BM13xx protocol frames.
 
-use crc_all::CrcAlgo;
-
 /// Calculates a 5-bit CRC using the USB polynomial over a slice of bytes.
 ///
 /// This function implements the CRC-5-USB algorithm which uses polynomial 0x05,
@@ -11,9 +9,15 @@ use crc_all::CrcAlgo;
 /// processes data in byte-sized chunks. The CRC is calculated over the entire sequence
 /// of bits in the provided bytes.
 pub fn crc5(data: &[u8]) -> u8 {
-    let mut crc = CRC5_INIT;
-    CRC5.update_crc(&mut crc, data);
-    CRC5.finish_crc(&crc)
+    let mut crc: u8 = 0x1f;
+    for &byte in data {
+        for i in (0..8).rev() {
+            let bit = (byte >> i) & 1;
+            let top = (crc >> 4) & 1;
+            crc = ((crc << 1) & 0x1f) ^ if top ^ bit != 0 { 0x05 } else { 0 };
+        }
+    }
+    crc
 }
 
 /// Validates data integrity using the CRC-5-USB algorithm.
@@ -26,16 +30,6 @@ pub fn crc5_is_valid(data: &[u8]) -> bool {
     crc5(data) == 0
 }
 
-const CRC5_INIT: u8 = 0x1f;
-
-const CRC5: CrcAlgo<u8> = CrcAlgo::<u8>::new(
-    0x5,       // polynomial
-    5,         // width
-    CRC5_INIT, // init
-    0,         // xorout
-    false,     // reflect
-);
-
 /// Calculates a 16-bit CRC using the CRC-16-FALSE algorithm over a slice of bytes.
 ///
 /// This is used for mining job packets in BM13xx chips. The algorithm uses:
@@ -44,20 +38,19 @@ const CRC5: CrcAlgo<u8> = CrcAlgo::<u8>::new(
 /// - No output XOR
 /// - No bit reflection
 pub fn crc16(data: &[u8]) -> u16 {
-    let mut crc = CRC16_INIT;
-    CRC16.update_crc(&mut crc, data);
-    CRC16.finish_crc(&crc)
+    let mut crc: u16 = 0xffff;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
 }
-
-const CRC16_INIT: u16 = 0xFFFF;
-
-const CRC16: CrcAlgo<u16> = CrcAlgo::<u16>::new(
-    0x1021,     // polynomial (CRC-16-CCITT-FALSE)
-    16,         // width
-    CRC16_INIT, // init
-    0,          // xorout
-    false,      // reflect
-);
 
 #[cfg(test)]
 mod tests {
