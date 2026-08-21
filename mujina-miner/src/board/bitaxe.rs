@@ -45,7 +45,7 @@ use crate::{
         UsbDeviceInfo,
         serial::{SerialReader, SerialStream, SerialWriter},
     },
-    types::Temperature,
+    types::{Ratio, Temperature, Voltage},
 };
 
 use super::{
@@ -300,7 +300,7 @@ impl BitaxeMonitor {
             )
         };
 
-        let (vin_mv, vout_mv, iout_ma, power_mw, vr_temp) = {
+        let (vin, vout, iout_ma, power_mw, vr_temp) = {
             let mut reg = self.regulator.lock().await;
 
             if let Err(e) = reg.check_status().await {
@@ -404,13 +404,13 @@ impl BitaxeMonitor {
             powers: vec![
                 PowerMeasurement {
                     name: "input".into(),
-                    voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
+                    voltage_v: vin.map(|v| v.volts()),
                     current_a: None,
                     power_w: None,
                 },
                 PowerMeasurement {
                     name: "core".into(),
-                    voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
+                    voltage_v: vout.map(|v| v.volts()),
                     current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
                     power_w: power_mw.map(|mw| mw as f32 / 1000.0),
                 },
@@ -431,8 +431,8 @@ impl BitaxeMonitor {
                 vr_temp_c = ?vr_temp,
                 power_w = ?power_mw.map(|mw| mw as f32 / 1000.0),
                 current_a = ?iout_ma.map(|ma| ma as f32 / 1000.0),
-                vin_v = ?vin_mv.map(|mv| mv as f32 / 1000.0),
-                vout_v = ?vout_mv.map(|mv| mv as f32 / 1000.0),
+                vin_v = ?vin.map(|v| v.volts()),
+                vout_v = ?vout.map(|v| v.volts()),
                 "Board status"
             );
         }
@@ -473,23 +473,23 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
         phase: 0x00,
         frequency_switch_khz: 650,
 
-        vin_on: 4.8,
-        vin_off: 4.5,
-        vin_uv_warn_limit: 0.0, // Disabled due to TI bug
-        vin_ov_fault_limit: 6.5,
+        vin_on: Voltage::from_volts(4.8),
+        vin_off: Voltage::from_volts(4.5),
+        vin_uv_warn_limit: Voltage::from_volts(0.0), // Disabled due to TI bug
+        vin_ov_fault_limit: Voltage::from_volts(6.5),
         vin_ov_fault_response: 0xB7,
 
         vout_scale_loop: 0.25,
-        vout_min: 1.0,
-        vout_max: 2.0,
-        vout_command: 1.15,
+        vout_min: Voltage::from_volts(1.0),
+        vout_max: Voltage::from_volts(2.0),
+        vout_command: Voltage::from_volts(1.15),
 
-        vout_ov_fault_limit: 1.25,
-        vout_ov_warn_limit: 1.16,
-        vout_margin_high: 1.10,
-        vout_margin_low: 0.90,
-        vout_uv_warn_limit: 0.90,
-        vout_uv_fault_limit: 0.75,
+        vout_ov_fault_limit: Ratio::from_factor(1.25),
+        vout_ov_warn_limit: Ratio::from_factor(1.16),
+        vout_margin_high: Ratio::from_factor(1.10),
+        vout_margin_low: Ratio::from_factor(0.90),
+        vout_uv_warn_limit: Ratio::from_factor(0.90),
+        vout_uv_fault_limit: Ratio::from_factor(0.75),
 
         iout_oc_warn_limit: 25.0,
         iout_oc_fault_limit: 30.0,
@@ -518,9 +518,7 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     time::sleep(Duration::from_millis(100)).await;
 
-    // Set point only; the hash thread enables the output at first
-    // task assignment
-    const DEFAULT_VOUT: f32 = 1.15;
+    const DEFAULT_VOUT: Voltage = Voltage::from_volts(1.15);
     tps546
         .set_vout_target(DEFAULT_VOUT)
         .await
