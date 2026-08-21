@@ -13,15 +13,29 @@ use futures::sink::Sink;
 use super::register::{Register, RegisterAddress};
 
 /// Sink that accepts both BM13xx command families.
-pub trait ChipCommandSink<E>:
-    Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E>
+///
+/// The error type is associated rather than generic: a sink has one
+/// error type, shared by its two Sink implementations.
+pub trait ChipCommandSink:
+    Sink<RegisterCommand, Error = <Self as ChipCommandSink>::Error>
+    + Sink<JobCommand, Error = <Self as ChipCommandSink>::Error>
 {
+    type Error;
 }
 
-impl<T, E> ChipCommandSink<E> for T where
-    T: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E>
+impl<T, E> ChipCommandSink for T
+where
+    T: Sink<RegisterCommand, Error = E> + Sink<JobCommand, Error = E>,
 {
+    type Error = E;
 }
+
+/// A sink's error type, spelled out.
+///
+/// `W::Error` alone is ambiguous where `W: ChipCommandSink`, since
+/// each Sink supertrait brings its own `Error`; this alias names the
+/// trait's without the qualified-path noise.
+pub type SinkError<W> = <W as ChipCommandSink>::Error;
 
 /// TYPE=2 frames: register reads/writes and chain addressing. Use CRC5.
 #[derive(Debug)]
