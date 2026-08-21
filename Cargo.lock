@@ -743,12 +743,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc_all"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c46c1a17ebeef917714db3ae9a17bd2184f7e9977d8e020c6c8bcf59a28a6f1b"
-
-[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1794,7 +1788,6 @@ dependencies = [
  "bytes",
  "clap",
  "core-foundation 0.10.1",
- "crc_all",
  "derive_more",
  "futures",
  "hex",
