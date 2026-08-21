@@ -17,18 +17,18 @@ use bitcoin::block::Header as BlockHeader;
 use futures::{SinkExt, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, MissedTickBehavior};
-use tokio_stream::StreamExt;
 
 use super::chip_config::ChipConfig;
 use super::command::{
     ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
     SetChipAddress, SinkError, WriteRegister,
 };
+use super::reader::{Reader, ReaderChannels};
 use super::register::{
     AdcCtrl1, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty, MidstateConfig,
     PllDivider, Register, TicketMask,
 };
-use super::response::{NonceResponse, RegisterResponse, Response};
+use super::response::{NonceResponse, Response};
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -91,14 +91,16 @@ impl BM13xxThread {
 
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
 
+        let (reader, channels) = Reader::spawn(chip_responses);
         let actor = Actor::new(
             config,
             event_tx,
             Arc::clone(&status),
             chip_commands,
             peripherals,
+            reader,
         );
-        tokio::spawn(actor.run(command_rx, removal_rx, chip_responses));
+        tokio::spawn(actor.run(command_rx, removal_rx, channels));
 
         Self {
             name,
@@ -211,9 +213,9 @@ enum ThreadCommand {
 
 /// Internal actor for BM13xxThread.
 ///
-/// The channels and stream the select loop awaits are `run`
-/// parameters rather than fields, so the loop can borrow them
-/// independently of the actor state.
+/// The channels the select loop awaits are `run` parameters rather
+/// than fields, so the loop can borrow them independently of the
+/// actor state.
 struct Actor<W> {
     /// Chip model configuration (identity, PLL parameters).
     config: ChipConfig,
@@ -229,6 +231,10 @@ struct Actor<W> {
 
     /// Hardware interfaces from the board (enable, regulator, etc.).
     peripherals: BoardPeripherals,
+
+    /// Owner of the response demux task. Held only so the task is
+    /// aborted, releasing the serial stream, when the actor exits.
+    _reader: Reader,
 
     /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
@@ -254,6 +260,7 @@ where
         status: Arc<RwLock<HashThreadStatus>>,
         chip_commands: W,
         peripherals: BoardPeripherals,
+        reader: Reader,
     ) -> Self {
         // ASIC ticket mask difficulty: ~1 nonce/sec at nameplate rate
         let asic_difficulty = Log2Difficulty::from_difficulty(
@@ -266,6 +273,7 @@ where
             status,
             chip_commands,
             peripherals,
+            _reader: reader,
             asic_difficulty,
             chip_initialized: false,
             current_task: None,
@@ -277,17 +285,20 @@ where
     ///
     /// Handles commands from the scheduler (update/replace work, go
     /// idle, shutdown), the removal signal from the board (USB unplug,
-    /// fault, etc.), and responses from the chip serial stream. The
-    /// chip is disabled on startup to establish known state, then
+    /// fault, etc.), and the demuxed chip responses from the reader.
+    /// The chip is disabled on startup to establish known state, then
     /// initialized lazily when the scheduler assigns first work.
-    async fn run<R>(
+    async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<ThreadCommand>,
         mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
-        mut chip_responses: R,
-    ) where
-        R: Stream<Item = Result<Response, std::io::Error>> + Unpin,
-    {
+        channels: ReaderChannels,
+    ) {
+        let ReaderChannels {
+            mut nonces,
+            mut register_responses,
+        } = channels;
+
         // Disable ASIC on startup to establish known state
         if let Some(ref mut asic_enable) = self.peripherals.asic_enable
             && let Err(e) = asic_enable.disable().await
@@ -345,15 +356,19 @@ where
                     }
                 }
 
-                // Chip responses from serial stream
-                Some(result) = chip_responses.next() => {
-                    match result {
-                        Ok(response) => self.handle_response(response).await,
-                        Err(e) => {
-                            error!(error = ?e, "Serial decode error");
-                            // TODO: Emit error event, potentially trigger going offline if persistent
-                        }
-                    }
+                // Nonce reports from the chips
+                Some(nonce) = nonces.recv() => {
+                    self.handle_nonce(nonce).await;
+                }
+
+                // Replies to register conversations; nothing asks
+                // yet, so log and discard
+                Some(response) = register_responses.recv() => {
+                    trace!(
+                        chip_address = %format!("0x{:02x}", response.chip_address),
+                        register = ?response.register,
+                        "Register read response"
+                    );
                 }
 
                 // ntime rolling timer (roll forward every second)
@@ -661,113 +676,102 @@ where
         Ok(())
     }
 
-    /// Handles one decoded response from the chip serial stream.
-    async fn handle_response(&mut self, response: Response) {
-        match response {
-            Response::Nonce(NonceResponse {
-                nonce,
-                job_id,
-                version,
-                excess_difficulty,
-                subcore_id,
-            }) => {
-                // Look up the task for this job_id
-                if let Some(task) = self.chip_jobs.get(job_id) {
-                    let template = task.template.as_ref();
+    /// Handles one nonce report from the chips.
+    async fn handle_nonce(&mut self, nonce_response: NonceResponse) {
+        let NonceResponse {
+            nonce,
+            job_id,
+            version,
+            excess_difficulty,
+            subcore_id,
+        } = nonce_response;
 
-                    // Reconstruct full version from rolling field
-                    let full_version = version.apply_to_version(template.version.base());
+        // Look up the task for this job_id
+        if let Some(task) = self.chip_jobs.get(job_id) {
+            let template = task.template.as_ref();
 
-                    // Compute merkle root for this task's EN2
-                    match task
-                        .en2
-                        .as_ref()
-                        .and_then(|en2| template.compute_merkle_root(en2).ok())
-                    {
-                        Some(merkle_root) => {
-                            // Build block header
-                            let header = BlockHeader {
-                                version: full_version,
-                                prev_blockhash: template.prev_blockhash,
-                                merkle_root,
-                                time: task.ntime,
-                                bits: template.bits,
-                                nonce,
-                            };
+            // Reconstruct full version from rolling field
+            let full_version = version.apply_to_version(template.version.base());
 
-                            // Compute hash
-                            let hash = header.block_hash();
+            // Compute merkle root for this task's EN2
+            match task
+                .en2
+                .as_ref()
+                .and_then(|en2| template.compute_merkle_root(en2).ok())
+            {
+                Some(merkle_root) => {
+                    // Build block header
+                    let header = BlockHeader {
+                        version: full_version,
+                        prev_blockhash: template.prev_blockhash,
+                        merkle_root,
+                        time: task.ntime,
+                        bits: template.bits,
+                        nonce,
+                    };
 
-                            // Validate against task share target
-                            if task.share_target.is_met_by(hash) {
-                                // Attribute work at the harder of the
-                                // ASIC ticket mask and the scheduler
-                                // target, since the actual filter is
-                                // whichever is stricter.
-                                let expected_work = max(
-                                    self.asic_difficulty.to_work(),
-                                    task.share_target.to_work(),
-                                );
+                    // Compute hash
+                    let hash = header.block_hash();
 
-                                let share = Share {
-                                    nonce,
-                                    hash,
-                                    version: full_version,
-                                    ntime: task.ntime,
-                                    extranonce2: task.en2,
-                                    expected_work,
-                                };
+                    // Validate against task share target
+                    if task.share_target.is_met_by(hash) {
+                        // Attribute work at the harder of the
+                        // ASIC ticket mask and the scheduler
+                        // target, since the actual filter is
+                        // whichever is stricter.
+                        let expected_work =
+                            max(self.asic_difficulty.to_work(), task.share_target.to_work());
 
-                                // Send via task's dedicated channel
-                                if task.share_tx.send(share).await.is_err() {
-                                    // Channel closed = task replaced, share is stale
-                                    debug!("Share channel closed (task replaced)");
-                                } else {
-                                    debug!(
-                                        chip_job_id = job_id,
-                                        nonce = format!("{:#x}", nonce),
-                                        hash = %hash,
-                                        hash_diff = %Difficulty::from_hash(&hash),
-                                        target_diff = %Difficulty::from_target(task.share_target),
-                                        "Share found and sent"
-                                    );
-                                }
-                            } else {
-                                trace!(
-                                    chip_job_id = job_id,
-                                    nonce = format!("{:#x}", nonce),
-                                    hash = %hash,
-                                    hash_diff = %Difficulty::from_hash(&hash),
-                                    target_diff = %Difficulty::from_target(task.share_target),
-                                    "Nonce does not meet target (filtered)"
-                                );
-                            }
-                        }
-                        None => {
-                            error!(
+                        let share = Share {
+                            nonce,
+                            hash,
+                            version: full_version,
+                            ntime: task.ntime,
+                            extranonce2: task.en2,
+                            expected_work,
+                        };
+
+                        // Send via task's dedicated channel
+                        if task.share_tx.send(share).await.is_err() {
+                            // Channel closed = task replaced, share is stale
+                            debug!("Share channel closed (task replaced)");
+                        } else {
+                            debug!(
                                 chip_job_id = job_id,
-                                "Failed to compute merkle root for nonce"
+                                nonce = format!("{:#x}", nonce),
+                                hash = %hash,
+                                hash_diff = %Difficulty::from_hash(&hash),
+                                target_diff = %Difficulty::from_target(task.share_target),
+                                "Share found and sent"
                             );
                         }
+                    } else {
+                        trace!(
+                            chip_job_id = job_id,
+                            nonce = format!("{:#x}", nonce),
+                            hash = %hash,
+                            hash_diff = %Difficulty::from_hash(&hash),
+                            target_diff = %Difficulty::from_target(task.share_target),
+                            "Nonce does not meet target (filtered)"
+                        );
                     }
-                } else {
-                    trace!(
+                }
+                None => {
+                    error!(
                         chip_job_id = job_id,
-                        nonce = format!("{:#x}", nonce),
-                        "Nonce for unknown job_id (possibly stale)"
+                        "Failed to compute merkle root for nonce"
                     );
                 }
-
-                let _ = (excess_difficulty, subcore_id); // Unused for now
             }
-
-            Response::ReadRegister(RegisterResponse {
-                chip_address,
-                register,
-            }) => {
-                trace!(chip_address = %format!("0x{:02x}", chip_address), register = ?register, "Register read response");
-            }
+        } else {
+            trace!(
+                chip_job_id = job_id,
+                nonce = format!("{:#x}", nonce),
+                "Nonce for unknown job_id (possibly stale)"
+            );
         }
+
+        let _ = (excess_difficulty, subcore_id); // Unused for now
     }
 
     /// Rolls the current task's ntime forward and sends the job to
