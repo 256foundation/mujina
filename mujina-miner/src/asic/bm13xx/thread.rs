@@ -19,7 +19,7 @@ use tokio_stream::StreamExt;
 
 use super::command::{
     ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
-    SetChipAddress, WriteRegister,
+    SetChipAddress, SinkError, WriteRegister,
 };
 use super::register::{
     AnalogMux, Core, InitControl, IoDriverStrength, Log2Difficulty, MiscControl, MiscSettings,
@@ -133,7 +133,7 @@ impl BM13xxThread {
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
-    pub fn new<R, W, E>(
+    pub fn new<R, W>(
         name: String,
         chip_responses: R,
         chip_commands: W,
@@ -142,8 +142,8 @@ impl BM13xxThread {
     ) -> Self
     where
         R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
-        W: ChipCommandSink<E> + Unpin + Send + 'static,
-        E: std::error::Error + Send + Sync + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, evt_rx) = mpsc::channel(100);
@@ -249,14 +249,14 @@ impl HashThread for BM13xxThread {
 /// Initialize BM13xx chip for mining.
 ///
 /// Enables chip, configures all registers, and ramps frequency to target.
-async fn initialize_chip<W, E>(
+async fn initialize_chip<W>(
     chip_commands: &mut W,
     peripherals: &mut BoardPeripherals,
     asic_difficulty: Log2Difficulty,
 ) -> Result<()>
 where
-    W: ChipCommandSink<E> + Unpin,
-    E: std::error::Error + Send + Sync + 'static,
+    W: ChipCommandSink + Unpin,
+    SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
@@ -571,7 +571,7 @@ fn calculate_pll_for_frequency(target_freq: f32) -> Option<PllDivider> {
 ///
 /// Chip is disabled on startup to establish known state. Chip is enabled and
 /// configured when scheduler assigns first work.
-async fn bm13xx_thread_actor<R, W, E>(
+async fn bm13xx_thread_actor<R, W>(
     mut cmd_rx: mpsc::Receiver<ThreadCommand>,
     evt_tx: mpsc::Sender<HashThreadEvent>,
     mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
@@ -581,8 +581,8 @@ async fn bm13xx_thread_actor<R, W, E>(
     mut peripherals: BoardPeripherals,
 ) where
     R: Stream<Item = Result<Response, std::io::Error>> + Unpin,
-    W: ChipCommandSink<E> + Unpin,
-    E: std::error::Error + Send + Sync + 'static,
+    W: ChipCommandSink + Unpin,
+    SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
     // Disable ASIC on startup to establish known state
     if let Some(ref mut asic_enable) = peripherals.asic_enable
