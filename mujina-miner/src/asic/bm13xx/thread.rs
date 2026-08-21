@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, MissedTickBehavior};
 use tokio_stream::StreamExt;
 
+use super::chip_config::ChipConfig;
 use super::command::{
     ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
     SetChipAddress, SinkError, WriteRegister,
@@ -34,7 +35,7 @@ use crate::{
         HashThreadStatus, Share, ThreadRemovalSignal,
     },
     tracing::prelude::*,
-    types::{Difficulty, HashRate, ShareRate},
+    types::{Difficulty, Frequency, HashRate, ShareRate},
 };
 
 /// BM13xx HashThread implementation.
@@ -67,12 +68,14 @@ impl BM13xxThread {
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
+    /// * `config` - Chip model configuration (identity, PLL parameters)
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
     pub fn new<R, W>(
         name: String,
+        config: ChipConfig,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
@@ -88,7 +91,13 @@ impl BM13xxThread {
 
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
 
-        let actor = Actor::new(event_tx, Arc::clone(&status), chip_commands, peripherals);
+        let actor = Actor::new(
+            config,
+            event_tx,
+            Arc::clone(&status),
+            chip_commands,
+            peripherals,
+        );
         tokio::spawn(actor.run(command_rx, removal_rx, chip_responses));
 
         Self {
@@ -206,6 +215,9 @@ enum ThreadCommand {
 /// parameters rather than fields, so the loop can borrow them
 /// independently of the actor state.
 struct Actor<W> {
+    /// Chip model configuration (identity, PLL parameters).
+    config: ChipConfig,
+
     /// Event channel to the scheduler.
     event_tx: mpsc::Sender<HashThreadEvent>,
 
@@ -237,6 +249,7 @@ where
     SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
     fn new(
+        config: ChipConfig,
         event_tx: mpsc::Sender<HashThreadEvent>,
         status: Arc<RwLock<HashThreadStatus>>,
         chip_commands: W,
@@ -248,6 +261,7 @@ where
         );
 
         Self {
+            config,
             event_tx,
             status,
             chip_commands,
@@ -609,7 +623,7 @@ where
 
         // Frequency ramping (56.25 MHz -> 525 MHz)
         debug!("Ramping frequency from 56.25 MHz to 525 MHz");
-        let frequency_steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
+        let frequency_steps = generate_frequency_ramp_steps(&self.config, 56.25, 525.0, 6.25);
 
         for (i, pll_config) in frequency_steps.iter().enumerate() {
             self.chip_commands
@@ -864,6 +878,7 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
 
 /// Generate frequency ramp steps for smooth PLL transitions
 fn generate_frequency_ramp_steps(
+    config: &ChipConfig,
     start_mhz: f32,
     target_mhz: f32,
     step_mhz: f32,
@@ -872,8 +887,8 @@ fn generate_frequency_ramp_steps(
     let mut current = start_mhz;
 
     while current <= target_mhz {
-        if let Some(config) = calculate_pll_for_frequency(current) {
-            configs.push(config);
+        if let Some(pll) = config.calculate_pll(Frequency::from_mhz(current)) {
+            configs.push(pll);
         }
         current += step_mhz;
         if current > target_mhz && (current - step_mhz) < target_mhz {
@@ -884,164 +899,37 @@ fn generate_frequency_ramp_steps(
     configs
 }
 
-/// Calculate PLL configuration for a specific frequency
-fn calculate_pll_for_frequency(target_freq: f32) -> Option<PllDivider> {
-    const CRYSTAL_FREQ: f32 = 25.0;
-    const MAX_FREQ_ERROR: f32 = 1.0;
-
-    let mut best_fb_div = 0u8;
-    let mut best_ref_div = 0u8;
-    let mut best_post_div1 = 0u8;
-    let mut best_post_div2 = 0u8;
-    let mut min_error = 10.0;
-
-    for ref_div in [2, 1] {
-        if best_fb_div != 0 {
-            break;
-        }
-        for post_div1 in (1..=7).rev() {
-            if best_fb_div != 0 {
-                break;
-            }
-            for post_div2 in (1..=7).rev() {
-                if best_fb_div != 0 {
-                    break;
-                }
-                if post_div1 >= post_div2 {
-                    let fb_div_f = (post_div1 * post_div2) as f32 * target_freq * ref_div as f32
-                        / CRYSTAL_FREQ;
-                    let fb_div = fb_div_f.round() as u8;
-
-                    if (0xa0..=0xef).contains(&fb_div) {
-                        let actual_freq =
-                            CRYSTAL_FREQ * fb_div as f32 / (ref_div * post_div1 * post_div2) as f32;
-                        let error = (actual_freq - target_freq).abs();
-
-                        if error < min_error && error < MAX_FREQ_ERROR {
-                            best_fb_div = fb_div;
-                            best_ref_div = ref_div;
-                            best_post_div1 = post_div1;
-                            best_post_div2 = post_div2;
-                            min_error = error;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if best_fb_div == 0 {
-        return None;
-    }
-
-    let post_div = ((best_post_div1 - 1) << 4) | (best_post_div2 - 1);
-    Some(PllDivider::new(best_fb_div, best_ref_div, post_div))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asic::bm13xx::register::VcoSel;
+    use crate::asic::bm13xx::chip_config;
 
     #[test]
-    fn test_pll_calculations_match_reference() {
-        // Test cases from the Bitaxe Gamma protocol capture
-        // Format: (freq_mhz, expected_vco_sel, expected_fb_div, expected_ref_div, expected_post_div)
-        let test_cases = vec![
-            (62.50, VcoSel::High, 0xD2, 0x02, 0x65),
-            (68.75, VcoSel::High, 0xE7, 0x02, 0x65),
-            (75.00, VcoSel::High, 0xD2, 0x02, 0x64),
-            (81.25, VcoSel::High, 0xE4, 0x02, 0x64),
-            (87.50, VcoSel::High, 0xC4, 0x02, 0x63),
-            (93.75, VcoSel::High, 0xD2, 0x02, 0x63),
-            (100.00, VcoSel::High, 0xE0, 0x02, 0x63),
-            (525.00, VcoSel::High, 0xD2, 0x02, 0x40),
+    fn ramp_covers_range_in_steps() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(&config, 56.25, 525.0, 6.25);
+
+        // 75 steps of 6.25 MHz above the starting frequency
+        assert_eq!(steps.len(), 76);
+
+        // Each step is the solver's answer for the next stepped
+        // frequency
+        for (i, step) in steps.iter().enumerate() {
+            let freq = Frequency::from_hz(56_250_000 + i as u64 * 6_250_000);
+            assert_eq!(*step, config.calculate_pll(freq).unwrap(), "step {i}");
+        }
+    }
+
+    #[test]
+    fn ramp_ends_on_target_when_step_overshoots() {
+        let config = chip_config::bm1370();
+        let steps = generate_frequency_ramp_steps(&config, 56.25, 60.0, 6.25);
+
+        let expected = [
+            config.calculate_pll(Frequency::from_mhz(56.25)).unwrap(),
+            config.calculate_pll(Frequency::from_mhz(60.0)).unwrap(),
         ];
-
-        for (freq_mhz, expected_vco_sel, expected_fb, expected_ref, expected_post) in test_cases {
-            let config = calculate_pll_for_frequency(freq_mhz)
-                .unwrap_or_else(|| panic!("Failed to calculate PLL for {} MHz", freq_mhz));
-
-            assert_eq!(
-                config.vco_sel, expected_vco_sel,
-                "VCO select mismatch for {} MHz",
-                freq_mhz
-            );
-            assert_eq!(
-                config.fb_div, expected_fb,
-                "FB divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_fb, config.fb_div
-            );
-            assert_eq!(
-                config.ref_div, expected_ref,
-                "Ref divider mismatch for {} MHz: expected {}, got {}",
-                freq_mhz, expected_ref, config.ref_div
-            );
-            assert_eq!(
-                config.post_div, expected_post,
-                "Post divider mismatch for {} MHz: expected 0x{:02X}, got 0x{:02X}",
-                freq_mhz, expected_post, config.post_div
-            );
-
-            let post_div1 = ((config.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (config.post_div & 0xF) + 1;
-            let calculated_freq =
-                25.0 * config.fb_div as f32 / (config.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (calculated_freq - freq_mhz).abs() < 1.0,
-                "Frequency calculation error for {} MHz: calculated {} MHz",
-                freq_mhz,
-                calculated_freq
-            );
-        }
-    }
-
-    #[test]
-    fn test_frequency_ramp_generation() {
-        let steps = generate_frequency_ramp_steps(56.25, 525.0, 6.25);
-
-        // (525 - 56.25) / 6.25 + 1 = 76 steps
-        assert_eq!(steps.len(), 76, "Expected 76 frequency steps");
-
-        if let Some(first) = steps.first() {
-            let post_div1 = ((first.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (first.post_div & 0xF) + 1;
-            let first_freq =
-                25.0 * first.fb_div as f32 / (first.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (first_freq - 56.25).abs() < 1.0,
-                "First frequency should be ~56.25 MHz"
-            );
-        }
-
-        if let Some(last) = steps.last() {
-            let post_div1 = ((last.post_div >> 4) & 0xF) + 1;
-            let post_div2 = (last.post_div & 0xF) + 1;
-            let last_freq =
-                25.0 * last.fb_div as f32 / (last.ref_div * post_div1 * post_div2) as f32;
-            assert!(
-                (last_freq - 525.0).abs() < 1.0,
-                "Last frequency should be ~525 MHz"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pll_flag_setting() {
-        // The VCO select is High when VCO frequency >= 2400 MHz
-        let low_freq = calculate_pll_for_frequency(100.0).unwrap();
-        assert_eq!(
-            low_freq.vco_sel,
-            VcoSel::High,
-            "high-VCO select for 100 MHz"
-        );
-
-        let high_freq = calculate_pll_for_frequency(525.0).unwrap();
-        assert_eq!(
-            high_freq.vco_sel,
-            VcoSel::High,
-            "high-VCO select for 525 MHz"
-        );
+        assert_eq!(steps, expected);
     }
 
     #[test]
