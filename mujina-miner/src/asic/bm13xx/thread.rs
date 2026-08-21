@@ -8,6 +8,7 @@
 //! chip responses, filters shares, and manages work assignment.
 
 use std::cmp::max;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -24,9 +25,8 @@ use super::command::{
     SetChipAddress, SinkError, WriteRegister,
 };
 use super::register::{
-    AdcCtrl1, AnalogMux, ChipModel, CoreCommand, CoreRegister, HashCountingNumber,
-    IoDriverStrength, Log2Difficulty, MidstateConfig, MiscControl, PllDivider, Register,
-    SoftResetControl, TicketMask,
+    AdcCtrl1, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty, MidstateConfig,
+    PllDivider, Register, TicketMask,
 };
 use super::response::{NonceResponse, RegisterResponse, Response};
 use crate::{
@@ -35,7 +35,7 @@ use crate::{
         HashThreadStatus, Share, ThreadRemovalSignal,
     },
     tracing::prelude::*,
-    types::{Difficulty, Frequency, HashRate, ShareRate},
+    types::{Difficulty, Frequency, ShareRate},
 };
 
 /// BM13xx HashThread implementation.
@@ -255,9 +255,9 @@ where
         chip_commands: W,
         peripherals: BoardPeripherals,
     ) -> Self {
-        // ASIC ticket mask difficulty: ~1 nonce/sec at 1 TH/s
+        // ASIC ticket mask difficulty: ~1 nonce/sec at nameplate rate
         let asic_difficulty = Log2Difficulty::from_difficulty(
-            ShareRate::per_second(1.0).to_difficulty(HashRate::from_terahashes(1.0)),
+            ShareRate::per_second(1.0).to_difficulty(config.nameplate),
         );
 
         Self {
@@ -368,9 +368,9 @@ where
 
     /// Declares the thread's expected hashrate to the scheduler.
     async fn configure(&mut self) {
-        // Nameplate rate for one BM1370 chip; a rough stand-in
-        // for a real frequency-derived estimate.
-        let expected = HashRate::from_terahashes(1.0);
+        // Nameplate rate for one chip; a rough stand-in for a real
+        // frequency-derived estimate.
+        let expected = self.config.nameplate;
         if self
             .event_tx
             .send(HashThreadEvent::ExpectedHashRate(expected))
@@ -490,13 +490,13 @@ where
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::SoftResetControl(SoftResetControl::defaults(ChipModel::BM1370)),
+                register: Register::SoftResetControl(self.config.soft_reset_defaults),
             }))
             .await?;
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::MiscControl(MiscControl::reporting_enabled(ChipModel::BM1370)),
+                register: Register::MiscControl(self.config.misc_control),
             }))
             .await?;
 
@@ -518,10 +518,7 @@ where
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::CoreMailbox(CoreCommand::write_all(
-                    CoreRegister::ClockSelectBM1368,
-                    0x00,
-                )),
+                register: Register::CoreMailbox(self.config.clock_select),
             }))
             .await?;
         self.chip_commands
@@ -556,24 +553,19 @@ where
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Chip(0x00),
-                register: Register::SoftResetControl(SoftResetControl::core_reset(
-                    ChipModel::BM1370,
-                )),
+                register: Register::SoftResetControl(self.config.core_reset),
             }))
             .await?;
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Chip(0x00),
-                register: Register::MiscControl(MiscControl::reporting_enabled(ChipModel::BM1370)),
+                register: Register::MiscControl(self.config.misc_control),
             }))
             .await?;
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Chip(0x00),
-                register: Register::CoreMailbox(CoreCommand::write_all(
-                    CoreRegister::ClockSelectBM1368,
-                    0x00,
-                )),
+                register: Register::CoreMailbox(self.config.clock_select),
             }))
             .await?;
         self.chip_commands
@@ -605,7 +597,7 @@ where
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::AnalogMux(AnalogMux::bring_up(ChipModel::BM1370)),
+                register: Register::AnalogMux(self.config.analog_mux),
             }))
             .await?;
         self.chip_commands
@@ -621,9 +613,16 @@ where
             }))
             .await?;
 
-        // Frequency ramping (56.25 MHz -> 525 MHz)
-        debug!("Ramping frequency from 56.25 MHz to 525 MHz");
-        let frequency_steps = generate_frequency_ramp_steps(&self.config, 56.25, 525.0, 6.25);
+        // Frequency ramping from the reset frequency to the
+        // configured target
+        let ramp = *self.config.freq_range.start()..=self.config.default_freq;
+        debug!(
+            "Ramping frequency from {} MHz to {} MHz",
+            ramp.start().mhz(),
+            ramp.end().mhz()
+        );
+        let frequency_steps =
+            generate_frequency_ramp_steps(&self.config, ramp, self.config.ramp_step);
 
         for (i, pll_config) in frequency_steps.iter().enumerate() {
             self.chip_commands
@@ -643,12 +642,11 @@ where
 
         debug!("Frequency ramping complete");
 
-        // Final configuration. The hash counting number is the BM1370
-        // factory value observed in captures.
+        // Final configuration
         self.chip_commands
             .send(RegisterCommand::WriteRegister(WriteRegister {
                 destination: Destination::Broadcast,
-                register: Register::HashCountingNumber(HashCountingNumber::from(0x1EB5)),
+                register: Register::HashCountingNumber(self.config.hash_counting_number),
             }))
             .await?;
         self.chip_commands
@@ -879,21 +877,24 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
 /// Generate frequency ramp steps for smooth PLL transitions
 fn generate_frequency_ramp_steps(
     config: &ChipConfig,
-    start_mhz: f32,
-    target_mhz: f32,
-    step_mhz: f32,
+    range: RangeInclusive<Frequency>,
+    step: Frequency,
 ) -> Vec<PllDivider> {
+    let target = *range.end();
     let mut configs = Vec::new();
-    let mut current = start_mhz;
+    let mut current = *range.start();
 
-    while current <= target_mhz {
-        if let Some(pll) = config.calculate_pll(Frequency::from_mhz(current)) {
+    while current <= target {
+        if let Some(pll) = config.calculate_pll(current) {
             configs.push(pll);
         }
-        current += step_mhz;
-        if current > target_mhz && (current - step_mhz) < target_mhz {
-            current = target_mhz;
-        }
+        let next = Frequency::from_hz(current.hz() + step.hz());
+        // A final short step ends the ramp exactly on the target
+        current = if next > target && current < target {
+            target
+        } else {
+            next
+        };
     }
 
     configs
@@ -907,7 +908,11 @@ mod tests {
     #[test]
     fn ramp_covers_range_in_steps() {
         let config = chip_config::bm1370();
-        let steps = generate_frequency_ramp_steps(&config, 56.25, 525.0, 6.25);
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
+            Frequency::from_mhz(6.25),
+        );
 
         // 75 steps of 6.25 MHz above the starting frequency
         assert_eq!(steps.len(), 76);
@@ -923,7 +928,11 @@ mod tests {
     #[test]
     fn ramp_ends_on_target_when_step_overshoots() {
         let config = chip_config::bm1370();
-        let steps = generate_frequency_ramp_steps(&config, 56.25, 60.0, 6.25);
+        let steps = generate_frequency_ramp_steps(
+            &config,
+            Frequency::from_mhz(56.25)..=Frequency::from_mhz(60.0),
+            Frequency::from_mhz(6.25),
+        );
 
         let expected = [
             config.calculate_pll(Frequency::from_mhz(56.25)).unwrap(),

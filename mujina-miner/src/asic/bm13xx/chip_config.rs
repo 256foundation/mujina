@@ -8,8 +8,11 @@
 
 use std::ops::RangeInclusive;
 
-use super::register::{ChipModel, PllDivider};
-use crate::types::Frequency;
+use super::register::{
+    AnalogMux, ChipModel, CoreCommand, CoreRegister, HashCountingNumber, MiscControl, PllDivider,
+    SoftResetControl,
+};
+use crate::types::{Frequency, HashRate};
 
 /// Per-chip-model configuration.
 ///
@@ -30,10 +33,41 @@ use crate::types::Frequency;
 pub struct ChipConfig {
     /// Chip model identity. Verified during enumeration.
     pub model: ChipModel,
+
     /// Frequencies supported on this chip. The lower bound is the
     /// chip's frequency out of reset, where the bring-up ramp
     /// starts.
     pub freq_range: RangeInclusive<Frequency>,
+
+    /// Default hash frequency.
+    pub default_freq: Frequency,
+
+    /// Frequency increase per ramp write.
+    pub ramp_step: Frequency,
+
+    /// Nonce sweep length, the factory value observed in captures at
+    /// the default frequency.
+    pub hash_counting_number: HashCountingNumber,
+
+    /// Nameplate hashrate of one chip: a production machine's
+    /// specified hashrate over its chip count, rounded.
+    pub nameplate: HashRate,
+
+    /// Soft reset value written broadcast before configuration.
+    pub soft_reset_defaults: SoftResetControl,
+
+    /// Soft reset value that resets each chip's cores.
+    pub core_reset: SoftResetControl,
+
+    /// Misc control value with nonce reporting enabled.
+    pub misc_control: MiscControl,
+
+    /// Analog mux routing written during bring-up.
+    pub analog_mux: AnalogMux,
+
+    /// Clock-select core command; register and value vary by model.
+    pub clock_select: CoreCommand,
+
     /// PLL search bounds for this chip model.
     pub pll_params: PllParams,
 }
@@ -99,13 +133,24 @@ impl ChipConfig {
     }
 }
 
-/// BM1362 defaults (EmberOne00, S19 J Pro). The frequency range
-/// follows the S19 J Pro capture's ramp target; the PLL bounds follow
-/// the model's row in REFERENCE.md.
+/// BM1362 defaults (EmberOne00, S19 J Pro). The frequency range and
+/// ramp step follow the S19 J Pro capture's ramp; the PLL bounds
+/// follow the model's row in REFERENCE.md.
 pub fn bm1362() -> ChipConfig {
     ChipConfig {
         model: ChipModel::BM1362,
         freq_range: Frequency::from_mhz(56.25)..=Frequency::from_mhz(525.0),
+        default_freq: Frequency::from_mhz(525.0),
+        ramp_step: Frequency::from_mhz(6.25),
+        hash_counting_number: HashCountingNumber::from(0x1381),
+        // S19j Pro: 104 TH/s over 378 chips
+        nameplate: HashRate::from_gigahashes(275.0),
+        soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1362),
+        core_reset: SoftResetControl::core_reset(ChipModel::BM1362),
+        misc_control: MiscControl::reporting_enabled(ChipModel::BM1362),
+        analog_mux: AnalogMux::bring_up(ChipModel::BM1362),
+        // Register offset and value from the S19j Pro capture
+        clock_select: CoreCommand::write_all(CoreRegister::ClockSelectBM1362, 0x40),
         pll_params: PllParams {
             fb_div_min: 0x10,
             fb_div_max: 0xfa,
@@ -115,13 +160,24 @@ pub fn bm1362() -> ChipConfig {
     }
 }
 
-/// BM1370 defaults (Bitaxe Gamma, S21 Pro). The frequency range
-/// follows the S21 Pro capture's ramp target; the PLL bounds follow
-/// the model's row in REFERENCE.md.
+/// BM1370 defaults (Bitaxe Gamma, S21 Pro). The frequency range and
+/// ramp step follow the S21 Pro capture's ramp; the PLL bounds
+/// follow the model's row in REFERENCE.md.
 pub fn bm1370() -> ChipConfig {
     ChipConfig {
         model: ChipModel::BM1370,
         freq_range: Frequency::from_mhz(56.25)..=Frequency::from_mhz(600.0),
+        default_freq: Frequency::from_mhz(525.0),
+        ramp_step: Frequency::from_mhz(6.25),
+        hash_counting_number: HashCountingNumber::from(0x1EB5),
+        // S21 Pro: 234 TH/s over 195 chips
+        nameplate: HashRate::from_terahashes(1.2),
+        soft_reset_defaults: SoftResetControl::defaults(ChipModel::BM1370),
+        core_reset: SoftResetControl::core_reset(ChipModel::BM1370),
+        misc_control: MiscControl::reporting_enabled(ChipModel::BM1370),
+        analog_mux: AnalogMux::bring_up(ChipModel::BM1370),
+        // Register offset and value from the Bitaxe capture
+        clock_select: CoreCommand::write_all(CoreRegister::ClockSelectBM1368, 0x00),
         pll_params: PllParams {
             fb_div_min: 0xa0,
             fb_div_max: 0xef,
