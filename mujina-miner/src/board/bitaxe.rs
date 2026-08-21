@@ -518,6 +518,8 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
 
     time::sleep(Duration::from_millis(100)).await;
 
+    // Set point only; the hash thread enables the output at first
+    // task assignment
     const DEFAULT_VOUT: f32 = 1.15;
     tps546
         .set_vout_target(DEFAULT_VOUT)
@@ -527,18 +529,6 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
         .clear_faults()
         .await
         .context("failed to clear faults")?;
-    tps546
-        .enable_output()
-        .await
-        .context("failed to enable output")?;
-    debug!("Core voltage set to {DEFAULT_VOUT}V");
-
-    time::sleep(Duration::from_millis(500)).await;
-
-    match tps546.get_vout().await {
-        Ok(mv) => debug!("Core voltage readback: {:.3}V", mv as f32 / 1000.0),
-        Err(e) => warn!("Failed to read core voltage: {}", e),
-    }
 
     if let Err(e) = tps546.dump_configuration().await {
         warn!("Failed to dump TPS546 configuration: {}", e);

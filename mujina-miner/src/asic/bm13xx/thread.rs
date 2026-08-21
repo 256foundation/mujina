@@ -259,6 +259,16 @@ where
     W: ChipCommandSink + Unpin,
     SinkError<W>: std::error::Error + Send + Sync + 'static,
 {
+    // Power the core rail before releasing reset
+    if let Some(ref mut regulator) = peripherals.voltage_regulator {
+        debug!("Enabling core voltage");
+        regulator
+            .enable()
+            .await
+            .context("failed to enable core voltage")?;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
     // Enable the ASIC
     if let Some(ref mut asic_enable) = peripherals.asic_enable {
         debug!("Enabling ASIC");
