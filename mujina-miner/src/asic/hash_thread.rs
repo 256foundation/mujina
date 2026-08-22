@@ -129,14 +129,16 @@ pub trait AsicEnable: Send + Sync {
 
 /// Hardware interfaces provided by the board to the hash thread.
 ///
-/// Bundles optional hardware capabilities. Not all boards provide all
-/// interfaces. Hash threads should handle missing capabilities gracefully.
+/// Every board supplies every interface. A board whose hardware
+/// lacks a control (a fixed rail, no host-driven reset) supplies an
+/// implementation declaring that, such as a regulator whose disable
+/// is a no-op, rather than omitting the interface.
 pub struct BoardPeripherals {
     /// ASIC enable/disable control
-    pub asic_enable: Option<Box<dyn AsicEnable>>,
+    pub asic_enable: Box<dyn AsicEnable>,
 
     /// Voltage regulator control
-    pub voltage_regulator: Option<Box<dyn VoltageRegulator>>,
+    pub voltage_regulator: Box<dyn VoltageRegulator>,
 }
 
 /// Signal from board to hash thread for shutdown coordination.

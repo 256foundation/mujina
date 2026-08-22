@@ -312,9 +312,7 @@ where
         } = channels;
 
         // Disable ASIC on startup to establish known state
-        if let Some(ref mut asic_enable) = self.peripherals.asic_enable
-            && let Err(e) = asic_enable.disable().await
-        {
+        if let Err(e) = self.peripherals.asic_enable.disable().await {
             warn!(error = %e, "Failed to disable ASIC on startup");
         }
 
@@ -481,23 +479,21 @@ where
         register_responses: &mut mpsc::Receiver<RegisterResponse>,
     ) -> Result<()> {
         // Power the core rail before releasing reset
-        if let Some(ref mut regulator) = self.peripherals.voltage_regulator {
-            debug!("Enabling core voltage");
-            regulator
-                .enable()
-                .await
-                .context("failed to enable core voltage")?;
-            time::sleep(Duration::from_millis(500)).await;
-        }
+        debug!("Enabling core voltage");
+        self.peripherals
+            .voltage_regulator
+            .enable()
+            .await
+            .context("failed to enable core voltage")?;
+        time::sleep(Duration::from_millis(500)).await;
 
         // Enable the ASIC
-        if let Some(ref mut asic_enable) = self.peripherals.asic_enable {
-            debug!("Enabling ASIC");
-            asic_enable
-                .enable()
-                .await
-                .context("failed to enable ASIC")?;
-        }
+        debug!("Enabling ASIC");
+        self.peripherals
+            .asic_enable
+            .enable()
+            .await
+            .context("failed to enable ASIC")?;
 
         time::sleep(Duration::from_millis(200)).await;
 

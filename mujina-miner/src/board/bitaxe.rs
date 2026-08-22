@@ -116,8 +116,8 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     } = device;
 
     let peripherals = BoardPeripherals {
-        asic_enable: Some(Box::new(asic_enable)),
-        voltage_regulator: Some(Box::new(voltage_regulator)),
+        asic_enable: Box::new(asic_enable),
+        voltage_regulator: Box::new(voltage_regulator),
     };
 
     let thread = BM13xxThread::new(
