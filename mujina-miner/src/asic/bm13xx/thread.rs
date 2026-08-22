@@ -390,7 +390,21 @@ where
             }
         }
 
+        self.disable_chain().await;
         debug!("BM13xx thread actor exiting");
+    }
+
+    /// Asserts the chips' reset, then disables the core rail.
+    /// Idempotent, and safe before bring-up. On an unplugged
+    /// board both writes fail; the warnings are all that can be
+    /// done.
+    async fn disable_chain(&mut self) {
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on exit");
+        }
+        if let Err(e) = self.peripherals.voltage_regulator.disable().await {
+            warn!(error = %e, "Failed to disable core voltage on exit");
+        }
     }
 
     /// Declares the thread's expected hashrate to the scheduler.
