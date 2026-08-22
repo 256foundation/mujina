@@ -113,18 +113,18 @@ pub enum HashThreadEvent {
 // Hardware abstraction traits for hash threads
 // ---------------------------------------------------------------------------
 
-/// ASIC enable/disable control.
+/// The chips' reset line.
 ///
-/// Hash threads use this to enable chips during initialization and disable
-/// them during shutdown. The underlying mechanism (reset pin, power gate,
-/// etc.) is an implementation detail.
+/// Hash threads hold the chips in reset until bring-up and assert
+/// reset again at shutdown. What drives the line (a GPIO, a
+/// management protocol command, etc.) is the board's concern.
 #[async_trait]
-pub trait AsicEnable: Send + Sync {
-    /// Enable the ASIC (allow it to run).
-    async fn enable(&mut self) -> Result<()>;
+pub trait ResetLine: Send + Sync {
+    /// Asserts reset, stopping the chips.
+    async fn assert(&mut self) -> Result<()>;
 
-    /// Disable the ASIC (put it in a safe, non-hashing state).
-    async fn disable(&mut self) -> Result<()>;
+    /// Releases reset, letting the chips run.
+    async fn release(&mut self) -> Result<()>;
 }
 
 /// Hardware interfaces provided by the board to the hash thread.
@@ -134,8 +134,8 @@ pub trait AsicEnable: Send + Sync {
 /// implementation declaring that, such as a regulator whose disable
 /// is a no-op, rather than omitting the interface.
 pub struct BoardPeripherals {
-    /// ASIC enable/disable control
-    pub asic_enable: Box<dyn AsicEnable>,
+    /// The chips' reset line
+    pub reset_line: Box<dyn ResetLine>,
 
     /// Voltage regulator control
     pub voltage_regulator: Box<dyn VoltageRegulator>,
