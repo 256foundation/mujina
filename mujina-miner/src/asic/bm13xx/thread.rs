@@ -66,8 +66,8 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts with chips disabled. The chain will be initialized when
-    /// first work is assigned.
+    /// Thread starts with the chips held in reset. The chain will be
+    /// initialized when first work is assigned.
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
@@ -75,7 +75,7 @@ impl BM13xxThread {
     /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
-    /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
+    /// * `peripherals` - Hardware interfaces from board (reset line, regulator, etc.)
     /// * `removal_rx` - Watch channel for board-triggered removal
     pub fn new<R, W>(
         name: String,
@@ -239,7 +239,7 @@ struct Actor<W> {
     /// Sink for sending encoded commands to chips.
     chip_commands: W,
 
-    /// Hardware interfaces from the board (enable, regulator, etc.).
+    /// Hardware interfaces from the board (reset line, regulator, etc.).
     peripherals: BoardPeripherals,
 
     /// Owner of the response demux task. Held only so the task is
@@ -298,8 +298,9 @@ where
     /// Handles commands from the scheduler (update/replace work, go
     /// idle, shutdown), the removal signal from the board (USB unplug,
     /// fault, etc.), and the demuxed chip responses from the reader.
-    /// The chip is disabled on startup to establish known state, then
-    /// initialized lazily when the scheduler assigns first work.
+    /// Reset is asserted on startup to establish known state; the
+    /// chain is initialized lazily when the scheduler assigns first
+    /// work.
     async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<ThreadCommand>,
@@ -311,9 +312,9 @@ where
             mut register_responses,
         } = channels;
 
-        // Disable ASIC on startup to establish known state
-        if let Err(e) = self.peripherals.asic_enable.disable().await {
-            warn!(error = %e, "Failed to disable ASIC on startup");
+        // Assert reset on startup to establish known state
+        if let Err(e) = self.peripherals.reset_line.assert().await {
+            warn!(error = %e, "Failed to assert chip reset on startup");
         }
 
         let mut ntime_ticker = time::interval(Duration::from_secs(1));
@@ -471,9 +472,10 @@ where
 
     /// Initializes the chip chain for mining.
     ///
-    /// Enables the chips, enumerates them against the declared
-    /// topology, assigns addresses, configures all registers, and
-    /// ramps the frequency to target.
+    /// Powers the core rail, releases the chips from reset,
+    /// enumerates them against the declared topology, assigns
+    /// addresses, configures all registers, and ramps the frequency
+    /// to target.
     async fn initialize_chain(
         &mut self,
         register_responses: &mut mpsc::Receiver<RegisterResponse>,
@@ -487,13 +489,13 @@ where
             .context("failed to enable core voltage")?;
         time::sleep(Duration::from_millis(500)).await;
 
-        // Enable the ASIC
-        debug!("Enabling ASIC");
+        // Release the chips from reset
+        debug!("Releasing chip reset");
         self.peripherals
-            .asic_enable
-            .enable()
+            .reset_line
+            .release()
             .await
-            .context("failed to enable ASIC")?;
+            .context("failed to release chip reset")?;
 
         time::sleep(Duration::from_millis(200)).await;
 

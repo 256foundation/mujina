@@ -24,7 +24,7 @@ use crate::{
         bm13xx::{
             self, chip_config, register::ChipModel, thread::BM13xxThread, topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
+        hash_thread::{BoardPeripherals, HashThread, ResetLine, ThreadRemovalSignal},
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
@@ -107,16 +107,16 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let voltage_regulator = Tps546Regulator::new(device.regulator.clone());
 
-    // The hash thread takes the data port and the reset control
+    // The hash thread takes the data port and the reset line
     let BitaxeDevice {
         data_reader,
         data_writer,
-        asic_enable,
+        reset_line,
         ..
     } = device;
 
     let peripherals = BoardPeripherals {
-        asic_enable: Box::new(asic_enable),
+        reset_line: Box::new(reset_line),
         voltage_regulator: Box::new(voltage_regulator),
     };
 
@@ -150,7 +150,7 @@ struct BitaxeDevice {
     data_writer: FramedWrite<SerialWriter, bm13xx::FrameCodec>,
     emc2101: Arc<Mutex<Emc2101<BitaxeRawI2c>>>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
-    asic_enable: BitaxeAsicEnable,
+    reset_line: BitaxeResetLine,
     serial_number: Option<String>,
 }
 
@@ -195,9 +195,9 @@ impl BitaxeDevice {
         let emc2101 = Arc::new(Mutex::new(init_fan_controller(i2c.clone()).await?));
         let regulator = Arc::new(Mutex::new(init_power_controller(i2c.clone()).await?));
 
-        let asic_enable = BitaxeAsicEnable {
+        let reset_line = BitaxeResetLine {
             nrst_pin: reset_pin,
-            enabled_since: Arc::new(StdMutex::new(None)),
+            released_since: Arc::new(StdMutex::new(None)),
         };
 
         Ok(Self {
@@ -205,7 +205,7 @@ impl BitaxeDevice {
             data_writer,
             emc2101,
             regulator,
-            asic_enable,
+            reset_line,
             serial_number: device.serial_number,
         })
     }
@@ -226,7 +226,7 @@ impl BitaxeDevice {
             board_model: "Bitaxe Gamma",
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
-            asic_enable: self.asic_enable.clone(),
+            reset_line: self.reset_line.clone(),
         };
         tokio::spawn(monitor.run(telemetry_tx, cancel))
     }
@@ -245,7 +245,7 @@ struct BitaxeMonitor {
     /// Consecutive bad thermal readings (I2C error, out-of-range, or
     /// above emergency threshold). Triggers emergency shutdown.
     bad_thermal_count: u32,
-    asic_enable: BitaxeAsicEnable,
+    reset_line: BitaxeResetLine,
 }
 
 impl BitaxeMonitor {
@@ -333,9 +333,9 @@ impl BitaxeMonitor {
         // Wait for the measurement to settle before trusting readings.
         const DIODE_SETTLE: Duration = Duration::from_millis(500);
         let diode_ready = self
-            .asic_enable
-            .enabled_since()
-            .context("failed to read ASIC enable state")?
+            .reset_line
+            .released_since()
+            .context("failed to read reset line state")?
             .is_some_and(|since| since.elapsed() >= DIODE_SETTLE);
         let asic_temp = if diode_ready {
             match raw_temp {
@@ -451,7 +451,7 @@ impl BitaxeMonitor {
             time::sleep(Duration::from_millis(200)).await;
         }
 
-        if let Err(e) = self.asic_enable.disable().await {
+        if let Err(e) = self.reset_line.assert().await {
             warn!("Failed to hold chips in reset: {}", e);
         }
 
@@ -539,48 +539,48 @@ async fn init_power_controller(i2c: BitaxeRawI2c) -> Result<Tps546<BitaxeRawI2c>
     Ok(tps546)
 }
 
-/// GPIO-based ASIC reset control that records when the ASIC was
-/// last enabled.
+/// GPIO-driven chip reset line that records when reset was last
+/// released.
 #[derive(Clone)]
-struct BitaxeAsicEnable {
+struct BitaxeResetLine {
     nrst_pin: BitaxeRawGpioPin,
-    enabled_since: Arc<StdMutex<Option<Instant>>>,
+    released_since: Arc<StdMutex<Option<Instant>>>,
 }
 
-impl BitaxeAsicEnable {
-    /// When the ASIC was last taken out of reset, or `None` if it
-    /// is currently in reset. Safe to call from another task.
-    fn enabled_since(&self) -> Result<Option<Instant>> {
-        self.enabled_since
+impl BitaxeResetLine {
+    /// When reset was last released, or `None` while reset is
+    /// asserted. Safe to call from another task.
+    fn released_since(&self) -> Result<Option<Instant>> {
+        self.released_since
             .lock()
             .map(|guard| *guard)
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))
+            .map_err(|_| anyhow!("reset line state lock poisoned"))
     }
 }
 
 #[async_trait]
-impl AsicEnable for BitaxeAsicEnable {
-    async fn enable(&mut self) -> Result<()> {
-        self.nrst_pin
-            .write(PinValue::High)
-            .await
-            .map_err(|e| anyhow!("failed to release reset: {}", e))?;
-        *self
-            .enabled_since
-            .lock()
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = Some(Instant::now());
-        Ok(())
-    }
-
-    async fn disable(&mut self) -> Result<()> {
+impl ResetLine for BitaxeResetLine {
+    async fn assert(&mut self) -> Result<()> {
         self.nrst_pin
             .write(PinValue::Low)
             .await
             .map_err(|e| anyhow!("failed to assert reset: {}", e))?;
         *self
-            .enabled_since
+            .released_since
             .lock()
-            .map_err(|_| anyhow!("ASIC enable state lock poisoned"))? = None;
+            .map_err(|_| anyhow!("reset line state lock poisoned"))? = None;
+        Ok(())
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        self.nrst_pin
+            .write(PinValue::High)
+            .await
+            .map_err(|e| anyhow!("failed to release reset: {}", e))?;
+        *self
+            .released_since
+            .lock()
+            .map_err(|_| anyhow!("reset line state lock poisoned"))? = Some(Instant::now());
         Ok(())
     }
 }
