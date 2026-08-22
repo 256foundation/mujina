@@ -11,13 +11,14 @@ use std::cmp::max;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, RwLock};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use bitcoin::block::Header as BlockHeader;
 use futures::{SinkExt, stream::Stream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Duration, MissedTickBehavior};
 
+use super::chain::Chain;
 use super::chip_config::ChipConfig;
 use super::command::{
     ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
@@ -26,9 +27,11 @@ use super::command::{
 use super::reader::{Reader, ReaderChannels};
 use super::register::{
     AdcCtrl1, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty, MidstateConfig,
-    PllDivider, Register, TicketMask,
+    PllDivider, Register, RegisterAddress, TicketMask,
 };
-use super::response::{NonceResponse, Response};
+use super::register_client::RegisterClient;
+use super::response::{NonceResponse, RegisterResponse, Response};
+use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
         BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
@@ -42,7 +45,7 @@ use crate::{
 ///
 /// Represents a chain of BM13xx chips as a schedulable worker. The thread
 /// manages serial communication with chips, filters shares, and reports events.
-/// Chip initialization happens lazily when first work is assigned.
+/// Chain initialization happens lazily when first work is assigned.
 pub struct BM13xxThread {
     /// Human-readable name for logging
     name: String,
@@ -63,12 +66,13 @@ pub struct BM13xxThread {
 impl BM13xxThread {
     /// Create a new BM13xx thread with Stream/Sink for chip communication
     ///
-    /// Thread starts with chip disabled. Chip will be initialized when first
-    /// work is assigned.
+    /// Thread starts with chips disabled. The chain will be initialized when
+    /// first work is assigned.
     ///
     /// # Arguments
     /// * `name` - Human-readable name for logging (e.g., "Bitaxe Gamma (e2f56f9b)")
     /// * `config` - Chip model configuration (identity, PLL parameters)
+    /// * `topology` - The board's declared chip wiring
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (enable, regulator, etc.)
@@ -76,6 +80,7 @@ impl BM13xxThread {
     pub fn new<R, W>(
         name: String,
         config: ChipConfig,
+        topology: TopologySpec,
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
@@ -94,6 +99,7 @@ impl BM13xxThread {
         let (reader, channels) = Reader::spawn(chip_responses);
         let actor = Actor::new(
             config,
+            topology,
             event_tx,
             Arc::clone(&status),
             chip_commands,
@@ -220,6 +226,10 @@ struct Actor<W> {
     /// Chip model configuration (identity, PLL parameters).
     config: ChipConfig,
 
+    /// Live model of the chip chain, built from the board's declared
+    /// topology.
+    chain: Chain,
+
     /// Event channel to the scheduler.
     event_tx: mpsc::Sender<HashThreadEvent>,
 
@@ -239,8 +249,8 @@ struct Actor<W> {
     /// ASIC ticket mask difficulty.
     asic_difficulty: Log2Difficulty,
 
-    /// Whether lazy chip initialization has run.
-    chip_initialized: bool,
+    /// Whether lazy chain initialization has run.
+    chain_initialized: bool,
 
     /// The task currently being hashed.
     current_task: Option<HashTask>,
@@ -256,6 +266,7 @@ where
 {
     fn new(
         config: ChipConfig,
+        topology: TopologySpec,
         event_tx: mpsc::Sender<HashThreadEvent>,
         status: Arc<RwLock<HashThreadStatus>>,
         chip_commands: W,
@@ -269,13 +280,14 @@ where
 
         Self {
             config,
+            chain: Chain::from_topology(&topology),
             event_tx,
             status,
             chip_commands,
             peripherals,
             _reader: reader,
             asic_difficulty,
-            chip_initialized: false,
+            chain_initialized: false,
             current_task: None,
             chip_jobs: ChipJobTracker::new(),
         }
@@ -333,11 +345,11 @@ where
                         ThreadCommand::Configure => self.configure().await,
 
                         ThreadCommand::UpdateTask { new_task, response_tx } => {
-                            self.assign_task(new_task, response_tx, false).await;
+                            self.assign_task(new_task, response_tx, false, &mut register_responses).await;
                         }
 
                         ThreadCommand::ReplaceTask { new_task, response_tx } => {
-                            self.assign_task(new_task, response_tx, true).await;
+                            self.assign_task(new_task, response_tx, true, &mut register_responses).await;
                         }
 
                         ThreadCommand::GoIdle { response_tx } => {
@@ -397,13 +409,14 @@ where
     }
 
     /// Takes a new task and sends its first job to the chip,
-    /// initializing the chip on the first assignment. `replace`
+    /// initializing the chain on the first assignment. `replace`
     /// forgets prior jobs, invalidating their shares.
     async fn assign_task(
         &mut self,
         new_task: HashTask,
         response_tx: oneshot::Sender<Result<Option<HashTask>>>,
         replace: bool,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
     ) {
         let verb = if replace { "Replacing" } else { "Updating" };
         if let Some(ref old) = self.current_task {
@@ -416,14 +429,14 @@ where
             debug!(new_job = %new_task.template.id, "{verb} work from idle");
         }
 
-        if !self.chip_initialized {
-            trace!("Initializing chip on first assignment.");
-            if let Err(e) = self.initialize_chip().await {
-                error!(error = %e, "Chip initialization failed");
+        if !self.chain_initialized {
+            trace!("Initializing chain on first assignment.");
+            if let Err(e) = self.initialize_chain(register_responses).await {
+                error!(error = %e, "Chain initialization failed");
                 response_tx.send(Err(e)).ok();
                 return;
             }
-            self.chip_initialized = true;
+            self.chain_initialized = true;
         }
 
         if replace {
@@ -458,11 +471,15 @@ where
         response_tx.send(Ok(old_task)).ok();
     }
 
-    /// Initializes the chip for mining.
+    /// Initializes the chip chain for mining.
     ///
-    /// Enables the chip, configures all registers, and ramps the
-    /// frequency to target.
-    async fn initialize_chip(&mut self) -> Result<()> {
+    /// Enables the chips, enumerates them against the declared
+    /// topology, assigns addresses, configures all registers, and
+    /// ramps the frequency to target.
+    async fn initialize_chain(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
         // Power the core rail before releasing reset
         if let Some(ref mut regulator) = self.peripherals.voltage_regulator {
             debug!("Enabling core voltage");
@@ -499,6 +516,23 @@ where
 
         time::sleep(Duration::from_millis(10)).await;
 
+        // Enumerate the chips and check them against the declared
+        // topology. The version mask above switched the chips to the
+        // 11-byte response format the codec parses.
+        debug!("Enumerating chips");
+        let replies = RegisterClient::new(&mut self.chip_commands, register_responses)
+            .broadcast_read(RegisterAddress::ChipId)
+            .await
+            .context("chip enumeration failed")?;
+        if replies.len() != self.chain.chip_count() {
+            bail!(
+                "found {} chips, declared topology has {}",
+                replies.len(),
+                self.chain.chip_count()
+            );
+        }
+        debug!(chips = replies.len(), "Chip enumeration complete");
+
         // Pre-configuration registers
         debug!("Sending pre-configuration registers");
 
@@ -520,12 +554,21 @@ where
             .await
             .context("failed to send ChainInactive")?;
 
-        self.chip_commands
-            .send(RegisterCommand::SetChipAddress(SetChipAddress {
-                chip_address: 0x00,
-            }))
-            .await
-            .context("failed to send SetChipAddress")?;
+        // Address the chips in chain order. After ChainInactive, the
+        // first unaddressed chip adopts each SetChipAddress and
+        // forwards later ones downstream, so one command per chip
+        // addresses the whole chain.
+        self.chain
+            .assign_addresses()
+            .context("chip address assignment failed")?;
+        for (_, chip) in self.chain.chips() {
+            self.chip_commands
+                .send(RegisterCommand::SetChipAddress(SetChipAddress {
+                    chip_address: chip.address,
+                }))
+                .await
+                .context("failed to send SetChipAddress")?;
+        }
 
         // Core configuration (broadcast)
         debug!("Sending broadcast core configuration");
@@ -565,42 +608,45 @@ where
         // Chip-specific configuration
         debug!("Sending chip-specific configuration");
 
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Chip(0x00),
-                register: Register::SoftResetControl(self.config.core_reset),
-            }))
-            .await?;
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Chip(0x00),
-                register: Register::MiscControl(self.config.misc_control),
-            }))
-            .await?;
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Chip(0x00),
-                register: Register::CoreMailbox(self.config.clock_select),
-            }))
-            .await?;
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Chip(0x00),
-                register: Register::CoreMailbox(CoreCommand::write_all(
-                    CoreRegister::ClockDelay,
-                    0x0C,
-                )),
-            }))
-            .await?;
-        self.chip_commands
-            .send(RegisterCommand::WriteRegister(WriteRegister {
-                destination: Destination::Chip(0x00),
-                register: Register::CoreMailbox(CoreCommand::write_all(
-                    CoreRegister::CoreEnable,
-                    0xAA,
-                )),
-            }))
-            .await?;
+        for (_, chip) in self.chain.chips() {
+            let destination = Destination::Chip(chip.address);
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::SoftResetControl(self.config.core_reset),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::MiscControl(self.config.misc_control),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(self.config.clock_select),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::ClockDelay,
+                        0x0C,
+                    )),
+                }))
+                .await?;
+            self.chip_commands
+                .send(RegisterCommand::WriteRegister(WriteRegister {
+                    destination,
+                    register: Register::CoreMailbox(CoreCommand::write_all(
+                        CoreRegister::CoreEnable,
+                        0xAA,
+                    )),
+                }))
+                .await?;
+        }
 
         // Additional settings
         self.chip_commands

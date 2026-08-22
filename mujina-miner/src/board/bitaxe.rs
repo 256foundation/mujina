@@ -21,7 +21,9 @@ use tokio_util::{
 use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
-        bm13xx::{self, chip_config, register::ChipModel, thread::BM13xxThread},
+        bm13xx::{
+            self, chip_config, register::ChipModel, thread::BM13xxThread, topology::TopologySpec,
+        },
         hash_thread::{AsicEnable, BoardPeripherals, HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
@@ -121,6 +123,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let thread = BM13xxThread::new(
         thread_name,
         chip_config::bm1370(),
+        TopologySpec::single_domain(1),
         data_reader,
         data_writer,
         peripherals,
