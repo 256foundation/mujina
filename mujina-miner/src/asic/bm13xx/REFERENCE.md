@@ -1361,9 +1361,14 @@ Configures version rolling for AsicBoost:[^midstatecfg]
 - Bits 29-28 (gen): midstate generation code, the number of midstates
     the chip generates per job. On the BM1366 and later, 1 means 8, 2
     means 12, and 3 means 16; the BM1362 uses only 1 (8 midstates). The
-    meaning of 0 is unobserved.
+    references give no meaning for 0.
 - Bits 15-0: mask of rollable version bits, applied to header version
     bits 28-13
+
+On the BM1370, the gen code reads back 0 after a write of 1; every
+other field reads back as written. Writing 0 changes nothing
+observable in a short mining run. Whether the field latches zero or
+the write takes no effect is unknown.[^genreadback]
 
 A pool's version-rolling mask, shifted right 13 bits, is the register's
 mask field. Stratum's 0x1FFFE000 becomes 0xFFFF. What version rolling
@@ -2346,6 +2351,10 @@ work above.
 [^midstatecfg]: The field names and the generation-code values follow
     reference driver code. Every host writes 0x9000FFFF (full mask,
     generation code 1, automatic generation on).
+[^genreadback]: Measured on a BM1370 during bring-up verification.
+    0xA4 written 0x9000FFFF answers 0x8000FFFF, with bit 28 cleared
+    and every other bit as written; MISC_CONTROL and TICKET_MASK read
+    back exactly as written in the same pass.
 [^adcproc]: The procedure, its pacing, and the front-end formula come
     from factory test firmware. A live BM1370 confirms all three.
 [^adcladder]: On a live BM1370, selects 4 and 5 read a base unit (about
