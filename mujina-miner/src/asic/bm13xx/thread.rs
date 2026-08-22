@@ -340,7 +340,11 @@ where
                 }
 
                 // Commands from scheduler
-                Some(cmd) = command_rx.recv() => {
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        debug!("Thread handle dropped");
+                        break;
+                    };
                     match cmd {
                         ThreadCommand::Configure => self.configure().await,
 
@@ -369,13 +373,21 @@ where
                 }
 
                 // Nonce reports from the chips
-                Some(nonce) = nonces.recv() => {
+                nonce = nonces.recv() => {
+                    let Some(nonce) = nonce else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
                     self.handle_nonce(nonce).await;
                 }
 
                 // Replies to register conversations; nothing asks
                 // yet, so log and discard
-                Some(response) = register_responses.recv() => {
+                response = register_responses.recv() => {
+                    let Some(response) = response else {
+                        warn!("Chip response stream ended");
+                        break;
+                    };
                     trace!(
                         chip_address = %format!("0x{:02x}", response.chip_address),
                         register = ?response.register,
@@ -1002,8 +1014,18 @@ fn generate_frequency_ramp_steps(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    use futures::{Sink, stream};
+
     use super::*;
     use crate::asic::bm13xx::chip_config;
+    use crate::asic::bm13xx::peripherals::ResetLine;
+    use crate::peripheral::regulator::VoltageRegulator;
+    use crate::types::Voltage;
 
     #[test]
     fn ramp_covers_range_in_steps() {
@@ -1094,5 +1116,156 @@ mod tests {
             *esp_miner_job::wire_tx::PREV_BLOCKHASH
         );
         assert_eq!(result.merkle_root, *esp_miner_job::wire_tx::MERKLE_ROOT);
+    }
+
+    /// Sink that accepts and discards every command.
+    struct NullSink;
+
+    impl Sink<RegisterCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Sink<JobCommand> for NullSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Peripheral states observed by the tests.
+    #[derive(Clone, Default)]
+    struct PeripheralFlags {
+        reset_asserted: Arc<AtomicBool>,
+        rail_disabled: Arc<AtomicBool>,
+    }
+
+    struct MockResetLine(PeripheralFlags);
+
+    #[async_trait]
+    impl ResetLine for MockResetLine {
+        async fn assert(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release(&mut self) -> Result<()> {
+            self.0.reset_asserted.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MockRegulator(PeripheralFlags);
+
+    #[async_trait]
+    impl VoltageRegulator for MockRegulator {
+        async fn enable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn disable(&mut self) -> Result<()> {
+            self.0.rail_disabled.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn is_enabled(&mut self) -> Result<bool> {
+            Ok(!self.0.rail_disabled.load(Ordering::SeqCst))
+        }
+
+        async fn set_voltage(&mut self, _voltage: Voltage) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_voltage(&mut self) -> Result<Voltage> {
+            Ok(Voltage::from_volts(1.15))
+        }
+    }
+
+    fn spawn_thread<R>(
+        chip_responses: R,
+    ) -> (
+        BM13xxThread,
+        watch::Sender<ThreadRemovalSignal>,
+        PeripheralFlags,
+    )
+    where
+        R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+    {
+        let flags = PeripheralFlags::default();
+        let peripherals = BoardPeripherals {
+            reset_line: Box::new(MockResetLine(flags.clone())),
+            voltage_regulator: Box::new(MockRegulator(flags.clone())),
+        };
+        let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+
+        let thread = BM13xxThread::new(
+            "test".into(),
+            chip_config::bm1370(),
+            TopologySpec::single_domain(1),
+            chip_responses,
+            NullSink,
+            peripherals,
+            removal_rx,
+        );
+
+        (thread, removal_tx, flags)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_response_stream_ends() {
+        let (mut thread, _removal_tx, flags) = spawn_thread(stream::iter(Vec::new()));
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // The actor disables the chain before it drops its event
+        // sender, so a closed event channel implies the cleanup ran
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exits_when_handle_dropped() {
+        let (mut thread, _removal_tx, flags) =
+            spawn_thread(stream::pending::<Result<Response, std::io::Error>>());
+        let mut events = thread.take_event_receiver().unwrap();
+
+        drop(thread);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
     }
 }
