@@ -36,7 +36,6 @@ use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
         HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
-        ThreadRemovalSignal,
     },
     tracing::prelude::*,
     types::{Difficulty, Frequency, ShareRate},
@@ -77,7 +76,8 @@ impl BM13xxThread {
     /// * `chip_responses` - Stream of decoded responses from chips
     /// * `chip_commands` - Sink for sending encoded commands to chips
     /// * `peripherals` - Hardware interfaces from board (reset line, regulator, etc.)
-    /// * `removal_rx` - Watch channel for board-triggered removal
+    /// * `shutdown_rx` - Shutdown signal from the board; a send or a
+    ///   dropped sender requests shutdown
     pub fn new<R, W>(
         name: String,
         config: ChipConfig,
@@ -85,7 +85,7 @@ impl BM13xxThread {
         chip_responses: R,
         chip_commands: W,
         peripherals: BoardPeripherals,
-        removal_rx: watch::Receiver<ThreadRemovalSignal>,
+        shutdown_rx: watch::Receiver<()>,
     ) -> Self
     where
         R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
@@ -107,7 +107,7 @@ impl BM13xxThread {
             peripherals,
             reader,
         );
-        tokio::spawn(actor.run(command_rx, removal_rx, channels));
+        tokio::spawn(actor.run(command_rx, shutdown_rx, channels));
 
         Self {
             name,
@@ -212,10 +212,6 @@ enum ThreadCommand {
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>>>,
     },
-
-    /// Shutdown the thread
-    #[expect(unused)]
-    Shutdown,
 }
 
 /// Internal actor for BM13xxThread.
@@ -294,10 +290,10 @@ where
         }
     }
 
-    /// Runs the actor loop until removal, shutdown, or channel closure.
+    /// Runs the actor loop until shutdown or channel closure.
     ///
     /// Handles commands from the scheduler (update/replace work, go
-    /// idle, shutdown), the removal signal from the board (USB unplug,
+    /// idle), the shutdown signal from the board (USB unplug,
     /// fault, etc.), and the demuxed chip responses from the reader.
     /// Reset is asserted on startup to establish known state; the
     /// chain is initialized lazily when the scheduler assigns first
@@ -305,7 +301,7 @@ where
     async fn run(
         mut self,
         mut command_rx: mpsc::Receiver<ThreadCommand>,
-        mut removal_rx: watch::Receiver<ThreadRemovalSignal>,
+        mut shutdown_rx: watch::Receiver<()>,
         channels: ReaderChannels,
     ) {
         let ReaderChannels {
@@ -323,20 +319,14 @@ where
 
         loop {
             tokio::select! {
-                // Removal signal (highest priority)
-                _ = removal_rx.changed() => {
-                    let signal = removal_rx.borrow().clone();  // Clone to avoid holding borrow across await
-                    match signal {
-                        ThreadRemovalSignal::Running => {
-                            // False alarm - still running
-                        }
-                        _reason => {
-                            self.set_active(false);
+                // Shutdown signal (highest priority); an error means
+                // the board dropped the sender, which requests
+                // shutdown too
+                _ = shutdown_rx.changed() => {
+                    self.set_active(false);
 
-                            // Exit actor loop (channel closure signals removal to scheduler)
-                            break;
-                        }
-                    }
+                    // Exit actor loop (channel closure signals exit to the scheduler)
+                    break;
                 }
 
                 // Commands from scheduler
@@ -362,12 +352,6 @@ where
                             let old_task = self.current_task.take();
                             self.set_active(false);
                             response_tx.send(Ok(old_task)).ok();
-                        }
-
-                        ThreadCommand::Shutdown => {
-                            info!("Shutdown command received");
-                            // Exit actor loop (channel closure signals shutdown to scheduler)
-                            break;
                         }
                     }
                 }
@@ -1222,13 +1206,7 @@ mod tests {
         }
     }
 
-    fn spawn_thread<R>(
-        chip_responses: R,
-    ) -> (
-        BM13xxThread,
-        watch::Sender<ThreadRemovalSignal>,
-        PeripheralFlags,
-    )
+    fn spawn_thread<R>(chip_responses: R) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
     where
         R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
     {
@@ -1237,7 +1215,7 @@ mod tests {
             reset_line: Box::new(MockResetLine(flags.clone())),
             voltage_regulator: Box::new(MockRegulator(flags.clone())),
         };
-        let (removal_tx, removal_rx) = watch::channel(ThreadRemovalSignal::Running);
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
 
         let thread = BM13xxThread::new(
             "test".into(),
@@ -1246,15 +1224,15 @@ mod tests {
             chip_responses,
             NullSink,
             peripherals,
-            removal_rx,
+            shutdown_rx,
         );
 
-        (thread, removal_tx, flags)
+        (thread, shutdown_tx, flags)
     }
 
     #[tokio::test(start_paused = true)]
     async fn exits_when_response_stream_ends() {
-        let (mut thread, _removal_tx, flags) = spawn_thread(stream::iter(Vec::new()));
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(stream::iter(Vec::new()));
         let mut events = thread.take_event_receiver().unwrap();
 
         // The actor disables the chain before it drops its event
@@ -1267,8 +1245,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn exits_when_shutdown_sender_drops() {
+        let (mut thread, shutdown_tx, flags) =
+            spawn_thread(stream::pending::<Result<Response, std::io::Error>>());
+        let mut events = thread.take_event_receiver().unwrap();
+
+        // Drop the sender without a signal, as a dying board task
+        // would
+        drop(shutdown_tx);
+
+        let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(closed.expect("actor should exit").is_none());
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn exits_when_handle_dropped() {
-        let (mut thread, _removal_tx, flags) =
+        let (mut thread, _shutdown_tx, flags) =
             spawn_thread(stream::pending::<Result<Response, std::io::Error>>());
         let mut events = thread.take_event_receiver().unwrap();
 
