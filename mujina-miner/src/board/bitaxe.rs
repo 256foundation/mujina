@@ -28,7 +28,7 @@ use crate::{
             thread::BM13xxThread,
             topology::TopologySpec,
         },
-        hash_thread::{HashThread, ThreadRemovalSignal},
+        hash_thread::HashThread,
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},
@@ -79,7 +79,7 @@ inventory::submit! {
 async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
     let device = BitaxeDevice::attach(device).await?;
 
-    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(ThreadRemovalSignal::Running);
+    let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
 
     let thread_name = match &device.serial_number {
         Some(serial) => format!("Bitaxe-Gamma-{}", &serial[..8.min(serial.len())]),
@@ -218,7 +218,7 @@ impl BitaxeDevice {
     fn spawn_monitor(
         &self,
         board_name: String,
-        thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+        thread_shutdown: watch::Sender<()>,
         telemetry_tx: watch::Sender<BoardTelemetry>,
         cancel: CancellationToken,
     ) -> JoinHandle<()> {
@@ -242,7 +242,10 @@ impl BitaxeDevice {
 struct BitaxeMonitor {
     emc2101: Arc<Mutex<Emc2101<BitaxeRawI2c>>>,
     regulator: Arc<Mutex<Tps546<BitaxeRawI2c>>>,
-    thread_shutdown: watch::Sender<ThreadRemovalSignal>,
+
+    /// Shutdown signal to the hash threads. A send requests
+    /// shutdown; a thread's exit drops its receiver.
+    thread_shutdown: watch::Sender<()>,
     board_name: String,
     board_model: &'static str,
     board_serial: Option<String>,
@@ -449,7 +452,7 @@ impl BitaxeMonitor {
     }
 
     async fn shutdown(&mut self) {
-        if let Err(e) = self.thread_shutdown.send(ThreadRemovalSignal::Shutdown) {
+        if let Err(e) = self.thread_shutdown.send(()) {
             warn!("Failed to send shutdown signal to threads: {}", e);
         } else {
             time::sleep(Duration::from_millis(200)).await;
