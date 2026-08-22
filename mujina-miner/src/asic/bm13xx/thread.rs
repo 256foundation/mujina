@@ -24,6 +24,7 @@ use super::command::{
     ChainInactive, ChipCommandSink, Destination, JobCommand, JobFullFormat, RegisterCommand,
     SetChipAddress, SinkError, WriteRegister,
 };
+use super::peripherals::BoardPeripherals;
 use super::reader::{Reader, ReaderChannels};
 use super::register::{
     AdcCtrl1, CoreCommand, CoreRegister, IoDriverStrength, Log2Difficulty, MidstateConfig,
@@ -34,8 +35,8 @@ use super::response::{NonceResponse, RegisterResponse, Response};
 use super::topology::TopologySpec;
 use crate::{
     asic::hash_thread::{
-        BoardPeripherals, HashTask, HashThread, HashThreadCapabilities, HashThreadEvent,
-        HashThreadStatus, Share, ThreadRemovalSignal,
+        HashTask, HashThread, HashThreadCapabilities, HashThreadEvent, HashThreadStatus, Share,
+        ThreadRemovalSignal,
     },
     tracing::prelude::*,
     types::{Difficulty, Frequency, ShareRate},
