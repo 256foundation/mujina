@@ -719,6 +719,43 @@ where
 
         time::sleep(Duration::from_millis(150)).await;
 
+        // Verify bring-up by reading configuration back from every
+        // chip at its assigned address; a directed read answered at
+        // that address also proves the chip took it.
+        debug!("Verifying chain configuration");
+        let target_pll = self
+            .config
+            .calculate_pll(self.config.default_freq)
+            .context("no PLL solution for the target frequency")?;
+        // What each chip should answer. The registers answer as
+        // written, except PLL_DIVIDER bit 31, the lock report
+        // (LOCKED), which a healthy chip answers set after the ramp.
+        let expected = [
+            Register::MiscControl(self.config.misc_control),
+            Register::TicketMask(ticket_mask),
+            Register::PllDivider(PllDivider {
+                locked: true,
+                ..target_pll
+            }),
+        ];
+        let addresses: Vec<u8> = self.chain.chips().map(|(_, chip)| chip.address).collect();
+        let mut client = RegisterClient::new(&mut self.chip_commands, register_responses);
+        for address in addresses {
+            for register in &expected {
+                let actual = client
+                    .read(address, register.address())
+                    .await
+                    .context("bring-up verification read failed")?;
+                if actual != *register {
+                    bail!(
+                        "chip 0x{address:02x} readback mismatch: \
+                         expected {register:?}, read {actual:?}"
+                    );
+                }
+            }
+        }
+        debug!("Chain configuration verified");
+
         Ok(())
     }
 
