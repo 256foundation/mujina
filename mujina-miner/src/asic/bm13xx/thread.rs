@@ -455,14 +455,10 @@ where
             debug!(new_job = %new_task.template.id, "{verb} work from idle");
         }
 
-        if !self.chain_initialized {
-            trace!("Initializing chain on first assignment.");
-            if let Err(e) = self.initialize_chain(register_responses).await {
-                error!(error = %e, "Chain initialization failed");
-                response_tx.send(Err(e)).ok();
-                return;
-            }
-            self.chain_initialized = true;
+        if let Err(e) = self.ensure_chain_initialized(register_responses).await {
+            error!(error = %e, "Chain initialization failed");
+            response_tx.send(Err(e)).ok();
+            return;
         }
 
         if replace {
@@ -495,6 +491,22 @@ where
 
         self.set_active(true);
         response_tx.send(Ok(old_task)).ok();
+    }
+
+    /// Initializes the chain on the first call; later calls are
+    /// no-ops.
+    async fn ensure_chain_initialized(
+        &mut self,
+        register_responses: &mut mpsc::Receiver<RegisterResponse>,
+    ) -> Result<()> {
+        if self.chain_initialized {
+            return Ok(());
+        }
+
+        trace!("Initializing chain on first assignment.");
+        self.initialize_chain(register_responses).await?;
+        self.chain_initialized = true;
+        Ok(())
     }
 
     /// Initializes the chip chain for mining.
