@@ -22,9 +22,13 @@ use crate::{
     api_client::types::{BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor},
     asic::{
         bm13xx::{
-            self, chip_config, register::ChipModel, thread::BM13xxThread, topology::TopologySpec,
+            self, chip_config,
+            peripherals::{BoardPeripherals, ResetLine},
+            register::ChipModel,
+            thread::BM13xxThread,
+            topology::TopologySpec,
         },
-        hash_thread::{BoardPeripherals, HashThread, ResetLine, ThreadRemovalSignal},
+        hash_thread::{HashThread, ThreadRemovalSignal},
     },
     hw_trait::{
         gpio::{Gpio, GpioPin, PinValue},

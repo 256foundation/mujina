@@ -9,6 +9,7 @@ pub mod codec;
 pub mod command;
 pub mod crc;
 pub mod error;
+pub mod peripherals;
 pub mod reader;
 pub mod register;
 pub mod register_client;
