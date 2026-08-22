@@ -1002,17 +1002,21 @@ Controls the hash frequency: fb_div x 25 MHz / (ref_div x post_div1
 x post_div2).
 
 ```text
- 31    28 27          16 15  14 13      8 7   4 3   0
-+-------+--------------+------+---------+-----+-----+
-| flag  |   FB_DIV     |  0   | REF_DIV | PD1 | PD2 |
-+-------+--------------+------+---------+-----+-----+
+ 31 30 29 28 27          16 15  14 13      8 7   4 3   0
++--+--+--+--+--------------+------+---------+-----+-----+
+|LK|EN|BY|VS|    FB_DIV    |  0   | REF_DIV | PD1 | PD2 |
++--+--+--+--+--------------+------+---------+-----+-----+
 ```
 
-- Bits 31-28: VCO-select flag. Bit 30 is always set and bit 28 is the
-    2400 MHz VCO select, so the top nibble reads 0x4 below 2.4 GHz and
-    0x5 at or above (byte 0x40 / 0x50).[^vcosel]
+- Bit 31 (LOCKED, LK): PLL lock report. Written 0; reads back 1 once
+    the PLL locks.[^pllfields]
+- Bit 30 (PLLEN, EN): PLL enable. 1 in every captured write.
+- Bit 29 (BYPASS, BY): PLL bypass. 0 in every captured write.
+- Bit 28 (VCOSEL, VS): 2400 MHz VCO select. 0 below 2.4 GHz, 1 at or
+    above.[^vcosel]
 - Bits 27-16: FB_DIV, a 12-bit feedback divider (top four bits zero in
     practice, fb_div staying under 256).
+- Bits 15-14: reserved, zero in every captured write.
 - Bits 13-8: REF_DIV, a 6-bit reference divider (2 in every
     captured write).
 - Bits 7-4 and 3-0: the two post dividers, each stored minus one (three
@@ -1661,8 +1665,9 @@ hash clock.[^bitaxeinit]
    +-------+--------------+------+---------+-----+-----+
    ```
 
-    - **flag** = 0x5: the high-VCO select; both endpoints run the VCO at
-        2625 MHz (FB_DIV x 25 MHz / REF_DIV)
+    - **flag** = 0x5: PLLEN (bit 30) and VCOSEL (bit 28) set; both
+        endpoints run the VCO in the high range at 2625 MHz (FB_DIV x
+        25 MHz / REF_DIV)
     - **FB_DIV** = 0x0D2 (210), **REF_DIV** = 2: shared by the
         endpoints; mid-ramp solutions vary them too
     - **PD1**, **PD2**: stored minus one, so the post dividers take the
@@ -2295,6 +2300,11 @@ work above.
 [^vcosel]: Factory firmware for the BM1362 and BM1370 confirms the 2400
     MHz threshold. The captures verify it at the boundary, where fb_div
     0xC0 with ref_div 2 is exactly 2.4 GHz and carries 0x50.
+[^pllfields]: The single-bit field names (LOCKED, PLLEN, BYPASS,
+    VCOSEL) come from the BM1362 firmware. The LOCKED readback is
+    measured on a Bitaxe BM1370: after the frequency ramp, a read
+    answers the written word with bit 31 set (flag bits 0x4 written,
+    0xC read) and every divider as written.
 [^pllranges]: The BM1362 fb_div and VCO ranges come from its firmware's
     PLL solver, which caps the VCO at 3125 MHz when ref_div is 1. The
     BM1370 VCO range comes from its firmware's solver. The BM1366/68 and
