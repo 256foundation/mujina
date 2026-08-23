@@ -1373,6 +1373,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn exits_on_shutdown_signal() {
+        let (_thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
+
+        shutdown_tx.send(()).unwrap();
+
+        // The actor drops its shutdown receiver only after disabling
+        // the chain, so a closed sender implies the cleanup ran
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
+
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn exits_when_handle_dropped() {
         let (mut thread, _shutdown_tx, flags) = spawn_thread(
             stream::pending::<Result<Response, std::io::Error>>(),

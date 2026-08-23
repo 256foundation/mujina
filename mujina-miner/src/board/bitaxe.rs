@@ -452,10 +452,16 @@ impl BitaxeMonitor {
     }
 
     async fn shutdown(&mut self) {
-        if let Err(e) = self.thread_shutdown.send(()) {
-            warn!("Failed to send shutdown signal to threads: {}", e);
-        } else {
-            time::sleep(Duration::from_millis(200)).await;
+        // The thread drops its shutdown receiver on exit, after
+        // disabling the chain, so closed() means it has finished.
+        // A failed send means it is already gone.
+        const THREAD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+        let _ = self.thread_shutdown.send(());
+        if time::timeout(THREAD_EXIT_TIMEOUT, self.thread_shutdown.closed())
+            .await
+            .is_err()
+        {
+            warn!("Timed out waiting for thread to exit");
         }
 
         if let Err(e) = self.reset_line.assert().await {
