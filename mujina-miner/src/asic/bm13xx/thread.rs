@@ -1186,6 +1186,49 @@ mod tests {
         }
     }
 
+    /// Sink that is never ready, parking the first send forever.
+    struct StallSink;
+
+    impl Sink<RegisterCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: RegisterCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<JobCommand> for StallSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: JobCommand) -> Result<(), io::Error> {
+            unreachable!("poll_ready never succeeds")
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+            Poll::Pending
+        }
+    }
+
     /// Peripheral states observed by the tests.
     #[derive(Clone, Default)]
     struct PeripheralFlags {
@@ -1235,9 +1278,14 @@ mod tests {
         }
     }
 
-    fn spawn_thread<R>(chip_responses: R) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
+    fn spawn_thread<R, W>(
+        chip_responses: R,
+        chip_commands: W,
+    ) -> (BM13xxThread, watch::Sender<()>, PeripheralFlags)
     where
         R: Stream<Item = Result<Response, std::io::Error>> + Unpin + Send + 'static,
+        W: ChipCommandSink + Unpin + Send + 'static,
+        SinkError<W>: std::error::Error + Send + Sync + 'static,
     {
         let flags = PeripheralFlags::default();
         let peripherals = BoardPeripherals {
@@ -1251,7 +1299,7 @@ mod tests {
             chip_config::bm1370(),
             TopologySpec::single_domain(1),
             chip_responses,
-            NullSink,
+            chip_commands,
             peripherals,
             shutdown_rx,
         );
@@ -1259,9 +1307,41 @@ mod tests {
         (thread, shutdown_tx, flags)
     }
 
+    /// Builds a minimal task for driving the actor.
+    fn test_task() -> HashTask {
+        use crate::asic::bm13xx::test_data::esp_miner_job;
+        use crate::job_source::{
+            Extranonce2, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
+        };
+
+        let template = Arc::new(JobTemplate {
+            id: "test".into(),
+            prev_blockhash: *esp_miner_job::wire_tx::PREV_BLOCKHASH,
+            version: VersionTemplate::new(
+                *esp_miner_job::wire_tx::VERSION,
+                GeneralPurposeBits::full(),
+            )
+            .expect("Valid version template"),
+            bits: *esp_miner_job::wire_tx::NBITS,
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            time: *esp_miner_job::wire_tx::NTIME,
+            merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
+        });
+        let (share_tx, _share_rx) = mpsc::channel(1);
+
+        HashTask {
+            template,
+            en2_range: None,
+            en2: Some(Extranonce2::new(0, 1).unwrap()),
+            share_target: crate::types::Difficulty::from(100_u64).to_target(),
+            ntime: *esp_miner_job::wire_tx::NTIME,
+            share_tx,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exits_when_response_stream_ends() {
-        let (mut thread, _shutdown_tx, flags) = spawn_thread(stream::iter(Vec::new()));
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(stream::iter(Vec::new()), NullSink);
         let mut events = thread.take_event_receiver().unwrap();
 
         // The actor disables the chain before it drops its event
@@ -1275,8 +1355,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exits_when_shutdown_sender_drops() {
-        let (mut thread, shutdown_tx, flags) =
-            spawn_thread(stream::pending::<Result<Response, std::io::Error>>());
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
         let mut events = thread.take_event_receiver().unwrap();
 
         // Drop the sender without a signal, as a dying board task
@@ -1292,8 +1374,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn exits_when_handle_dropped() {
-        let (mut thread, _shutdown_tx, flags) =
-            spawn_thread(stream::pending::<Result<Response, std::io::Error>>());
+        let (mut thread, _shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            NullSink,
+        );
         let mut events = thread.take_event_receiver().unwrap();
 
         drop(thread);
@@ -1301,6 +1385,43 @@ mod tests {
         let closed = time::timeout(Duration::from_secs(5), events.recv()).await;
         assert!(closed.expect("actor should exit").is_none());
 
+        assert!(flags.reset_asserted.load(Ordering::SeqCst));
+        assert!(flags.rail_disabled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_bring_up() {
+        // The stalling sink parks bring-up at its first chip
+        // command, holding it in progress until the signal arrives
+        let (mut thread, shutdown_tx, flags) = spawn_thread(
+            stream::pending::<Result<Response, std::io::Error>>(),
+            StallSink,
+        );
+
+        let assign = thread.update_task(test_task());
+        let signal = async {
+            // Bring-up has begun once the startup reset assertion
+            // is released
+            while !flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            while flags.reset_asserted.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+            shutdown_tx.send(()).unwrap();
+        };
+        let (result, _) = time::timeout(Duration::from_secs(60), async {
+            tokio::join!(assign, signal)
+        })
+        .await
+        .expect("bring-up should abort");
+
+        assert!(result.is_err());
+
+        // The actor exits, disabling the chain on the way out
+        time::timeout(Duration::from_secs(5), shutdown_tx.closed())
+            .await
+            .expect("actor should drop its shutdown receiver");
         assert!(flags.reset_asserted.load(Ordering::SeqCst));
         assert!(flags.rail_disabled.load(Ordering::SeqCst));
     }
