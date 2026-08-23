@@ -8,7 +8,7 @@
 //! chip responses, filters shares, and manages work assignment.
 
 use std::cmp::max;
-use std::ops::RangeInclusive;
+use std::ops::{ControlFlow, RangeInclusive};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -339,11 +339,21 @@ where
                         ThreadCommand::Configure => self.configure().await,
 
                         ThreadCommand::UpdateTask { new_task, response_tx } => {
-                            self.assign_task(new_task, response_tx, false, &mut register_responses).await;
+                            let flow = self
+                                .assign_task(new_task, response_tx, false, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
                         }
 
                         ThreadCommand::ReplaceTask { new_task, response_tx } => {
-                            self.assign_task(new_task, response_tx, true, &mut register_responses).await;
+                            let flow = self
+                                .assign_task(new_task, response_tx, true, &mut shutdown_rx, &mut register_responses)
+                                .await;
+                            if flow.is_break() {
+                                break;
+                            }
                         }
 
                         ThreadCommand::GoIdle { response_tx } => {
@@ -420,14 +430,17 @@ where
 
     /// Takes a new task and sends its first job to the chip,
     /// initializing the chain on the first assignment. `replace`
-    /// forgets prior jobs, invalidating their shares.
+    /// forgets prior jobs, invalidating their shares. Returns
+    /// `Break` when the actor must exit because the board's
+    /// shutdown signal cut bring-up short.
     async fn assign_task(
         &mut self,
         new_task: HashTask,
         response_tx: oneshot::Sender<Result<Option<HashTask>>>,
         replace: bool,
+        shutdown_rx: &mut watch::Receiver<()>,
         register_responses: &mut mpsc::Receiver<RegisterResponse>,
-    ) {
+    ) -> ControlFlow<()> {
         let verb = if replace { "Replacing" } else { "Updating" };
         if let Some(ref old) = self.current_task {
             debug!(
@@ -439,10 +452,25 @@ where
             debug!(new_job = %new_task.template.id, "{verb} work from idle");
         }
 
-        if let Err(e) = self.ensure_chain_initialized(register_responses).await {
-            error!(error = %e, "Chain initialization failed");
-            response_tx.send(Err(e)).ok();
-            return;
+        // The select watches for shutdown while bring-up runs, so
+        // every await point in bring-up is an abort point.
+        // Dropping the half-done future is safe because the actor
+        // disables the chain on exit whatever the bring-up
+        // progress.
+        tokio::select! {
+            result = self.ensure_chain_initialized(register_responses) => {
+                if let Err(e) = result {
+                    error!(error = %e, "Chain initialization failed");
+                    response_tx.send(Err(e)).ok();
+                    return ControlFlow::Continue(());
+                }
+            }
+
+            _ = shutdown_rx.changed() => {
+                debug!("Shutdown requested during bring-up");
+                response_tx.send(Err(anyhow!("shut down during bring-up"))).ok();
+                return ControlFlow::Break(());
+            }
         }
 
         if replace {
@@ -450,31 +478,32 @@ where
             self.chip_jobs.clear();
         }
 
-        // Send initial job to chip
+        // Send the task's first job; the ntime roller sends the rest
         let chip_job_id = self.chip_jobs.insert(new_task.clone());
         let old_task = self.current_task.replace(new_task.clone());
         match task_to_job_full(&new_task, chip_job_id) {
             Ok(job_data) => {
                 if let Err(e) = self.chip_commands.send(JobCommand::JobFull(job_data)).await {
-                    error!(error = ?e, "Failed to send initial JobFull to chip");
+                    error!(error = ?e, "Failed to send first JobFull to chip");
                     let err = anyhow!("failed to send job to chip: {e:?}");
                     response_tx.send(Err(err)).ok();
-                    return;
+                    return ControlFlow::Continue(());
                 } else if replace {
-                    debug!("Sent initial job to chip (old work invalidated)");
+                    debug!("Sent first job to chip (old work invalidated)");
                 } else {
-                    debug!("Sent initial job to chip");
+                    debug!("Sent first job to chip");
                 }
             }
             Err(e) => {
                 error!(error = %e, "Failed to convert task to JobFull");
                 response_tx.send(Err(e)).ok();
-                return;
+                return ControlFlow::Continue(());
             }
         }
 
         self.set_active(true);
         response_tx.send(Ok(old_task)).ok();
+        ControlFlow::Continue(())
     }
 
     /// Initializes the chain on the first call; later calls are
