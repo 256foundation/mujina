@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use std::{
+    fmt,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
@@ -59,7 +60,6 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
-// Register this board type with the inventory system
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
@@ -71,13 +71,58 @@ inventory::submit! {
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
-        create_fn: |device| Box::pin(create_from_usb(device)),
+        create_fn: |device| Box::pin(create_from_usb(device, Firmware::BitaxeRaw)),
+    }
+}
+
+inventory::submit! {
+    crate::board::BoardDescriptor {
+        pattern: crate::board::pattern::BoardPattern {
+            // pid.codes allocation to the Bitaxe project
+            vid: Match::Specific(0x1209),
+            pid: Match::Specific(0x6102),
+            bcd_device: Match::Any,
+            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
+            product: Match::Specific(StringMatch::Exact("Bitaxe Gamma RHAP-D")),
+            serial_pattern: Match::Any,
+        },
+        name: "Bitaxe Gamma",
+        create_fn: |device| Box::pin(create_from_usb(device, Firmware::RhapD)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Firmware {
+    /// bitaxe-raw, the original pass-through firmware.
+    BitaxeRaw,
+    /// RHAP-D, the successor to bitaxe-raw.
+    RhapD,
+}
+
+impl fmt::Display for Firmware {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Firmware::BitaxeRaw => f.write_str("bitaxe-raw"),
+            Firmware::RhapD => f.write_str("RHAP-D"),
+        }
+    }
+}
+
+impl Firmware {
+    /// bitaxe-raw sends the v0 frame with no status byte. RHAP-D
+    /// has only ever sent the v1 frame, the one the EmberOne
+    /// firmware also adopted.
+    fn response_format(self) -> ResponseFormat {
+        match self {
+            Firmware::BitaxeRaw => ResponseFormat::V0,
+            Firmware::RhapD => ResponseFormat::V1,
+        }
     }
 }
 
 /// Create a Bitaxe board from USB device info.
-async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
-    let device = BitaxeDevice::attach(device).await?;
+async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<BackplaneConnector> {
+    let device = BitaxeDevice::attach(device, firmware).await?;
 
     let (thread_shutdown_tx, thread_shutdown_rx) = watch::channel(());
 
@@ -101,7 +146,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
 
     let info = BoardInfo {
         model: "Bitaxe Gamma".to_string(),
-        firmware_version: Some("bitaxe-raw".to_string()),
+        firmware_version: Some(firmware.to_string()),
         serial_number: device.serial_number.clone(),
     };
 
@@ -160,7 +205,7 @@ struct BitaxeDevice {
 
 impl BitaxeDevice {
     /// Claims the USB device and assembles the board's hardware.
-    async fn attach(device: UsbDeviceInfo) -> Result<Self> {
+    async fn attach(device: UsbDeviceInfo, firmware: Firmware) -> Result<Self> {
         let serial_ports = device.get_serial_ports(2).await?;
 
         debug!(
@@ -172,7 +217,7 @@ impl BitaxeDevice {
 
         // Open control port, create management channel and I2C bus
         let control_port = tokio_serial::new(&serial_ports[0], 115200).open_native_async()?;
-        let control_channel = ControlChannel::new(control_port, ResponseFormat::V0);
+        let control_channel = ControlChannel::new(control_port, firmware.response_format());
         let mut i2c = BitaxeRawI2c::new(control_channel.clone());
 
         // Open data port for chip communication
@@ -633,5 +678,51 @@ impl<R: AsyncRead + Unpin> AsyncRead for TracingReader<R> {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backplane::BoardRegistry;
+
+    fn osmu_device(vid: u16, pid: u16, product: &str) -> UsbDeviceInfo {
+        UsbDeviceInfo {
+            vid,
+            pid,
+            manufacturer: Some("OSMU".to_string()),
+            product: Some(product.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn bitaxe_raw_device() -> UsbDeviceInfo {
+        osmu_device(0xc0de, 0xcafe, "Bitaxe")
+    }
+
+    fn rhapd_device() -> UsbDeviceInfo {
+        osmu_device(0x1209, 0x6102, "Bitaxe Gamma RHAP-D")
+    }
+
+    #[test]
+    fn registry_finds_both_firmwares() {
+        for device in [bitaxe_raw_device(), rhapd_device()] {
+            let desc = BoardRegistry
+                .find_descriptor(&device)
+                .unwrap_or_else(|| panic!("no descriptor for {device:?}"));
+            assert_eq!(desc.name, "Bitaxe Gamma");
+        }
+    }
+
+    #[test]
+    fn registry_ignores_other_osmu_products() {
+        let device = osmu_device(0x1209, 0x6102, "Bitaxe Ultra");
+        assert!(BoardRegistry.find_descriptor(&device).is_none());
+    }
+
+    #[test]
+    fn registry_ignores_rhapd_string_on_foreign_ids() {
+        let device = osmu_device(0xc0de, 0xcafe, "Bitaxe Gamma RHAP-D");
+        assert!(BoardRegistry.find_descriptor(&device).is_none());
     }
 }
