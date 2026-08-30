@@ -744,8 +744,9 @@ impl<I2C: I2c> Tps546<I2C> {
             critical_faults.push(format!("CML fault: {}", desc.join(", ")));
         }
 
-        // Check if unit is OFF (critical - means power has shut down)
-        if status_flags.contains(pmbus::StatusWord::OFF) {
+        // The chip sets OFF whenever the output is off, commanded off
+        // included, so OFF is a fault only while OPERATION is on.
+        if status_flags.contains(pmbus::StatusWord::OFF) && self.output_enabled().await? {
             error!(
                 "CRITICAL: Power controller is OFF - Reading all status registers for diagnostics"
             );
@@ -1325,5 +1326,140 @@ impl<I2C: I2c + Send> VoltageRegulator for Tps546Regulator<I2C> {
 
     async fn get_voltage(&mut self) -> Result<Voltage> {
         self.tps546.lock().await.get_vout_target().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hw_trait::{HwError, Result as HwResult};
+    use std::collections::HashMap;
+
+    /// Mock I2C bus backed by a table of PMBus registers.
+    ///
+    /// Reads of registers not in the table fail, and every register
+    /// read is recorded.
+    struct RegisterTable {
+        registers: HashMap<u8, Vec<u8>>,
+        reads: Vec<u8>,
+    }
+
+    impl RegisterTable {
+        fn new(registers: &[(PmbusCommand, &[u8])]) -> Self {
+            Self {
+                registers: registers
+                    .iter()
+                    .map(|(cmd, bytes)| (cmd.as_u8(), bytes.to_vec()))
+                    .collect(),
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl I2c for RegisterTable {
+        async fn write(&mut self, _addr: u8, _data: &[u8]) -> HwResult<()> {
+            Ok(())
+        }
+
+        async fn read(&mut self, _addr: u8, _buffer: &mut [u8]) -> HwResult<()> {
+            Err(HwError::NotSupported("plain read".into()))
+        }
+
+        async fn write_read(&mut self, _addr: u8, write: &[u8], read: &mut [u8]) -> HwResult<()> {
+            let command = write[0];
+            self.reads.push(command);
+            let bytes = self
+                .registers
+                .get(&command)
+                .ok_or_else(|| HwError::Other(format!("no register 0x{command:02x}")))?;
+            read.copy_from_slice(&bytes[..read.len()]);
+            Ok(())
+        }
+
+        async fn set_frequency(&mut self, _hz: u32) -> HwResult<()> {
+            Ok(())
+        }
+    }
+
+    fn config() -> Tps546Config {
+        Tps546Config {
+            phase: 0x00,
+            frequency_switch_khz: 650,
+            vin_on: Voltage::from_volts(4.8),
+            vin_off: Voltage::from_volts(4.5),
+            vin_uv_warn_limit: Voltage::from_volts(0.0),
+            vin_ov_fault_limit: Voltage::from_volts(6.5),
+            vin_ov_fault_response: 0xB7,
+            vout_scale_loop: 0.25,
+            vout_min: Voltage::from_volts(1.0),
+            vout_max: Voltage::from_volts(2.0),
+            vout_command: Voltage::from_volts(1.15),
+            vout_ov_fault_limit: Ratio::from_factor(1.25),
+            vout_ov_warn_limit: Ratio::from_factor(1.16),
+            vout_margin_high: Ratio::from_factor(1.10),
+            vout_margin_low: Ratio::from_factor(0.90),
+            vout_uv_warn_limit: Ratio::from_factor(0.90),
+            vout_uv_fault_limit: Ratio::from_factor(0.75),
+            iout_oc_warn_limit: 25.0,
+            iout_oc_fault_limit: 30.0,
+            iout_oc_fault_response: 0xC0,
+            ot_warn_limit: 105,
+            ot_fault_limit: 145,
+            ot_fault_response: 0xB7,
+            ton_delay: 0,
+            ton_rise: 3,
+            ton_max_fault_limit: 0,
+            ton_max_fault_response: 0x3B,
+            toff_delay: 0,
+            toff_fall: 0,
+            pin_detect_override: 0xFFFF,
+        }
+    }
+
+    /// STATUS_WORD with only PGOOD and OFF set, as the chip reports
+    /// it while the output is commanded off and no fault is latched.
+    const OFF_STATUS: [u8; 2] = [0x40, 0x08];
+
+    #[tokio::test]
+    async fn output_off_as_commanded_is_not_a_fault() {
+        let table = RegisterTable::new(&[
+            (PmbusCommand::StatusWord, &OFF_STATUS),
+            (
+                PmbusCommand::Operation,
+                &[pmbus::Operation::OffImmediate.as_u8()],
+            ),
+        ]);
+        let mut tps = Tps546::new(table, config());
+
+        tps.check_status()
+            .await
+            .expect("commanded-off output is not a fault");
+
+        // Reading only STATUS_WORD and OPERATION proves check_status
+        // never reached the per-register diagnostic reads.
+        assert_eq!(
+            tps.i2c.reads,
+            vec![
+                PmbusCommand::StatusWord.as_u8(),
+                PmbusCommand::Operation.as_u8()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn output_off_while_commanded_on_is_a_fault() {
+        let table = RegisterTable::new(&[
+            (PmbusCommand::StatusWord, &OFF_STATUS),
+            (PmbusCommand::Operation, &[pmbus::Operation::On.as_u8()]),
+        ]);
+        let mut tps = Tps546::new(table, config());
+
+        let err = tps
+            .check_status()
+            .await
+            .expect_err("commanded-on output that is off");
+
+        assert!(err.to_string().contains("Power controller is OFF"), "{err}");
     }
 }
