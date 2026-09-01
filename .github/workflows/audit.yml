@@ -12,6 +12,8 @@ on:
 jobs:
   audit:
     name: just audit
+    # Run the schedule only upstream, not on forks.
+    if: github.event_name != 'schedule' || github.repository == '256foundation/mujina'
     runs-on: ubuntu-latest
     permissions:
       contents: read
