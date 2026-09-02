@@ -15,9 +15,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
 use super::server::SharedState;
-use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
-};
+use crate::api_client::types::{BoardTelemetry, MinerPatchRequest, MinerTelemetry};
+use crate::config::{Config, SourceConfig};
 
 /// Build the v0 API routes with OpenAPI metadata.
 pub fn routes() -> OpenApiRouter<SharedState> {
@@ -26,6 +25,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
+        .routes(routes!(get_config))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -139,20 +139,33 @@ async fn get_board(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// Return all registered job sources.
+/// Return the full configuration tree.
+#[utoipa::path(
+    get,
+    path = "/config",
+    tag = "config",
+    responses(
+        (status = OK, description = "Current configuration", body = Config),
+    ),
+)]
+async fn get_config(State(state): State<SharedState>) -> Json<Config> {
+    Json((*state.config).clone())
+}
+
+/// Return the configured job sources.
 #[utoipa::path(
     get,
     path = "/sources",
     tag = "sources",
     responses(
-        (status = OK, description = "List of job sources", body = Vec<SourceTelemetry>),
+        (status = OK, description = "List of configured job sources", body = Vec<SourceConfig>),
     ),
 )]
-async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceTelemetry>> {
-    Json(state.miner_telemetry_rx.borrow().sources.clone())
+async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceConfig>> {
+    Json(state.config.sources.clone())
 }
 
-/// Return a single source by name, or 404 if not found.
+/// Return a single configured job source by name, or 404 if not found.
 #[utoipa::path(
     get,
     path = "/sources/{name}",
@@ -161,17 +174,16 @@ async fn get_sources(State(state): State<SharedState>) -> Json<Vec<SourceTelemet
         ("name" = String, Path, description = "Source name"),
     ),
     responses(
-        (status = OK, description = "Source details", body = SourceTelemetry),
+        (status = OK, description = "Source details", body = SourceConfig),
         (status = NOT_FOUND, description = "Source not found"),
     ),
 )]
 async fn get_source(
     State(state): State<SharedState>,
     Path(name): Path<String>,
-) -> Result<Json<SourceTelemetry>, StatusCode> {
+) -> Result<Json<SourceConfig>, StatusCode> {
     state
-        .miner_telemetry_rx
-        .borrow()
+        .config
         .sources
         .iter()
         .find(|s| s.name == name)
