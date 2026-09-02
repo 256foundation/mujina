@@ -1,0 +1,6 @@
+# Dependency cooldown. A version published less than this long ago
+# may not enter Cargo.lock. Most malicious crate releases are caught
+# and yanked within days. scripts/check-dep-cooldown enforces it on
+# pull requests; cargo itself enforces it from version 1.100 forward.
+[registry]
+global-min-publish-age = "7 days"

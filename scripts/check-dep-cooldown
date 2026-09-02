@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Fail when Cargo.lock holds a crates.io version younger than the cooldown.
+
+    check-dep-cooldown [BASE_REF]
+
+With BASE_REF, only versions absent from that ref's Cargo.lock are
+checked, so a pull request fails exactly when it adds a too-young
+version. Without it, every crates.io version in the lock is checked.
+
+The cooldown is registry.global-min-publish-age in .cargo/config.toml.
+Publish times come from cargo's local index cache, which cargo fills
+whenever it resolves the lock, so the check needs no network and
+never uses it. A version missing from the cache fails the check;
+`cargo fetch --locked` fills the cache, and the just recipe runs it
+first.
+"""
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+CONFIG = Path(".cargo/config.toml")
+LOCK = Path("Cargo.lock")
+FILL_HINT = "run `cargo fetch --locked` to fill the index cache"
+
+
+def main(argv):
+    if len(argv) > 2:
+        sys.exit(__doc__.strip())
+    base_ref = argv[1] if len(argv) == 2 else None
+    added, problems = check(base_ref, datetime.now(timezone.utc))
+    for problem in problems:
+        print(f"error: {problem}")
+    scope = f"added since {base_ref}" if base_ref else "in Cargo.lock"
+    print(
+        f"checked {len(added)} crates.io versions {scope}; "
+        f"{len(problems)} too young or unknown"
+    )
+    sys.exit(1 if problems else 0)
+
+
+def check(base_ref, now):
+    """Return the versions checked and one problem line per failing version."""
+    window = cooldown()
+    added = sorted(
+        packages(LOCK.read_text())
+        - (packages(base_lock(base_ref)) if base_ref else set())
+    )
+    problems = []
+    for name, version in added:
+        published = pubtime(name, version)
+        if published is None:
+            problems.append(
+                f"{name} {version}: not in the local index cache; {FILL_HINT}"
+            )
+        elif now - published < window:
+            age = now - published
+            problems.append(
+                f"{name} {version}: published {published.isoformat()}, "
+                f"{age.days} days old, cooldown is {window.days} days"
+            )
+    return added, problems
+
+
+def cooldown():
+    config = tomllib.loads(CONFIG.read_text())
+    text = config["registry"]["global-min-publish-age"]
+    match = re.fullmatch(r"(\d+)\s*(second|minute|hour|day)s?", text.strip())
+    if not match:
+        sys.exit(f"error: cannot parse global-min-publish-age {text!r} in {CONFIG}")
+    return timedelta(**{match.group(2) + "s": int(match.group(1))})
+
+
+def packages(lock_text):
+    lock = tomllib.loads(lock_text)
+    return {
+        (p["name"], p["version"])
+        for p in lock.get("package", [])
+        if p.get("source") == CRATES_IO
+    }
+
+
+def base_lock(ref):
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{LOCK}"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        sys.exit(f"error: cannot read {LOCK} at {ref}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def pubtime(name, version):
+    """The version's publish time from cargo's sparse index cache, or None."""
+    for path in glob.glob(
+        os.path.join(
+            cargo_home(), "registry/index/index.crates.io-*/.cache", index_path(name)
+        )
+    ):
+        # Five header bytes, then NUL-separated fields: an etag, then
+        # version and JSON pairs.
+        fields = Path(path).read_bytes()[5:].split(b"\0")
+        for i in range(1, len(fields) - 1, 2):
+            if fields[i].decode() == version:
+                stamp = json.loads(fields[i + 1]).get("pubtime")
+                return (
+                    datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                    if stamp
+                    else None
+                )
+    return None
+
+
+def cargo_home():
+    return os.environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo")
+
+
+def index_path(name):
+    name = name.lower()
+    if len(name) == 1:
+        return f"1/{name}"
+    if len(name) == 2:
+        return f"2/{name}"
+    if len(name) == 3:
+        return f"3/{name[0]}/{name}"
+    return f"{name[:2]}/{name[2:4]}/{name}"
+
+
+if __name__ == "__main__":
+    main(sys.argv)
