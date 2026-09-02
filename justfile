@@ -38,10 +38,11 @@ test-scripts:
 run:
     cargo run --locked --bin mujina-minerd
 
-# Quick mining check on an attached Bitaxe Gamma; pass "baseline" for
-# the full check with the hashrate band; needs the board powered;
-# set MUJINA_POOL_URL/MUJINA_POOL_USER to mine to a pool, or leave
-# them unset to mine to the daemon's dummy source
+# Pass "baseline" for the full check with the hashrate band. Needs
+# the board powered. Set MUJINA_POOL_URL/MUJINA_POOL_USER to mine to
+# a pool, or leave them unset to mine to the daemon's dummy source.
+#
+# Quick mining check on an attached Bitaxe Gamma
 [group('hw')]
 test-bitaxe-gamma tier='smoke':
     cargo test --locked --test bitaxe_gamma -- --ignored --nocapture --test-threads=1 {{tier}}
