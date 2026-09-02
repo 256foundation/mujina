@@ -1,0 +1,54 @@
+# Fail a pull request that adds a crates.io version younger than the
+# cooldown in .cargo/config.toml. The recipe fetches the locked crates
+# and compiles nothing.
+
+name: Check dep cooldown
+
+on:
+  pull_request:
+    paths:
+      - Cargo.lock
+      - .cargo/config.toml
+      - scripts/check-dep-cooldown
+      - .github/workflows/check-dep-cooldown.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check-dep-cooldown:
+    name: just check-dep-cooldown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # The base branch's Cargo.lock is the point of comparison.
+          fetch-depth: 0
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.40.0"
+
+      - id: image
+        run: echo "tag=$(just --evaluate BUILD_TAG)" >> "$GITHUB_OUTPUT"
+
+      # Reuse the build toolchain image cached by ci.yml (same
+      # key); build and save it only on a miss.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        id: image-cache
+        with:
+          path: /tmp/mujina-build.tar
+          key: build-image-${{ steps.image.outputs.tag }}
+
+      - name: Load cached build image
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: podman load -i /tmp/mujina-build.tar
+
+      - env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: just in-container check-dep-cooldown "$BASE_REF"
+
+      - name: Save build image for cache
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          podman save -o /tmp/mujina-build.tar \
+              "mujina-build:${{ steps.image.outputs.tag }}"

@@ -25,9 +25,14 @@ deny: (_require "cargo-deny")
 audit: (_require "cargo-deny")
     cargo deny --locked check advisories
 
+# Run the unit tests of the Python scripts
+[group('dev')]
+test-scripts:
+    python3 -B -m unittest discover -s scripts -p '*_test.py'
+
 # Run all checks (before commit, push, merge, release)
 [group('dev')]
-@checks: (fmt "--check") lint test deny
+@checks: (fmt "--check") lint test-scripts deny test
 
 [group('dev')]
 run:
@@ -50,6 +55,16 @@ update-deps *crates: (_require "cargo-cooldown")
 [group('deps')]
 resolve-deps: (_require "cargo-cooldown")
     cargo cooldown check
+
+# The fetch resolves the lock, which fills cargo's index cache, where
+# the check reads publish times. With the crates already fetched it
+# does nothing and needs no network.
+#
+# Fail if Cargo.lock gained a crates.io version younger than the cooldown
+[group('deps')]
+check-dep-cooldown base='origin/main':
+    cargo fetch --locked
+    scripts/check-dep-cooldown {{base}}
 
 [private]
 _require tool:
@@ -82,6 +97,9 @@ build-image-clean:
         | grep -v ':{{BUILD_TAG}}$' \
         | xargs -r podman rmi
 
+# The git config marks the mounted workspace as trusted, since git
+# refuses a repository owned by another user.
+#
 # Run a just recipe inside the build toolchain image
 [group('container')]
 in-container *args: build-image
@@ -91,6 +109,9 @@ in-container *args: build-image
         -v "$(pwd)/.cache/cargo-registry":/usr/local/cargo/registry \
         -v "$(pwd)/.cache/cargo-git":/usr/local/cargo/git \
         -w /workspace \
+        -e GIT_CONFIG_COUNT=1 \
+        -e GIT_CONFIG_KEY_0=safe.directory \
+        -e GIT_CONFIG_VALUE_0=/workspace \
         {{BUILD_IMAGE}}:{{BUILD_TAG}} \
         just {{args}}
 
