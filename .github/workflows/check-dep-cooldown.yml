@@ -1,23 +1,47 @@
 # Fail a pull request that adds a crates.io version younger than the
 # cooldown in .cargo/config.toml. The recipe fetches the locked crates
 # and compiles nothing.
+#
+# The workflow runs on every pull request so branch protection can
+# require the check. A job skipped by its `if` reports as skipped,
+# which counts as a pass.
 
 name: Check dep cooldown
 
 on:
   pull_request:
-    paths:
-      - Cargo.lock
-      - .cargo/config.toml
-      - scripts/check-dep-cooldown
-      - .github/workflows/check-dep-cooldown.yml
 
 permissions:
   contents: read
 
 jobs:
+  # Decide whether there is anything to check.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      lock: ${{ steps.changed.outputs.lock }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - id: changed
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          if git diff --quiet "$BASE_REF"...HEAD -- \
+              Cargo.lock \
+              .cargo/config.toml \
+              scripts/check-dep-cooldown \
+              .github/workflows/check-dep-cooldown.yml; then
+            echo "lock=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "lock=true" >> "$GITHUB_OUTPUT"
+          fi
+
   check-dep-cooldown:
     name: just check-dep-cooldown
+    needs: changes
+    if: needs.changes.outputs.lock == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
