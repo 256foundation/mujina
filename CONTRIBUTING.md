@@ -178,19 +178,39 @@ just in-container checks
 
 ### Updating Dependencies
 
-Dependency versions are locked in `Cargo.lock`, and every build
-passes `--locked`, so versions change only deliberately.
+To mitigate supply-chain attacks, the project holds every crate
+release back for several days before it may enter `Cargo.lock` (the
+age is set in `.cargo/config.toml`). The Rust community catches and
+yanks most malicious releases within hours or days of publication.
 
-After editing `Cargo.toml` (adding, removing, or re-ranging a
-dependency), run:
+Dependency versions are locked in `Cargo.lock`. Pass `--locked` to
+cargo so a build never rewrites the lock as a side effect. The just
+recipes and CI pass `--locked` on every cargo call.
+
+After editing `Cargo.toml` to add, remove, or re-range a
+dependency, update the lockfile through the just recipes, which
+honor the cooldown.
 
 ```bash
 just resolve-deps
 ```
 
-This picks versions for the dependencies you changed, writes
-them to `Cargo.lock`, and leaves every other locked version
-unchanged.
+`resolve-deps` picks appropriate versions for the dependencies you
+changed, writes them to `Cargo.lock`, and leaves every other locked
+version unchanged.
+
+Review the `Cargo.lock` diff and commit it like any other change.
+`just check-dep-cooldown` fails if a dependency introduced since a
+base ref, `origin/main` by default, is too young. A CI job runs
+that check against the base branch. When an underage version must
+go in, such as a security fix that cannot wait, a maintainer
+merges despite the failed CI job.
+
+Cargo's min-publish-age setting is unstable until cargo 1.100. Until
+it ships, only the nightly toolchain enforces the age, so the just
+recipes which edit dependencies run `cargo +nightly`. Stable cargo
+ignores the setting without a warning, so a plain `cargo add` or
+`cargo update` picks young versions.
 
 To refresh all dependencies to the newest allowed versions:
 
@@ -198,14 +218,17 @@ To refresh all dependencies to the newest allowed versions:
 just update-deps
 ```
 
-Both commands refuse versions published less than seven days ago
-and automatically pick the newest older version instead (the
-cooldown in `cooldown.toml`). The cooldown defends against
-supply-chain attacks. Most malicious crate releases are caught
-and yanked within days of publication, and the wait keeps them
-out of `Cargo.lock`.
+To move one crate to its newest allowed version and nothing else:
 
-Review the `Cargo.lock` diff and commit it like any other change.
+```bash
+just update-dep h2
+```
+
+To move one crate to a version that violates the cooldown:
+
+```bash
+just force-dep h2 0.4.16
+```
 
 ### Documenting Known Bugs with `#[should_panic]`
 

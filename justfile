@@ -47,15 +47,35 @@ run:
 test-bitaxe-gamma tier='smoke':
     cargo test --locked --test bitaxe_gamma -- --ignored --nocapture --test-threads=1 {{tier}}
 
-# Update all dependencies, or only the named crates, to aged versions
+# Dependency edits use the nightly toolchain until cargo 1.100
+# enforces the cooldown in .cargo/config.toml on stable.
+CARGO_DEPS := "cargo +nightly"
+
+# Update all dependencies to their newest allowed versions
 [group('deps')]
-update-deps *crates: (_require "cargo-cooldown")
-    cargo cooldown update {{ prepend("-p ", crates) }}
+update-deps:
+    {{CARGO_DEPS}} update
+
+# The single-crate recipes that follow edit the crate's lock entry and let
+# cargo re-resolve it. The direct way, `cargo update -p`, also rewrites
+# unrelated entries to older versions (rust-lang/cargo#5529).
+
+# Update one crate to its newest allowed version; nothing else moves
+[group('deps')]
+update-dep crate:
+    scripts/lock-edit drop {{crate}}
+    {{CARGO_DEPS}} update --workspace
+
+# Move one crate to an exact version, even inside the cooldown
+[group('deps')]
+force-dep crate version:
+    scripts/lock-edit set {{crate}} {{version}}
+    CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow {{CARGO_DEPS}} update --workspace
 
 # Bring Cargo.lock in line with Cargo.toml after a manifest edit
 [group('deps')]
-resolve-deps: (_require "cargo-cooldown")
-    cargo cooldown check
+resolve-deps:
+    {{CARGO_DEPS}} update --workspace
 
 # The fetch resolves the lock, which fills cargo's index cache, where
 # the check reads publish times. With the crates already fetched it

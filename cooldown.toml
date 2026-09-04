@@ -1,7 +1,0 @@
-# Dependency update cooldown, enforced by cargo-cooldown. Refuse
-# versions younger than the age below; most malicious crate
-# releases are caught and yanked within days. The key name
-# follows cargo RFC 3923. When cargo implements the RFC, drop
-# the wrapper and move this setting into .cargo/config.toml.
-[registry]
-global-min-publish-age = "7 days"

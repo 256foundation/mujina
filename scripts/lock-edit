@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Edit one package entry in Cargo.lock so cargo re-resolves it.
+
+    lock-edit drop NAME[@VERSION]
+        Remove the entry. On the next resolve cargo adds the crate
+        back at its newest allowed version.
+
+    lock-edit set NAME VERSION
+        Rewrite the entry's version and remove its checksum. On the
+        next resolve cargo fills the checksum in and updates only
+        what the new version requires.
+
+Neither runs `cargo update -p`, which also rewrites unrelated
+entries (rust-lang/cargo#5529).
+"""
+
+import re
+import sys
+from pathlib import Path
+
+LOCK = Path("Cargo.lock")
+BLOCK = re.compile(r"\[\[package\]\]\n(?:[^\n]+\n)+\n?")
+
+
+def main(argv):
+    if len(argv) == 3 and argv[1] == "drop":
+        name, _, version = argv[2].partition("@")
+        edit(name, version or None, drop)
+    elif len(argv) == 4 and argv[1] == "set":
+        edit(argv[2], None, lambda block: set_version(block, argv[3]))
+    else:
+        sys.exit(__doc__.strip())
+
+
+def edit(name, version, transform):
+    text = LOCK.read_text()
+    matches = [m for m in BLOCK.finditer(text) if entry(m.group())[0] == name]
+    if version:
+        matches = [m for m in matches if entry(m.group())[1] == version]
+    if not matches:
+        sys.exit(f"error: {name} is not in Cargo.lock")
+    if len(matches) > 1:
+        versions = ", ".join(entry(m.group())[1] for m in matches)
+        sys.exit(
+            f"error: {name} has several entries ({versions}); "
+            f"name one as {name}@VERSION"
+        )
+    match = matches[0]
+    if "\nsource = " not in match.group():
+        sys.exit(f"error: {name} is a workspace member, not a registry crate")
+    LOCK.write_text(
+        text[: match.start()] + transform(match.group()) + text[match.end() :]
+    )
+
+
+def entry(block):
+    name = re.search(r'^name = "([^"]+)"', block, re.M).group(1)
+    version = re.search(r'^version = "([^"]+)"', block, re.M).group(1)
+    return name, version
+
+
+def drop(block):
+    return ""
+
+
+def set_version(block, version):
+    block = re.sub(
+        r'^version = "[^"]+"', f'version = "{version}"', block, count=1, flags=re.M
+    )
+    return re.sub(r'^checksum = "[^"]+"\n', "", block, count=1, flags=re.M)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
