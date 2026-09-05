@@ -286,7 +286,18 @@ fn compute_merkle_root(task: &HashTask) -> Option<bitcoin::TxMerkleNode> {
         MerkleRootKind::Fixed(mr) => Some(*mr),
         MerkleRootKind::Computed(_) => {
             let en2 = task.en2.as_ref()?;
-            template.compute_merkle_root(en2).ok()
+            let root = template.compute_merkle_root(en2);
+            if root.is_err() {
+                // Without a merkle root the task cannot be mined; say so
+                // loudly instead of idling in silence. Jobs from the
+                // stratum source are validated upstream, so this should
+                // be rare.
+                warn!(
+                    job_id = %template.id,
+                    "Job coinbase does not parse; task cannot be mined"
+                );
+            }
+            root.ok()
         }
     }
 }
@@ -330,7 +341,10 @@ fn update_status(status: &Arc<RwLock<HashThreadStatus>>, is_active: bool, shares
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job_source::{GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate};
+    use crate::job_source::{
+        Extranonce2, Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind,
+        MerkleRootTemplate, VersionTemplate,
+    };
     use bitcoin::hashes::Hash;
     use bitcoin::pow::Target;
     use std::sync::Arc;
@@ -376,6 +390,51 @@ mod tests {
     fn probe_measures_a_positive_rate() {
         let rate = probe_peak_hashrate_for(Duration::from_millis(20));
         assert!(!rate.is_zero(), "probe should observe some hashing");
+    }
+
+    /// Build a task with a Computed merkle root from raw coinbase halves.
+    fn make_computed_task(coinbase1: Vec<u8>, coinbase2: Vec<u8>) -> HashTask {
+        let task = make_test_task();
+        let template = Arc::new(JobTemplate {
+            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
+                coinbase1,
+                extranonce1: vec![0xab, 0xcd, 0xef, 0x01],
+                extranonce2_range: Extranonce2Range::new(4).unwrap(),
+                coinbase2,
+                merkle_branches: vec![],
+            }),
+            ..task.template.as_ref().clone()
+        });
+        HashTask {
+            template,
+            en2: Some(Extranonce2::new(0, 4).unwrap()),
+            ..task
+        }
+    }
+
+    #[test]
+    fn unparseable_coinbase_yields_no_merkle_root() {
+        // A coinbase that hex-decodes but doesn't form a transaction
+        // can't be mined; compute_merkle_root reports None (and warns).
+        let task = make_computed_task(vec![0xaa], vec![0xbb]);
+        assert!(compute_merkle_root(&task).is_none());
+    }
+
+    #[test]
+    fn valid_coinbase_yields_merkle_root() {
+        // version(4) vin_count(1) prevhash(32) index(4) scriptlen(8) ||
+        // sequence(4) vout_count(1) locktime(4): a structure-valid
+        // 1-in/0-out transaction once the extranonces (4+4 bytes) are
+        // spliced in as the scriptSig.
+        let mut coinbase1 = hex::decode("02000000").unwrap();
+        coinbase1.push(0x01);
+        coinbase1.extend_from_slice(&[0x00; 32]);
+        coinbase1.extend_from_slice(&[0xff; 4]);
+        coinbase1.push(0x08);
+        let coinbase2 = hex::decode("ffffffff0000000000").unwrap();
+
+        let task = make_computed_task(coinbase1, coinbase2);
+        assert!(compute_merkle_root(&task).is_some());
     }
 
     #[test]
