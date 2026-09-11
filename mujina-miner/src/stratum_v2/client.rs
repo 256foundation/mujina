@@ -36,7 +36,7 @@ use stratum_apps::stratum_core::common_messages_sv2::{
 use stratum_apps::stratum_core::mining_sv2::{
     CloseChannelOwned, NewExtendedMiningJobOwned, OpenExtendedMiningChannelOwned,
     OpenExtendedMiningChannelSuccessOwned, SetNewPrevHashOwned, SetTargetOwned,
-    SubmitSharesErrorOwned, SubmitSharesExtendedOwned, SubmitSharesSuccess,
+    SubmitSharesErrorOwned, SubmitSharesExtendedOwned, SubmitSharesSuccess, UpdateChannelOwned,
 };
 use stratum_apps::stratum_core::parsers_sv2::{
     AnyMessage, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
@@ -147,6 +147,13 @@ impl PoolConfig {
 pub enum ClientCommand {
     /// Send a `SubmitSharesExtended` message to the pool.
     SubmitShare(ShareSubmission),
+    /// Send an `UpdateChannel` message to the pool.
+    UpdateChannel {
+        /// Channel the update applies to.
+        channel_id: u32,
+        /// Hash rate the pool should size the channel's target for.
+        nominal_hash_rate: HashRate,
+    },
 }
 
 /// A share to submit to the pool.
@@ -572,6 +579,18 @@ impl StratumV2Client {
                                 AnyMessageOwned::Mining(MiningOwned::SubmitSharesExtended(submit)),
                             ).await?;
                         }
+                        Some(ClientCommand::UpdateChannel { channel_id, nominal_hash_rate }) => {
+                            debug!(channel_id, %nominal_hash_rate, "Updating channel");
+                            let update = UpdateChannelOwned {
+                                channel_id,
+                                nominal_hash_rate: nominal_hash_rate.0 as f32,
+                                maximum_target: U256Owned::from(Target::MAX.to_le_bytes()),
+                            };
+                            send_message(
+                                &mut write_half,
+                                AnyMessageOwned::Mining(MiningOwned::UpdateChannel(update)),
+                            ).await?;
+                        }
                         None => {
                             info!(host = %self.config.host, "Command channel closed; stopping");
                             return Ok(ClientOutcome::Shutdown);
@@ -662,6 +681,14 @@ impl StratumV2Client {
                 info!(channel_id = msg.channel_id, "CloseChannel");
                 self.emit(ClientEvent::from(msg)).await?;
                 Ok(ControlFlow::Break(ClientOutcome::ChannelClosed))
+            }
+            AnyMessageOwned::Mining(MiningOwned::UpdateChannelError(error)) => {
+                warn!(
+                    channel_id = error.channel_id,
+                    reason = error.error_code.as_utf8_or_hex(),
+                    "UpdateChannel.Error"
+                );
+                Ok(ControlFlow::Continue(()))
             }
             unexpected => {
                 warn!(host = %self.config.host, ?unexpected, "Ignoring unexpected message");

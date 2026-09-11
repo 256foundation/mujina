@@ -287,6 +287,7 @@ impl StratumV2Source {
                         }
                         SourceCommand::UpdateHashRate(rate) => {
                             self.nominal_hash_rate = rate;
+                            self.report_hash_rate(client_command_tx);
                         }
                     }
                 }
@@ -667,6 +668,31 @@ impl StratumV2Source {
                 merkle_branches,
             }),
         })
+    }
+
+    /// Tells the pool the channel's current nominal hash rate.
+    ///
+    /// Pools size the channel's target from this figure, so a value left at
+    /// the rate observed when the channel opened costs share quality for the
+    /// life of the connection.  Does nothing before a channel exists; the
+    /// opening `OpenExtendedMiningChannel` carries the rate instead.
+    ///
+    /// Like shares, the update is dropped rather than waited on when the
+    /// client has fallen behind; the source keeps the rate, so the next
+    /// update or channel open carries it.
+    fn report_hash_rate(&self, client_command_tx: &mpsc::Sender<ClientCommand>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+
+        let update = ClientCommand::UpdateChannel {
+            channel_id: session.channel_id,
+            nominal_hash_rate: self.nominal_hash_rate,
+        };
+
+        if let Err(e) = client_command_tx.try_send(update) {
+            warn!(error = %e, "Failed to queue UpdateChannel");
+        }
     }
 
     /// Builds the client's configuration for the configured pool, carrying
