@@ -56,6 +56,15 @@ use super::{
     SourceCommand, SourceEvent, VersionTemplate,
 };
 
+/// How long the pool may go without sending work before the connection is
+/// recycled.
+///
+/// A half-open TCP connection — the NAT or firewall drops state without
+/// sending a FIN — produces no reader error and no EOF, so without a deadline
+/// both the source and the client wait forever and the reconnect back-off is
+/// never reached.  The V1 source bounds the same gap with the same limit.
+const MAX_JOB_GAP: Duration = Duration::from_secs(2 * 60);
+
 /// Why [`StratumV2Source::serve_events`] stopped serving a connection.
 enum ServeOutcome {
     /// The source is shutting down.
@@ -64,6 +73,8 @@ enum ServeOutcome {
     ClientExited,
     /// The session cannot continue and the connection must be rebuilt.
     SessionFailed(anyhow::Error),
+    /// The pool stopped sending work within [`MAX_JOB_GAP`].
+    JobGap,
 }
 
 /// Per-connection channel state.
@@ -297,6 +308,15 @@ impl StratumV2Source {
                 let _ = client_handle.await;
                 return ConnectOutcome::Disconnected;
             }
+            ServeOutcome::JobGap => {
+                warn!(
+                    gap_secs = MAX_JOB_GAP.as_secs(),
+                    "No job from pool within the gap limit; recycling the connection"
+                );
+                attempt_shutdown.cancel();
+                let _ = client_handle.await;
+                return ConnectOutcome::Disconnected;
+            }
             // The client ended on its own; its return value says why.
             ServeOutcome::ClientExited => {}
         }
@@ -333,11 +353,23 @@ impl StratumV2Source {
         client_event_rx: &mut mpsc::Receiver<ClientEvent>,
         client_command_tx: &mpsc::Sender<ClientCommand>,
     ) -> ServeOutcome {
+        let mut gap_start = tokio::time::Instant::now();
+
         loop {
             tokio::select! {
                 event_opt = client_event_rx.recv() => {
                     match event_opt {
                         Some(event) => {
+                            // Only work-bearing messages count as liveness; a
+                            // pool that keeps the socket warm without ever
+                            // sending a job is the case MAX_JOB_GAP guards.
+                            if matches!(
+                                event,
+                                ClientEvent::NewExtendedMiningJob(_)
+                                    | ClientEvent::SetNewPrevHash(_)
+                            ) {
+                                gap_start = tokio::time::Instant::now();
+                            }
                             if let Err(e) = self.handle_client_event(event).await {
                                 return ServeOutcome::SessionFailed(e);
                             }
@@ -355,6 +387,10 @@ impl StratumV2Source {
                             self.config.nominal_hash_rate = rate;
                         }
                     }
+                }
+
+                _ = tokio::time::sleep_until(gap_start + MAX_JOB_GAP) => {
+                    return ServeOutcome::JobGap;
                 }
 
                 _ = self.shutdown.cancelled() => return ServeOutcome::Shutdown,
@@ -899,6 +935,23 @@ mod tests {
         (source, command_tx, event_rx, shutdown)
     }
 
+    /// Contract: a pool that holds the socket open but sends no work for
+    /// MAX_JOB_GAP is treated as dead, so the reconnect back-off is reachable.
+    #[tokio::test(start_paused = true)]
+    async fn silent_pool_trips_the_job_gap() {
+        let (mut source, _command_tx, _event_rx, _shutdown) = make_source();
+        // Held open, so the loop never sees the client exit.
+        let (_client_event_tx, mut client_event_rx) = mpsc::channel::<ClientEvent>(10);
+        let (client_command_tx, _client_command_rx) = mpsc::channel::<ClientCommand>(10);
+
+        tokio::time::advance(MAX_JOB_GAP + Duration::from_secs(1)).await;
+        let outcome = source
+            .serve_events(&mut client_event_rx, &client_command_tx)
+            .await;
+
+        assert!(matches!(outcome, ServeOutcome::JobGap));
+    }
+
     /// Contract: an event that fails the session ends the loop with
     /// SessionFailed rather than being logged and ignored, so the caller
     /// rebuilds the channel instead of idling on a live socket.
@@ -945,7 +998,8 @@ mod tests {
         assert!(matches!(outcome, ServeOutcome::ClientExited));
     }
 
-    /// Contract: a cancelled shutdown token stops the loop with Shutdown.
+    /// Contract: a cancelled shutdown token stops the loop with Shutdown, in
+    /// preference to the job-gap deadline.
     #[tokio::test(start_paused = true)]
     async fn shutdown_ends_the_loop() {
         let (mut source, _command_tx, _event_rx, shutdown) = make_source();
