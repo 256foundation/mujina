@@ -31,8 +31,8 @@ use anyhow::{Context as _, Result};
 use bitcoin::block::Version;
 use bitcoin::hash_types::{BlockHash, TxMerkleNode};
 use bitcoin::hashes::Hash as _;
-use bitcoin::pow::CompactTarget;
-use stratum_apps::stratum_core::binary_sv2::B032;
+use bitcoin::pow::{CompactTarget, Target};
+use stratum_apps::stratum_core::binary_sv2::{B032, U256};
 use stratum_apps::stratum_core::channels_sv2::chain_tip::ChainTip;
 use stratum_apps::stratum_core::channels_sv2::client::error::ExtendedChannelError;
 use stratum_apps::stratum_core::channels_sv2::client::extended::{ExtendedChannel, ExtendedJob};
@@ -40,7 +40,7 @@ use stratum_apps::stratum_core::channels_sv2::client::share_accounting::{
     ShareValidationError, ShareValidationResult,
 };
 use stratum_apps::stratum_core::channels_sv2::extranonce_manager::ExtranoncePrefix;
-use stratum_apps::stratum_core::mining_sv2::SubmitSharesExtended;
+use stratum_apps::stratum_core::mining_sv2::{SubmitSharesExtended, UpdateChannel};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -385,6 +385,7 @@ impl StratumV2Source {
                         }
                         SourceCommand::UpdateHashRate(rate) => {
                             self.config.nominal_hash_rate = rate;
+                            self.report_hash_rate(client_command_tx).await;
                         }
                     }
                 }
@@ -856,6 +857,31 @@ impl StratumV2Source {
         })
     }
 
+    /// Tells the pool the channel's current nominal hash rate.
+    ///
+    /// Pools size the channel's target from this figure, so a value left at
+    /// the rate observed when the channel opened costs share quality for the
+    /// life of the connection.  Does nothing before a channel exists; the
+    /// opening `OpenExtendedMiningChannel` carries the rate instead.
+    async fn report_hash_rate(&self, client_command_tx: &mpsc::Sender<ClientCommand>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+
+        let update = UpdateChannel {
+            channel_id: session.channel_id,
+            nominal_hash_rate: self.config.nominal_hash_rate.0 as f32,
+            maximum_target: U256::from(Target::MAX.to_le_bytes()),
+        };
+
+        if let Err(e) = client_command_tx
+            .send(ClientCommand::UpdateChannel(update.into_static()))
+            .await
+        {
+            warn!(error = %e, "Failed to queue UpdateChannel");
+        }
+    }
+
     /// Drains commands during the back-off sleep.
     ///
     /// Returns `true` if shutdown was requested during the wait.
@@ -876,9 +902,8 @@ impl StratumV2Source {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::pow::Target;
     use stratum_apps::stratum_core::{
-        binary_sv2::{B064K, Seq0255, Sv2Option, U256},
+        binary_sv2::{B064K, Seq0255, Sv2Option},
         mining_sv2::{
             NewExtendedMiningJob, OpenExtendedMiningChannelSuccess,
             SetNewPrevHash as SetNewPrevHashMp,

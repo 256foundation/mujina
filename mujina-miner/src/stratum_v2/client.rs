@@ -32,7 +32,7 @@ use stratum_apps::stratum_core::common_messages_sv2::{Protocol, Reconnect, Setup
 use stratum_apps::stratum_core::mining_sv2::{
     CloseChannel, NewExtendedMiningJob, OpenExtendedMiningChannel,
     OpenExtendedMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
-    SubmitSharesExtended, SubmitSharesSuccess,
+    SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel,
 };
 use stratum_apps::stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
 use tokio::sync::mpsc;
@@ -154,6 +154,8 @@ impl PoolConfig {
 pub enum ClientCommand {
     /// Send a `SubmitSharesExtended` message to the pool.
     SubmitShare(SubmitSharesExtended<'static>),
+    /// Send an `UpdateChannel` message to the pool.
+    UpdateChannel(UpdateChannel<'static>),
 }
 
 /// Events emitted by the SV2 client to the consumer.
@@ -517,6 +519,17 @@ impl StratumV2Client {
                                 AnyMessage::Mining(Mining::SubmitSharesExtended(share)),
                             ).await?;
                         }
+                        Some(ClientCommand::UpdateChannel(update)) => {
+                            debug!(
+                                channel_id = update.channel_id,
+                                nominal_hash_rate = update.nominal_hash_rate,
+                                "Updating channel"
+                            );
+                            send_message(
+                                &mut write_half,
+                                AnyMessage::Mining(Mining::UpdateChannel(update)),
+                            ).await?;
+                        }
                         None => {
                             info!(host = %self.config.host(), "Command channel closed; stopping");
                             return Ok(ClientOutcome::Shutdown);
@@ -607,6 +620,14 @@ impl StratumV2Client {
                 info!(channel_id = msg.channel_id, "CloseChannel");
                 self.emit(ClientEvent::CloseChannel(msg)).await?;
                 Ok(ControlFlow::Break(ClientOutcome::ChannelClosed))
+            }
+            AnyMessage::Mining(Mining::UpdateChannelError(error)) => {
+                warn!(
+                    channel_id = error.channel_id,
+                    reason = error.error_code.as_utf8_or_hex(),
+                    "UpdateChannel.Error"
+                );
+                Ok(ControlFlow::Continue(()))
             }
             unexpected => {
                 warn!(host = %self.config.host(), ?unexpected, "Ignoring unexpected message");
