@@ -473,6 +473,37 @@ impl StratumV2Source {
                 }
             }
 
+            ClientEvent::SetExtranoncePrefix(msg) => {
+                let Some(session) = &mut self.session else {
+                    warn!("SetExtranoncePrefix arrived before channel opened; dropping");
+                    return Ok(());
+                };
+                // The prefix belongs to one channel, never to a group, so a
+                // message addressed anywhere else is not meant for this one.
+                if msg.channel_id != session.channel_id {
+                    warn!(
+                        expected = session.channel_id,
+                        got = msg.channel_id,
+                        "SetExtranoncePrefix channel_id mismatch; ignoring"
+                    );
+                    return Ok(());
+                }
+                let extranonce_prefix_bytes = msg.extranonce_prefix.inner_as_ref().to_vec();
+                let extranonce_prefix =
+                    ExtranoncePrefix::from_wire(extranonce_prefix_bytes.clone()).map_err(|e| {
+                        anyhow::anyhow!("SetExtranoncePrefix: invalid extranonce prefix: {e}")
+                    })?;
+                session
+                    .channel
+                    .set_extranonce_prefix(extranonce_prefix)
+                    .map_err(|e| anyhow::anyhow!("SetExtranoncePrefix: {e:?}"))?;
+                info!(
+                    channel_id = msg.channel_id,
+                    extranonce_prefix = %hex::encode(&extranonce_prefix_bytes),
+                    "Extranonce prefix replaced"
+                );
+            }
+
             ClientEvent::NewExtendedMiningJob(job) => {
                 let job_id = job.job_id;
                 let is_future = job.is_future();
@@ -905,7 +936,7 @@ mod tests {
     use stratum_apps::stratum_core::{
         binary_sv2::{B064K, Seq0255, Sv2Option},
         mining_sv2::{
-            NewExtendedMiningJob, OpenExtendedMiningChannelSuccess,
+            NewExtendedMiningJob, OpenExtendedMiningChannelSuccess, SetExtranoncePrefix,
             SetNewPrevHash as SetNewPrevHashMp,
         },
     };
@@ -1080,6 +1111,100 @@ mod tests {
         assert!(
             err.to_string().contains("coinbase_tx_prefix"),
             "error should name the offending field, got: {err}"
+        );
+    }
+
+    /// Contract: a SetExtranoncePrefix applies to jobs received after it, so
+    /// their templates carry the new prefix into the coinbase.
+    #[tokio::test]
+    async fn set_extranonce_prefix_applies_to_later_jobs() {
+        let (mut source, _command_tx, mut event_rx, _shutdown) = make_source();
+
+        // Give the channel a chain tip, so a non-future job is emitted as
+        // soon as it arrives.
+        let mut session = make_session();
+        session
+            .channel
+            .on_new_extended_mining_job(make_job(
+                7,
+                0x2000_0000,
+                false,
+                None, // future
+                vec![0x01; 8],
+                vec![0x02; 8],
+                vec![],
+            ))
+            .expect("future job accepted");
+        session
+            .channel
+            .on_set_new_prev_hash(SetNewPrevHashMp {
+                channel_id: 1,
+                job_id: 7,
+                prev_hash: U256::from([0u8; 32]),
+                min_ntime: 0,
+                nbits: 0x1d00_ffff,
+            })
+            .expect("prev hash activates the future job");
+        source.session = Some(session);
+
+        source
+            .handle_client_event(ClientEvent::SetExtranoncePrefix(SetExtranoncePrefix {
+                channel_id: 1,
+                extranonce_prefix: B032::try_from(vec![0xbe, 0xef]).unwrap().into_static(),
+            }))
+            .await
+            .expect("SetExtranoncePrefix is handled");
+        source
+            .handle_client_event(ClientEvent::NewExtendedMiningJob(make_job(
+                8,
+                0x2000_0000,
+                false,
+                Some(0),
+                vec![0x01; 8],
+                vec![0x02; 8],
+                vec![],
+            )))
+            .await
+            .expect("job is handled");
+
+        let SourceEvent::ReplaceJob(template) = event_rx.try_recv().expect("a job was emitted")
+        else {
+            panic!("expected ReplaceJob");
+        };
+        let MerkleRootKind::Computed(mrt) = template.merkle_root else {
+            panic!("expected MerkleRootKind::Computed");
+        };
+        assert_eq!(
+            mrt.extranonce_prefix,
+            vec![0xbe, 0xef],
+            "a job received after SetExtranoncePrefix must use the new prefix"
+        );
+    }
+
+    /// Contract: a SetExtranoncePrefix addressed to the group channel leaves
+    /// the channel's prefix unchanged, since the prefix belongs to a single
+    /// channel.
+    #[tokio::test]
+    async fn set_extranonce_prefix_for_group_channel_is_ignored() {
+        let (mut source, _command_tx, _event_rx, _shutdown) = make_source();
+        source.session = Some(SessionState {
+            group_channel_id: 9,
+            ..make_session()
+        });
+
+        source
+            .handle_client_event(ClientEvent::SetExtranoncePrefix(SetExtranoncePrefix {
+                channel_id: 9,
+                extranonce_prefix: B032::try_from(vec![0xbe, 0xef]).unwrap().into_static(),
+            }))
+            .await
+            .expect("SetExtranoncePrefix is handled");
+
+        let session = source.session.as_ref().expect("session is kept");
+        assert_eq!(
+            session.channel.get_extranonce_prefix(),
+            [0xde, 0xad].as_slice(),
+            "a group-addressed SetExtranoncePrefix must not change the prefix"
         );
     }
 

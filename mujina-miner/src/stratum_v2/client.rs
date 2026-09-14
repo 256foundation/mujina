@@ -31,8 +31,8 @@ use stratum_apps::stratum_core::codec_sv2::StandardEitherFrame;
 use stratum_apps::stratum_core::common_messages_sv2::{Protocol, Reconnect, SetupConnection};
 use stratum_apps::stratum_core::mining_sv2::{
     CloseChannel, NewExtendedMiningJob, OpenExtendedMiningChannel,
-    OpenExtendedMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
-    SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel,
+    OpenExtendedMiningChannelSuccess, SetExtranoncePrefix, SetNewPrevHash, SetTarget,
+    SubmitSharesError, SubmitSharesExtended, SubmitSharesSuccess, UpdateChannel,
 };
 use stratum_apps::stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
 use tokio::sync::mpsc;
@@ -176,6 +176,8 @@ pub enum ClientEvent {
     SetNewPrevHash(SetNewPrevHash<'static>),
     /// Pool updated the share difficulty target.
     SetTarget(SetTarget<'static>),
+    /// Pool replaced the channel's extranonce prefix.
+    SetExtranoncePrefix(SetExtranoncePrefix<'static>),
     /// Pool accepted a previously submitted share.
     SubmitSharesSuccess(SubmitSharesSuccess),
     /// Pool rejected a previously submitted share.
@@ -572,6 +574,11 @@ impl StratumV2Client {
             AnyMessage::Mining(Mining::SetTarget(target)) => {
                 debug!(channel_id = target.channel_id, "SetTarget");
                 self.emit(ClientEvent::SetTarget(target)).await?;
+                Ok(ControlFlow::Continue(()))
+            }
+            AnyMessage::Mining(Mining::SetExtranoncePrefix(msg)) => {
+                debug!(channel_id = msg.channel_id, "SetExtranoncePrefix");
+                self.emit(ClientEvent::SetExtranoncePrefix(msg)).await?;
                 Ok(ControlFlow::Continue(()))
             }
             AnyMessage::Mining(Mining::SubmitSharesSuccess(success)) => {
