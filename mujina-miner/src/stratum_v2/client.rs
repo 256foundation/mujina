@@ -35,8 +35,9 @@ use stratum_apps::stratum_core::common_messages_sv2::{
 };
 use stratum_apps::stratum_core::mining_sv2::{
     CloseChannelOwned, NewExtendedMiningJobOwned, OpenExtendedMiningChannelOwned,
-    OpenExtendedMiningChannelSuccessOwned, SetNewPrevHashOwned, SetTargetOwned,
-    SubmitSharesErrorOwned, SubmitSharesExtendedOwned, SubmitSharesSuccess, UpdateChannelOwned,
+    OpenExtendedMiningChannelSuccessOwned, SetExtranoncePrefixOwned, SetNewPrevHashOwned,
+    SetTargetOwned, SubmitSharesErrorOwned, SubmitSharesExtendedOwned, SubmitSharesSuccess,
+    UpdateChannelOwned,
 };
 use stratum_apps::stratum_core::parsers_sv2::{
     AnyMessage, AnyMessageOwned, CommonMessagesOwned, MiningOwned,
@@ -215,6 +216,13 @@ pub enum ClientEvent {
         channel_id: u32,
         /// New maximum share target.
         target: Target,
+    },
+    /// Pool replaced the channel's extranonce prefix.
+    SetExtranoncePrefix {
+        /// Channel the prefix applies to.
+        channel_id: u32,
+        /// New prefix for jobs that follow.
+        extranonce_prefix: ExtranoncePrefix,
     },
     /// Pool accepted previously submitted shares.
     SubmitSharesSuccess {
@@ -635,6 +643,11 @@ impl StratumV2Client {
                 self.emit(ClientEvent::from(target)).await?;
                 Ok(ControlFlow::Continue(()))
             }
+            AnyMessageOwned::Mining(MiningOwned::SetExtranoncePrefix(msg)) => {
+                debug!(channel_id = msg.channel_id, "SetExtranoncePrefix");
+                self.emit(ClientEvent::try_from(msg)?).await?;
+                Ok(ControlFlow::Continue(()))
+            }
             AnyMessageOwned::Mining(MiningOwned::SubmitSharesSuccess(success)) => {
                 trace!(channel_id = success.channel_id, "SubmitShares.Success");
                 self.emit(ClientEvent::from(success)).await?;
@@ -725,6 +738,17 @@ impl From<SetTargetOwned> for ClientEvent {
             channel_id: msg.channel_id,
             target: Target::from_le_bytes(msg.maximum_target.into_array()),
         }
+    }
+}
+
+impl TryFrom<SetExtranoncePrefixOwned> for ClientEvent {
+    type Error = StratumV2Error;
+
+    fn try_from(msg: SetExtranoncePrefixOwned) -> StratumV2Result<Self> {
+        Ok(ClientEvent::SetExtranoncePrefix {
+            channel_id: msg.channel_id,
+            extranonce_prefix: ExtranoncePrefix::from_wire(msg.extranonce_prefix.into_bytes())?,
+        })
     }
 }
 
