@@ -198,13 +198,13 @@ differently.
 - ASICs: 1 BM1370 (BM13xx family)
 - HashThreads exposed: 1
 - Peripherals: EMC2101 fan controller, TPS546 power regulator
-- Management channel: bitaxe-raw over USB serial
+- Management channel: RHAP over USB serial
 
 **EmberOne00**, a multi-chip chain:
 - ASICs: 12 BM1362 (BM13xx family)
 - HashThreads exposed: 1 (one thread drives the chain)
 - Peripherals: TMP1075 / TMP451 temperature sensors, RGB status LED
-- Management channel: bitaxe-raw over USB serial
+- Management channel: RHAP over USB serial
 
 **CPU backend**, a virtual board:
 - ASICs: none; software SHA-256 instead
