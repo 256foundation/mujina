@@ -246,8 +246,9 @@ GitHub.
 
 - [Bitaxe](https://github.com/bitaxeorg): open-source Bitcoin mining
   hardware
-- [bitaxe-raw](https://github.com/bitaxeorg/bitaxe-raw): pass-through firmware for
-  Bitaxe boards required for use by Mujina
+- [rhapd-bitaxe-gamma](https://github.com/256foundation/rhapd-bitaxe-gamma):
+  pass-through firmware for the Bitaxe Gamma required for use by
+  Mujina; it replaces the deprecated bitaxe-raw
 - [EmberOne00](https://github.com/256foundation/emberone00-pcb): 256
   Foundation's first open-source Bitcoin mining hashboard
 - [Libreboard](https://github.com/256foundation/libreboard): 256

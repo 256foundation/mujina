@@ -149,7 +149,7 @@ body:
         - Multiple boards if relevant
       placeholder: |
         - Stock Bitaxe Gamma, no modifications
-        - Bitaxe firmware: bitaxe-raw v1.2.3
+        - Bitaxe firmware: rhapd-bitaxe-gamma 59e90f6
         - 5V 6A power supply
     validations:
       required: false
