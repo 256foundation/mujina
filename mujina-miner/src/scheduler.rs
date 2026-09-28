@@ -1170,6 +1170,7 @@ impl MiningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::hash_thread::{HashThreadCapabilities, HashThreadStatus};
     use crate::types::Difficulty;
 
     #[test]
@@ -1301,5 +1302,127 @@ mod tests {
         gate.record_enumeration_complete();
         gate.record_timeout();
         assert!(!gate.is_holding());
+    }
+
+    /// A HashThread that accepts any task and records assigned tasks.
+    struct StubThread {
+        name: String,
+        capabilities: HashThreadCapabilities,
+        event_rx: Option<mpsc::Receiver<HashThreadEvent>>,
+        assigned_tasks: Arc<std::sync::Mutex<Vec<HashTask>>>,
+    }
+
+    impl StubThread {
+        fn new(name: String, assigned_tasks: Arc<std::sync::Mutex<Vec<HashTask>>>) -> Self {
+            let (_tx, rx) = mpsc::channel(1);
+            Self {
+                name,
+                capabilities: HashThreadCapabilities::default(),
+                event_rx: Some(rx),
+                assigned_tasks,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HashThread for StubThread {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn capabilities(&self) -> &HashThreadCapabilities {
+            &self.capabilities
+        }
+
+        async fn configure(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.assigned_tasks.lock().unwrap().push(task);
+            Ok(None)
+        }
+
+        async fn replace_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.assigned_tasks.lock().unwrap().push(task);
+            Ok(None)
+        }
+
+        async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
+            Ok(None)
+        }
+
+        fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
+            self.event_rx.take()
+        }
+
+        fn status(&self) -> HashThreadStatus {
+            HashThreadStatus::default()
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic]
+    async fn assign_job_when_en2_space_smaller_than_thread_count() {
+        use crate::job_source::{
+            Extranonce2Range, GeneralPurposeBits, MerkleRootTemplate, VersionTemplate,
+        };
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash;
+        use bitcoin::{BlockHash, CompactTarget};
+
+        let mut scheduler = Scheduler::new();
+        let mut share_channels = ShareStream::new();
+
+        let thread_tasks: Vec<Arc<std::sync::Mutex<Vec<HashTask>>>> = (0..257)
+            .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
+            .collect();
+
+        // 257 eligible threads against a 1-byte (256-value) EN2 space.
+        for (i, tasks) in thread_tasks.iter().enumerate() {
+            scheduler.threads.insert(ThreadEntry {
+                thread: Box::new(StubThread::new(format!("stub-{i}"), tasks.clone())),
+                hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+                expected: Some(HashRate::from_megahashes(1.0)),
+            });
+        }
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let source_id = scheduler.sources.insert(SourceEntry {
+            name: "test".into(),
+            url: None,
+            command_tx,
+            last_job: None,
+            difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
+        });
+
+        let template = JobTemplate {
+            id: "job-1".into(),
+            prev_blockhash: BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                Version::from_consensus(0x20000000),
+                GeneralPurposeBits::none(),
+            )
+            .unwrap(),
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            share_target: Target::MAX,
+            time: 0,
+            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
+                coinbase1: vec![],
+                extranonce1: vec![],
+                extranonce2_range: Extranonce2Range::new(1).unwrap(),
+                coinbase2: vec![],
+                merkle_branches: vec![],
+            }),
+        };
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                template,
+                &mut share_channels,
+            )
+            .await;
     }
 }
