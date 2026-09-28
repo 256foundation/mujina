@@ -456,7 +456,8 @@ impl Scheduler {
             self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
         }
 
-        // Split the EN2 range evenly across the currently-eligible threads.
+        // Split the EN2 range evenly across eligible threads, capping at the
+        // EN2 space capacity so excess threads remain idle rather than panicking.
         //
         // TODO: A thread that becomes eligible later is handed the full EN2
         // range on its first report, overlapping these slices until the next
@@ -466,9 +467,35 @@ impl Scheduler {
             debug!(source = %source_name, "No eligible threads yet, job cached for later");
             return;
         }
-        let en2_slices = full_en2_range
-            .split(eligible.len())
-            .expect("Failed to split EN2 range among threads");
+
+        let en2_values = full_en2_range.len();
+        let eligible_count = eligible.len();
+        let usable_count = usize::try_from(en2_values)
+            .map(|v| v.min(eligible_count))
+            .unwrap_or(eligible_count);
+
+        if usable_count < eligible_count {
+            let idle_count = eligible_count - usable_count;
+            warn!(
+                source = %source_name,
+                eligible_threads = eligible_count,
+                en2_values = en2_values,
+                assigned_threads = usable_count,
+                idle_threads = idle_count,
+                "Extranonce2 space smaller than eligible thread count; \
+                 leaving excess threads idle"
+            );
+        }
+
+        let Some(en2_slices) = full_en2_range.split(usable_count) else {
+            error!(
+                source = %source_name,
+                usable_threads = usable_count,
+                en2_values = en2_values,
+                "Failed to split extranonce2 range"
+            );
+            return;
+        };
 
         for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
@@ -1361,9 +1388,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[should_panic]
-    async fn assign_job_when_en2_space_smaller_than_thread_count() {
+    fn make_test_job(en2_size: u8) -> JobTemplate {
         use crate::job_source::{
             Extranonce2Range, GeneralPurposeBits, MerkleRootTemplate, VersionTemplate,
         };
@@ -1371,14 +1396,38 @@ mod tests {
         use bitcoin::hashes::Hash;
         use bitcoin::{BlockHash, CompactTarget};
 
-        let mut scheduler = Scheduler::new();
-        let mut share_channels = ShareStream::new();
+        JobTemplate {
+            id: "job-1".into(),
+            prev_blockhash: BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                Version::from_consensus(0x20000000),
+                GeneralPurposeBits::none(),
+            )
+            .unwrap(),
+            bits: CompactTarget::from_consensus(0x1d00ffff),
+            share_target: Target::MAX,
+            time: 0,
+            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
+                coinbase1: vec![],
+                extranonce1: vec![],
+                extranonce2_range: Extranonce2Range::new(en2_size).unwrap(),
+                coinbase2: vec![],
+                merkle_branches: vec![],
+            }),
+        }
+    }
 
-        let thread_tasks: Vec<Arc<std::sync::Mutex<Vec<HashTask>>>> = (0..257)
+    type TestThreadTasks = Arc<std::sync::Mutex<Vec<HashTask>>>;
+    type TestSchedulerSetup = (Scheduler, SourceId, ShareStream, Vec<TestThreadTasks>);
+
+    fn setup_scheduler_with_threads(thread_count: usize) -> TestSchedulerSetup {
+        let mut scheduler = Scheduler::new();
+        let share_channels = ShareStream::new();
+
+        let thread_tasks: Vec<TestThreadTasks> = (0..thread_count)
             .map(|_| Arc::new(std::sync::Mutex::new(Vec::new())))
             .collect();
 
-        // 257 eligible threads against a 1-byte (256-value) EN2 space.
         for (i, tasks) in thread_tasks.iter().enumerate() {
             scheduler.threads.insert(ThreadEntry {
                 thread: Box::new(StubThread::new(format!("stub-{i}"), tasks.clone())),
@@ -1396,25 +1445,15 @@ mod tests {
             difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
         });
 
-        let template = JobTemplate {
-            id: "job-1".into(),
-            prev_blockhash: BlockHash::all_zeros(),
-            version: VersionTemplate::new(
-                Version::from_consensus(0x20000000),
-                GeneralPurposeBits::none(),
-            )
-            .unwrap(),
-            bits: CompactTarget::from_consensus(0x1d00ffff),
-            share_target: Target::MAX,
-            time: 0,
-            merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
-                coinbase1: vec![],
-                extranonce1: vec![],
-                extranonce2_range: Extranonce2Range::new(1).unwrap(),
-                coinbase2: vec![],
-                merkle_branches: vec![],
-            }),
-        };
+        (scheduler, source_id, share_channels, thread_tasks)
+    }
+
+    #[tokio::test]
+    async fn assign_job_when_en2_space_smaller_than_thread_count() {
+        let (mut scheduler, source_id, mut share_channels, thread_tasks) =
+            setup_scheduler_with_threads(257);
+
+        let template = make_test_job(1);
 
         scheduler
             .assign_job_to_threads(
@@ -1424,5 +1463,108 @@ mod tests {
                 &mut share_channels,
             )
             .await;
+
+        // Exactly 256 tasks created (capped by EN2 space size)
+        assert_eq!(scheduler.tasks.len(), 256);
+
+        // First 256 threads received work
+        for (i, task_store) in thread_tasks.iter().enumerate().take(256) {
+            let tasks = task_store.lock().unwrap();
+            assert_eq!(tasks.len(), 1, "thread {i} should receive exactly one task");
+        }
+
+        // The 257th thread remains idle
+        assert_eq!(
+            thread_tasks[256].lock().unwrap().len(),
+            0,
+            "thread 256 (the 257th thread) should remain idle"
+        );
+
+        // Assigned EN2 ranges are valid, non-overlapping, and fully cover the space
+        let mut assigned_ranges: Vec<(u64, u64)> = thread_tasks
+            .iter()
+            .take(256)
+            .map(|task_store| {
+                let tasks = task_store.lock().unwrap();
+                let en2_range = tasks[0].en2_range.as_ref().expect("en2 range assigned");
+                assert_eq!(en2_range.size, 1);
+                assert!(en2_range.min <= en2_range.max);
+                (en2_range.min, en2_range.max)
+            })
+            .collect();
+
+        assigned_ranges.sort_by_key(|&(min, _)| min);
+        assert_eq!(assigned_ranges.first().unwrap().0, 0);
+        assert_eq!(assigned_ranges.last().unwrap().1, 255);
+        for w in assigned_ranges.windows(2) {
+            assert_eq!(
+                w[0].1 + 1,
+                w[1].0,
+                "assigned ranges must be contiguous and non-overlapping"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_job_boundary_threads_fewer_than_en2_space() {
+        let (mut scheduler, source_id, mut share_channels, thread_tasks) =
+            setup_scheduler_with_threads(255);
+
+        let template = make_test_job(1);
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                template,
+                &mut share_channels,
+            )
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 255);
+        for task_store in &thread_tasks {
+            assert_eq!(task_store.lock().unwrap().len(), 1);
+        }
+
+        let mut assigned_ranges: Vec<(u64, u64)> = thread_tasks
+            .iter()
+            .map(|task_store| {
+                let tasks = task_store.lock().unwrap();
+                let range = tasks[0].en2_range.as_ref().unwrap();
+                (range.min, range.max)
+            })
+            .collect();
+        assigned_ranges.sort_by_key(|&(min, _)| min);
+        assert_eq!(assigned_ranges.first().unwrap().0, 0);
+        assert_eq!(assigned_ranges.last().unwrap().1, 255);
+        for w in assigned_ranges.windows(2) {
+            assert_eq!(w[0].1 + 1, w[1].0);
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_job_boundary_threads_equal_to_en2_space() {
+        let (mut scheduler, source_id, mut share_channels, thread_tasks) =
+            setup_scheduler_with_threads(256);
+
+        let template = make_test_job(1);
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                template,
+                &mut share_channels,
+            )
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 256);
+        for (i, task_store) in thread_tasks.iter().enumerate() {
+            let tasks = task_store.lock().unwrap();
+            assert_eq!(tasks.len(), 1);
+            let range = tasks[0].en2_range.as_ref().unwrap();
+            assert_eq!(range.min, i as u64);
+            assert_eq!(range.max, i as u64);
+        }
     }
 }
