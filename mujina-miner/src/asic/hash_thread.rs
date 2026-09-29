@@ -368,3 +368,234 @@ impl From<(Share, String)> for crate::job_source::Share {
         }
     }
 }
+
+/// Bounds telemetry publication by TIME rather than by wire rate.
+///
+/// The failure this exists to prevent, measured on hardware rather than
+/// imagined. On 2026-09-18 a write-enabled handover left the BZM2 DTS/VS
+/// sensor stream running at **13,850 frames per second** (397,516 frames in
+/// 28.7 s, measured in our captures). The
+/// frame handler did two things per frame:
+///
+/// - took a **blocking** `RwLock` write on the shared thread status, which
+///   every API handler must read, and
+/// - `send().await` into a **64-slot** channel.
+///
+/// On the two-core control board the API then answered **nothing at all** for
+/// the entire window -- not one HTTP status line in 29 seconds, while the
+/// daemon sat healthy with its listener bound. The same build under a
+/// dry-run policy saw only 454 frames per second and served most requests, so
+/// this had read as an intermittent API fault for days.
+///
+/// **Nothing is dropped that a consumer could have used.** A temperature is a
+/// *level*, not an event: the newest reading for a device IS its current one,
+/// so keeping the latest per device and publishing on a timer loses no
+/// information a reader could have observed -- nobody polls at 13.8 kHz. What
+/// is bounded is how often the shared lock is taken and the channel is fed.
+///
+/// **The protection path does not come through here.** The thermal interlock
+/// observes every frame directly, before coalescing, so a spike cannot hide in
+/// a window. For the same reason the level published to the shared status is
+/// the window's **hottest** reading rather than whichever device reported
+/// last: a hotspot is the number an operator needs, and last-writer-wins made
+/// it arbitrary.
+#[derive(Debug)]
+pub struct TelemetryCoalescer {
+    latest: std::collections::BTreeMap<u8, HashThreadTelemetryUpdate>,
+    board_level: Vec<HashThreadTelemetryUpdate>,
+    hottest_c: Option<f32>,
+    window_start: Option<std::time::Instant>,
+    interval: std::time::Duration,
+    observed: u64,
+    published: u64,
+}
+
+impl TelemetryCoalescer {
+    pub fn new(interval: std::time::Duration) -> Self {
+        Self {
+            latest: std::collections::BTreeMap::new(),
+            board_level: Vec::new(),
+            hottest_c: None,
+            window_start: None,
+            interval,
+            observed: 0,
+            published: 0,
+        }
+    }
+
+    /// Readings taken in, whether or not they were ever published.
+    pub fn observed(&self) -> u64 {
+        self.observed
+    }
+
+    /// Readings handed out. The ratio against [`Self::observed`] is what the
+    /// shared lock and the channel were spared.
+    pub fn published(&self) -> u64 {
+        self.published
+    }
+
+    /// Take one update. Cheap: no lock, no channel, no allocation beyond the
+    /// per-device slot it replaces.
+    pub fn observe(&mut self, update: HashThreadTelemetryUpdate, now: std::time::Instant) {
+        self.observed = self.observed.saturating_add(1);
+        self.window_start.get_or_insert(now);
+
+        for reading in &update.temperatures {
+            if let Some(t) = reading.temperature_c {
+                self.hottest_c = Some(match self.hottest_c {
+                    Some(h) if h >= t => h,
+                    _ => t,
+                });
+            }
+        }
+
+        match update.asic {
+            Some(observation) => {
+                self.latest.insert(observation.asic_id, update);
+            }
+            // Board-level polls are not per-device, so there is no slot to
+            // replace and nothing to coalesce them against. They are rare by
+            // construction; keeping them all is correct.
+            None => self.board_level.push(update),
+        }
+    }
+
+    /// Whether the window has run long enough to publish.
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        match self.window_start {
+            Some(start) => now.saturating_duration_since(start) >= self.interval,
+            None => false,
+        }
+    }
+
+    /// Hand back everything held, and the level to publish alongside it.
+    ///
+    /// Returns an empty vector and `None` when nothing has been observed, so
+    /// a caller can drain unconditionally.
+    pub fn drain(
+        &mut self,
+        now: std::time::Instant,
+    ) -> (Vec<HashThreadTelemetryUpdate>, Option<f32>) {
+        let mut out: Vec<HashThreadTelemetryUpdate> = self.board_level.drain(..).collect();
+        out.extend(std::mem::take(&mut self.latest).into_values());
+        let hottest = self.hottest_c.take();
+        self.window_start = if out.is_empty() { None } else { Some(now) };
+        self.published = self.published.saturating_add(out.len() as u64);
+        (out, hottest)
+    }
+}
+
+#[cfg(test)]
+mod telemetry_coalescer_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn reading(asic: u8, temp: f32) -> HashThreadTelemetryUpdate {
+        HashThreadTelemetryUpdate {
+            temperatures: vec![HashThreadTemperatureReading {
+                name: format!("asic-{asic}-dts"),
+                temperature_c: Some(temp),
+            }],
+            powers: Vec::new(),
+            asic: Some(HashThreadAsicObservation {
+                asic_id: asic,
+                observed_at: Instant::now(),
+                faults: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_stream_that_silenced_the_api_costs_a_bounded_number_of_publications() {
+        // The measured shape: 397,516 frames from 100 ASICs over 28.7 s, the
+        // rate at which the control board's API stopped answering entirely.
+        const FRAMES: u64 = 397_516;
+        const ASICS: u8 = 100;
+        let window = Duration::from_millis(28_700);
+
+        let mut c = TelemetryCoalescer::new(Duration::from_millis(500));
+        let start = Instant::now();
+        let step = window / FRAMES as u32;
+
+        let mut publications = 0u64;
+        let mut flushes = 0u64;
+        for i in 0..FRAMES {
+            let now = start + step * i as u32;
+            c.observe(reading((i % ASICS as u64) as u8, 40.0), now);
+            if c.due(now) {
+                let (batch, _hottest) = c.drain(now);
+                flushes += 1;
+                publications += batch.len() as u64;
+            }
+        }
+
+        // Unbounded this was 397,516 lock writes and 397,516 sends into a
+        // 64-slot channel. Bounded, it is one flush per interval.
+        assert!(
+            flushes <= 60,
+            "{flushes} flushes over 28.7 s is not bounded"
+        );
+        assert!(
+            FRAMES / publications >= 50,
+            "expected a 50x reduction at least, got {}x",
+            FRAMES / publications
+        );
+        assert_eq!(c.observed(), FRAMES, "every reading must still be counted");
+
+        // And no device is starved: a flush carries every ASIC that reported
+        // in the window, so a slow device is not crowded out by a fast one.
+        let (final_batch, _) = c.drain(start + window);
+        let ids: std::collections::BTreeSet<u8> = final_batch
+            .iter()
+            .filter_map(|u| u.asic.map(|o| o.asic_id))
+            .collect();
+        assert!(
+            ids.len() >= 50,
+            "a flush carried only {} devices; coalescing must not drop devices",
+            ids.len()
+        );
+    }
+
+    #[test]
+    fn the_hottest_reading_in_a_window_is_the_one_published() {
+        // Regression against last-writer-wins. A spike that arrives mid-window
+        // must not be erased by a cooler reading behind it -- that is the
+        // number an operator looks at.
+        let mut c = TelemetryCoalescer::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        c.observe(reading(0, 45.0), t0);
+        c.observe(reading(1, 88.5), t0 + Duration::from_millis(10));
+        c.observe(reading(2, 46.0), t0 + Duration::from_millis(20));
+
+        let (batch, hottest) = c.drain(t0 + Duration::from_millis(500));
+        assert_eq!(
+            hottest,
+            Some(88.5),
+            "the spike was published, not the last reading"
+        );
+        assert_eq!(batch.len(), 3, "every device that reported is carried");
+    }
+
+    #[test]
+    fn a_device_that_reports_repeatedly_keeps_only_its_newest_reading() {
+        // A temperature is a level. Ten readings from one device inside one
+        // window are not ten facts; the last is the current one.
+        let mut c = TelemetryCoalescer::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        for i in 0..10 {
+            c.observe(reading(7, 50.0 + i as f32), t0 + Duration::from_millis(i));
+        }
+        let (batch, _) = c.drain(t0 + Duration::from_millis(500));
+        assert_eq!(batch.len(), 1, "one device, one slot");
+        assert_eq!(batch[0].temperatures[0].temperature_c, Some(59.0));
+        assert_eq!(c.observed(), 10, "but all ten were counted");
+    }
+
+    #[test]
+    fn draining_an_empty_coalescer_is_harmless() {
+        let mut c = TelemetryCoalescer::new(Duration::from_millis(500));
+        let (batch, hottest) = c.drain(Instant::now());
+        assert!(batch.is_empty());
+        assert_eq!(hottest, None);
+    }
+}
