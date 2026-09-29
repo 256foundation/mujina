@@ -54,18 +54,46 @@ value until changed again.
 All values are in raw SI-ish units. Clients are responsible for
 formatting and unit conversion.
 
-| Field suffix | Unit                   |
-|--------------|------------------------|
-| `_secs`      | seconds                |
-| `_c`         | degrees Celsius        |
-| `_v`         | volts                  |
-| `_a`         | amperes                |
-| `_w`         | watts                  |
-| `rpm`        | revolutions per minute |
-| `hashrate`   | hashes per second      |
+| Field suffix          | Unit                   |
+|-----------------------|------------------------|
+| `_secs`               | seconds                |
+| `_c`                  | degrees Celsius        |
+| `_v`                  | volts                  |
+| `_a`                  | amperes                |
+| `_w`                  | watts                  |
+| `rpm`                 | revolutions per minute |
+| `hashrate`            | hashes per second      |
+| `joules_per_terahash` | joules per terahash    |
 
 Percentage fields (`percent`, `target_percent`) are integers
 0--100.
+
+### Efficiency
+
+A board reports `efficiency` as one entry per power domain, each
+holding several lookback windows. There is no single J/TH for a
+miner: `asic` is what the silicon consumes, `board` adds the
+housekeeping load the board draws alongside it, and `wall` adds
+the power supply's conversion loss. The differences between them
+are the useful diagnostics, so a client should say which domain
+it is showing rather than picking one and calling it "the"
+efficiency.
+
+An absent window means the miner has not run long enough to fill
+it, not that the value is zero or unknown. Windows appear as they
+are earned, shortest first, so a board reports its five-minute
+figure long before its 72-hour one. A window that is present but
+whose domain is missing entirely means that domain has no sensor.
+
+Each window carries a `provenance` of `measured` or `estimated`.
+`estimated` means at least one power sample in that window was
+modelled or apportioned rather than metered. Display it freely;
+do not close a control loop on it.
+
+The `hashrate` on a window is the denominator that J/TH was
+computed against, over the same span. It is reported so the
+figure can be judged rather than taken on trust — a short-window
+J/TH rests on a hashrate that share variance still dominates.
 
 ### Naming
 

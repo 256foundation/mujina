@@ -35,6 +35,9 @@ pub struct BoardTelemetry {
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadTelemetry>,
+    /// Windowed J/TH, one entry per power domain the board can measure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efficiency: Vec<EfficiencyReport>,
     /// Per-ASIC topology/diagnostics state (multi-ASIC boards only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asics: Vec<AsicState>,
@@ -68,6 +71,38 @@ pub struct PowerMeasurement {
     pub voltage_v: Option<f32>,
     pub current_a: Option<f32>,
     pub power_w: Option<f32>,
+}
+
+/// Energy efficiency for one power domain, over several lookback windows.
+///
+/// A miner has more than one J/TH and the differences between them are the
+/// diagnostics: `board` minus `asic` is the vampire load, `wall` minus `board`
+/// is what the power supply costs. Quoting a single figure without saying where
+/// it was measured overstates the miner.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct EfficiencyReport {
+    /// Where in the delivery chain the power was measured: `asic`, `board`, or
+    /// `wall`.
+    pub domain: String,
+    pub windows: Vec<EfficiencyWindow>,
+}
+
+/// Efficiency over one lookback window.
+///
+/// A window appears only once the miner has run long enough to fill it, so a
+/// freshly started board reports the short windows and grows into the long
+/// ones. An absent window means "not yet", never "zero".
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct EfficiencyWindow {
+    pub window_secs: u64,
+    pub joules_per_terahash: f32,
+    /// `measured` if every power sample in the window came from a meter,
+    /// `estimated` if any was modelled or apportioned. A control loop must not
+    /// act on `estimated`.
+    pub provenance: String,
+    /// Average hashrate over the same window, in hashes per second. The
+    /// denominator the J/TH figure was computed against.
+    pub hashrate: Option<u64>,
 }
 
 /// Per-thread telemetry.
