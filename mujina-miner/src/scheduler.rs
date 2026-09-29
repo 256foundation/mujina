@@ -212,7 +212,7 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new() -> Self {
+    fn new(start_paused: bool) -> Self {
         Self {
             sources: SlotMap::new(),
             threads: SlotMap::new(),
@@ -220,7 +220,7 @@ impl Scheduler {
             stats: MiningStats::default(),
             last_thread_count: 0,
             startup_gate: StartupGate::new(),
-            paused: false,
+            paused: start_paused,
         }
     }
 
@@ -389,6 +389,15 @@ impl Scheduler {
         job_template: JobTemplate,
         share_channels: &mut ShareStream,
     ) {
+        // Paused means no work reaches the hardware. Checked here rather than
+        // at the source, so a job arriving while paused is dropped instead of
+        // queued: on resume the scheduler assigns the cached job, which is the
+        // current one, not a stale one.
+        if self.paused {
+            debug!("Mining paused; job not assigned");
+            return;
+        }
+
         let source_name = self
             .sources
             .get(source_id)
@@ -746,6 +755,14 @@ impl Scheduler {
         thread_name: &str,
         share_channels: &mut ShareStream,
     ) {
+        // A board that attaches while paused stays idle. This is what makes
+        // observer mode safe on a machine whose boards share one PSU rail: an
+        // enumerated board draws no hashing current until mining is resumed.
+        if self.paused {
+            debug!(thread = %thread_name, "Mining paused; thread left idle");
+            return;
+        }
+
         let thread_hashrate = {
             let entry = self
                 .threads
@@ -840,25 +857,67 @@ impl Scheduler {
     ///
     /// Publishes an updated state snapshot before replying so the API
     /// handler's subsequent `borrow()` sees the new value.
-    fn handle_api_command(
+    async fn handle_api_command(
         &mut self,
         cmd: SchedulerCommand,
         miner_telemetry_tx: &watch::Sender<MinerTelemetry>,
+        share_channels: &mut ShareStream,
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
                 self.paused = true;
-                warn!("Mining paused via API (not yet implemented)");
+                self.idle_all_threads(share_channels).await;
+                info!("Mining paused: every thread idled, no further work assigned");
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
                 self.paused = false;
-                warn!("Mining resumed via API (not yet implemented)");
+                // SPLIT, as a new job is. Handing each thread the cached job
+                // through the new-thread path gave every thread the WHOLE
+                // extranonce2 range, so after a resume every chain hashed the
+                // same space until the next job re-split it.
+                let jobs: Vec<(SourceId, Arc<JobTemplate>)> = self
+                    .sources
+                    .iter()
+                    .filter_map(|(id, source)| source.last_job.clone().map(|job| (id, job)))
+                    .collect();
+                for (source_id, template) in jobs {
+                    self.assign_template(AssignMode::Update, source_id, template, share_channels)
+                        .await;
+                }
+                info!(threads = self.threads.len(), "Mining resumed");
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
         }
+    }
+
+    /// Stop every thread and drop the tasks they were running.
+    ///
+    /// `go_idle` is the thread's own stop: it stops dispatching and returns
+    /// whatever task it held. Their tasks and share channels go with them, so
+    /// a later resume assigns the current job rather than reviving a stale one.
+    ///
+    /// **This is a load step, and on some machines that matters.** Dispatched
+    /// work is what draws current; on a series-stacked hashboard the per-ASIC
+    /// voltage follows each ASIC's draw relative to its neighbours, so taking
+    /// all work away at once moves operating points, not just hashrate. That
+    /// is why such machines keep a floor of work under the ASICs rather than
+    /// letting the pipeline run dry. Pausing a powered, loaded machine is a
+    /// deliberate act with a power consequence; starting paused (observer
+    /// mode) has none, because no work was ever dispatched.
+    async fn idle_all_threads(&mut self, share_channels: &mut ShareStream) {
+        let thread_ids: Vec<ThreadId> = self.threads.keys().collect();
+        for thread_id in thread_ids {
+            let Some(entry) = self.threads.get_mut(thread_id) else {
+                continue;
+            };
+            if let Err(e) = entry.thread.go_idle().await {
+                error!(thread = %entry.thread.name(), error = %e, "Failed to idle thread");
+            }
+        }
+        self.remove_tasks_where(share_channels, |_| true);
     }
 
     /// Main scheduler loop.
@@ -990,7 +1049,7 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
-                    self.handle_api_command(cmd, &miner_telemetry_tx);
+                    self.handle_api_command(cmd, &miner_telemetry_tx, &mut share_channels).await;
                 }
 
                 // Periodic state publishing
@@ -1058,8 +1117,9 @@ pub async fn task(
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
     miner_telemetry_tx: watch::Sender<MinerTelemetry>,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
+    start_paused: bool,
 ) {
-    let mut scheduler = Scheduler::new();
+    let mut scheduler = Scheduler::new(start_paused);
     scheduler
         .run(
             running,
@@ -1201,7 +1261,321 @@ impl MiningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::hash_thread::{HashThreadCapabilities, HashThreadStatus};
+    use crate::job_source::{MerkleRootKind, VersionTemplate};
     use crate::types::Difficulty;
+    use bitcoin::hashes::Hash;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    /// A hash thread that records what the scheduler asked it to do.
+    ///
+    /// The scheduler had no behavioural tests because exercising it needs a
+    /// thread; this is the smallest one that works, and the counters are what
+    /// the pause tests assert on.
+    #[derive(Default)]
+    struct ThreadCalls {
+        updates: AtomicUsize,
+        replaces: AtomicUsize,
+        idles: AtomicUsize,
+        /// The extranonce2 range of every task handed over, in order.
+        ranges: std::sync::Mutex<Vec<Option<crate::job_source::Extranonce2Range>>>,
+    }
+
+    struct RecordingThread {
+        name: String,
+        capabilities: HashThreadCapabilities,
+        calls: Arc<ThreadCalls>,
+    }
+
+    #[async_trait::async_trait]
+    impl HashThread for RecordingThread {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn capabilities(&self) -> &HashThreadCapabilities {
+            &self.capabilities
+        }
+        async fn configure(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.calls.updates.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .ranges
+                .lock()
+                .unwrap()
+                .push(task.en2_range.clone());
+            Ok(None)
+        }
+        async fn replace_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.calls.replaces.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .ranges
+                .lock()
+                .unwrap()
+                .push(task.en2_range.clone());
+            Ok(None)
+        }
+        async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
+            self.calls.idles.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
+            None
+        }
+        fn status(&self) -> HashThreadStatus {
+            HashThreadStatus::default()
+        }
+    }
+
+    fn test_template() -> Arc<JobTemplate> {
+        Arc::new(JobTemplate {
+            id: "job-1".into(),
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                bitcoin::block::Version::from_consensus(0x2000_0000),
+                crate::job_source::GeneralPurposeBits::full(),
+            )
+            .unwrap(),
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x1d00_ffff),
+            share_target: Difficulty::from(1024).to_target(),
+            time: 1_700_000_000,
+            // Computed, not Fixed: the cached-job path skips a fixed merkle
+            // root, so a Fixed fixture would pass the pause tests for the
+            // wrong reason.
+            merkle_root: MerkleRootKind::Computed(crate::job_source::MerkleRootTemplate {
+                coinbase1: vec![0u8; 4],
+                extranonce1: vec![0u8; 4],
+                extranonce2_range: crate::job_source::Extranonce2Range::new(4).unwrap(),
+                coinbase2: vec![0u8; 4],
+                merkle_branches: Vec::new(),
+            }),
+        })
+    }
+
+    /// A scheduler holding one source with a cached job and one thread that
+    /// has reported an expected hashrate, so it is eligible for work.
+    fn scheduler_with_source_and_thread(
+        paused: bool,
+    ) -> (Scheduler, SourceId, ThreadId, Arc<ThreadCalls>) {
+        let mut scheduler = Scheduler::new(paused);
+        let (command_tx, _command_rx) = mpsc::channel(4);
+        let source_id = scheduler.sources.insert(SourceEntry {
+            name: "test".into(),
+            url: None,
+            command_tx,
+            last_job: Some(test_template()),
+            difficulty_alarm: DebouncedAlarm::new(Duration::from_secs(60)),
+        });
+        let calls = Arc::new(ThreadCalls::default());
+        let thread_id = scheduler.threads.insert(ThreadEntry {
+            thread: Box::new(RecordingThread {
+                name: "test-thread".into(),
+                capabilities: HashThreadCapabilities::default(),
+                calls: calls.clone(),
+            }),
+            hashrate: HashrateEstimator::new(Duration::from_secs(60)),
+            expected: Some(HashRate::from_terahashes(1.0)),
+        });
+        (scheduler, source_id, thread_id, calls)
+    }
+
+    /// A scheduler with one source (and its cached job) and `n` eligible
+    /// threads.
+    fn scheduler_with_threads(
+        n: usize,
+        paused: bool,
+    ) -> (Scheduler, SourceId, Vec<(ThreadId, Arc<ThreadCalls>)>) {
+        let (mut scheduler, source_id, first, calls) = scheduler_with_source_and_thread(paused);
+        let mut threads = vec![(first, calls)];
+        for i in 1..n {
+            let calls = Arc::new(ThreadCalls::default());
+            let id = scheduler.threads.insert(ThreadEntry {
+                thread: Box::new(RecordingThread {
+                    name: format!("test-thread-{i}"),
+                    capabilities: HashThreadCapabilities::default(),
+                    calls: calls.clone(),
+                }),
+                hashrate: HashrateEstimator::new(Duration::from_secs(60)),
+                expected: Some(HashRate::from_terahashes(1.0)),
+            });
+            threads.push((id, calls));
+        }
+        (scheduler, source_id, threads)
+    }
+
+    fn tasks_per_thread(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
+        threads
+            .iter()
+            .map(|(_, c)| c.updates.load(Ordering::SeqCst) + c.replaces.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    async fn job_arrives(
+        scheduler: &mut Scheduler,
+        source_id: SourceId,
+        share_channels: &mut ShareStream,
+    ) {
+        let job = (*test_template()).clone();
+        scheduler
+            .assign_job_to_threads(AssignMode::Update, source_id, job, share_channels)
+            .await;
+    }
+
+    fn idles(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
+        threads
+            .iter()
+            .map(|(_, c)| c.idles.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    async fn pause(scheduler: &mut Scheduler, share_channels: &mut ShareStream) {
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::PauseMining { reply },
+                &telemetry_tx,
+                share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    /// D7. A resume handed every thread the cached job through the new-thread
+    /// path, which gives each the WHOLE extranonce2 range: after a pause every
+    /// chain hashed the same space until the next job re-split it.
+    #[tokio::test]
+    async fn a_resume_splits_the_range_instead_of_giving_each_chain_all_of_it() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, _source, threads) = scheduler_with_threads(3, true);
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+        let ranges: Vec<_> = threads
+            .iter()
+            .map(|(_, c)| c.ranges.lock().unwrap()[0].clone().expect("a range"))
+            .collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(
+                    a.max < b.min || b.max < a.min,
+                    "overlapping ranges after resume: {a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Observer mode's load-bearing guarantee: a board that attaches while
+    /// paused is left idle. On a machine whose hashboards share one PSU rail,
+    /// an unasked-for job is current nobody budgeted for.
+    #[tokio::test]
+    async fn paused_scheduler_leaves_an_attaching_thread_idle() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_cached_jobs_to_thread(thread_id, "test-thread", &mut share_channels)
+            .await;
+
+        assert_eq!(calls.updates.load(Ordering::SeqCst), 0, "no work assigned");
+        assert_eq!(calls.replaces.load(Ordering::SeqCst), 0, "no work assigned");
+        assert!(scheduler.tasks.is_empty(), "no task recorded");
+    }
+
+    /// The same thread gets the cached job once mining resumes, which is what
+    /// makes observer mode a starting state rather than a dead end.
+    #[tokio::test]
+    async fn resuming_assigns_the_cached_job() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(!scheduler.paused);
+        assert_eq!(
+            calls.updates.load(Ordering::SeqCst),
+            1,
+            "resume should hand the cached job to the waiting thread"
+        );
+        assert_eq!(scheduler.tasks.len(), 1);
+        let _ = thread_id;
+    }
+
+    /// Pausing has to stop hardware that is already running, not just refuse
+    /// the next job: before this, the API reported `paused` while every thread
+    /// kept mining.
+    #[tokio::test]
+    async fn pausing_idles_running_threads_and_drops_their_tasks() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(false);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_cached_jobs_to_thread(thread_id, "test-thread", &mut share_channels)
+            .await;
+        assert_eq!(
+            calls.updates.load(Ordering::SeqCst),
+            1,
+            "mining before pause"
+        );
+        assert_eq!(scheduler.tasks.len(), 1);
+
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::PauseMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(scheduler.paused);
+        assert_eq!(
+            calls.idles.load(Ordering::SeqCst),
+            1,
+            "every thread must be told to go idle"
+        );
+        assert!(scheduler.tasks.is_empty(), "tasks dropped with the work");
+    }
+
+    /// A job arriving while paused reaches no thread.
+    #[tokio::test]
+    async fn paused_scheduler_drops_an_incoming_job() {
+        let (mut scheduler, source_id, _thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                (*test_template()).clone(),
+                &mut share_channels,
+            )
+            .await;
+
+        assert_eq!(calls.updates.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.replaces.load(Ordering::SeqCst), 0);
+        assert!(scheduler.tasks.is_empty());
+    }
 
     #[test]
     fn scheduler_target_zero_hashrate_passthrough() {

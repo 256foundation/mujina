@@ -43,6 +43,23 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
+        // Observer mode: attach and enumerate hardware, stream telemetry, serve
+        // read-only diagnostics, and never dispatch work. Intended for a
+        // machine whose hashboards share one PSU rail, where an unasked-for
+        // job would draw current the operator did not budget for. Two
+        // independent guarantees, because one switch that half-works is worse
+        // than none: no job source is created at all, and the scheduler starts
+        // paused, so even a source arriving another way assigns nothing.
+        // READ THE VALUE, NOT THE PRESENCE. This was `.is_ok()`, the only
+        // switch in the tree read that way, so `MUJINA_OBSERVE=0` turned
+        // observer mode ON. The first run planned to dispatch work set exactly
+        // that, and would have dispatched nothing while reporting nothing
+        // wrong -- a mining run that silently cannot mine.
+        let observe = observe_requested(std::env::var("MUJINA_OBSERVE").ok().as_deref());
+        if observe {
+            warn!("Observer mode (MUJINA_OBSERVE): no job source, mining starts paused");
+        }
+
         // Create channels for component communication. Each transport gets its
         // own event channel; the backplane waits for one enumeration completion
         // per channel.
@@ -207,6 +224,8 @@ impl Daemon {
                     }
                 });
             }
+        } else if observe {
+            info!("Observer mode: no job source registered");
         } else {
             // Use DummySource
             info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
@@ -247,6 +266,7 @@ impl Daemon {
             source_reg_rx,
             miner_telemetry_tx,
             scheduler_cmd_rx,
+            observe,
         ));
 
         // Start the API server
@@ -309,5 +329,69 @@ impl Daemon {
 impl Default for Daemon {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Is observer mode requested, given the raw `MUJINA_OBSERVE` value?
+///
+/// FAILS TOWARD OBSERVING. Unset means dispatch, as it always has, and the
+/// explicit falsy spellings mean dispatch. Anything this does not recognise --
+/// a typo, `O` for `0`, `flase` -- means OBSERVE, loudly. The rest of the tree's
+/// flags treat an unknown value as false, which is right for them and wrong
+/// here: for this switch false means "send work to a 3 kW machine", and a
+/// mistyped value must not be the thing that starts it hashing.
+pub(crate) fn observe_requested(value: Option<&str>) -> bool {
+    let Some(raw) = value else { return false };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" | "" => false,
+        other => {
+            tracing::warn!(
+                value = other,
+                "MUJINA_OBSERVE has a value that is neither on nor off; treating it as ON -- \
+                 observing, dispatching nothing -- because an unreadable switch must not be \
+                 the one that starts the machine hashing"
+            );
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod observe_switch_tests {
+    use super::observe_requested;
+
+    /// The defect: presence, not value. `MUJINA_OBSERVE=0` meant observe.
+    #[test]
+    fn zero_means_dispatch_not_observe() {
+        assert!(
+            !observe_requested(Some("0")),
+            "=0 must NOT enable observer mode"
+        );
+        assert!(!observe_requested(Some("false")));
+        assert!(!observe_requested(Some("off")));
+        assert!(!observe_requested(Some("")));
+    }
+
+    #[test]
+    fn unset_means_dispatch_as_before() {
+        assert!(!observe_requested(None));
+    }
+
+    #[test]
+    fn the_on_spellings_observe() {
+        for v in ["1", "true", "YES", " on "] {
+            assert!(observe_requested(Some(v)), "{v:?}");
+        }
+    }
+
+    /// An unreadable value fails toward NOT making heat.
+    #[test]
+    fn an_unrecognised_value_observes() {
+        assert!(
+            observe_requested(Some("O")),
+            "a typo for 0 must not start hashing"
+        );
+        assert!(observe_requested(Some("flase")));
     }
 }
