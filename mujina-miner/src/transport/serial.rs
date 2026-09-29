@@ -120,16 +120,37 @@ struct SerialInner {
 }
 
 /// Reader half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialReader {
     inner: Arc<SerialInner>,
 }
 
 /// Writer half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialWriter {
     inner: Arc<SerialInner>,
+    /// Optional veto on outbound frames, consulted before every write.
+    ///
+    /// Lives here, at the one point every byte passes through, because a guard
+    /// applied at call sites is a guard that the next call site forgets. The
+    /// transport knows nothing about what it is enforcing -- it asks the policy
+    /// and obeys the answer.
+    policy: Option<Arc<dyn OutboundFramePolicy>>,
+}
+
+/// A veto on outbound frames, installed by whoever knows what the bytes mean.
+///
+/// Implementations must be conservative: this exists to stop writes reaching
+/// hardware that must not be written to, so an implementation that cannot tell
+/// what a buffer is should refuse it rather than pass it.
+pub trait OutboundFramePolicy: Send + Sync + std::fmt::Debug {
+    /// Return `Err(reason)` to refuse the frame. The reason is logged and
+    /// surfaced to the caller as an error; nothing is written.
+    fn allow(&self, frame: &[u8]) -> Result<(), String>;
 }
 
 /// Control handle for a split serial stream.
+#[derive(Clone)]
 pub struct SerialControl {
     inner: Arc<SerialInner>,
 }
@@ -263,6 +284,20 @@ impl SerialStream {
     ///
     /// This allows concurrent reading and writing while maintaining the ability
     /// to reconfigure the port.
+    /// Split, installing a veto on everything this port will ever send.
+    ///
+    /// Separate from `split` so that guarding is a deliberate act with a
+    /// visible call site, rather than a default someone can forget to override
+    /// -- and so a reader of the call site can see that this port is guarded.
+    pub fn split_guarded(
+        self,
+        policy: Arc<dyn OutboundFramePolicy>,
+    ) -> (SerialReader, SerialWriter, SerialControl) {
+        let (r, mut w, c) = self.split();
+        w.policy = Some(policy);
+        (r, w, c)
+    }
+
     pub fn split(self) -> (SerialReader, SerialWriter, SerialControl) {
         (
             SerialReader {
@@ -270,6 +305,7 @@ impl SerialStream {
             },
             SerialWriter {
                 inner: self.inner.clone(),
+                policy: None,
             },
             SerialControl {
                 inner: self.inner.clone(),
@@ -365,6 +401,16 @@ impl AsyncWrite for SerialWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(policy) = self.policy.as_ref()
+            && let Err(reason) = policy.allow(buf)
+        {
+            tracing::warn!(
+                bytes = buf.len(),
+                %reason,
+                "outbound frame REFUSED by policy; nothing was written"
+            );
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::PermissionDenied, reason)));
+        }
         loop {
             let mut guard = ready!(self.inner.fd.poll_write_ready(cx))?;
 
