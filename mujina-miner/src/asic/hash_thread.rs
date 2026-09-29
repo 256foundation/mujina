@@ -161,6 +161,44 @@ pub enum HashThreadEvent {
     TelemetryUpdate(HashThreadTelemetryUpdate),
 }
 
+/// Error types for HashThread operations.
+#[derive(Debug, thiserror::Error)]
+pub enum HashThreadError {
+    #[error("Thread has been shut down")]
+    ThreadOffline,
+
+    #[error("Channel closed: {0}")]
+    ChannelClosed(String),
+
+    #[error("Work assignment failed: {0}")]
+    WorkAssignmentFailed(String),
+
+    #[error("Preemption failed: {0}")]
+    PreemptionFailed(String),
+
+    #[error("Telemetry query failed: {0}")]
+    TelemetryQueryFailed(String),
+
+    /// A device asserted a hardware fault, observed while answering a query.
+    ///
+    /// Distinct from `TelemetryQueryFailed` on purpose. The query did not
+    /// fail: it succeeded, and the answer is bad news. Collapsing the two
+    /// meant an operator asking a suspicious chain for its temperature was
+    /// told the question had failed, at exactly the moment they most needed
+    /// the answer.
+    #[error("Hardware fault reported: {0}")]
+    HardwareFaultReported(String),
+
+    #[error("Diagnostics failed: {0}")]
+    DiagnosticsFailed(String),
+
+    #[error("Shutdown timeout")]
+    ShutdownTimeout,
+
+    #[error("Chip initialization failed: {0}")]
+    InitializationFailed(String),
+}
+
 /// HashThread trait - the scheduler's view of a schedulable worker.
 ///
 /// A HashThread represents a group of hashing engines that can be assigned work
