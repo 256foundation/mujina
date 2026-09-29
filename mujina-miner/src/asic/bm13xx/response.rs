@@ -3,7 +3,6 @@
 //! BM13xx chips send back two kinds of frames: replies to register
 //! reads, and nonce reports when a chip finds passing work.
 
-use bitvec::prelude::*;
 use bytes::{Buf, BytesMut};
 use num_enum::TryFromPrimitive;
 
@@ -94,8 +93,7 @@ impl Response {
         bytes: &mut BytesMut,
         model: ChipModel,
     ) -> Result<Response, ProtocolError> {
-        let type_and_crc = bytes[bytes.len() - 1].view_bits::<Lsb0>();
-        let type_repr = type_and_crc[5..].load::<u8>();
+        let type_repr = bytes[bytes.len() - 1] >> 5;
 
         match ResponseType::try_from(type_repr).ok() {
             Some(ResponseType::ReadRegister) => {
@@ -179,6 +177,26 @@ mod tests {
     use super::super::register::{ChipId, ChipModel, Register};
     use super::*;
     use crate::asic::bm13xx::crc::crc5_is_valid;
+
+    #[test]
+    fn response_type_is_independent_of_crc_bits() {
+        for type_and_crc in 0u8..=u8::MAX {
+            // Register address zero is ChipId; the same payload also
+            // supplies all fields needed by a nonce response.
+            let mut bytes =
+                BytesMut::from(&[0x13, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, type_and_crc][..]);
+            let result = Response::decode(&mut bytes, ChipModel::BM1370);
+            match type_and_crc {
+                0x00..=0x1f => assert!(matches!(result, Ok(Response::ReadRegister(_)))),
+                0x80..=0x9f => assert!(matches!(result, Ok(Response::Nonce(_)))),
+                _ => assert!(matches!(
+                    result,
+                    Err(ProtocolError::InvalidResponseType(kind))
+                        if kind == type_and_crc / 32
+                )),
+            }
+        }
+    }
 
     #[test]
     fn verify_crc_calculation() {
