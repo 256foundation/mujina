@@ -5,10 +5,11 @@ pub mod pattern;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
-    api_client::types::BoardTelemetry, asic::hash_thread::HashThread, transport::UsbDeviceInfo,
+    api::commands::BoardCommand, api_client::types::BoardTelemetry, asic::hash_thread::HashThread,
+    transport::UsbDeviceInfo,
 };
 
 /// Returned by board factory functions with everything the backplane
@@ -26,6 +27,10 @@ pub struct BackplaneConnector {
     /// Shuts down the board when awaited. `None` if the board has
     /// no shutdown work to do.
     pub shutdown: Option<BoxFuture<'static, ()>>,
+
+    /// Sender for board commands (diagnostics, fan control). `None` if
+    /// the board accepts no commands.
+    pub command_tx: Option<mpsc::Sender<BoardCommand>>,
 }
 
 /// Information about a board.

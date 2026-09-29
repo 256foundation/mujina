@@ -190,6 +190,7 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         threads,
         telemetry_rx,
         shutdown: Some(shutdown),
+        command_tx: None,
     })
 }
 

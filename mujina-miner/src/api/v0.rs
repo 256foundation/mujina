@@ -11,12 +11,13 @@ use axum::{
 use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tracing::warn;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::commands::SchedulerCommand;
+use super::commands::{BoardCommand, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SetFanTargetRequest, SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -26,6 +27,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
+        .routes(routes!(set_fan_target))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -84,9 +86,7 @@ async fn patch_miner(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         // Result layers: timeout / channel-closed / command-error.
-        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        };
+        await_command_reply("scheduler", "patch_miner", rx).await?;
     }
 
     Ok(Json(state.miner_telemetry()))
@@ -132,9 +132,66 @@ async fn get_board(
         .board_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .boards()
-        .into_iter()
-        .find(|b| b.name == name)
+        .board(&name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Set a fan's target duty cycle on a board, or return it to automatic
+/// control.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/fans/{fan}",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+        ("fan" = String, Path, description = "Fan name"),
+    ),
+    request_body = SetFanTargetRequest,
+    responses(
+        (status = OK, description = "Updated board telemetry", body = BoardTelemetry),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = BAD_REQUEST, description = "Board accepts no commands"),
+        (status = INTERNAL_SERVER_ERROR, description = "Command channel error"),
+    ),
+)]
+async fn set_fan_target(
+    State(state): State<SharedState>,
+    Path((name, fan)): Path<(String, String)>,
+    Json(req): Json<SetFanTargetRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::SetFanTarget {
+            board: name.clone(),
+            fan,
+            percent: req.target_percent,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Result layers: timeout / channel-closed / command-error.
+    await_command_reply(&name, "SetFanTarget", rx).await?;
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -178,4 +235,46 @@ async fn get_source(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// How long a handler waits for a board or the scheduler to answer.
+const COMMAND_REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait for a command's reply, and KEEP THE REASON when there is not one.
+///
+/// Handlers used to match `Ok(Ok(Ok(v)))` and answer everything else with a
+/// bare 500. That discarded three different facts -- the command's own error,
+/// a reply dropped unanswered, and the API giving up while the command may
+/// still be running on the hardware -- and left the log saying only "response
+/// failed". An engine discovery failed that way once and took its reason with it.
+///
+/// The HTTP answer is unchanged. What changes is that the log says why.
+async fn await_command_reply<T>(
+    board: &str,
+    command: &'static str,
+    rx: oneshot::Receiver<anyhow::Result<T>>,
+) -> Result<T, StatusCode> {
+    match tokio::time::timeout(COMMAND_REPLY_WAIT, rx).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(err))) => {
+            warn!(board, command, error = %format!("{err:#}"), "Command failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Ok(Err(_)) => {
+            warn!(
+                board,
+                command, "Command's reply was dropped without an answer"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => {
+            warn!(
+                board,
+                command,
+                wait_s = COMMAND_REPLY_WAIT.as_secs(),
+                "No reply within the API's wait; the command may STILL BE RUNNING on the hardware"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
