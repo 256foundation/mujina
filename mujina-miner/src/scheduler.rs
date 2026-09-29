@@ -105,6 +105,37 @@ struct Stagger {
     episode: Option<ReleaseEpisode>,
 }
 
+/// STOP CHAINS ONE AT A TIME, WHEN A PAUSE ASKS FOR IT.
+///
+/// Opt-in, with `MUJINA_STAGGER_STOP_S=<spacing in seconds>`. A pause idles
+/// the first thread at once and the rest one per `spacing`, so a supply shared
+/// by several chains sees each chain's load come off as its own step. Only a
+/// deliberate pause is staggered: a safety stop or a shutdown is never delayed.
+/// A pause replies when the first thread is idle; the rest follow on the
+/// scheduler's clock rather than holding the loop.
+struct StopStagger {
+    spacing: Duration,
+    queue: std::collections::VecDeque<ThreadId>,
+    last_at: tokio::time::Instant,
+}
+
+impl StopStagger {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("MUJINA_STAGGER_STOP_S").ok()?;
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(Self {
+                spacing: Duration::from_secs(secs),
+                queue: std::collections::VecDeque::new(),
+                last_at: tokio::time::Instant::now(),
+            }),
+            _ => {
+                warn!(value = %raw, "MUJINA_STAGGER_STOP_S is not a positive whole number of seconds; a pause stops every chain at once");
+                None
+            }
+        }
+    }
+}
+
 /// One start: every thread in it, in release order, and how far it has got.
 struct ReleaseEpisode {
     /// The split is across all of these, so a thread released late gets the
@@ -288,6 +319,9 @@ struct Scheduler {
 
     /// Staggered start, when configured.
     stagger: Option<Stagger>,
+
+    /// Staggered stop on pause, when configured.
+    stop_stagger: Option<StopStagger>,
 }
 
 impl Scheduler {
@@ -301,6 +335,7 @@ impl Scheduler {
             startup_gate: StartupGate::new(),
             paused: start_paused,
             stagger: None,
+            stop_stagger: None,
         }
     }
 
@@ -1157,16 +1192,60 @@ impl Scheduler {
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
+                // A pause during a staggered stop is an escalation: the chains
+                // still loaded stop now rather than on a restarted clock.
+                let pending: Vec<ThreadId> = self
+                    .stop_stagger
+                    .as_mut()
+                    .map(|stop| stop.queue.drain(..).collect())
+                    .unwrap_or_default();
+                let second = self.paused && !pending.is_empty();
+                for thread_id in pending {
+                    self.idle_thread(thread_id, share_channels).await;
+                }
+                if second {
+                    info!("Mining paused again mid-stop: every remaining chain idled at once");
+                    let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
                 self.paused = true;
                 if let Some(stagger) = self.stagger.as_mut() {
                     stagger.episode = None;
                 }
-                self.idle_all_threads(share_channels).await;
-                info!("Mining paused: every thread idled, no further work assigned");
+                if self.stop_stagger.is_some() && self.threads.len() > 1 {
+                    let mut order: Vec<ThreadId> = self.threads.keys().collect();
+                    let first = order.remove(0);
+                    self.idle_thread(first, share_channels).await;
+                    let spacing = {
+                        let stop = self.stop_stagger.as_mut().expect("checked above");
+                        stop.queue = order.into();
+                        stop.last_at = tokio::time::Instant::now();
+                        stop.spacing
+                    };
+                    info!(
+                        remaining = self.threads.len() - 1,
+                        spacing_s = spacing.as_secs(),
+                        "Mining paused: first chain idled, the rest follow one per spacing"
+                    );
+                } else {
+                    self.idle_all_threads(share_channels).await;
+                    info!("Mining paused: every thread idled, no further work assigned");
+                }
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
+                // A resume mid-stop finishes the stop first, so no chain is
+                // still running its old task when the cached job is re-split.
+                let pending: Vec<ThreadId> = self
+                    .stop_stagger
+                    .as_mut()
+                    .map(|stop| stop.queue.drain(..).collect())
+                    .unwrap_or_default();
+                for thread_id in pending {
+                    self.idle_thread(thread_id, share_channels).await;
+                }
                 self.paused = false;
                 // SPLIT, as a new job is. Handing each thread the cached job
                 // through the new-thread path gave every thread the WHOLE
@@ -1185,6 +1264,38 @@ impl Scheduler {
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
+        }
+    }
+
+    /// Idle one thread and drop its tasks.
+    async fn idle_thread(&mut self, thread_id: ThreadId, share_channels: &mut ShareStream) {
+        if let Some(entry) = self.threads.get_mut(thread_id)
+            && let Err(e) = entry.thread.go_idle().await
+        {
+            error!(thread = %entry.thread.name(), error = %e, "Failed to idle thread");
+        }
+        self.remove_tasks_where(share_channels, |e| e.thread_id == thread_id);
+    }
+
+    /// Idle the next chain of a staggered stop when it is due.
+    async fn advance_stop(&mut self, now: tokio::time::Instant, share_channels: &mut ShareStream) {
+        let next = match self.stop_stagger.as_mut() {
+            Some(stop)
+                if !stop.queue.is_empty()
+                    && now.saturating_duration_since(stop.last_at) >= stop.spacing =>
+            {
+                stop.last_at = now;
+                stop.queue.pop_front()
+            }
+            _ => None,
+        };
+        if let Some(thread_id) = next {
+            let name = self
+                .threads
+                .get(thread_id)
+                .map(|e| e.thread.name().to_string());
+            self.idle_thread(thread_id, share_channels).await;
+            info!(thread = %name.as_deref().unwrap_or("?"), "Staggered stop: chain idled");
         }
     }
 
@@ -1352,9 +1463,10 @@ impl Scheduler {
                 }
 
                 // Staggered start: release the next chain when it is due.
-                _ = release_interval.tick(), if self.stagger.is_some() => {
+                _ = release_interval.tick(), if self.stagger.is_some() || self.stop_stagger.is_some() => {
                     let now = tokio::time::Instant::now();
                     self.advance_release(now, &mut share_channels).await;
+                    self.advance_stop(now, &mut share_channels).await;
                 }
 
                 // Periodic state publishing
@@ -1426,6 +1538,13 @@ pub async fn task(
 ) {
     let mut scheduler = Scheduler::new(start_paused);
     scheduler.stagger = Stagger::from_env();
+    scheduler.stop_stagger = StopStagger::from_env();
+    if let Some(stop) = &scheduler.stop_stagger {
+        info!(
+            spacing_s = stop.spacing.as_secs(),
+            "Staggered stop configured: a pause idles chains one at a time"
+        );
+    }
     if let Some(stagger) = &scheduler.stagger {
         info!(
             spacing_s = stagger.spacing.as_secs(),
@@ -1873,6 +1992,103 @@ mod tests {
         );
     }
 
+    fn idles(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
+        threads
+            .iter()
+            .map(|(_, c)| c.idles.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    async fn pause(scheduler: &mut Scheduler, share_channels: &mut ShareStream) {
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::PauseMining { reply },
+                &telemetry_tx,
+                share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    /// A pause takes every chain's load off at once: one step the size of all
+    /// of them on a shared supply. Staggered, each comes off as its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_staggered_pause_idles_one_chain_per_spacing() {
+        let mut share_channels = ShareStream::new();
+        // Today, for contrast: all at once.
+        let (mut together, source, threads) = scheduler_with_threads(3, false, None);
+        job_arrives(&mut together, source, &mut share_channels).await;
+        pause(&mut together, &mut share_channels).await;
+        assert_eq!(idles(&threads), vec![1, 1, 1]);
+
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        assert_eq!(scheduler.tasks.len(), 3);
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(
+            idles(&threads),
+            vec![1, 0, 0],
+            "the pause idles the first chain only"
+        );
+        assert_eq!(scheduler.tasks.len(), 2);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 0, 0]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 1, 0]);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 1, 1]);
+        assert!(scheduler.tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_mid_stop_finishes_the_stop_first() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert_eq!(
+            idles(&threads),
+            vec![1, 1, 1],
+            "every chain stopped before the resume"
+        );
+        assert_eq!(
+            scheduler.tasks.len(),
+            3,
+            "and each holds one task again, not two"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_first_chain_going_away_holds_the_start_instead_of_aborting() {
         let mut share_channels = ShareStream::new();
@@ -2004,24 +2220,25 @@ mod tests {
         }
     }
 
-    fn idles(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
-        threads
-            .iter()
-            .map(|(_, c)| c.idles.load(Ordering::SeqCst))
-            .collect()
-    }
-
-    async fn pause(scheduler: &mut Scheduler, share_channels: &mut ShareStream) {
-        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
-        let (reply, reply_rx) = oneshot::channel();
-        scheduler
-            .handle_api_command(
-                SchedulerCommand::PauseMining { reply },
-                &telemetry_tx,
-                share_channels,
-            )
-            .await;
-        assert!(reply_rx.await.unwrap().is_ok());
+    #[tokio::test(start_paused = true)]
+    async fn a_second_pause_mid_stop_stops_every_remaining_chain_at_once() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(idles(&threads), vec![1, 0, 0]);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(
+            idles(&threads),
+            vec![1, 1, 1],
+            "the second pause must not restart the clock"
+        );
     }
 
     /// D7. A resume handed every thread the cached job through the new-thread

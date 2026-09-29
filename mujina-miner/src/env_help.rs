@@ -180,17 +180,29 @@ const GROUPS: &[EnvGroup] = &[
     },
     EnvGroup {
         title: "Scheduler",
-        vars: &[EnvVar {
-            name: "MUJINA_STAGGER_START_S",
-            summary: "Spacing in whole seconds between releasing chains that \
-                      share one supply at start. The first assignment gives \
-                      work to one thread; each next thread is released once \
-                      the previous one has returned a share and the spacing \
-                      has passed, so the supply sees one chain's load step at \
-                      a time rather than all of them at once.",
-            default: Some("unset starts every chain together"),
-            example: Some("MUJINA_STAGGER_START_S=5"),
-        }],
+        vars: &[
+            EnvVar {
+                name: "MUJINA_STAGGER_START_S",
+                summary: "Spacing in whole seconds between releasing chains that \
+                          share one supply at start. The first assignment gives \
+                          work to one thread; each next thread is released once \
+                          the previous one has returned a share and the spacing \
+                          has passed, so the supply sees one chain's load step at \
+                          a time rather than all of them at once.",
+                default: Some("unset starts every chain together"),
+                example: Some("MUJINA_STAGGER_START_S=5"),
+            },
+            EnvVar {
+                name: "MUJINA_STAGGER_STOP_S",
+                summary: "Spacing in whole seconds between idling chains on a \
+                          pause. The first thread idles at once and each next one \
+                          idles one spacing later, so a shared supply sees each \
+                          chain's load come off as its own step. A second pause \
+                          or a resume mid-stop finishes the stop at once.",
+                default: Some("unset idles every chain together"),
+                example: Some("MUJINA_STAGGER_STOP_S=5"),
+            },
+        ],
     },
     EnvGroup {
         title: "Logging",
