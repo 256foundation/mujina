@@ -165,7 +165,7 @@ struct SourceEntry {
 }
 
 /// Whether to update alongside existing work or replace it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum AssignMode {
     /// Add new task alongside existing (UpdateJob behavior)
     Update,
@@ -395,14 +395,11 @@ impl Scheduler {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Extract EN2 range (only supported for computed merkle roots)
-        let full_en2_range = match &job_template.merkle_root {
-            MerkleRootKind::Computed(template) => template.extranonce2_range.clone(),
-            MerkleRootKind::Fixed(_) => {
-                error!(job_id = %job_template.id, "Header-only jobs not supported");
-                return;
-            }
-        };
+        // Only computed merkle roots carry an EN2 range to split.
+        if let MerkleRootKind::Fixed(_) = &job_template.merkle_root {
+            error!(job_id = %job_template.id, "Header-only jobs not supported");
+            return;
+        }
 
         let template = Arc::new(job_template);
 
@@ -456,61 +453,91 @@ impl Scheduler {
             self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
         }
 
-        // Split the EN2 range evenly across the currently-eligible threads.
-        //
-        // TODO: A thread that becomes eligible later is handed the full EN2
-        // range on its first report, overlapping these slices until the next
-        // job re-splits.
+        self.assign_template(mode, source_id, template, share_channels)
+            .await;
+    }
+
+    /// Hand one job to the threads that should have it, each in its own slice
+    /// of the extranonce2 range.
+    ///
+    /// TODO: A thread that becomes eligible later is handed the full EN2 range
+    /// on its first report, overlapping these slices until the next job
+    /// re-splits.
+    async fn assign_template(
+        &mut self,
+        mode: AssignMode,
+        source_id: SourceId,
+        template: Arc<JobTemplate>,
+        share_channels: &mut ShareStream,
+    ) {
+        let full_en2_range = match &template.merkle_root {
+            MerkleRootKind::Computed(t) => t.extranonce2_range.clone(),
+            MerkleRootKind::Fixed(_) => return,
+        };
         let eligible: Vec<ThreadId> = self.eligible_thread_ids().collect();
         if eligible.is_empty() {
-            debug!(source = %source_name, "No eligible threads yet, job cached for later");
+            debug!(job_id = %template.id, "No eligible threads yet, job cached for later");
             return;
         }
+        let (order, give) = (eligible.clone(), eligible.len());
         let en2_slices = full_en2_range
-            .split(eligible.len())
+            .split(order.len())
             .expect("Failed to split EN2 range among threads");
+        for (thread_id, en2_range) in order.into_iter().zip(en2_slices).take(give) {
+            self.assign_slice(
+                mode.clone(),
+                source_id,
+                &template,
+                thread_id,
+                en2_range,
+                share_channels,
+            )
+            .await;
+        }
+    }
 
-        for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
-            let starting_en2 = en2_range.iter().next();
-            let entry = self
-                .threads
-                .get_mut(thread_id)
-                .expect("eligible thread present");
-
-            let hashrate = entry
-                .hashrate
-                .settled_hashrate()
-                .or(entry.expected)
-                .unwrap_or_default();
-            let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
-
-            // Create share channel for this task
-            let (share_tx, share_rx) = mpsc::channel(32);
-
-            let hash_task = HashTask {
+    /// Give one thread one job, in one slice, and record the task.
+    async fn assign_slice(
+        &mut self,
+        mode: AssignMode,
+        source_id: SourceId,
+        template: &Arc<JobTemplate>,
+        thread_id: ThreadId,
+        en2_range: crate::job_source::Extranonce2Range,
+        share_channels: &mut ShareStream,
+    ) {
+        let starting_en2 = en2_range.iter().next();
+        let Some(entry) = self.threads.get_mut(thread_id) else {
+            return;
+        };
+        let hashrate = entry
+            .hashrate
+            .settled_hashrate()
+            .or(entry.expected)
+            .unwrap_or_default();
+        let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
+        let (share_tx, share_rx) = mpsc::channel(32);
+        let hash_task = HashTask {
+            template: template.clone(),
+            en2_range: Some(en2_range),
+            en2: starting_en2,
+            share_target,
+            ntime: template.time,
+            share_tx,
+        };
+        let result = match mode {
+            AssignMode::Update => entry.thread.update_task(hash_task).await,
+            AssignMode::Replace => entry.thread.replace_task(hash_task).await,
+        };
+        if let Err(e) = result {
+            error!(thread = %entry.thread.name(), error = %e, "Failed to assign task");
+        } else {
+            let task_id = self.tasks.insert(TaskEntry {
+                source_id,
                 template: template.clone(),
-                en2_range: Some(en2_range),
-                en2: starting_en2,
-                share_target,
-                ntime: template.time,
-                share_tx,
-            };
-
-            let result = match mode {
-                AssignMode::Update => entry.thread.update_task(hash_task).await,
-                AssignMode::Replace => entry.thread.replace_task(hash_task).await,
-            };
-
-            if let Err(e) = result {
-                error!(thread = %entry.thread.name(), error = %e, "Failed to assign task");
-            } else {
-                let task_id = self.tasks.insert(TaskEntry {
-                    source_id,
-                    template: template.clone(),
-                    thread_id,
-                });
-                share_channels.insert(task_id, ReceiverStream::new(share_rx));
-            }
+                thread_id,
+            });
+            share_channels.insert(task_id, ReceiverStream::new(share_rx));
         }
     }
 
