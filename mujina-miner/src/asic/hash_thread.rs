@@ -28,6 +28,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -36,6 +37,7 @@ use bitcoin::block::Version;
 use bitcoin::pow::Target;
 use tokio::sync::mpsc;
 
+use crate::api_client::types::AsicFaultBits;
 use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};
 use crate::types::HashRate;
 use bitcoin::pow::Work;
@@ -76,6 +78,54 @@ pub struct HashThreadStatus {
     pub is_active: bool,
 }
 
+/// Temperature reading reported by a hash thread.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashThreadTemperatureReading {
+    pub name: String,
+    pub temperature_c: Option<f32>,
+}
+
+/// Voltage/current/power reading reported by a hash thread.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashThreadPowerReading {
+    pub name: String,
+    pub voltage_v: Option<f32>,
+    pub current_a: Option<f32>,
+    pub power_w: Option<f32>,
+}
+
+/// Telemetry update reported by a hash thread.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HashThreadTelemetryUpdate {
+    pub temperatures: Vec<HashThreadTemperatureReading>,
+    pub powers: Vec<HashThreadPowerReading>,
+    /// Which ASIC these readings came from, when they were observed, and
+    /// what it reported alongside them. `None` where the readings are not
+    /// per-ASIC (a board-level sensor poll).
+    ///
+    /// One field for the whole update rather than a stamp per reading: every
+    /// reading in one update is decoded from one frame, so they share one
+    /// observation time and one set of fault bits. Stamping them separately
+    /// would be several copies of one arrival, free to drift.
+    pub asic: Option<HashThreadAsicObservation>,
+}
+
+/// When one ASIC's readings arrived, and what it reported with them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HashThreadAsicObservation {
+    /// The id this ASIC answers to on its own chain -- the id the readings
+    /// in this update are named with.
+    pub asic_id: u8,
+    /// Monotonic, never wall time: an age measured across a wall-clock step
+    /// is not a measurement.
+    pub observed_at: Instant,
+    /// The fault bits this frame credibly reported, or `None` where it
+    /// reported none that can be believed -- a generation whose frames carry
+    /// no fault bits at all, or a frame the decoder judged mis-parsed.
+    /// Unavailable, which is not the same as none asserted.
+    pub faults: Option<AsicFaultBits>,
+}
+
 /// Events emitted by HashThreads back to the scheduler.
 ///
 /// When a thread shuts down (USB unplug, fault, user request, etc.), it closes
@@ -106,6 +156,9 @@ pub enum HashThreadEvent {
     ///
     /// Emitted after `configure()` and whenever the expectation changes.
     ExpectedHashRate(HashRate),
+
+    /// Additional telemetry update
+    TelemetryUpdate(HashThreadTelemetryUpdate),
 }
 
 /// HashThread trait - the scheduler's view of a schedulable worker.
