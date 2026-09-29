@@ -229,14 +229,17 @@ fn spawn_monitor(
                     TemperatureSensor {
                         name: "pcb-left".into(),
                         temperature: t_left,
+                        observed_at: Some(std::time::Instant::now()),
                     },
                     TemperatureSensor {
                         name: "pcb-right".into(),
                         temperature: t_right,
+                        observed_at: Some(std::time::Instant::now()),
                     },
                     TemperatureSensor {
                         name: "chip-0".into(),
                         temperature: t_chip0,
+                        observed_at: Some(std::time::Instant::now()),
                     },
                 ];
             });

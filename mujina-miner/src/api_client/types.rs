@@ -5,10 +5,10 @@
 //! for the full API contract documentation, including conventions
 //! for null values and units.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
-use std::time::Instant;
 
 use crate::types::Temperature;
 
@@ -56,12 +56,32 @@ pub struct Fan {
 }
 
 /// Temperature sensor reading.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct TemperatureSensor {
     pub name: String,
     #[serde(rename = "temperature_c")]
     #[schema(value_type = Option<f32>)]
     pub temperature: Option<Temperature>,
+    /// When this reading was taken, on the monotonic clock of the process that
+    /// observed it.
+    ///
+    /// WITHOUT THIS, A SENSOR THAT FROZE AN HOUR AGO COUNTS EXACTLY LIKE ONE
+    /// ANSWERING NOW. The reasoning was already written down for
+    /// [`AsicState::observed_at`] and simply never applied here, and the
+    /// consequence is worse for temperatures than for fault bits: board state
+    /// keeps every row it has ever seen -- nothing prunes -- so a die whose
+    /// chain stopped publishing holds its last value for the life of the
+    /// process, and a ceiling evaluated against it is evaluated against a
+    /// number that stopped being a measurement.
+    ///
+    /// `None` is "unknown", and a reader deciding safety must treat unknown as
+    /// stale rather than as fresh. Monotonic rather than wall time: wall time
+    /// can step, and an age measured across a step is not a measurement. Never
+    /// serialised, because an `Instant` names an instant only inside the
+    /// process that took it.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub observed_at: Option<Instant>,
 }
 
 /// Voltage, current, and power from a single measurement point.
