@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::asic::hash_thread::{
     HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
@@ -15,8 +15,13 @@ use crate::types::{Difficulty, HashRate};
 use super::protocol::{DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT, DtsVsGeneration};
 
 mod actor;
+mod diagnostics;
+mod dispatch;
+mod engine;
 mod interlock;
 pub(crate) mod telemetry;
+#[cfg(all(test, unix))]
+mod test_support;
 
 use self::actor::*;
 
@@ -122,19 +127,46 @@ impl HashThread for Bzm2Thread {
         Ok(())
     }
 
-    async fn update_task(&mut self, _new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
-        // Dispatch does not exist yet at this point in the series; the
-        // dispatch ring lands with the next commit. Refuse honestly rather
-        // than silently drop the task.
-        Err(HashThreadError::WorkAssignmentFailed("dispatch not yet wired".into()).into())
+    async fn update_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::UpdateTask {
+                new_task,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
-    async fn replace_task(&mut self, _new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
-        Err(HashThreadError::WorkAssignmentFailed("dispatch not yet wired".into()).into())
+    async fn replace_task(&mut self, new_task: HashTask) -> anyhow::Result<Option<HashTask>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::ReplaceTask {
+                new_task,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
     async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
-        Ok(None)
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::GoIdle { response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::WorkAssignmentFailed("thread dropped response".into()))?
+            .map_err(Into::into)
     }
 
     fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
@@ -276,6 +308,17 @@ impl Bzm2ThreadHandle {
 enum ThreadCommand {
     /// Declare expected hashrate and ready the thread for work
     Configure,
+    UpdateTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    ReplaceTask {
+        new_task: HashTask,
+        response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    GoIdle {
+        response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
     Shutdown,
 }
 
@@ -305,6 +348,7 @@ fn set_temperature(status: &Arc<RwLock<HashThreadStatus>>, temperature_c: Option
 
 #[cfg(all(test, unix))]
 mod tests {
+
     use super::*;
 
     /// CLOSED IS NOT REFUSED, and on hardware the difference printed a lie.

@@ -4,15 +4,17 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-use crate::asic::hash_thread::{HashThreadEvent, HashThreadStatus, TelemetryCoalescer};
+use crate::asic::hash_thread::{HashTask, HashThreadEvent, HashThreadStatus, TelemetryCoalescer};
 use crate::transport::serial::{SerialControl, SerialReader, SerialWriter};
 use crate::types::HashRate;
 
-use super::super::protocol::{BROADCAST_ASIC, TdmFrame, TdmFrameParser};
+use super::super::protocol::{BROADCAST_ASIC, Bzm2EngineLayout, TdmFrame, TdmFrameParser};
 use super::super::uart::{
     Bzm2DtsVsConfig, configure_dts_vs_stream, confirm_on_die_protection, confirm_stream_stopped,
     disable_dts_vs_sensors, soft_reset_engines, suspend_dts_vs_stream,
 };
+use super::dispatch::*;
+use super::engine::*;
 use super::interlock::*;
 use super::telemetry::*;
 use super::*;
@@ -94,6 +96,22 @@ async fn drain_serial_input<R: AsyncReadExt + Unpin>(
 /// streaming, which the next open handles.
 const DTS_VS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// THE FIRST DISPATCH SINCE A RESET SAYS WHAT IT WAS ALLOWED ON.
+///
+/// The interlock logs a hold and a release, but a chain whose dies were
+/// already fresh logged nothing, so no run could show that it waited for them
+/// (measured on hardware). Called at every site that dispatches: the first version
+/// covered only the dispatch tick, and the first dispatch after a reset
+/// happens in the task handlers, so an earlier version had no such line at all.
+fn log_first_dispatch(interlock: &ThermalInterlock, config: &Bzm2ThreadConfig) {
+    let (fresh, expected, hottest) = interlock.fresh_count();
+    info!(
+        path = %config.serial_path,
+        fresh, expected, hottest_c = hottest,
+        "First dispatch since the reset: the interlock read every guarded device fresh"
+    );
+}
+
 /// How long the chain must stay silent before we believe the stream stopped.
 ///
 /// At the rates this part streams at, a running stream produces a frame in far
@@ -119,7 +137,15 @@ pub(super) async fn bzm2_thread_actor(
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
 
+    let engine_layout = Bzm2EngineLayout::default();
+
     let mut parser = TdmFrameParser::new(config.dts_vs_generation);
+
+    let mut current_task: Option<HashTask> = None;
+    // Recent dispatches, so a hit read after the next dispatch still finds
+    // its own work. UpdateTask leaves them; ReplaceTask and GoIdle
+    // invalidate them. See `DispatchRing`.
+    let mut engine_dispatches = DispatchRing::default();
 
     // One interlock per chain, owned by the actor that drives it. It starts
     // refusing: no reading has been observed yet, and unknown reads as hot.
@@ -128,11 +154,32 @@ pub(super) async fn bzm2_thread_actor(
     let mut dts_vs_diagnostics = DtsVsDiagnostics::default();
     let mut telemetry_coalescer = TelemetryCoalescer::new(TELEMETRY_PUBLISH_INTERVAL);
 
+    // WHETHER WORK IS HELD BACK BY THE INTERLOCK, as opposed to absent.
+    //
+    // A task the interlock will not let us send yet is ACCEPTED and DEFERRED,
+    // not failed. It used to be answered with Err while the thread kept it as
+    // `current_task`: the scheduler, told the assignment failed, never
+    // registered the task's share receiver, and the dispatch tick then sent the
+    // task anyway once the dies cooled -- so every share it found went to a
+    // dropped channel. On the very first dispatch, when the first job can
+    // easily arrive before the sensor stream has delivered a reading, that is a
+    // run that reports hashrate and delivers no shares at all.
+    //
+    // Tracked so `is_active` stays honest -- "being given work" -- and so the
+    // deferral is logged once per transition rather than every 500 ms tick.
+    let mut dispatch_deferred = false;
+
     let mut interlock = ThermalInterlock::new(
         config.thermal_ceiling_c,
         Duration::from_secs(config.thermal_reading_max_age_s.into()),
     )
     .expecting(&config.asic_ids);
+
+    let mut base_sequence: u8 = 0;
+    let mut dispatch_tick = tokio::time::interval(config.dispatch_interval);
+    dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ntime_tick = tokio::time::interval(Duration::from_secs(1));
+    ntime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut read_buf = [0u8; 4096];
     let mut dts_vs = DtsVsStream::default();
@@ -248,6 +295,29 @@ pub(super) async fn bzm2_thread_actor(
              owner's telemetry rather than our reply."),
     }
 
+    // UNGATE THE ENGINES THE RESET ABOVE GATED, and read back that it took.
+    // Here, because the readback needs the quiet line this point guarantees
+    // and the stream is configured next. See `EngineGate`.
+    let mut engine_gate = if reset_on_attach {
+        ungate_engines_and_confirm(&mut reader, &mut writer, &engine_layout, &config).await
+    } else {
+        EngineGate::Inherited
+    };
+    match engine_gate.refusal() {
+        None => info!(path = %config.serial_path, gate = ?engine_gate,
+            "Engines ungated and confirmed running-ready"),
+        Some(why) => error!(path = %config.serial_path, gate = ?engine_gate, reason = %why,
+            "ENGINES NOT READY: work will be accepted and NOT dispatched"),
+    }
+    // One ERROR line per refusal episode, not one per job or per tick.
+    let mut engine_refusal_logged = engine_gate.refusal().is_some();
+    // Whether anything of ours may be hashing now: a stop must reset only then
+    // on a chain whose previous owner's state this attach left alone.
+    let mut dispatched_since_reset = false;
+    // Extranonce2 consumed from the current task, so each dispatch hashes
+    // values no earlier dispatch of this task did. Reset per new task.
+    let mut en2_cursor: u64 = 0;
+
     let bring_up = tokio::time::timeout(
         DTS_VS_BRING_UP_TIMEOUT,
         configure_dts_vs_stream(&mut writer, &mut reader, &Bzm2DtsVsConfig::from_env()),
@@ -299,6 +369,30 @@ pub(super) async fn bzm2_thread_actor(
         }
     }
 
+    // EACH ASIC'S OWN SLICE OF THE NONCE SPACE, before any work -- and AFTER
+    // the stream bring-up, never before it. The silicon does not split work,
+    // so without these every ASIC hashes the same nonces. They are about
+    // 519 KB for a hundred-device chain, and the driver accepts bytes long
+    // before the wire carries them (~1.15 s here). Written before the bring-up,
+    // they put the bring-up's 500 ms register read behind that backlog: it
+    // timed out, the stream never started, the interlock refused all work and
+    // the monitor scrammed an idle board, measured on hardware.
+    // Here only the first dispatch, write-only, waits behind them. A slice
+    // write that fails leaves the ASICs overlapping, which refuses dispatch.
+    if engine_gate.refusal().is_none() {
+        match program_nonce_slices(&mut writer, &engine_layout, &config).await {
+            Ok(()) => info!(path = %config.serial_path, asics = config.asic_ids.len(),
+                "Per-ASIC nonce slices set"),
+            Err(err) => {
+                engine_gate =
+                    EngineGate::Unmeasured(format!("the nonce slices could not be written: {err}"));
+                error!(path = %config.serial_path, gate = ?engine_gate,
+                    "ENGINES NOT READY: work will be accepted and NOT dispatched");
+                engine_refusal_logged = true;
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             Some(command) = command_rx.recv() => {
@@ -316,6 +410,181 @@ pub(super) async fn bzm2_thread_actor(
                         }
                     }
 
+
+                    ThreadCommand::UpdateTask { new_task, response_tx } => {
+                        let old = current_task.replace(new_task);
+                        en2_cursor = 0;
+                        if let Some(ref task) = current_task {
+                            // Engines first: a task for gated engines is
+                            // accepted and held, like a thermal deferral.
+                            if !engines_may_dispatch(
+                                &mut writer,
+                                &mut engine_gate,
+                                &engine_layout,
+                                &config,
+                                &mut engine_refusal_logged,
+                            )
+                            .await
+                            {
+                                set_active(&status, false, config.expected_chain_hashrate_ths());
+                                let _ = response_tx.send(Ok(old));
+                                continue;
+                            }
+                            // ACCEPTED, DEFERRED. See `dispatch_deferred`.
+                            if let Err(refusal) = interlock.check() {
+                                interlock.record_refusal();
+                                if !dispatch_deferred {
+                                    dispatch_deferred = true;
+
+                                    // A HOLD TAKES THE LOAD OFF. A running engine repeats its last job
+
+                                    // until given another, so deferring dispatch alone left a hot chain
+
+                                    // hashing through the very hold meant to cool it.
+
+                                    if dispatched_since_reset {
+
+                                        stop_engines(&mut writer, &config).await;
+
+                                        engine_gate = EngineGate::Stopped;
+
+                                        dispatched_since_reset = false;
+
+                                    }
+                                    set_active(&status, false, config.expected_chain_hashrate_ths());
+                                    info!(
+                                        path = %config.serial_path,
+                                        reason = %refusal,
+                                        "Task accepted; dispatch DEFERRED until the thermal \
+                                         interlock allows it. The scheduler keeps the share \
+                                         channel and the dispatch tick sends it when it is safe."
+                                    );
+                                }
+                                let _ = response_tx.send(Ok(old));
+                                continue;
+                            }
+                            if let Err(err) = dispatch_task_to_board(
+                                &mut writer,
+                                task,
+                                base_sequence,
+                                &engine_layout,
+                                &mut engine_dispatches,
+                                &config,
+                                &mut interlock,
+                                &engine_gate,
+                                &mut en2_cursor,
+                            ).await {
+                                let _ = response_tx.send(Err(err));
+                                continue;
+                            }
+                            base_sequence = base_sequence.wrapping_add(1);
+                            if !dispatched_since_reset {
+                                log_first_dispatch(&interlock, &config);
+                            }
+                            dispatched_since_reset = true;
+                            dispatch_deferred = false;
+                            set_active(&status, true, config.expected_chain_hashrate_ths());
+
+                            let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
+                        }
+                        let _ = response_tx.send(Ok(old));
+                    }
+                    ThreadCommand::ReplaceTask { new_task, response_tx } => {
+                        // clean_jobs: the pool takes no share for anything
+                        // dispatched before this, so nothing resolves to it.
+                        engine_dispatches.invalidate();
+                        let old = current_task.replace(new_task);
+                        en2_cursor = 0;
+                        if let Some(ref task) = current_task {
+                            // Engines first: a task for gated engines is
+                            // accepted and held, like a thermal deferral.
+                            if !engines_may_dispatch(
+                                &mut writer,
+                                &mut engine_gate,
+                                &engine_layout,
+                                &config,
+                                &mut engine_refusal_logged,
+                            )
+                            .await
+                            {
+                                set_active(&status, false, config.expected_chain_hashrate_ths());
+                                let _ = response_tx.send(Ok(old));
+                                continue;
+                            }
+                            // ACCEPTED, DEFERRED. See `dispatch_deferred`.
+                            if let Err(refusal) = interlock.check() {
+                                interlock.record_refusal();
+                                if !dispatch_deferred {
+                                    dispatch_deferred = true;
+
+                                    // A HOLD TAKES THE LOAD OFF. A running engine repeats its last job
+
+                                    // until given another, so deferring dispatch alone left a hot chain
+
+                                    // hashing through the very hold meant to cool it.
+
+                                    if dispatched_since_reset {
+
+                                        stop_engines(&mut writer, &config).await;
+
+                                        engine_gate = EngineGate::Stopped;
+
+                                        dispatched_since_reset = false;
+
+                                    }
+                                    set_active(&status, false, config.expected_chain_hashrate_ths());
+                                    info!(
+                                        path = %config.serial_path,
+                                        reason = %refusal,
+                                        "Task accepted; dispatch DEFERRED until the thermal \
+                                         interlock allows it. The scheduler keeps the share \
+                                         channel and the dispatch tick sends it when it is safe."
+                                    );
+                                }
+                                let _ = response_tx.send(Ok(old));
+                                continue;
+                            }
+                            if let Err(err) = dispatch_task_to_board(
+                                &mut writer,
+                                task,
+                                base_sequence,
+                                &engine_layout,
+                                &mut engine_dispatches,
+                                &config,
+                                &mut interlock,
+                                &engine_gate,
+                                &mut en2_cursor,
+                            ).await {
+                                let _ = response_tx.send(Err(err));
+                                continue;
+                            }
+                            base_sequence = base_sequence.wrapping_add(1);
+                            if !dispatched_since_reset {
+                                log_first_dispatch(&interlock, &config);
+                            }
+                            dispatched_since_reset = true;
+                            dispatch_deferred = false;
+                            set_active(&status, true, config.expected_chain_hashrate_ths());
+
+                            let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
+                        }
+                        let _ = response_tx.send(Ok(old));
+                    }
+                    ThreadCommand::GoIdle { response_tx } => {
+                        engine_dispatches.invalidate();
+                        // Idle means the load comes off, not just that no
+                        // new job is sent. See `stop_engines`.
+                        if dispatched_since_reset {
+                            stop_engines(&mut writer, &config).await;
+                            engine_gate = EngineGate::Stopped;
+                            dispatched_since_reset = false;
+                        }
+                        let old = current_task.take();
+                        set_active(&status, false, config.expected_chain_hashrate_ths());
+
+                        let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
+                        let _ = response_tx.send(Ok(old));
+                    }
 
                     ThreadCommand::Shutdown => break,
                 }
@@ -350,7 +619,111 @@ pub(super) async fn bzm2_thread_actor(
                 }
             }
 
+            _ = dispatch_tick.tick(), if current_task.is_some() => {
+                if let Some(ref task) = current_task {
+                    if !engines_may_dispatch(
+                        &mut writer,
+                        &mut engine_gate,
+                        &engine_layout,
+                        &config,
+                        &mut engine_refusal_logged,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    // A THERMAL HOLD IS NOT A HARDWARE ERROR. This path used to
+                    // log every interlock refusal at ERROR as "BZM2 dispatch
+                    // failed" and count it with record_hardware_error, twice a
+                    // second for as long as the dies stayed hot -- a deliberate
+                    // safety refusal mislabelled as a fault, and a log flood.
+                    if let Err(refusal) = interlock.check() {
+                        interlock.record_refusal();
+                        if !dispatch_deferred {
+                            dispatch_deferred = true;
+
+                            // A HOLD TAKES THE LOAD OFF. A running engine repeats its last job
+
+                            // until given another, so deferring dispatch alone left a hot chain
+
+                            // hashing through the very hold meant to cool it.
+
+                            if dispatched_since_reset {
+
+                                stop_engines(&mut writer, &config).await;
+
+                                engine_gate = EngineGate::Stopped;
+
+                                dispatched_since_reset = false;
+
+                            }
+                            // Not being given work, so not active: the stall
+                            // watch must not read a thermal hold as a dead chain.
+                            set_active(&status, false, config.expected_chain_hashrate_ths());
+                            warn!(
+                                path = %config.serial_path,
+                                reason = %refusal,
+                                "Thermal interlock is holding dispatch; the chain is idle \
+                                 until it allows work again"
+                            );
+                        }
+                        continue;
+                    }
+                    match dispatch_task_to_board(
+                        &mut writer,
+                        task,
+                        base_sequence,
+                        &engine_layout,
+                        &mut engine_dispatches,
+                        &config,
+                                &mut interlock,
+                                &engine_gate,
+                                &mut en2_cursor,
+                    ).await {
+                        Ok(()) => {
+                            base_sequence = base_sequence.wrapping_add(1);
+                            // THE FIRST DISPATCH SINCE A RESET SAYS WHAT IT
+                            // WAS ALLOWED ON. The interlock logs a hold and a
+                            // release, but a chain whose dies were already
+                            // fresh logged nothing, so no run could show that
+                            // it waited for them, measured on hardware.
+                            if !dispatched_since_reset {
+                                log_first_dispatch(&interlock, &config);
+                            }
+                            dispatched_since_reset = true;
+                            if dispatch_deferred {
+                                dispatch_deferred = false;
+                                set_active(&status, true, config.expected_chain_hashrate_ths());
+
+                                let _ = event_tx
+                                    .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
+                                    .await;
+                                info!(
+                                    path = %config.serial_path,
+                                    "Thermal interlock allows dispatch again; deferred work sent"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            error!(path = %config.serial_path, error = %err, "BZM2 dispatch failed");
+                            record_hardware_error(&status);
+                        }
+                    }
+                }
+            }
+            _ = ntime_tick.tick(), if current_task.is_some() => {
+                if let Some(ref mut task) = current_task {
+                    task.ntime = task.ntime.wrapping_add(1);
+                }
+            }
+
         }
+    }
+
+    // Our work stops before anything else is taken down, and before the
+    // sensor-off frame, which stays the last thing on the bus.
+    if dispatched_since_reset {
+        stop_engines(&mut writer, &config).await;
     }
 
     // Leave the part as a cold boot would: sensor stream off. Otherwise the
@@ -385,6 +758,7 @@ pub(super) async fn bzm2_thread_actor(
 #[cfg(all(test, unix))]
 mod tests {
     use super::super::super::protocol::{self, encode_write_register};
+    use super::super::test_support::*;
     use super::*;
 
     use crate::transport::{SerialConfig, SerialStream};
@@ -392,6 +766,101 @@ mod tests {
     use nix::pty::openpty;
     use std::os::unix::io::IntoRawFd;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc as tokio_mpsc;
+    #[tokio::test]
+    async fn gen2_dts_vs_fault_shuts_down_live_thread() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (_host_reader, mut host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.dts_vs_generation = protocol::DtsVsGeneration::Gen2;
+        // The chain must contain the device the fault frame comes from, or the
+        // address gate discards it before the fault is ever evaluated -- which
+        // is the intended behaviour for a frame from a device we do not have.
+        config.asic_ids = (0..=3).collect();
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let mut event_rx = thread.take_event_receiver().unwrap();
+
+        let initial = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(initial, HashThreadEvent::StatusUpdate(_)));
+
+        // The actor now brings DTS/VS streaming up before entering its select
+        // loop, and `configure_dts_vs_stream` read-modify-writes the bandgap
+        // register — so bring-up performs a real read. This fake host never
+        // answers it, so bring-up runs to its bounded timeout and gives up. Wait
+        // that out before injecting: a frame written during the window is
+        // consumed by the pending read rather than reaching the frame parser.
+        // Includes the pre-bring-up drain, which runs first and costs one quiet
+        // window before bring-up even starts. Composed from the constants
+        // rather than a hand-picked number, so adding another step to attach
+        // cannot silently push the injection back inside the read window.
+        // Attach gained a step: after the drain it now PROVES the chain is
+        // quiet, which costs its own drain plus DTS_VS_QUIET_CONFIRM. This
+        // test predicted that -- "adding another step to attach cannot
+        // silently push the injection back inside the read window" -- and it
+        // is why the constant is added here rather than a number being nudged.
+        // Attach's phases on a line that answers nothing, each at its own
+        // timeout -- including the engine-state read around the ungate.
+        tokio::time::sleep(
+            DTS_VS_DRAIN_QUIET
+                + DTS_VS_BRING_UP_TIMEOUT
+                + DTS_VS_QUIET_CONFIRM
+                + UNGATE_READ_TIMEOUT
+                + Duration::from_millis(250),
+        )
+        .await;
+
+        // A sustained fault, not a single frame. One assertion no longer
+        // stops a thread: it arms the corroborator, because measurement showed
+        // junk on the wire stopping the miner eight times per twenty-five
+        // kilobytes and a spurious stop is only safe once. A real fault
+        // asserts on every sweep, so this is what one looks like.
+        // Payload in WIRE ORDER; this fixture previously ran back-to-front.
+        let fault_frame = [
+            0x00,
+            protocol::OPCODE_UART_DTS_VS,
+            0xF7,
+            0xA9,
+            0x96,
+            0x45,
+            0x12,
+            0x34,
+            0xAB,
+            0xD5,
+        ];
+        for _ in 0..FAULT_CORROBORATION_COUNT {
+            host_writer.write_all(&fault_frame).await.unwrap();
+        }
+
+        let mut saw_fault_status = false;
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(event) = event_rx.recv().await {
+                if let HashThreadEvent::StatusUpdate(status) = event {
+                    if !status.is_active && status.hardware_errors >= 1 {
+                        saw_fault_status = true;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            closed.is_ok(),
+            "thread should exit after DTS/VS hardware fault"
+        );
+        assert!(
+            saw_fault_status,
+            "thread should publish a final faulted status"
+        );
+    }
 
     /// Shutdown must leave the part as a cold boot would. Before this, a
     /// clean exit left sensor frames streaming onto the bus for the next
@@ -490,6 +959,588 @@ mod tests {
             frames.last().map(Vec::as_slice),
             Some(off.as_slice()),
             "the last frame on the bus must take the sensor stream off"
+        );
+    }
+
+    /// A part for the actor tests, modelling what was measured on hardware: engine
+    /// CONFIG reads 0x77 until written 0x04, then 0x14; a reset gates it
+    /// again. Once the stream is enabled it sends two die readings captured
+    /// on hardware (ASICs 70 and 71), for as long as `live` is set. Every frame
+    /// the actor sends comes back on the returned channel.
+    fn spawn_config_modelling_part(
+        mut host_reader: crate::transport::serial::SerialReader,
+        mut host_writer: crate::transport::serial::SerialWriter,
+        live: Arc<std::sync::atomic::AtomicBool>,
+        wire_bytes_per_s: Option<u64>,
+    ) -> tokio_mpsc::UnboundedReceiver<Vec<u8>> {
+        let (frames_tx, frames_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        // THE DRIVER TAKES BYTES FASTER THAN THE WIRE CARRIES THEM. The reader
+        // accepts every frame at once, the way the chain port's driver does;
+        // the part acts on each only when its bytes would have finished
+        // crossing a wire of `wire_bytes_per_s`. Without this a pty drains
+        // instantly and no test can see a transmit backlog -- which is how
+        // 519 KB of slice writes queued ahead of a 500 ms register read
+        // passed every test and failed on hardware.
+        let (inbox_tx, mut inbox) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            loop {
+                let mut len = [0u8; 2];
+                if host_reader.read_exact(&mut len).await.is_err() {
+                    break;
+                }
+                let total = u16::from_le_bytes(len) as usize;
+                let mut frame = len.to_vec();
+                frame.resize(total.max(2), 0);
+                if host_reader.read_exact(&mut frame[2..]).await.is_err() {
+                    break;
+                }
+                if inbox_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            // Two die readings captured from hardware, ASICs 70 and 71.
+            let readings: [[u8; 10]; 2] = [
+                [
+                    70,
+                    protocol::OPCODE_UART_DTS_VS,
+                    0xc8,
+                    0x9b,
+                    0x98,
+                    0x98,
+                    0x62,
+                    0x50,
+                    0xae,
+                    0x82,
+                ],
+                [
+                    71,
+                    protocol::OPCODE_UART_DTS_VS,
+                    0xc8,
+                    0x93,
+                    0x98,
+                    0x73,
+                    0x62,
+                    0x49,
+                    0xad,
+                    0x82,
+                ],
+            ];
+            let mut ungated = std::collections::HashSet::<u16>::new();
+            let mut streaming = false;
+            let mut tick = tokio::time::interval(Duration::from_millis(40));
+            let mut wire_clock = tokio::time::Instant::now();
+            loop {
+                tokio::select! {
+                    got = inbox.recv() => {
+                        let Some(frame) = got else { break; };
+                        if let Some(rate) = wire_bytes_per_s {
+                            // Sleep only once the wire has fallen 2 ms behind:
+                            // the timer's resolution is a millisecond, and one
+                            // sleep per 11-byte frame ran this part ~40x slow.
+                            let now = tokio::time::Instant::now();
+                            wire_clock = wire_clock.max(now)
+                                + Duration::from_micros(frame.len() as u64 * 1_000_000 / rate);
+                            if wire_clock > now + Duration::from_millis(2) {
+                                tokio::time::sleep_until(wire_clock).await;
+                            }
+                        }
+                        let len = [frame[0], frame[1]];
+                        let rest = frame[2..].to_vec();
+                        let opcode = rest.get(1).map(|b| b >> 4);
+                        let engine = if rest.len() >= 3 {
+                            (u16::from(rest[1] & 0x0f) << 8) | u16::from(rest[2])
+                        } else {
+                            0
+                        };
+                        if opcode == Some(protocol::OPCODE_UART_WRITEREG) && rest.len() >= 6 {
+                            if engine != crate::asic::bzm2::uart::NOTCH_REG && rest[3] == 0x01 && rest[5] == 0x04 {
+                                ungated.insert(engine);
+                            }
+                            if engine == crate::asic::bzm2::uart::NOTCH_REG && rest[3] == 0x0a && rest[5] == 0x0f {
+                                streaming = true;
+                            }
+                            // The suspend (transmit reset) stops new output;
+                            // what was already on its way still arrives. One
+                            // batch in flight, then silence -- the shape the
+                            // hardware showed.
+                            if engine == crate::asic::bzm2::uart::NOTCH_REG
+                                && rest[3] == 0x0a
+                                && rest[5] == crate::asic::bzm2::uart::UART_TX_CTRL_RESET as u8
+                            {
+                                if streaming {
+                                    for r in &readings {
+                                        if host_writer.write_all(r).await.is_err() { return; }
+                                    }
+                                }
+                                streaming = false;
+                            }
+                            if engine == crate::asic::bzm2::uart::NOTCH_REG && rest[3] == 0x16 && rest[5] == 0x00 {
+                                ungated.clear(); // a reset gates everything again
+                            }
+                        }
+                        if opcode == Some(protocol::OPCODE_UART_NOOP) {
+                            let sig = crate::asic::bzm2::uart::NOOP_SIGNATURE;
+                            let reply = [rest[0], protocol::OPCODE_UART_NOOP, sig[0], sig[1], sig[2]];
+                            if host_writer.write_all(&reply).await.is_err() { break; }
+                        }
+                        if opcode == Some(protocol::OPCODE_UART_READREG) && rest.len() >= 4 {
+                            let mut reply = vec![rest[0], protocol::OPCODE_UART_READREG, 0, 0, 0, 0];
+                            if engine != crate::asic::bzm2::uart::NOTCH_REG && rest[3] == 0x00 {
+                                reply[3] = if ungated.contains(&engine) { 0x14 } else { 0x77 };
+                            }
+                            if host_writer.write_all(&reply).await.is_err() { break; }
+                        }
+                        let mut frame = len.to_vec();
+                        frame.extend_from_slice(&rest);
+                        if frames_tx.send(frame).is_err() { break; }
+                    }
+                    _ = tick.tick(), if streaming && live.load(std::sync::atomic::Ordering::SeqCst) => {
+                        for r in &readings {
+                            if host_writer.write_all(r).await.is_err() { return; }
+                        }
+                    }
+                }
+            }
+        });
+        frames_rx
+    }
+
+    /// THE SENSOR STREAM COMES UP ON A FULL CHAIN, AT WIRE RATE.
+    ///
+    /// Measured on hardware: attach wrote each of 100 ASICs'
+    /// nonce slices -- about 519 KB -- and then brought the sensor stream up.
+    /// The driver takes bytes long before the wire carries them, so the
+    /// bring-up's 500 ms register read queued behind ~1.15 s of transmit and
+    /// timed out. No stream, no die reading; the interlock refused all work,
+    /// and the monitor scrammed a board that was never given any. A pty drains
+    /// instantly, so every test passed. This part runs at 5 Mbaud's ~450 KB/s.
+    #[tokio::test]
+    async fn the_sensor_stream_comes_up_on_a_full_chain_at_wire_rate() {
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (host_reader, host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = (0..100).collect();
+        let thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut frames_rx =
+            spawn_config_modelling_part(host_reader, host_writer, live, Some(450_000));
+
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let mut frames = Vec::new();
+        while let Ok(f) = frames_rx.try_recv() {
+            frames.push(f);
+        }
+        let _ = handle.shutdown();
+
+        let stream_on = encode_write_register(
+            protocol::BROADCAST_ASIC,
+            crate::asic::bzm2::uart::NOTCH_REG,
+            0x0a,
+            &0x0fu32.to_le_bytes(),
+        );
+        assert!(
+            frames.iter().any(|f| *f == stream_on),
+            "the sensor stream was never enabled: its bring-up read timed out behind the \
+                 attach's own writes ({} frames reached the part)",
+            frames.len()
+        );
+        // And the slices still went out, for the last ASIC too.
+        let (row, col) = protocol::default_engine_coordinates()[0];
+        let last_slice = encode_write_register(
+            99,
+            protocol::logical_engine_address(row, col),
+            protocol::ENGINE_REG_START_NONCE,
+            &nonce_slices(100)[99].0.to_le_bytes(),
+        );
+        assert!(
+            frames.iter().any(|f| *f == last_slice),
+            "ASIC 99's nonce slice never reached the part"
+        );
+    }
+
+    /// Every place that marks a dispatch logs the first one. Source-level,
+    /// because the sites are three arms of one actor loop and the one that
+    /// was missed was the one that runs first.
+    #[test]
+    fn every_dispatch_site_logs_the_first_dispatch() {
+        let src = include_str!("actor.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let lines: Vec<&str> = body.lines().collect();
+        let mut sites = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if l.trim() == "dispatched_since_reset = true;" {
+                sites += 1;
+                let before = lines[i.saturating_sub(4)..i].join("\n");
+                assert!(
+                    before.contains("log_first_dispatch("),
+                    "a dispatch site at line {} does not log the first dispatch",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(sites, 3, "the dispatch sites this test knows about");
+    }
+
+    /// A THERMAL HOLD TAKES THE LOAD OFF, not just the next job.
+    ///
+    /// A running engine repeats its last job until given another, so a hold
+    /// that only deferred dispatch left a chain hashing through the very
+    /// refusal meant to cool it. Here the die readings go stale mid-work; the
+    /// engines must be reset with nobody calling idle.
+    #[tokio::test]
+    async fn a_thermal_hold_takes_the_load_off() {
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (host_reader, host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = vec![70, 71];
+        config.dispatch_interval = Duration::from_millis(100);
+        config.thermal_reading_max_age_s = 1;
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut frames_rx =
+            spawn_config_modelling_part(host_reader, host_writer, live.clone(), None);
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        thread.update_task(test_task()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        live.store(false, std::sync::atomic::Ordering::SeqCst); // the dies go quiet
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+
+        // Collected BEFORE shutdown: shutdown resets engines that have run, so
+        // a reset seen after it would prove nothing about the hold. The first
+        // version of this test read the frames after shutdown and passed with
+        // the hold's stop removed.
+        let mut frames = Vec::new();
+        while let Ok(f) = frames_rx.try_recv() {
+            frames.push(f);
+        }
+        let _ = handle.shutdown();
+        let reset_low = encode_write_register(
+            protocol::BROADCAST_ASIC,
+            crate::asic::bzm2::uart::NOTCH_REG,
+            0x16,
+            &0u32.to_le_bytes(),
+        );
+        let is_job = |f: &Vec<u8>| f.len() == 48 && f[3] >> 4 == protocol::OPCODE_UART_WRITEJOB;
+        let first_job = frames.iter().position(is_job).expect("work was dispatched");
+        let last_job = frames.iter().rposition(is_job).unwrap();
+        let reset_after_work = frames[first_job..]
+            .iter()
+            .position(|f| *f == reset_low)
+            .map(|i| i + first_job)
+            .expect("the hold never reset the engines: they kept hashing their last job");
+        assert!(
+            reset_after_work > last_job,
+            "work went out after the hold had reset the engines"
+        );
+    }
+
+    /// ENGINES ARE UNGATED BEFORE WORK, AND STOPPED WHEN WORK STOPS.
+    ///
+    /// The first test to dispatch real work through this actor. Its part
+    /// models the one engine behaviour measured on hardware:
+    /// CONFIG reads 0x77 (every TCE gated) until written
+    /// 0x04, then 0x14. It streams two die readings captured on hardware so
+    /// the thermal interlock lets work through.
+    ///
+    /// What it pins, in order on the bus:
+    ///  1. after the attach reset, CONFIG 0x04 to every active engine, then a
+    ///     readback -- measured on hardware, 125 s of work sent to gated engines;
+    ///  2. work goes out;
+    ///  3. idle pulses the engine reset after the last job -- a running engine
+    ///     re-runs its job until given another, so stopping dispatch alone
+    ///     leaves the load on;
+    ///  4. the next job is preceded by the ungate again;
+    ///  5. shutdown pulses the reset after the last job, and the sensor-off
+    ///     frame is still the last thing on the bus.
+    #[tokio::test]
+    async fn engines_are_ungated_before_work_and_stopped_when_it_stops() {
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (host_reader, host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = vec![70, 71];
+        config.dispatch_interval = Duration::from_millis(100);
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut frames_rx =
+            spawn_config_modelling_part(host_reader, host_writer, live.clone(), None);
+
+        let reset_low = encode_write_register(
+            protocol::BROADCAST_ASIC,
+            crate::asic::bzm2::uart::NOTCH_REG,
+            0x16,
+            &0u32.to_le_bytes(),
+        );
+        let reset_high = encode_write_register(
+            protocol::BROADCAST_ASIC,
+            crate::asic::bzm2::uart::NOTCH_REG,
+            0x16,
+            &1u32.to_le_bytes(),
+        );
+        let off = encode_write_register(
+            protocol::BROADCAST_ASIC,
+            crate::asic::bzm2::uart::NOTCH_REG,
+            0x0a,
+            &crate::asic::bzm2::uart::UART_TX_CTRL_RESET.to_le_bytes(),
+        );
+        let ungates: Vec<Vec<u8>> = protocol::default_engine_coordinates()
+            .into_iter()
+            .map(|(row, col)| {
+                encode_write_register(
+                    protocol::BROADCAST_ASIC,
+                    protocol::logical_engine_address(row, col),
+                    0x01,
+                    &[0x04],
+                )
+            })
+            .collect();
+        let is_job = |f: &Vec<u8>| f.len() == 48 && f[3] >> 4 == protocol::OPCODE_UART_WRITEJOB;
+
+        // Attach, then one job, then idle, then a second job, then shutdown.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        thread.update_task(test_task()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        thread.go_idle().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        thread.update_task(test_task()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut frames = Vec::new();
+        while let Ok(f) = frames_rx.try_recv() {
+            frames.push(f);
+        }
+        let pos = |want: &[u8], from: usize| {
+            frames[from..]
+                .iter()
+                .position(|f| f.as_slice() == want)
+                .map(|i| i + from)
+        };
+
+        // 1. The attach reset, then every engine ungated, then a readback.
+        let attach_released = pos(&reset_high, 0).expect("attach released the engine reset");
+        for u in &ungates {
+            assert!(
+                pos(u, attach_released).is_some(),
+                "an active engine was never ungated after the attach reset"
+            );
+        }
+        let first_job = frames
+            .iter()
+            .position(is_job)
+            .expect("no work was ever dispatched");
+        let last_ungate = ungates
+            .iter()
+            .filter_map(|u| pos(u, attach_released))
+            .max()
+            .unwrap();
+        assert!(
+            last_ungate < first_job,
+            "work went out before the engines were ungated"
+        );
+        assert!(
+            frames[last_ungate..first_job].iter().any(|f| f.len() >= 4
+                && f[3] >> 4 == protocol::OPCODE_UART_READREG
+                && f[5] == 0x00),
+            "nothing read back engine state between the ungate and the first job"
+        );
+
+        // 3. Idle: a reset pulse after the first burst of jobs.
+        let idle_low = pos(&reset_low, first_job).expect("idle never reset the engines");
+        assert_eq!(
+            pos(&reset_high, idle_low).map(|i| i > idle_low),
+            Some(true),
+            "idle pulsed the reset low and never released it"
+        );
+        // 4. The next job is preceded by the ungate again.
+        let second_job = frames[idle_low..]
+            .iter()
+            .position(is_job)
+            .map(|i| i + idle_low)
+            .expect("the second task was never dispatched");
+        assert!(
+            ungates
+                .iter()
+                .all(|u| frames[idle_low..second_job].iter().any(|f| f == u)),
+            "work went to engines the idle reset had gated, without ungating them"
+        );
+        // Each ASIC's nonce slice, unicast, before the first job and again
+        // after the idle reset (which clears it) before the next.
+        let slices = nonce_slices(2);
+        let (row0, col0) = protocol::default_engine_coordinates()[0];
+        for (&asic, &(start, _)) in [70u8, 71].iter().zip(slices.iter()) {
+            let w = encode_write_register(
+                asic,
+                protocol::logical_engine_address(row0, col0),
+                protocol::ENGINE_REG_START_NONCE,
+                &start.to_le_bytes(),
+            );
+            assert!(
+                frames[attach_released..first_job].iter().any(|f| *f == w),
+                "ASIC {asic}'s nonce slice was not set before the first job"
+            );
+            assert!(
+                frames[idle_low..second_job].iter().any(|f| *f == w),
+                "the idle reset cleared ASIC {asic}'s slice and it was not set again"
+            );
+        }
+        // 5. Shutdown: reset after the last job, sensor-off still last.
+        let last_job = frames.iter().rposition(is_job).unwrap();
+        let shutdown_low = pos(&reset_low, last_job).expect("shutdown never reset the engines");
+        assert!(shutdown_low > last_job);
+        assert_eq!(
+            frames.last().map(Vec::as_slice),
+            Some(off.as_slice()),
+            "the sensor-off frame must stay the last thing on the bus"
+        );
+    }
+
+    /// A TASK THE INTERLOCK WILL NOT SEND YET IS ACCEPTED, NOT FAILED.
+    ///
+    /// The first test of task assignment through this actor at all -- before
+    /// it, nothing in the tree sent a BZM2 thread a job.
+    ///
+    /// The case it pins is the first dispatch. The first job can easily arrive
+    /// before the sensor stream has delivered a reading, and the interlock
+    /// refuses on NoReading. That refusal used to be answered with Err while
+    /// the thread KEPT the task: the scheduler, told the assignment failed,
+    /// never registered the task's share receiver -- the task carries
+    /// `share_tx` -- and the dispatch tick then sent the task once readings
+    /// arrived. Every share it found went to a dropped channel. A first mining
+    /// run that shows hashrate and delivers nothing to the pool.
+    ///
+    /// The emulator here answers the attach sequence and never streams a
+    /// sensor frame, so the interlock has no reading for the whole test.
+    #[tokio::test]
+    async fn a_task_the_interlock_refuses_is_accepted_and_nothing_is_sent() {
+        use crate::asic::hash_thread::HashThread;
+        use crate::job_source::{GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate};
+        use bitcoin::hashes::Hash;
+
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (mut host_reader, mut host_writer, _host_control) = host_side.split();
+
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+
+        let collector = tokio::spawn(async move {
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut len = [0u8; 2];
+                match tokio::time::timeout(Duration::from_secs(2), host_reader.read_exact(&mut len))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+                let total = u16::from_le_bytes(len) as usize;
+                let mut rest = vec![0u8; total.saturating_sub(2)];
+                if host_reader.read_exact(&mut rest).await.is_err() {
+                    break;
+                }
+                let mut frame = len.to_vec();
+                frame.extend_from_slice(&rest);
+                if rest.len() >= 4 && (rest[1] >> 4) == protocol::OPCODE_UART_READREG {
+                    let reply = [rest[0], protocol::OPCODE_UART_READREG, 0, 0, 0, 0];
+                    if host_writer.write_all(&reply).await.is_err() {
+                        break;
+                    }
+                }
+                frames.push(frame);
+            }
+            frames
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target = bitcoin::pow::Target::MAX;
+        let template = std::sync::Arc::new(JobTemplate {
+            id: "deferred".into(),
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                bitcoin::block::Version::from_consensus(0x20000000),
+                GeneralPurposeBits::none(),
+            )
+            .unwrap(),
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x1d00ffff),
+            share_target: target,
+            time: 1_234_567_890,
+            merkle_root: MerkleRootKind::Fixed(bitcoin::TxMerkleNode::all_zeros()),
+        });
+        let (share_tx, _share_rx) = tokio::sync::mpsc::channel(8);
+        let task = HashTask {
+            template,
+            en2_range: None,
+            en2: None,
+            share_target: target,
+            ntime: 1_234_567_890,
+            share_tx,
+        };
+
+        let answer = thread.update_task(task).await;
+        assert!(
+            answer.is_ok(),
+            "a thermal refusal must be ACCEPTED and deferred: the scheduler registers the \
+                 task's share receiver only on Ok, so an Err here orphans every share the task \
+                 later finds. Got {answer:?}"
+        );
+
+        // Let a few dispatch ticks pass: still no reading, so still nothing sent.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let _ = handle.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        let frames = collector.await.unwrap();
+        let jobs = frames
+            .iter()
+            .filter(|f| f.len() >= 4 && (f[3] >> 4) == protocol::OPCODE_UART_WRITEJOB)
+            .count();
+        assert_eq!(
+            jobs, 0,
+            "deferred means NOTHING dispatched while the interlock has no reading"
         );
     }
 }
