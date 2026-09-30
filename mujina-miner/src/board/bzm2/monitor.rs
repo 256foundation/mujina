@@ -579,7 +579,7 @@ fn fan_blind_condition(
 /// never asked, and on a safety trip that is the difference between a board
 /// that stops making heat and one that does not. A full channel means a busy
 /// thread -- precisely the thread this is trying to stop.
-async fn stop_dispatch(
+pub(super) async fn stop_dispatch(
     board_name: &str,
     handles: &[Bzm2ThreadHandle],
     telemetry_tx: &watch::Sender<crate::api_client::types::BoardTelemetry>,

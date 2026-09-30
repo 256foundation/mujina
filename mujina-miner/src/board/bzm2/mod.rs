@@ -263,6 +263,20 @@ impl Bzm2Board {
         let platform = platform::DEFAULT;
         let interval = self.config.heartbeat.interval;
         let (tx, rx) = watch::channel(false);
+        // A CONFIRMED RAIL DROP TAKES THE BOARD'S OWN SCRAM PATH, NOT A NEW
+        // ONE.
+        //
+        // `scram` opens its own I2C handle per board index, so it needs no
+        // access to the bus this task already owns. Cloning these once,
+        // before any beat lands, mirrors how `spawn_monitor` captures
+        // `shutdown_handles` and the driven board indices before its own
+        // spawn: both read `self.shutdown_handles` as it stood when
+        // `create_hash_threads` populated it, which is complete by the time
+        // `spawn_heartbeats` runs.
+        let board_name = self.config.device_id();
+        let dispatch_handles = self.shutdown_handles.clone();
+        let scram_boards = self.driven_board_indices();
+        let heartbeat_shutdown_for_scram = Some(tx.clone());
 
         for serial_path in &self.config.serial_paths {
             let Some(board_index) =
@@ -298,6 +312,10 @@ impl Bzm2Board {
 
             let mut rx = rx.clone();
             let telemetry_tx = self.telemetry_tx.clone();
+            let board_name = board_name.clone();
+            let dispatch_handles = dispatch_handles.clone();
+            let scram_boards = scram_boards.clone();
+            let heartbeat_shutdown_for_scram = heartbeat_shutdown_for_scram.clone();
             // Announce the intent, not the outcome: nothing is armed until a
             // beat has actually landed, announced below.
             info!(
@@ -373,22 +391,29 @@ impl Bzm2Board {
                                                 );
                                             });
                                         }
-                                        match heartbeat.verify_still_energised().await {
-                                            Some(false) => error!(
+                                        let witness = heartbeat.verify_still_energised().await;
+                                        let must_stop = react_to_rail_witness(
+                                            witness,
+                                            HeartbeatSafetyContext {
                                                 board_index,
-                                                beats = heartbeat.beats(),
-                                                "BOARD DE-ENERGISED WHILE WE ARE BEATING IT. \
-                                                 Every write was accepted, so the beat is being \
-                                                 sent and is not being honoured. Treat this \
-                                                 board as unprotected."
-                                            ),
-                                            None => warn!(
-                                                board_index,
-                                                "Cannot read this board's rail, so whether the \
-                                                 heartbeat is working is UNMEASURED -- not \
-                                                 confirmed."
-                                            ),
-                                            Some(true) => {}
+                                                board_name: &board_name,
+                                                beats: heartbeat.beats(),
+                                                dispatch_handles: &dispatch_handles,
+                                                telemetry_tx: &telemetry_tx,
+                                                heartbeat_shutdown: &heartbeat_shutdown_for_scram,
+                                                scram_boards: &scram_boards,
+                                            },
+                                        )
+                                        .await;
+                                        if must_stop {
+                                            // The scram inside
+                                            // `react_to_rail_witness` has
+                                            // already asked every heartbeat
+                                            // task, this one included, to
+                                            // stop -- return rather than loop
+                                            // back to a beat this board must
+                                            // not receive.
+                                            return;
                                         }
                                     }
                                 }
@@ -422,6 +447,66 @@ impl Bzm2Board {
             }));
         }
         self.heartbeat_shutdown = Some(tx);
+    }
+}
+
+/// What [`react_to_rail_witness`] needs to actuate a confirmed drop, bundled
+/// so the function stays under clippy's argument count: everything here is
+/// per-board plumbing, captured once in [`Bzm2Board::spawn_heartbeats`] and
+/// passed through unchanged on every beat.
+struct HeartbeatSafetyContext<'a> {
+    board_index: usize,
+    board_name: &'a str,
+    beats: u64,
+    dispatch_handles: &'a [Bzm2ThreadHandle],
+    telemetry_tx: &'a watch::Sender<BoardTelemetry>,
+    heartbeat_shutdown: &'a Option<watch::Sender<bool>>,
+    scram_boards: &'a [usize],
+}
+
+/// React to one heartbeat task's periodic rail witness.
+///
+/// Pulled out of the spawned per-board task so the decision is
+/// testable without a real I2C bus: the task supplies what
+/// `verify_still_energised` already read, this owns what happens next, and
+/// the task around it only owns wiring the pieces together.
+///
+/// `Some(false)` is a CONFIRMED drop, witnessed while still beating -- the
+/// same evidence the monitor ladder's own `Scram` rung acts on, so this
+/// takes that rung's own two actions, [`monitor::stop_dispatch`] then
+/// [`monitor::scram`], rather than a second path to the same outcome.
+/// `None` is UNMEASURED and must not be treated as energised-and-fine: no
+/// action is taken on it, but nothing here claims the board is fine either.
+///
+/// Returns `true` when this task must stop feeding this board: the scram
+/// above has already asked every heartbeat task to stop, through the
+/// channel behind `heartbeat_shutdown` (this one included), so beating on
+/// afterward would fight it.
+async fn react_to_rail_witness(witness: Option<bool>, ctx: HeartbeatSafetyContext<'_>) -> bool {
+    match witness {
+        Some(false) => {
+            error!(
+                board_index = ctx.board_index,
+                beats = ctx.beats,
+                "BOARD DE-ENERGISED WHILE WE ARE BEATING IT. Every write was accepted, so \
+                 the beat is being sent and is not being honoured. STOPPING DISPATCH AND \
+                 SCRAMMING: a rail this witness confirms dark is not a board to keep sending \
+                 work to."
+            );
+            monitor::stop_dispatch(ctx.board_name, ctx.dispatch_handles, ctx.telemetry_tx).await;
+            monitor::scram(ctx.board_name, ctx.heartbeat_shutdown, ctx.scram_boards).await;
+            true
+        }
+        None => {
+            warn!(
+                board_index = ctx.board_index,
+                "Cannot read this board's rail, so whether the heartbeat is working is \
+                 UNMEASURED -- not confirmed. Not treated as energised: no beat is skipped or \
+                 added on this reading, and dispatch is not stopped on an unmeasured rail."
+            );
+            false
+        }
+        Some(true) => false,
     }
 }
 
@@ -1171,6 +1256,112 @@ mod tests {
         .await;
         assert_eq!(arrived, Ok(true), "the rate report never arrived");
         let _ = status_seen;
+    }
+
+    /// A CONFIRMED RAIL DROP MUST STOP DISPATCH AND SCRAM.
+    ///
+    /// `Some(false)` is `verify_still_energised`'s CONFIRMED-dark outcome.
+    /// Fails on the unmodified code because it only logged an `error!` and
+    /// let the loop continue beating (and dispatch kept running): this
+    /// function must return `true` (stop this heartbeat task) and must
+    /// reset every dispatch row to idle through the same `stop_dispatch`
+    /// the monitor ladder's own Scram rung calls, and must ask every
+    /// heartbeat task to stop through `heartbeat_shutdown`, the same
+    /// channel `scram` sends on.
+    #[tokio::test]
+    async fn react_to_rail_witness_stops_dispatch_and_scrams_on_a_confirmed_drop() {
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            threads: vec![
+                ThreadTelemetry {
+                    name: "BZM2 UART 0".into(),
+                    hashrate: 123,
+                    is_active: true,
+                },
+                ThreadTelemetry {
+                    name: "BZM2 UART 1".into(),
+                    hashrate: 0,
+                    is_active: false,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let heartbeat_shutdown = Some(shutdown_tx);
+
+        let must_stop = react_to_rail_witness(
+            Some(false),
+            HeartbeatSafetyContext {
+                board_index: 0,
+                board_name: "bzm2-252-heartbeat-test",
+                beats: 7,
+                dispatch_handles: &[],
+                telemetry_tx: &telemetry_tx,
+                heartbeat_shutdown: &heartbeat_shutdown,
+                scram_boards: &[],
+            },
+        )
+        .await;
+
+        assert!(
+            must_stop,
+            "a confirmed rail drop must stop this heartbeat task's own loop"
+        );
+        assert!(
+            !telemetry_rx.borrow().threads[0].is_active,
+            "stop_dispatch must have reset the dispatching row to idle"
+        );
+        assert_eq!(
+            telemetry_rx.borrow().threads[0].hashrate,
+            0,
+            "stop_dispatch must have reset the dispatching row's hashrate"
+        );
+        assert!(
+            *shutdown_rx.borrow_and_update(),
+            "scram's heartbeat-stop must have asked every heartbeat task, through the same \
+             channel every heartbeat task's own rx.changed() watches, to stop"
+        );
+    }
+
+    /// THE UNMEASURED CASE: `None` (the rail could not be read)
+    /// must not be treated as either energised or dark -- no scram, no
+    /// dispatch stop, and this task keeps beating.
+    #[tokio::test]
+    async fn react_to_rail_witness_takes_no_action_on_an_unmeasured_rail() {
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            threads: vec![ThreadTelemetry {
+                name: "BZM2 UART 0".into(),
+                hashrate: 123,
+                is_active: true,
+            }],
+            ..Default::default()
+        });
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let heartbeat_shutdown = Some(shutdown_tx);
+
+        let must_stop = react_to_rail_witness(
+            None,
+            HeartbeatSafetyContext {
+                board_index: 0,
+                board_name: "bzm2-252-heartbeat-test",
+                beats: 3,
+                dispatch_handles: &[],
+                telemetry_tx: &telemetry_tx,
+                heartbeat_shutdown: &heartbeat_shutdown,
+                scram_boards: &[],
+            },
+        )
+        .await;
+
+        assert!(!must_stop, "an unmeasured rail must not stop this task");
+        assert!(
+            telemetry_rx.borrow().threads[0].is_active,
+            "an unmeasured rail must not reset dispatch"
+        );
+        assert!(
+            !*shutdown_rx.borrow_and_update(),
+            "an unmeasured rail must not signal a heartbeat shutdown"
+        );
     }
 
     #[tokio::test]
