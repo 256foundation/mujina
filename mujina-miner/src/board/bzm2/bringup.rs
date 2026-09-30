@@ -510,7 +510,13 @@ impl Bzm2Board {
     /// itself is short; calibration is about ten minutes of raised voltage and
     /// frequency across every part on every chain, and that is the interval
     /// that must not be run with the silicon's last-resort protection off.
-    pub(super) async fn arm_on_die_protection_before_calibration(&self) {
+    ///
+    /// Returns `Err` naming every chain whose protection is UNCONFIRMED --
+    /// the port could not be opened, the sensor block could not be
+    /// configured, or no device reported it armed. The caller decides what
+    /// unconfirmed protection means for calibration; this function only
+    /// reports it, per chain, completely.
+    pub(super) async fn arm_on_die_protection_before_calibration(&self) -> Result<(), BoardError> {
         use crate::asic::bzm2::uart::{
             Bzm2DtsVsConfig, configure_dts_vs_stream, confirm_on_die_protection,
         };
@@ -518,6 +524,8 @@ impl Bzm2Board {
         // Short. If the parts are not talking with the stack down, this is
         // paid on every bring-up and must not become the reason one is slow.
         const REACH_TIMEOUT: Duration = Duration::from_millis(1500);
+
+        let mut unconfirmed: Vec<String> = Vec::new();
 
         for serial_path in &self.config.serial_paths {
             let stream = match crate::transport::serial::open_with_platform_cflag(
@@ -529,9 +537,10 @@ impl Bzm2Board {
                     warn!(
                         serial_path,
                         %err,
-                        "Cannot open this chain to arm its sensors; it will be CALIBRATED with \
-                         the on-die protection UNARMED, until its thread attaches"
+                        "Cannot open this chain to arm its sensors; on-die protection is \
+                         UNCONFIRMED for this chain"
                     );
+                    unconfirmed.push(format!("{serial_path}: cannot open chain ({err})"));
                     continue;
                 }
             };
@@ -550,15 +559,20 @@ impl Bzm2Board {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     warn!(serial_path, %err,
-                        "Could not configure the sensor block before the ramp");
+                        "Could not configure the sensor block before the ramp; on-die \
+                         protection is UNCONFIRMED for this chain");
+                    unconfirmed.push(format!(
+                        "{serial_path}: could not configure sensors ({err})"
+                    ));
                     continue;
                 }
                 Err(_) => {
-                    info!(
+                    warn!(
                         serial_path,
-                        "Chain did not answer when arming its sensors; the thread will arm them \
-                         when it attaches, as it does today."
+                        "Chain did not answer when arming its sensors within {REACH_TIMEOUT:?}; \
+                         on-die protection is UNCONFIRMED for this chain"
                     );
+                    unconfirmed.push(format!("{serial_path}: no answer within {REACH_TIMEOUT:?}"));
                     continue;
                 }
             }
@@ -576,11 +590,26 @@ impl Bzm2Board {
                     asic = who,
                     "On-die protection armed and confirmed BEFORE the stack ramp"
                 ),
-                Err(err) => warn!(
-                    serial_path, %err,
-                    "Sensors were configured before the ramp and no device reported them in                      force, so the stack is about to come up UNVERIFIED"
-                ),
+                Err(err) => {
+                    warn!(
+                        serial_path, %err,
+                        "Sensors were configured before the ramp and no device reported them in \
+                         force; on-die protection is UNCONFIRMED for this chain"
+                    );
+                    unconfirmed.push(format!("{serial_path}: not confirmed ({err})"));
+                }
             }
+        }
+
+        if unconfirmed.is_empty() {
+            Ok(())
+        } else {
+            Err(BoardError::InitializationFailed(format!(
+                "on-die protection unconfirmed on {} of {} chain(s): {}",
+                unconfirmed.len(),
+                self.config.serial_paths.len(),
+                unconfirmed.join("; ")
+            )))
         }
     }
 
@@ -847,4 +876,149 @@ fn calibration_error(serial_path: &str, err: impl std::fmt::Display) -> BoardErr
         "BZM2 calibration failed on {}: {}",
         serial_path, err
     ))
+}
+
+/// `arm_on_die_protection_before_calibration` reports one of three
+/// UNCONFIRMED outcomes per chain (see the function's own doc comment): the
+/// port could not be opened, the sensor block could not be configured within
+/// `REACH_TIMEOUT`, or it was configured but no device answered with
+/// protection actually in force. The `create_hash_threads` integration test
+/// in `mod.rs` (`create_hash_threads_refuses_to_calibrate_when_on_die_protection_is_unconfirmed`)
+/// only ever drives an unanswered chain, which is one of the three -- a
+/// verifier found that dropping either of the other two `unconfirmed.push`
+/// calls went uncaught. These call the function directly, one branch each,
+/// and each is proven against its own mutation below before being restored.
+#[cfg(all(test, unix))]
+mod arm_tests {
+    use super::*;
+    use crate::api_client::types::BoardTelemetry;
+    use crate::board::bzm2::config::{
+        Bzm2CalibrationConfig, Bzm2EnumerationConfig, Bzm2HeartbeatConfig, Bzm2RuntimeConfig,
+        DEFAULT_BAUD_RATE, TEST_NOMINAL_HASHRATE_THS,
+    };
+    use crate::board::bzm2::telemetry::Bzm2TelemetryConfig;
+
+    use nix::pty::openpty;
+    use std::fs;
+    use std::os::fd::AsRawFd;
+    use tokio::sync::{mpsc, watch};
+
+    fn minimal_config(serial_paths: Vec<String>) -> Bzm2RuntimeConfig {
+        Bzm2RuntimeConfig {
+            serial_paths,
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            result_min_difficulty: None,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            calibration: Bzm2CalibrationConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig::default(),
+            stored_calibration: None,
+            heartbeat: Bzm2HeartbeatConfig::default(),
+        }
+    }
+
+    fn new_board(serial_paths: Vec<String>) -> Bzm2Board {
+        let (telemetry_tx, _rx) = watch::channel(BoardTelemetry::default());
+        Bzm2Board::new(
+            minimal_config(serial_paths),
+            telemetry_tx,
+            mpsc::channel(1).1,
+        )
+    }
+
+    /// OPEN-FAILURE BRANCH: the chain path does not exist, so
+    /// `open_with_platform_cflag` returns `Err` before anything is written to
+    /// the wire. Mutation this catches: deleting
+    /// `unconfirmed.push(format!("{serial_path}: cannot open chain ({err})"))`
+    /// from the `Err(err) => { .. }` arm of the open match -- with that push
+    /// gone, an unconfirmed open-failure is silently dropped from the
+    /// `unconfirmed` list and, with only one chain configured, the function
+    /// wrongly returns `Ok(())`.
+    #[tokio::test]
+    async fn open_failure_is_reported_unconfirmed() {
+        let board = new_board(vec![
+            "/nonexistent/bzm2-arm-test-path-does-not-exist".to_string(),
+        ]);
+
+        let err = board
+            .arm_on_die_protection_before_calibration()
+            .await
+            .expect_err("a chain path that cannot be opened must be UNCONFIRMED");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot open chain"),
+            "expected the open-failure branch's message, got: {message}"
+        );
+    }
+
+    /// CONFIRM-FAILURE BRANCH: the sensor block is configured successfully
+    /// (the chain answers the one register read `configure_dts_vs_stream`
+    /// makes, the bandgap read, with the exact reply bytes `uart.rs`'s own
+    /// `a_broadcast_register_read_accepts_the_device_that_answers` test
+    /// uses), but no device ever streams a DTS/VS frame back, so
+    /// `confirm_on_die_protection` times out on its own read and on-die
+    /// protection is never actually confirmed armed. Mutation this catches:
+    /// deleting `unconfirmed.push(format!("{serial_path}: not confirmed
+    /// ({err})"))` from the `Err(err) => { .. }` arm of the confirm match --
+    /// with that push gone, a chain that was configured but never confirmed
+    /// is silently dropped and, with only one chain configured, the function
+    /// wrongly returns `Ok(())`.
+    #[tokio::test]
+    async fn configured_but_unconfirmed_chain_is_reported_unconfirmed() {
+        use std::os::unix::io::FromRawFd;
+        use tokio::io::AsyncWriteExt as _;
+
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // Raw 8N1 mode FIRST, same reason as the timeout fixture above:
+        // termios belongs to the device, so this must be set before the
+        // reply bytes are queued, or the still-cooked/canonical line
+        // discipline holds them behind a newline that never comes and the
+        // read never sees them.
+        drop(crate::transport::serial::open_with_platform_cflag(
+            &serial_path,
+            DEFAULT_BAUD_RATE,
+        ));
+
+        // The single broadcast register reply `configure_dts_vs_stream` waits
+        // on (the bandgap read); everything else it does is a bare write.
+        // Bytes lifted from the same fixture `uart.rs` uses for this exact
+        // reply: asic 0x48, opcode 0x03 (register read), value 0x0000_02f3.
+        let bandgap_reply: [u8; 6] = [0x48, 0x03, 0xf3, 0x02, 0x00, 0x00];
+        let mut master = tokio::fs::File::from_std(unsafe {
+            std::fs::File::from_raw_fd(pty.master.as_raw_fd())
+        });
+        master.write_all(&bandgap_reply).await.unwrap();
+        master.flush().await.unwrap();
+        std::mem::forget(master);
+
+        let board = new_board(vec![serial_path]);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            board.arm_on_die_protection_before_calibration(),
+        )
+        .await
+        .expect("arm must not hang past its own REACH_TIMEOUT");
+        let err = outcome.expect_err(
+            "sensors were configured but no device ever streamed a DTS/VS frame back, so \
+             protection must be UNCONFIRMED",
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("not confirmed"),
+            "expected the confirm-failure branch's message, got: {message}"
+        );
+
+        drop(pty);
+    }
 }

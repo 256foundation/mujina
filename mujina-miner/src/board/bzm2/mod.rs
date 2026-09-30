@@ -803,24 +803,37 @@ impl Bzm2Board {
         // before it starts is the only safe window.
         self.board_serials = self.drain_board_faults_before_bringup().await;
         self.apply_bringup_sequence().await?;
-        // Arm the silicon's own thermal/voltage protection before the long
-        // bring-up stress, not after: the sensors come up powered down and
-        // carry no thresholds, so a part cannot assert its own trip or
-        // shutdown until firmware arms it.
-        //
-        // Only when there is a ramp and a sweep to protect. With bring-up
-        // disabled -- a handover, or an observation run -- there is no ramp
-        // and no calibration for this to precede, and the chain-attach path
-        // arms the sensors exactly as it always has. Opening the chain port
-        // here anyway buys nothing and costs a close-then-reopen of the same
-        // tty, which some drivers punish with a refusal that latches until
-        // reboot -- measured on hardware.
-        if self.config.bringup.enabled {
-            self.arm_on_die_protection_before_calibration().await;
+        // Arm the silicon's own thermal/voltage protection before the ramp
+        // and sweep. It runs whenever bring-up or calibration is enabled --
+        // the arm has no bring-up dependency and opens the chain ports
+        // itself -- and a failure while calibration is enabled refuses to
+        // calibrate and scrams the whole board, rather than run the
+        // ten-minute voltage-and-frequency sweep with the silicon's
+        // last-resort protection unarmed.
+        if self.config.bringup.enabled || self.config.calibration.enabled {
+            if let Err(err) = self.arm_on_die_protection_before_calibration().await
+                && self.config.calibration.enabled
+            {
+                error!(
+                    board = %self.config.device_id(),
+                    error = %err,
+                    "REFUSING TO CALIBRATE: on-die protection is unconfirmed and calibration \
+                     ramps domain voltage and frequency across every part on every chain for \
+                     about ten minutes. De-energising now rather than running that sweep with \
+                     the silicon's last-resort protection unarmed."
+                );
+                monitor::scram(
+                    &self.config.device_id(),
+                    &None,
+                    &self.driven_board_indices(),
+                )
+                .await;
+                return Err(err.into());
+            }
         } else {
             info!(
-                "Bring-up disabled, so no ramp or calibration to protect: on-die protection \
-                 will be armed by the chain attach, not by a separate open of the port"
+                "Bring-up and calibration both disabled, so no ramp or calibration to protect: \
+                 on-die protection is left unarmed"
             );
         }
         let bus_layouts = self.resolve_bus_layouts().await?;
@@ -1283,6 +1296,217 @@ mod tests {
         let _ = fs::remove_file(enable0_path);
         let _ = fs::remove_file(enable1_path);
         let _ = fs::remove_file(reset_path);
+        drop(pty);
+    }
+
+    /// BRING-UP MUST FAIL CLOSED.
+    ///
+    /// Nothing answers the chain port, so
+    /// `arm_on_die_protection_before_calibration` cannot confirm the on-die
+    /// sensors on this chain. Calibration is enabled -- a ramp and a sweep
+    /// exist here to protect -- so `create_hash_threads` must refuse rather
+    /// than proceed toward calibration with the silicon's last-resort
+    /// protection unconfirmed.
+    ///
+    /// Bounded by an outer timeout because the defect this guards against is
+    /// exactly a board that proceeds into the real calibration sweep: on the
+    /// unmodified code that sweep runs for real against a chain that never
+    /// answers, which does not resolve on its own within any budget this
+    /// test can afford to wait out. The fixed code returns in well under a
+    /// second, so the bound is not close on the passing side.
+    #[tokio::test]
+    async fn create_hash_threads_refuses_to_calibrate_when_on_die_protection_is_unconfirmed() {
+        unsafe { std::env::set_var("MUJINA_BZM2_VARIANT", "bench") };
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rail0_path = std::env::temp_dir().join(format!("bzm2-252-rail0-{unique}.txt"));
+        let rail1_path = std::env::temp_dir().join(format!("bzm2-252-rail1-{unique}.txt"));
+        let enable0_path = std::env::temp_dir().join(format!("bzm2-252-enable0-{unique}.txt"));
+        let enable1_path = std::env::temp_dir().join(format!("bzm2-252-enable1-{unique}.txt"));
+        let reset_path = std::env::temp_dir().join(format!("bzm2-252-reset-{unique}.txt"));
+
+        let config = Bzm2RuntimeConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            result_min_difficulty: None,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            // No enumeration: bus layouts come from configured counts, no
+            // wire traffic, so nothing here masks the arm failure with a
+            // second, unrelated I/O error.
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig {
+                enabled: true,
+                rail_set_paths: vec![
+                    rail0_path.to_string_lossy().into_owned(),
+                    rail1_path.to_string_lossy().into_owned(),
+                ],
+                rail_write_scales: vec![1000.0, 1000.0],
+                domain_rail_indices: Vec::new(),
+                rail_enable_paths: vec![
+                    enable0_path.to_string_lossy().into_owned(),
+                    enable1_path.to_string_lossy().into_owned(),
+                ],
+                rail_enable_values: vec!["EN".into(), "ON".into()],
+                rail_vin: Vec::new(),
+                rail_vout: Vec::new(),
+                rail_current: Vec::new(),
+                rail_power: Vec::new(),
+                rail_temperature: Vec::new(),
+                reset_path: Some(reset_path.to_string_lossy().into_owned()),
+                reset_active_low: true,
+                plan: VoltageStackBringupPlan {
+                    pre_power_delay: Duration::ZERO,
+                    post_power_delay: Duration::ZERO,
+                    release_reset_delay: Duration::ZERO,
+                    steps: vec![
+                        VoltageStackStep {
+                            rail_index: 0,
+                            voltage: 1.1,
+                            settle_for: Duration::ZERO,
+                        },
+                        VoltageStackStep {
+                            rail_index: 1,
+                            voltage: 1.25,
+                            settle_for: Duration::ZERO,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            },
+            heartbeat: Default::default(),
+            stored_calibration: None,
+            // ENABLED: the ramp and sweep the on-die protection arm guards.
+            calibration: Bzm2CalibrationConfig {
+                enabled: true,
+                discover_engine_topology: false,
+                ..Default::default()
+            },
+        };
+        let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-252-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-252-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
+
+        // Nobody answers `pty.master`, so the arm's chain probe cannot
+        // confirm on-die protection on this chain.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), board.create_hash_threads()).await;
+        let result = outcome.unwrap_or_else(|_| {
+            panic!(
+                "create_hash_threads did not return within 5s: on-die protection was never \
+                 confirmed and calibration is enabled, so the unmodified code proceeds into a \
+                 real calibration sweep against this chain instead of refusing"
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "on-die protection was never confirmed on this chain and calibration is enabled, \
+             so create_hash_threads must refuse rather than proceed toward calibration: got {:?}",
+            result.map(|threads| threads.len())
+        );
+
+        let _ = fs::remove_file(rail0_path);
+        let _ = fs::remove_file(rail1_path);
+        let _ = fs::remove_file(enable0_path);
+        let _ = fs::remove_file(enable1_path);
+        let _ = fs::remove_file(reset_path);
+        drop(pty);
+    }
+
+    /// Bring-up and calibration are independent env flags, so bring-up off
+    /// must not skip the arm when calibration is on: it must still refuse
+    /// when on-die protection cannot be confirmed.
+    ///
+    /// Bring-up is OFF here (no rail/reset paths at all: `apply_bringup_sequence`
+    /// early-returns `Ok(())` for a disabled bring-up and never touches them),
+    /// and calibration is ON. Nothing answers the chain, so the arm cannot
+    /// confirm protection, and `create_hash_threads` must still refuse.
+    ///
+    /// Bounded by an outer timeout for the same reason as the sibling test
+    /// above: on the unmodified code this does not refuse, it proceeds into
+    /// `execute_live_calibration` against a chain that never answers.
+    #[tokio::test]
+    async fn create_hash_threads_refuses_to_calibrate_when_bringup_is_disabled_and_protection_is_unconfirmed()
+     {
+        unsafe { std::env::set_var("MUJINA_BZM2_VARIANT", "bench") };
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let config = Bzm2RuntimeConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            result_min_difficulty: None,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            // OFF. This is the case the defect actually lived in: bring-up
+            // disabled, so the old gate skipped the arm no matter what
+            // calibration asked for.
+            bringup: Bzm2BringupConfig {
+                enabled: false,
+                ..Bzm2BringupConfig::default()
+            },
+            heartbeat: Default::default(),
+            stored_calibration: None,
+            // ENABLED: the ramp and sweep the on-die protection arm guards.
+            calibration: Bzm2CalibrationConfig {
+                enabled: true,
+                discover_engine_topology: false,
+                ..Default::default()
+            },
+        };
+        let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-252b-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-252b-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
+
+        // Nobody answers `pty.master`, so the arm's chain probe cannot
+        // confirm on-die protection on this chain.
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), board.create_hash_threads()).await;
+        let result = outcome.unwrap_or_else(|_| {
+            panic!(
+                "create_hash_threads did not return within 5s: bring-up is disabled, on-die \
+                 protection was never confirmed, and calibration is enabled, so the unmodified \
+                 code (gated only on bringup.enabled) skips the arm and proceeds into a real \
+                 calibration sweep against this chain instead of refusing"
+            )
+        });
+
+        assert!(
+            result.is_err(),
+            "bring-up is disabled but calibration is enabled and on-die protection was never \
+             confirmed, so create_hash_threads must still refuse rather than proceed toward \
+             calibration: got {:?}",
+            result.map(|threads| threads.len())
+        );
+
         drop(pty);
     }
 
