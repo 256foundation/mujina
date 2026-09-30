@@ -21,6 +21,7 @@ use super::dispatch::*;
 use super::engine::*;
 use super::interlock::*;
 use super::metrics::*;
+use super::recorder::*;
 use super::results::*;
 use super::telemetry::*;
 use super::*;
@@ -420,6 +421,31 @@ pub(super) async fn bzm2_thread_actor(
         }
     }
 
+    // Off unless a path is given. When on it costs a write and nothing else
+    // on the hot path.
+    let mut recorder = std::env::var("MUJINA_BZM2_RECORD").ok().and_then(|configured| {
+        let limit = std::env::var("MUJINA_BZM2_RECORD_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_WIRE_RECORD_LIMIT);
+        let path = per_port_record_path(&configured, &config.serial_path);
+        match WireRecorder::open(&path, &config, limit) {
+            Ok(r) => {
+                info!(path = %path, limit, "Recording BZM2 wire traffic");
+                // Boxed to keep it off the actor's async state machine. The
+                // cross compiler hit an internal error laying out that
+                // coroutine once this was inline; the host compiler did not,
+                // which is a good reminder that "it builds" is a claim about
+                // one target.
+                Some(Box::new(r))
+            }
+            Err(e) => {
+                warn!(path = %path, error = %e, "Could not open wire recording; continuing without");
+                None
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             Some(command) = command_rx.recv() => {
@@ -786,6 +812,10 @@ pub(super) async fn bzm2_thread_actor(
                 match read_result {
                     Ok(0) => break,
                     Ok(n) => {
+
+                        if let Some(r) = recorder.as_mut() {
+                            r.record(&read_buf[..n]);
+                        }
 
                         let mut should_shutdown = false;
                         for frame in parser.push(&read_buf[..n]) {

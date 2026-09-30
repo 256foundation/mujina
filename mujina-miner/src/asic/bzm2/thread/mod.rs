@@ -22,6 +22,7 @@ mod dispatch;
 mod engine;
 mod interlock;
 mod metrics;
+mod recorder;
 mod results;
 pub(crate) mod telemetry;
 #[cfg(all(test, unix))]
