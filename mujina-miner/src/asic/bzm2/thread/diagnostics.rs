@@ -14,9 +14,9 @@ use super::super::clock::{
     Bzm2ClockDebugReport, Bzm2Dll, Bzm2DllStatus, Bzm2Pll, Bzm2PllStatus, fincon_is_valid,
 };
 use super::super::protocol::{
-    Bzm2EngineLayout, MIN_REGISTER_TRANSFER_BYTES, OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP,
-    OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame, TdmFrameParser, encode_loopback, encode_noop,
-    encode_read_register, encode_write_register,
+    Bzm2EngineLayout, MAX_REGISTER_TRANSFER_BYTES, MIN_REGISTER_TRANSFER_BYTES,
+    OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP, OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame,
+    TdmFrameParser, encode_loopback, encode_noop, encode_read_register, encode_write_register,
 };
 use super::super::uart::{
     Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT, configure_dts_vs_stream, resume_dts_vs_stream,
@@ -173,6 +173,21 @@ pub(super) fn after_direct_read(parser: &mut TdmFrameParser, corroborator: &mut 
     corroborator.clear();
 }
 
+/// The byte-count field is one byte and zero-based, so only
+/// MIN_REGISTER_TRANSFER_BYTES..=MAX_REGISTER_TRANSFER_BYTES has a
+/// representation. Checked here, the chokepoint every diagnostic register
+/// write funnels through, rather than changing encode_write_register's
+/// signature (every other caller passes a fixed, always-valid literal).
+fn validate_register_value_len(len: usize) -> Result<(), HashThreadError> {
+    if !(MIN_REGISTER_TRANSFER_BYTES..=MAX_REGISTER_TRANSFER_BYTES).contains(&len) {
+        return Err(HashThreadError::DiagnosticsFailed(format!(
+            "register write refused: {len} bytes is outside the wire's representable \
+             range of {MIN_REGISTER_TRANSFER_BYTES} to {MAX_REGISTER_TRANSFER_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) async fn write_register(
     writer: &mut SerialWriter,
     asic: u8,
@@ -180,6 +195,7 @@ pub(super) async fn write_register(
     offset: u8,
     value: &[u8],
 ) -> Result<(), HashThreadError> {
+    validate_register_value_len(value.len())?;
     writer
         .write_all(&encode_write_register(asic, engine_address, offset, value))
         .await
@@ -551,6 +567,46 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, HashThreadError::DiagnosticsFailed(reason) if reason.contains("count")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Reported by @j-kon in review of #117: a write of 0 bytes encodes a
+    /// wire length byte of 0, which the ASIC reads as ONE byte (the field
+    /// is zero-based) -- a frame whose declared length disagrees with what
+    /// follows it. Refused before it reaches the wire.
+    #[tokio::test]
+    async fn write_register_refuses_an_empty_value_before_the_wire() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader, mut writer, _control) = thread_side.split();
+
+        let err = write_register(&mut writer, 2, 0x0345, 0x67, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HashThreadError::DiagnosticsFailed(reason) if reason.contains("0 bytes")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Reported by @j-kon in review of #117: a write of more than 256 bytes
+    /// has no representation in the zero-based, single-byte length field.
+    /// Refused before encoding.
+    #[tokio::test]
+    async fn write_register_refuses_a_value_over_256_bytes() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader, mut writer, _control) = thread_side.split();
+
+        let value = vec![0u8; 257];
+        let err = write_register(&mut writer, 2, 0x0345, 0x67, &value)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HashThreadError::DiagnosticsFailed(reason) if reason.contains("257")),
             "unexpected error: {err:?}"
         );
     }
