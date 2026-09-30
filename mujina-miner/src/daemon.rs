@@ -14,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    board::bzm2::Bzm2RuntimeConfig,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -111,6 +112,22 @@ impl Daemon {
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
+
+        // Attach a configured BZM2 board before the backplane starts draining
+        // transport events, so its threads register ahead of the
+        // initial-enumeration-complete signal and count toward the startup
+        // hold.
+        if let Some(config) = Bzm2RuntimeConfig::from_env() {
+            info!(
+                serials = config.serial_paths.len(),
+                baud = config.baud_rate,
+                "BZM2 board enabled from configured serial paths"
+            );
+            backplane
+                .attach_configured_board("bzm2", config.device_id())
+                .await?;
+        }
+
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
@@ -121,6 +138,24 @@ impl Daemon {
                         }
                     }
                     _ = shutdown.cancelled() => {}
+                }
+
+                // The event loop ending is not the daemon ending.
+                //
+                // `run()` multiplexes per-transport event streams. With no
+                // transports -- the embedded case, where USB discovery is
+                // compiled out or disabled and boards come from configuration
+                // instead -- there is nothing to multiplex, so it returns on
+                // its first poll. Falling straight through to the teardown
+                // below destroyed every configured board a few milliseconds
+                // after it was attached, while the daemon stayed up serving an
+                // empty board list and 404s.
+                //
+                // A board attached by configuration outlives the loop that
+                // never carried it. Only cancellation ends it.
+                if !shutdown.is_cancelled() {
+                    debug!("Backplane event loop finished; holding boards until shutdown");
+                    shutdown.cancelled().await;
                 }
 
                 backplane.shutdown_all_boards().await;

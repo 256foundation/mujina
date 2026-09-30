@@ -296,6 +296,42 @@ impl Backplane {
 
         Ok(())
     }
+
+    /// Attach a configured board directly without going through a synthetic transport.
+    pub async fn attach_configured_board(
+        &mut self,
+        device_type: &str,
+        device_id: String,
+    ) -> Result<()> {
+        let Some(descriptor) = self.virtual_registry.find(device_type) else {
+            error!(device_type = %device_type, "No configured board descriptor found");
+            return Ok(());
+        };
+
+        info!(
+            board = descriptor.name,
+            device_type = %device_type,
+            device_id = %device_id,
+            "Configured board attached."
+        );
+
+        let conn = match (descriptor.create_fn)().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!(
+                    board = descriptor.name,
+                    device_type = %device_type,
+                    error = %e,
+                    "Failed to create configured board"
+                );
+                return Ok(());
+            }
+        };
+
+        self.start_board(device_id, conn).await;
+
+        Ok(())
+    }
 }
 
 /// Per-board state the backplane keeps for lifecycle management.

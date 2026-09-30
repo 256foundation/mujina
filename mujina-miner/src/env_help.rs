@@ -166,6 +166,17 @@ const GROUPS: &[EnvGroup] = &[
                 example: Some("MUJINA_SERIAL_CFLAG=0x300F,0x2001"),
             },
             EnvVar {
+                name: "MUJINA_BZM2_DRY_RUN",
+                summary: "Set to 1 for dry run: every state-changing frame to a \
+                          BZM2 chain is REFUSED at the transport and logged. Reads, \
+                          telemetry and diagnostics work. Stronger than observer \
+                          mode, which withholds work but still enumerates -- and \
+                          enumeration assigns ASIC ids, which is a write. Use this \
+                          for first contact with a powered part.",
+                default: Some("unset permits writes"),
+                example: Some("MUJINA_BZM2_DRY_RUN=1"),
+            },
+            EnvVar {
                 name: "MUJINA_OBSERVE",
                 summary: "0/false/no/off/empty or unset mines normally; 1/true/yes/on, or \
                           any other value, is observer mode: boards are attached, \
