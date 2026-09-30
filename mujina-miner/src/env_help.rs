@@ -156,6 +156,16 @@ const GROUPS: &[EnvGroup] = &[
                 example: None,
             },
             EnvVar {
+                name: "MUJINA_SERIAL_CFLAG",
+                summary: "Platform control-flag override for a serial port, as \
+                          `mask,value` applied to `c_cflag` last at open and after \
+                          every baud-rate change. For drivers that take their line \
+                          rate from private control-flag bits rather than \
+                          c_ispeed/c_ospeed.",
+                default: Some("unset applies no override"),
+                example: Some("MUJINA_SERIAL_CFLAG=0x300F,0x2001"),
+            },
+            EnvVar {
                 name: "MUJINA_OBSERVE",
                 summary: "0/false/no/off/empty or unset mines normally; 1/true/yes/on, or \
                           any other value, is observer mode: boards are attached, \
