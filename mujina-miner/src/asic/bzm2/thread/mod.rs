@@ -6,13 +6,15 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::asic::hash_thread::{
     HashTask, HashThread, HashThreadCapabilities, HashThreadError, HashThreadEvent,
-    HashThreadStatus,
+    HashThreadStatus, HashThreadTelemetryUpdate,
 };
 use crate::tracing::prelude::*;
 use crate::transport::serial::{SerialControl, SerialReader, SerialWriter};
 use crate::types::{Difficulty, HashRate};
 
+use super::clock::Bzm2ClockDebugReport;
 use super::protocol::{DEFAULT_NONCE_GAP, DEFAULT_TIMESTAMP_COUNT, DtsVsGeneration};
+use super::uart::Bzm2DiscoveredEngineMap;
 
 mod actor;
 mod diagnostics;
@@ -310,6 +312,126 @@ impl Bzm2ThreadHandle {
         }
     }
 
+    pub async fn noop(&self, asic: u8) -> Result<[u8; 3], HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryNoop { asic, response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn loopback(&self, asic: u8, payload: Vec<u8>) -> Result<Vec<u8>, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryLoopback {
+                asic,
+                payload,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn read_register(
+        &self,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+    ) -> Result<Vec<u8>, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::ReadRegister {
+                asic,
+                engine_address,
+                offset,
+                count,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn write_register(
+        &self,
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+    ) -> Result<(), HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::WriteRegister {
+                asic,
+                engine_address,
+                offset,
+                value,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn query_dts_vs(
+        &self,
+        asic: u8,
+    ) -> Result<HashThreadTelemetryUpdate, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryDtsVs { asic, response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::TelemetryQueryFailed("thread dropped response".into()))?
+    }
+
+    pub async fn clock_report(&self, asic: u8) -> Result<Bzm2ClockDebugReport, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryClockReport { asic, response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
+    pub async fn discover_engine_map(
+        &self,
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout: Duration,
+    ) -> Result<Bzm2DiscoveredEngineMap, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::DiscoverEngineMap {
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout,
+                response_tx,
+            })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
+
     pub async fn runtime_metrics(&self) -> Result<Bzm2ThreadRuntimeMetrics, HashThreadError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -327,6 +449,7 @@ impl Bzm2ThreadHandle {
 enum ThreadCommand {
     /// Declare expected hashrate and ready the thread for work
     Configure,
+
     UpdateTask {
         new_task: HashTask,
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
@@ -337,6 +460,44 @@ enum ThreadCommand {
     },
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    QueryNoop {
+        asic: u8,
+        response_tx: oneshot::Sender<Result<[u8; 3], HashThreadError>>,
+    },
+    QueryLoopback {
+        asic: u8,
+        payload: Vec<u8>,
+        response_tx: oneshot::Sender<Result<Vec<u8>, HashThreadError>>,
+    },
+    QueryClockReport {
+        asic: u8,
+        response_tx: oneshot::Sender<Result<Bzm2ClockDebugReport, HashThreadError>>,
+    },
+    ReadRegister {
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        count: u8,
+        response_tx: oneshot::Sender<Result<Vec<u8>, HashThreadError>>,
+    },
+    WriteRegister {
+        asic: u8,
+        engine_address: u16,
+        offset: u8,
+        value: Vec<u8>,
+        response_tx: oneshot::Sender<Result<(), HashThreadError>>,
+    },
+    QueryDtsVs {
+        asic: u8,
+        response_tx: oneshot::Sender<Result<HashThreadTelemetryUpdate, HashThreadError>>,
+    },
+    DiscoverEngineMap {
+        asic: u8,
+        tdm_prediv_raw: u32,
+        tdm_counter: u8,
+        timeout: Duration,
+        response_tx: oneshot::Sender<Result<Bzm2DiscoveredEngineMap, HashThreadError>>,
     },
     QueryRuntimeMetrics {
         response_tx: oneshot::Sender<Result<Bzm2ThreadRuntimeMetrics, HashThreadError>>,

@@ -4,15 +4,19 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-use crate::asic::hash_thread::{HashTask, HashThreadEvent, HashThreadStatus, TelemetryCoalescer};
+use crate::asic::hash_thread::{
+    HashTask, HashThreadError, HashThreadEvent, HashThreadStatus, TelemetryCoalescer,
+};
 use crate::transport::serial::{SerialControl, SerialReader, SerialWriter};
 use crate::types::HashRate;
 
 use super::super::protocol::{BROADCAST_ASIC, Bzm2EngineLayout, TdmFrame, TdmFrameParser};
 use super::super::uart::{
-    Bzm2DtsVsConfig, configure_dts_vs_stream, confirm_on_die_protection, confirm_stream_stopped,
-    disable_dts_vs_sensors, soft_reset_engines, suspend_dts_vs_stream,
+    Bzm2DtsVsConfig, Bzm2TdmControl, configure_dts_vs_stream, confirm_on_die_protection,
+    confirm_stream_stopped, disable_dts_vs_sensors, discover_engine_map_stream, soft_reset_engines,
+    suspend_dts_vs_stream,
 };
+use super::diagnostics::*;
 use super::dispatch::*;
 use super::engine::*;
 use super::interlock::*;
@@ -155,7 +159,7 @@ pub(super) async fn bzm2_thread_actor(
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
 
-    let engine_layout = Bzm2EngineLayout::default();
+    let mut engine_layout = Bzm2EngineLayout::default();
 
     let mut parser = TdmFrameParser::new(config.dts_vs_generation);
 
@@ -627,6 +631,150 @@ pub(super) async fn bzm2_thread_actor(
                         let _ = response_tx.send(Ok(old));
                     }
 
+                    ThreadCommand::QueryNoop { asic, response_tx } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            &mut dts_vs,
+                            DiagnosticStream { reader: &mut reader, parser: &mut parser, corroborator: &mut corroborator },
+                            &mut control_writer,
+                            async |reader| query_noop(reader, &mut writer, asic).await,
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryLoopback {
+                        asic,
+                        payload,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            &mut dts_vs,
+                            DiagnosticStream { reader: &mut reader, parser: &mut parser, corroborator: &mut corroborator },
+                            &mut control_writer,
+                            async |reader| query_loopback(reader, &mut writer, asic, &payload).await,
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryClockReport { asic, response_tx } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            &mut dts_vs,
+                            DiagnosticStream { reader: &mut reader, parser: &mut parser, corroborator: &mut corroborator },
+                            &mut control_writer,
+                            async |reader| query_clock_report(reader, &mut writer, asic).await,
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::ReadRegister {
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            &mut dts_vs,
+                            DiagnosticStream { reader: &mut reader, parser: &mut parser, corroborator: &mut corroborator },
+                            &mut control_writer,
+                            async |reader| {
+                                read_register(
+                                    reader,
+                                    &mut writer,
+                                    asic,
+                                    engine_address,
+                                    offset,
+                                    count,
+                                )
+                                .await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::WriteRegister {
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        response_tx,
+                    } => {
+                        let result = run_idle_uart_diagnostic(
+                            current_task.is_some(),
+                            &mut dts_vs,
+                            DiagnosticStream { reader: &mut reader, parser: &mut parser, corroborator: &mut corroborator },
+                            &mut control_writer,
+                            async |_reader| {
+                                write_register(
+                                    &mut writer,
+                                    asic,
+                                    engine_address,
+                                    offset,
+                                    &value,
+                                )
+                                .await
+                            },
+                        )
+                        .await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::QueryDtsVs { asic, response_tx } => {
+                        let result = query_dts_vs_telemetry(
+                            asic,
+                            &mut reader,
+                            &mut writer,
+                            &mut parser,
+                            &engine_dispatches,
+                            &engine_layout,
+                            &config,
+                            &status,
+                            &event_tx,
+                            &mut runtime_measurements,
+                            &mut dts_vs,
+                        ).await;
+                        let _ = response_tx.send(result);
+                    }
+                    ThreadCommand::DiscoverEngineMap {
+                        asic,
+                        tdm_prediv_raw,
+                        tdm_counter,
+                        timeout,
+                        response_tx,
+                    } => {
+                        if current_task.is_some() {
+                            let _ = response_tx.send(Err(HashThreadError::DiagnosticsFailed(
+                                "BZM2 engine discovery requires the thread to be idle".into(),
+                            )));
+                            continue;
+                        }
+                        // Discovery re-slots the chain for its sweep. What it
+                        // hands back is THIS chain's operating TDM, derived
+                        // from the ids the thread addresses -- not "off", which
+                        // silences every result and every temperature.
+                        let result = discover_engine_map_stream(
+                            &mut reader,
+                            &mut writer,
+                            asic,
+                            tdm_prediv_raw,
+                            tdm_counter,
+                            Bzm2TdmControl::operating(&config.asic_ids),
+                            timeout,
+                        )
+                        .await
+                        .inspect(|discovery| {
+                            engine_layout = Bzm2EngineLayout::from_active_coordinates(
+                                discovery.present.iter().map(|engine| (engine.row, engine.col)),
+                            );
+                        })
+                        .map_err(|err| HashThreadError::DiagnosticsFailed(err.to_string()));
+                        // Discovery read the line itself, success or not.
+                        after_direct_read(&mut parser, &mut corroborator);
+                        let _ = response_tx.send(result);
+                    }
+
                     ThreadCommand::QueryRuntimeMetrics { response_tx } => {
                         let _ = response_tx.send(Ok(runtime_measurements.snapshot_at(Instant::now())));
                     }
@@ -942,6 +1090,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diagnostic_read_times_out_and_actor_stays_responsive() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (mut host_reader, mut host_writer, _host_control) = host_side.split();
+
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+
+        // Drain the initial status update so we know the actor is up.
+        let initial = tokio::time::timeout(Duration::from_millis(250), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(initial, HashThreadEvent::StatusUpdate(_)));
+
+        // Host reads the NOOP request, replies with a single (short) byte, then
+        // goes silent. Without a bounded read the actor's read_exact would block
+        // forever, wedging every other command including Shutdown.
+        let emulator = tokio::spawn(async move {
+            let mut request = [0u8; 4];
+            host_reader.read_exact(&mut request).await.unwrap();
+            host_writer.write_all(&[0x02]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(host_writer);
+        });
+
+        // QueryNoop must resolve to an error within the diagnostic timeout.
+        let result = tokio::time::timeout(Duration::from_secs(4), handle.noop(2)).await;
+        assert!(result.is_ok(), "QueryNoop hung past the diagnostic timeout");
+        assert!(
+            result.unwrap().is_err(),
+            "QueryNoop should fail on a short, stalled response"
+        );
+
+        // The actor is still responsive: Shutdown is honored and the event
+        // stream closes.
+        let _ = handle.shutdown();
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while event_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "actor did not honor Shutdown after the diagnostic read timed out"
+        );
+
+        emulator.abort();
+    }
+
     /// Shutdown must leave the part as a cold boot would. Before this, a
     /// clean exit left sensor frames streaming onto the bus for the next
     /// process to open, and the only "off" value the thread knew was a
@@ -1246,6 +1450,73 @@ mod tests {
             frames.iter().any(|f| *f == last_slice),
             "ASIC 99's nonce slice never reached the part"
         );
+    }
+
+    /// A DIAGNOSTIC ON A STREAMING CHAIN READS ITS OWN REPLY.
+    ///
+    /// Measured on hardware: with the sensor stream running on a full
+    /// chain, a noop read stream bytes as its reply (`asic 0x40 opcode 0x99`),
+    /// and the misaligned remainder produced a "corroborated" voltage fault
+    /// that the wire recording shows once -- which stopped thread 1. The part
+    /// here does what the hardware did: on the suspend it still sends what
+    /// was already in flight, then goes quiet.
+    #[tokio::test]
+    async fn a_diagnostic_on_a_streaming_chain_reads_its_own_reply() {
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (host_reader, host_writer, _host_control) = host_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = (0..100).collect();
+        let thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut frames_rx =
+            spawn_config_modelling_part(host_reader, host_writer, live, Some(450_000));
+
+        // Streaming, and the attach's own writes all across the wire, before
+        // the diagnostics start: the last nonce slice is the attach's last
+        // write. (Issued earlier, the suspend queues behind ~1 s of slices at
+        // wire rate while the stream keeps flowing, and the drain rightly
+        // refuses to run a diagnostic on a line that will not go quiet.)
+        let (row, col) = protocol::default_engine_coordinates()[0];
+        let last_slice = encode_write_register(
+            99,
+            protocol::logical_engine_address(row, col),
+            protocol::ENGINE_REG_START_NONCE,
+            &nonce_slices(100)[99].0.to_le_bytes(),
+        );
+        let up = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(f) = frames_rx.recv().await {
+                if f == last_slice {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(up, Ok(true), "the attach never finished");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        for attempt in 0..5 {
+            let got = tokio::time::timeout(Duration::from_secs(4), handle.noop(0)).await;
+            assert!(
+                matches!(got, Ok(Ok(sig)) if sig == crate::asic::bzm2::uart::NOOP_SIGNATURE),
+                "noop {attempt} on a streaming chain: {got:?}"
+            );
+            // Streaming again before the next one, so each noop meets a stream.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(
+            handle.runtime_metrics().await.is_ok(),
+            "the thread must still be running after diagnostics on a live stream"
+        );
+        let _ = handle.shutdown();
     }
 
     /// Every place that marks a dispatch logs the first one. Source-level,
