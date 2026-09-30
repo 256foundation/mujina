@@ -14,9 +14,9 @@ use super::super::clock::{
     Bzm2ClockDebugReport, Bzm2Dll, Bzm2DllStatus, Bzm2Pll, Bzm2PllStatus, fincon_is_valid,
 };
 use super::super::protocol::{
-    Bzm2EngineLayout, OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP, OPCODE_UART_READREG, TdmDtsVsFrame,
-    TdmFrame, TdmFrameParser, encode_loopback, encode_noop, encode_read_register,
-    encode_write_register,
+    Bzm2EngineLayout, MIN_REGISTER_TRANSFER_BYTES, OPCODE_UART_LOOPBACK, OPCODE_UART_NOOP,
+    OPCODE_UART_READREG, TdmDtsVsFrame, TdmFrame, TdmFrameParser, encode_loopback, encode_noop,
+    encode_read_register, encode_write_register,
 };
 use super::super::uart::{
     Bzm2DtsVsConfig, DEFAULT_DTS_VS_QUERY_TIMEOUT, configure_dts_vs_stream, resume_dts_vs_stream,
@@ -242,6 +242,16 @@ pub(super) async fn read_register(
     offset: u8,
     count: u8,
 ) -> Result<Vec<u8>, HashThreadError> {
+    // `count` is a u8, already within the wire's 1-256 range at its upper
+    // end, but a count of 0 has no representation -- the zero-based field
+    // would read it back as 1 -- so only the lower bound needs a guard here.
+    if (count as usize) < MIN_REGISTER_TRANSFER_BYTES {
+        return Err(HashThreadError::DiagnosticsFailed(
+            "register read refused: a count of 0 has no representation on the wire \
+             (the byte-count field is zero-based, so 0 reads back as 1 byte)"
+                .to_string(),
+        ));
+    }
     let request = encode_read_register(asic, engine_address, offset, count);
     writer
         .write_all(&request)
@@ -524,6 +534,26 @@ mod tests {
 
     use nix::pty::openpty;
     use std::os::unix::io::IntoRawFd;
+
+    /// Reported by @j-kon in review of #117: a read count of 0 encodes as
+    /// "1 byte" on the wire (the count field is zero-based), desyncing the
+    /// reader from the ASIC's actual reply. Refused before the request is
+    /// encoded or sent.
+    #[tokio::test]
+    async fn read_register_refuses_a_zero_count_before_the_wire() {
+        let pty = openpty(None, None).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (mut reader, mut writer, _control) = thread_side.split();
+
+        let err = read_register(&mut reader, &mut writer, 2, 0x0345, 0x67, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HashThreadError::DiagnosticsFailed(reason) if reason.contains("count")),
+            "unexpected error: {err:?}"
+        );
+    }
 
     #[test]
     fn a_reported_fault_is_not_a_failed_query() {

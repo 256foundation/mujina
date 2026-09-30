@@ -12,6 +12,12 @@ pub const OPCODE_UART_DTS_VS: u8 = 0x0d;
 pub const OPCODE_UART_LOOPBACK: u8 = 0x0e;
 pub const OPCODE_UART_NOOP: u8 = 0x0f;
 
+/// The ReadReg byte-count field is one byte, and zero-based (the value on
+/// the wire is the real count minus one), so a real count of 0 has no
+/// representation. One home for the bound so every boundary that checks a
+/// register read's length can't disagree about it.
+pub const MIN_REGISTER_TRANSFER_BYTES: usize = 1;
+
 /// Is this one of the opcodes the part actually emits?
 ///
 /// Used to tell a correctly-sized frame from a mis-sized one: after a good
