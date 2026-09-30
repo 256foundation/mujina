@@ -3,6 +3,7 @@ pub(crate) mod bzm2;
 pub(crate) mod cpu;
 pub(crate) mod emberone00;
 pub mod pattern;
+pub mod power;
 
 use anyhow::Result;
 use futures::future::BoxFuture;

@@ -216,11 +216,13 @@ mod tests {
             dispatch_interval: Duration::from_millis(50),
             nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Default::default(),
             enumeration: Bzm2EnumerationConfig {
                 enabled: true,
                 start_id: 0,
                 max_asics_per_bus: vec![4],
             },
+            bringup: Default::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
@@ -271,11 +273,13 @@ mod tests {
             dispatch_interval: Duration::from_millis(50),
             nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Default::default(),
             enumeration: Bzm2EnumerationConfig {
                 enabled: true,
                 start_id: 0,
                 max_asics_per_bus: vec![4],
             },
+            bringup: Default::default(),
             calibration: Bzm2CalibrationConfig {
                 asics_per_bus: vec![3],
                 ..Default::default()

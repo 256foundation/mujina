@@ -1,12 +1,215 @@
 //! Sensor polling and board telemetry publishing for the BZM2 board.
 
+use std::env;
+use std::fs;
+use std::time::Duration;
+
 use tokio::sync::watch;
 
-use crate::api_client::types::{AsicState, BoardTelemetry, PowerMeasurement, TemperatureSensor};
+use crate::api_client::types::{
+    AsicState, BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor,
+};
 use crate::asic::hash_thread::{
     HashThreadAsicObservation, HashThreadStatus, HashThreadTelemetryUpdate,
 };
 use crate::types::Temperature;
+
+use super::config::{
+    ASSUMED_FAN_TACHO_RPM_SCALE, DEFAULT_ASIC_TEMP_SCALE, DEFAULT_BOARD_TEMP_SCALE,
+    DEFAULT_CURRENT_SCALE, DEFAULT_FAN_PERCENT_PATHS, DEFAULT_FAN_PERCENT_SCALE,
+    DEFAULT_FAN_RPM_PATHS, DEFAULT_POWER_SCALE, DEFAULT_TELEMETRY_INTERVAL_SECS,
+    DEFAULT_VOLTAGE_SCALE, env_csv_strings_any, parse_csv_numbers_any,
+};
+
+#[derive(Debug, Clone, Default)]
+pub struct Bzm2TelemetryConfig {
+    pub poll_interval: Duration,
+    pub asic_temp: Option<SensorSpec>,
+    pub board_temp: Option<SensorSpec>,
+    /// One entry per physical fan (four on this platform's control board).
+    /// Index `i` here and in `fan_percent` describe the same fan; they are
+    /// read as parallel arrays rather than paired up front because a fan
+    /// with a live tachometer and a dead duty read (or vice versa) is still
+    /// worth reporting.
+    pub fan_rpm: Vec<SensorSpec>,
+    pub fan_percent: Vec<SensorSpec>,
+    pub input_voltage: Option<SensorSpec>,
+    pub input_current: Option<SensorSpec>,
+    pub input_power: Option<SensorSpec>,
+}
+impl Bzm2TelemetryConfig {
+    pub(super) fn from_env() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(
+                env::var("MUJINA_BZM2_TELEMETRY_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_TELEMETRY_INTERVAL_SECS),
+            ),
+            asic_temp: SensorSpec::from_env(
+                "MUJINA_BZM2_ASIC_TEMP_PATH",
+                "MUJINA_BZM2_ASIC_TEMP_SCALE",
+                DEFAULT_ASIC_TEMP_SCALE,
+            ),
+            board_temp: SensorSpec::from_env(
+                "MUJINA_BZM2_BOARD_TEMP_PATH",
+                "MUJINA_BZM2_BOARD_TEMP_SCALE",
+                DEFAULT_BOARD_TEMP_SCALE,
+            ),
+            // Plural: this control board has four fans, not one. The old
+            // singular path/scale keys are kept as a fallback in the key
+            // list so a one-fan override still works, but the platform
+            // default is the real four-fan sysfs layout, not an empty list.
+            fan_rpm: sensor_specs_from_env_or_default(
+                &["MUJINA_BZM2_FAN_RPM_PATHS", "MUJINA_BZM2_FAN_RPM_PATH"],
+                &["MUJINA_BZM2_FAN_RPM_SCALES", "MUJINA_BZM2_FAN_RPM_SCALE"],
+                ASSUMED_FAN_TACHO_RPM_SCALE,
+                &DEFAULT_FAN_RPM_PATHS,
+            ),
+            fan_percent: sensor_specs_from_env_or_default(
+                &[
+                    "MUJINA_BZM2_FAN_PERCENT_PATHS",
+                    "MUJINA_BZM2_FAN_PERCENT_PATH",
+                ],
+                &[
+                    "MUJINA_BZM2_FAN_PERCENT_SCALES",
+                    "MUJINA_BZM2_FAN_PERCENT_SCALE",
+                ],
+                DEFAULT_FAN_PERCENT_SCALE,
+                &DEFAULT_FAN_PERCENT_PATHS,
+            ),
+            input_voltage: SensorSpec::from_env(
+                "MUJINA_BZM2_INPUT_VOLTAGE_PATH",
+                "MUJINA_BZM2_INPUT_VOLTAGE_SCALE",
+                DEFAULT_VOLTAGE_SCALE,
+            ),
+            input_current: SensorSpec::from_env(
+                "MUJINA_BZM2_INPUT_CURRENT_PATH",
+                "MUJINA_BZM2_INPUT_CURRENT_SCALE",
+                DEFAULT_CURRENT_SCALE,
+            ),
+            input_power: SensorSpec::from_env(
+                "MUJINA_BZM2_INPUT_POWER_PATH",
+                "MUJINA_BZM2_INPUT_POWER_SCALE",
+                DEFAULT_POWER_SCALE,
+            ),
+        }
+    }
+
+    /// Whether telemetry will be PUBLISHED. Says nothing about protection --
+    /// see [`Self::any_trip_armed`] and [`Self::unarmed_limits`].
+    pub(super) fn is_enabled(&self) -> bool {
+        self.asic_temp.is_some()
+            || self.board_temp.is_some()
+            || !self.fan_rpm.is_empty()
+            || !self.fan_percent.is_empty()
+            || self.input_voltage.is_some()
+            || self.input_current.is_some()
+            || self.input_power.is_some()
+    }
+
+    pub(super) fn snapshot(&self) -> Bzm2TelemetrySnapshot {
+        let asic_temp = self.asic_temp.as_ref().and_then(SensorSpec::read);
+        let board_temp = self.board_temp.as_ref().and_then(SensorSpec::read);
+        let fan_rpm: Vec<Option<u32>> = self
+            .fan_rpm
+            .iter()
+            .map(|spec| spec.read().map(|v| v.round() as u32))
+            .collect();
+        let fan_percent: Vec<Option<u8>> = self
+            .fan_percent
+            .iter()
+            .map(|spec| spec.read().map(|v| v.round().clamp(0.0, 100.0) as u8))
+            .collect();
+        let voltage_v = self.input_voltage.as_ref().and_then(SensorSpec::read);
+        let current_a = self.input_current.as_ref().and_then(SensorSpec::read);
+        let power_w = self
+            .input_power
+            .as_ref()
+            .and_then(SensorSpec::read)
+            .or_else(|| voltage_v.zip(current_a).map(|(v, c)| v * c));
+
+        // One entry per configured fan slot, not per fan that actually
+        // answered: a fan whose tachometer read failed still needs to show
+        // up as "fanN: rpm unknown" rather than vanish from the list, which
+        // is what let a single dead sensor silently look identical to "this
+        // board only has one fan".
+        let fan_count = fan_rpm.len().max(fan_percent.len());
+        let fans = (0..fan_count)
+            .map(|index| Fan {
+                name: format!("fan{index}"),
+                rpm: fan_rpm.get(index).copied().flatten(),
+                percent: fan_percent.get(index).copied().flatten(),
+                target_percent: None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut temperatures = Vec::new();
+        if self.asic_temp.is_some() || asic_temp.is_some() {
+            temperatures.push(TemperatureSensor {
+                name: "asic".into(),
+                temperature: asic_temp.map(Temperature::from_celsius),
+                observed_at: Some(std::time::Instant::now()),
+            });
+        }
+        if self.board_temp.is_some() || board_temp.is_some() {
+            temperatures.push(TemperatureSensor {
+                name: "board".into(),
+                temperature: board_temp.map(Temperature::from_celsius),
+                observed_at: Some(std::time::Instant::now()),
+            });
+        }
+
+        let powers = if self.input_voltage.is_some()
+            || self.input_current.is_some()
+            || self.input_power.is_some()
+            || power_w.is_some()
+        {
+            vec![PowerMeasurement {
+                name: "input".into(),
+                voltage_v,
+                current_a,
+                power_w,
+            }]
+        } else {
+            Vec::new()
+        };
+        Bzm2TelemetrySnapshot {
+            fans,
+            temperatures,
+            powers,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SensorSpec {
+    pub path: String,
+    pub scale: f32,
+}
+
+impl SensorSpec {
+    fn from_env(path_var: &str, scale_var: &str, default_scale: f32) -> Option<Self> {
+        let path = env::var(path_var).ok()?;
+        let scale = env::var(scale_var)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default_scale);
+        Some(Self { path, scale })
+    }
+
+    pub(super) fn read(&self) -> Option<f32> {
+        let raw = fs::read_to_string(&self.path).ok()?;
+        parse_scaled_sensor_value(&raw, self.scale)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct Bzm2TelemetrySnapshot {
+    pub(super) fans: Vec<Fan>,
+    pub(super) temperatures: Vec<TemperatureSensor>,
+    pub(super) powers: Vec<PowerMeasurement>,
+}
 
 pub(super) fn publish_thread_status(
     telemetry_tx: &watch::Sender<BoardTelemetry>,
@@ -165,12 +368,268 @@ fn sort_asic_rows(state: &mut BoardTelemetry) {
         .sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
 }
 
+pub(super) fn merge_temperature_readings(
+    existing: &mut Vec<TemperatureSensor>,
+    updates: &[TemperatureSensor],
+) {
+    for update in updates {
+        if let Some(sensor) = existing
+            .iter_mut()
+            .find(|sensor| sensor.name == update.name)
+        {
+            sensor.temperature = update.temperature;
+            // The stamp travels with the reading. Updating the value and
+            // leaving the old time would make a fresh reading look stale and,
+            // worse, a stale one look fresh the moment anything touched it.
+            sensor.observed_at = update.observed_at;
+        } else {
+            existing.push(update.clone());
+        }
+    }
+}
+
+pub(super) fn merge_power_readings(
+    existing: &mut Vec<PowerMeasurement>,
+    updates: &[PowerMeasurement],
+) {
+    for update in updates {
+        if let Some(sensor) = existing
+            .iter_mut()
+            .find(|sensor| sensor.name == update.name)
+        {
+            sensor.voltage_v = update.voltage_v;
+            sensor.current_a = update.current_a;
+            sensor.power_w = update.power_w;
+        } else {
+            existing.push(update.clone());
+        }
+    }
+}
+
+pub(super) fn sensor_specs_from_env(
+    paths_keys: &[&str],
+    scales_keys: &[&str],
+    default_scale: f32,
+) -> Vec<SensorSpec> {
+    build_sensor_specs(env_csv_strings_any(paths_keys), scales_keys, default_scale)
+}
+
+/// Like [`sensor_specs_from_env`], but for a fixed set of instances this
+/// platform always has (e.g. the four control-board fans): when the paths
+/// keys are unset, `default_paths` is used instead of an empty list, so the
+/// sensor is live with zero configuration. An explicit path list always
+/// replaces the defaults outright rather than merging with them.
+pub(super) fn sensor_specs_from_env_or_default(
+    paths_keys: &[&str],
+    scales_keys: &[&str],
+    default_scale: f32,
+    default_paths: &[&str],
+) -> Vec<SensorSpec> {
+    let paths = env_csv_strings_any(paths_keys);
+    let paths = if paths.is_empty() {
+        default_paths
+            .iter()
+            .map(|path| (*path).to_owned())
+            .collect()
+    } else {
+        paths
+    };
+    build_sensor_specs(paths, scales_keys, default_scale)
+}
+
+fn build_sensor_specs(
+    paths: Vec<String>,
+    scales_keys: &[&str],
+    default_scale: f32,
+) -> Vec<SensorSpec> {
+    let scales = parse_csv_numbers_any::<f32>(scales_keys).unwrap_or_default();
+    paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| SensorSpec {
+            path,
+            scale: *scales
+                .get(index)
+                .or_else(|| scales.last())
+                .unwrap_or(&default_scale),
+        })
+        .collect()
+}
+
+/// Parse a number out of a sysfs attribute. ONE HOME, used by every reader.
+///
+/// THE FAN TACHOMETER DRIVER ON THIS PLATFORM TERMINATES WITH NUL, NOT
+/// NEWLINE. Captured from `/sys/class/hwmon/hwmon0/speed` on hardware,
+/// 2026-09-22: bytes `[50, 50, 53, 0]` -- "225\0". `cat` prints `225` and a
+/// terminal swallows the NUL, so every shell read ever taken looked clean.
+/// `str::trim` strips whitespace and NUL is not whitespace, so every parse
+/// failed.
+///
+/// The consequence was total and silent: Mujina has NEVER read a fan speed on
+/// this hardware. Every capture of its own API shows `"rpm": null` for all
+/// four fans in every run, while the harness -- reading the same nodes from a
+/// shell -- recorded 5,640 rpm. So the fan-death and under-speed conditions
+/// could never fire, and the fan-blindness condition added on 2026-09-22
+/// would have tripped the ladder and de-energised a healthy board on its first
+/// energised run.
+///
+/// Diagnosed late, and worth recording why: the padding hypothesis was
+/// considered and wrongly dismissed because `wc -c` returned 4, read as
+/// "225\n". "225\0" is also 4 bytes. The check could not tell the two cases
+/// apart, so it falsified nothing. What settled it was making the reader
+/// report the raw bytes it saw.
+pub(super) fn parse_sysfs_number<T: std::str::FromStr>(raw: &str) -> Option<T> {
+    let trimmed = raw.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+fn parse_scaled_sensor_value(raw: &str, scale: f32) -> Option<f32> {
+    parse_sysfs_number::<f32>(raw).map(|value| value * scale)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::*;
     use crate::api_client::types::{AsicFaultBits, ThreadTelemetry};
+
+    /// THE EXACT BYTES CAPTURED FROM THE RIG. Before this, every fan speed
+    /// Mujina ever tried to read on this hardware parsed to None.
+    #[test]
+    fn a_nul_terminated_sysfs_value_parses() {
+        let captured = std::str::from_utf8(&[50, 50, 53, 0]).unwrap();
+        assert_eq!(parse_sysfs_number::<u32>(captured), Some(225));
+        assert_eq!(parse_scaled_sensor_value(captured, 30.0), Some(6750.0));
+        // Both terminators, and neither, still parse; garbage still does not.
+        assert_eq!(parse_sysfs_number::<u32>("225\n"), Some(225));
+        assert_eq!(parse_sysfs_number::<u32>("225"), Some(225));
+        assert_eq!(parse_sysfs_number::<u32>("225\n\0\0"), Some(225));
+        assert_eq!(parse_sysfs_number::<u32>("\0"), None);
+        assert_eq!(parse_sysfs_number::<u32>("22x5"), None);
+    }
+
+    #[test]
+    fn parse_scaled_sensor_value_applies_scale() {
+        let parsed = parse_scaled_sensor_value("42500\n", 0.001).unwrap();
+        assert!((parsed - 42.5).abs() < 0.001);
+        assert_eq!(parse_scaled_sensor_value("", 0.001), None);
+        assert_eq!(parse_scaled_sensor_value("nope", 1.0), None);
+    }
+
+    /// The usable duty range this hardware documents is 11000..=40000 raw
+    /// against a fixed period of 40000; these are the two endpoints of that
+    /// range, computed from the raw sysfs value through the same scaling
+    /// path production reads through (`parse_scaled_sensor_value` with the
+    /// real `DEFAULT_FAN_PERCENT_SCALE`), not restated from the scale
+    /// constant itself.
+    #[test]
+    fn fan_duty_scale_converts_range_endpoints_to_percent() {
+        let low = parse_scaled_sensor_value("11000", DEFAULT_FAN_PERCENT_SCALE).unwrap();
+        assert!(
+            (low - 27.5).abs() < 0.01,
+            "11000 raw should be 27.5%, got {low}"
+        );
+
+        let high = parse_scaled_sensor_value("40000", DEFAULT_FAN_PERCENT_SCALE).unwrap();
+        assert!(
+            (high - 100.0).abs() < 0.01,
+            "40000 raw should be 100%, got {high}"
+        );
+    }
+
+    /// From the task's own worked example: a captured raw tach count of 177
+    /// scaled to RPM should land at 5310, the same figure that motivated
+    /// choosing this scale in the first place -- computed here via the raw
+    /// count and the constant, not asserted as a bare number.
+    #[test]
+    fn fan_tacho_scale_applies_assumed_pulses_per_rev() {
+        let rpm = parse_scaled_sensor_value("177", ASSUMED_FAN_TACHO_RPM_SCALE).unwrap();
+        assert!(
+            (rpm - 5310.0).abs() < 0.01,
+            "177 raw should be 5310 RPM, got {rpm}"
+        );
+    }
+
+    #[test]
+    fn sensor_specs_from_env_or_default_uses_defaults_when_unset() {
+        // Keys deliberately unused anywhere else, so this cannot race a
+        // concurrently-running test over real MUJINA_BZM2_* env state.
+        let specs = sensor_specs_from_env_or_default(
+            &["MUJINA_BZM2_TEST_UNUSED_FAN_PATHS_KEY"],
+            &["MUJINA_BZM2_TEST_UNUSED_FAN_SCALES_KEY"],
+            2.5,
+            &["/sensors/a", "/sensors/b", "/sensors/c"],
+        );
+        assert_eq!(specs.len(), 3);
+        for (spec, expected_path) in specs.iter().zip(["/sensors/a", "/sensors/b", "/sensors/c"]) {
+            assert_eq!(spec.path, expected_path);
+            assert_eq!(spec.scale, 2.5);
+        }
+    }
+
+    /// Reads four independently-valued fans through the real
+    /// `Bzm2TelemetryConfig::snapshot` path -- distinct raw values per fan,
+    /// so a bug that aliased every slot to the first sensor (or to a fixed
+    /// "fan" name) would fail this rather than pass by coincidence.
+    #[test]
+    fn snapshot_reports_one_named_entry_per_configured_fan() {
+        let unique = std::process::id();
+        let rpm_raw = [100i64, 110, 120, 130]; // -> 3000/3300/3600/3900 RPM
+        let duty_raw = [12000i64, 16000, 20000, 24000]; // -> 30/40/50/60 %
+
+        let rpm_paths: Vec<_> = rpm_raw
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                let path = env::temp_dir().join(format!("bzm2-fan-rpm-{unique}-{index}.txt"));
+                fs::write(&path, raw.to_string()).unwrap();
+                path
+            })
+            .collect();
+        let duty_paths: Vec<_> = duty_raw
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                let path = env::temp_dir().join(format!("bzm2-fan-duty-{unique}-{index}.txt"));
+                fs::write(&path, raw.to_string()).unwrap();
+                path
+            })
+            .collect();
+
+        let telemetry = Bzm2TelemetryConfig {
+            fan_rpm: rpm_paths
+                .iter()
+                .map(|path| SensorSpec {
+                    path: path.to_string_lossy().into_owned(),
+                    scale: ASSUMED_FAN_TACHO_RPM_SCALE,
+                })
+                .collect(),
+            fan_percent: duty_paths
+                .iter()
+                .map(|path| SensorSpec {
+                    path: path.to_string_lossy().into_owned(),
+                    scale: DEFAULT_FAN_PERCENT_SCALE,
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.fans.len(), 4);
+        for (index, fan) in snapshot.fans.iter().enumerate() {
+            assert_eq!(fan.name, format!("fan{index}"));
+            assert_eq!(fan.rpm, Some((rpm_raw[index] * 30) as u32));
+            assert_eq!(fan.percent, Some((duty_raw[index] * 100 / 40_000) as u8));
+        }
+
+        for path in rpm_paths.into_iter().chain(duty_paths) {
+            let _ = fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn publish_thread_telemetry_updates_board_state() {

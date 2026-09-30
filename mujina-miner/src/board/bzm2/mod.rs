@@ -1,3 +1,5 @@
+use tokio::task::JoinHandle;
+
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
@@ -12,10 +14,15 @@ use crate::{
         },
     },
     tracing::prelude::*,
+    transport::SerialControl,
 };
 
+use telemetry::{merge_power_readings, merge_temperature_readings};
+
+mod bringup;
 mod calibration;
 mod config;
+mod monitor;
 mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -39,6 +46,8 @@ pub enum BoardError {
     InitializationFailed(String),
     /// Serial or file I/O failure while talking to the board.
     Communication(std::io::Error),
+    /// A hardware control operation (rails, reset, clocks) failed.
+    HardwareControl(String),
 }
 
 impl std::fmt::Display for BoardError {
@@ -48,6 +57,7 @@ impl std::fmt::Display for BoardError {
                 write!(f, "board initialization failed: {msg}")
             }
             BoardError::Communication(err) => write!(f, "board communication error: {err}"),
+            BoardError::HardwareControl(msg) => write!(f, "hardware control error: {msg}"),
         }
     }
 }
@@ -62,16 +72,24 @@ impl From<std::io::Error> for BoardError {
 
 pub struct Bzm2Board {
     config: Bzm2RuntimeConfig,
+    bringup_applied: bool,
     shutdown_handles: Vec<Bzm2ThreadHandle>,
+    serial_controls: Vec<SerialControl>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
+    monitor_shutdown: Option<watch::Sender<bool>>,
+    monitor_task: Option<JoinHandle<()>>,
 }
 
 impl Bzm2Board {
     pub fn new(config: Bzm2RuntimeConfig, telemetry_tx: watch::Sender<BoardTelemetry>) -> Self {
         Self {
             config,
+            bringup_applied: false,
             shutdown_handles: Vec::new(),
+            serial_controls: Vec::new(),
             telemetry_tx,
+            monitor_shutdown: None,
+            monitor_task: None,
         }
     }
 }
@@ -86,6 +104,12 @@ impl Bzm2Board {
     }
 
     async fn shutdown(&mut self) -> AnyhowResult<()> {
+        if let Some(tx) = self.monitor_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.monitor_task.take() {
+            let _ = handle.await;
+        }
         // A deliberate shutdown, so a refused stop is still worth saying: it
         // means a thread was never asked, and the rails are about to come down
         // underneath it.
@@ -100,20 +124,54 @@ impl Bzm2Board {
             }
         }
         self.shutdown_handles.clear();
+        self.serial_controls.clear();
         self.telemetry_tx.send_modify(|state| {
             for thread in &mut state.threads {
                 thread.is_active = false;
                 thread.hashrate = 0;
             }
         });
+        self.apply_shutdown_sequence().await?;
         Ok(())
     }
 
     async fn create_hash_threads(&mut self) -> AnyhowResult<Vec<Box<dyn HashThread>>> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
+        self.apply_bringup_sequence().await?;
+        // Arm the silicon's own thermal/voltage protection before the long
+        // bring-up stress, not after: the sensors come up powered down and
+        // carry no thresholds, so a part cannot assert its own trip or
+        // shutdown until firmware arms it.
+        //
+        // Only when there is a ramp and a sweep to protect. With bring-up
+        // disabled -- a handover, or an observation run -- there is no ramp
+        // and no calibration for this to precede, and the chain-attach path
+        // arms the sensors exactly as it always has. Opening the chain port
+        // here anyway buys nothing and costs a close-then-reopen of the same
+        // tty, which some drivers punish with a refusal that latches until
+        // reboot -- measured on hardware.
+        if self.config.bringup.enabled {
+            self.arm_on_die_protection_before_calibration().await;
+        } else {
+            info!(
+                "Bring-up disabled, so no ramp or calibration to protect: on-die protection \
+                 will be armed by the chain attach, not by a separate open of the port"
+            );
+        }
         let bus_layouts = self.resolve_bus_layouts().await?;
-        self.telemetry_tx.send_modify(|_state| {});
+        let initial_snapshot = self.config.telemetry.snapshot();
+        let initial_rail_snapshot = self.config.bringup.snapshot_telemetry();
+        self.telemetry_tx.send_modify(|state| {
+            state.fans = initial_snapshot.fans.clone();
+            merge_temperature_readings(&mut state.temperatures, &initial_snapshot.temperatures);
+            merge_power_readings(&mut state.powers, &initial_snapshot.powers);
+            merge_temperature_readings(
+                &mut state.temperatures,
+                &initial_rail_snapshot.temperatures,
+            );
+            merge_power_readings(&mut state.powers, &initial_rail_snapshot.powers);
+        });
 
         for (index, serial_path) in self.config.serial_paths.iter().enumerate() {
             let stream = crate::transport::serial::open_with_platform_cflag(
@@ -152,6 +210,7 @@ impl Bzm2Board {
                 .filter(|ids| !ids.is_empty())
                 .unwrap_or_else(|| vec![self.config.enumeration.start_id]);
 
+            self.serial_controls.push(control.clone());
             let thread = Bzm2Thread::new(thread_name.clone(), reader, writer, control, config);
             self.shutdown_handles.push(thread.shutdown_handle());
             thread_states.push(ThreadTelemetry {
@@ -170,6 +229,7 @@ impl Bzm2Board {
             state.threads = thread_states.clone();
         });
 
+        self.spawn_monitor();
         Ok(threads)
     }
 }
@@ -338,9 +398,20 @@ async fn create_bzm2_board() -> AnyhowResult<BackplaneConnector> {
 #[cfg(all(test, unix))]
 mod tests {
 
+    use super::bringup::Bzm2BringupConfig;
+    use super::config::{
+        Bzm2CalibrationConfig, Bzm2EnumerationConfig, DEFAULT_BAUD_RATE,
+        DEFAULT_NOMINAL_HASHRATE_THS,
+    };
+    use super::telemetry::{Bzm2TelemetryConfig, SensorSpec};
     use super::*;
+    use crate::board::power::{VoltageStackBringupPlan, VoltageStackStep};
+    use crate::types::Temperature;
 
-    use std::time::Duration;
+    use nix::pty::openpty;
+    use std::fs;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// A chain streaming telemetry must never wait on a scheduler that is not
     /// reading: while the scheduler awaits another chain's `update_task`,
@@ -409,5 +480,224 @@ mod tests {
         .await;
         assert_eq!(arrived, Ok(true), "the rate report never arrived");
         let _ = status_seen;
+    }
+
+    #[tokio::test]
+    async fn create_hash_threads_applies_bringup_and_shutdown_sequences() {
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let rail0_path = std::env::temp_dir().join(format!("bzm2-rail0-{unique}.txt"));
+        let rail1_path = std::env::temp_dir().join(format!("bzm2-rail1-{unique}.txt"));
+        let enable0_path = std::env::temp_dir().join(format!("bzm2-enable0-{unique}.txt"));
+        let enable1_path = std::env::temp_dir().join(format!("bzm2-enable1-{unique}.txt"));
+        let reset_path = std::env::temp_dir().join(format!("bzm2-reset-{unique}.txt"));
+
+        let config = Bzm2RuntimeConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            result_min_difficulty: None,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig {
+                enabled: true,
+                rail_set_paths: vec![
+                    rail0_path.to_string_lossy().into_owned(),
+                    rail1_path.to_string_lossy().into_owned(),
+                ],
+                rail_write_scales: vec![1000.0, 1000.0],
+                rail_enable_paths: vec![
+                    enable0_path.to_string_lossy().into_owned(),
+                    enable1_path.to_string_lossy().into_owned(),
+                ],
+                rail_enable_values: vec!["EN".into(), "ON".into()],
+                rail_vin: Vec::new(),
+                rail_vout: Vec::new(),
+                rail_current: Vec::new(),
+                rail_power: Vec::new(),
+                rail_temperature: Vec::new(),
+                reset_path: Some(reset_path.to_string_lossy().into_owned()),
+                reset_active_low: true,
+                plan: VoltageStackBringupPlan {
+                    pre_power_delay: Duration::ZERO,
+                    post_power_delay: Duration::ZERO,
+                    release_reset_delay: Duration::ZERO,
+                    steps: vec![
+                        VoltageStackStep {
+                            rail_index: 0,
+                            voltage: 1.1,
+                            settle_for: Duration::ZERO,
+                        },
+                        VoltageStackStep {
+                            rail_index: 1,
+                            voltage: 1.25,
+                            settle_for: Duration::ZERO,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            },
+            calibration: Bzm2CalibrationConfig::default(),
+        };
+        let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, telemetry_tx);
+
+        let _threads = board.create_hash_threads().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&rail0_path).unwrap(), "1100");
+        assert_eq!(fs::read_to_string(&rail1_path).unwrap(), "1250");
+        assert_eq!(fs::read_to_string(&enable0_path).unwrap(), "EN");
+        assert_eq!(fs::read_to_string(&enable1_path).unwrap(), "ON");
+        assert_eq!(fs::read_to_string(&reset_path).unwrap(), "1");
+
+        board.shutdown().await.unwrap();
+
+        assert_eq!(fs::read_to_string(&rail0_path).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&rail1_path).unwrap(), "0");
+        assert_eq!(fs::read_to_string(&reset_path).unwrap(), "0");
+
+        // THE ENABLE NODES, which this test created, wrote, asserted after
+        // bring-up, and then deleted after shutdown without ever looking at
+        // again. It held the evidence in its hand. A rail whose setpoint is
+        // zero but whose enable is still asserted is not off -- it is an
+        // enabled rail commanded to zero volts, a different electrical state
+        // and not the one `shutdown()` is asked for.
+        assert_eq!(
+            fs::read_to_string(&enable0_path).unwrap(),
+            "0",
+            "shutdown must de-assert the enable node, not only zero the setpoint"
+        );
+        assert_eq!(
+            fs::read_to_string(&enable1_path).unwrap(),
+            "0",
+            "shutdown must de-assert the enable node, not only zero the setpoint"
+        );
+
+        let _ = fs::remove_file(rail0_path);
+        let _ = fs::remove_file(rail1_path);
+        let _ = fs::remove_file(enable0_path);
+        let _ = fs::remove_file(enable1_path);
+        let _ = fs::remove_file(reset_path);
+        drop(pty);
+    }
+
+    #[tokio::test]
+    async fn create_hash_threads_publishes_rail_telemetry() {
+        let pty = openpty(None, None).unwrap();
+        let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let vin_path = std::env::temp_dir().join(format!("bzm2-vin-{unique}.txt"));
+        let vout_path = std::env::temp_dir().join(format!("bzm2-vout-{unique}.txt"));
+        let current_path = std::env::temp_dir().join(format!("bzm2-current-{unique}.txt"));
+        let power_path = std::env::temp_dir().join(format!("bzm2-power-{unique}.txt"));
+        let temp_path = std::env::temp_dir().join(format!("bzm2-temp-{unique}.txt"));
+        fs::write(&vin_path, "12000\n").unwrap();
+        fs::write(&vout_path, "850\n").unwrap();
+        fs::write(&current_path, "1500\n").unwrap();
+        fs::write(&power_path, "1275\n").unwrap();
+        fs::write(&temp_path, "47000\n").unwrap();
+
+        let config = Bzm2RuntimeConfig {
+            serial_paths: vec![serial_path],
+            baud_rate: DEFAULT_BAUD_RATE,
+            timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
+            nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
+            result_min_difficulty: None,
+            dispatch_interval: Duration::from_millis(50),
+            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
+            telemetry: Bzm2TelemetryConfig::default(),
+            enumeration: Bzm2EnumerationConfig::default(),
+            bringup: Bzm2BringupConfig {
+                rail_vin: vec![SensorSpec {
+                    path: vin_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_vout: vec![SensorSpec {
+                    path: vout_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_current: vec![SensorSpec {
+                    path: current_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_power: vec![SensorSpec {
+                    path: power_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                rail_temperature: vec![SensorSpec {
+                    path: temp_path.to_string_lossy().into_owned(),
+                    scale: 0.001,
+                }],
+                ..Default::default()
+            },
+            calibration: Bzm2CalibrationConfig::default(),
+        };
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+        let mut board = Bzm2Board::new(config, telemetry_tx);
+
+        let _threads = board.create_hash_threads().await.unwrap();
+        let state = telemetry_rx.borrow().clone();
+        assert!(state.temperatures.iter().any(|sensor| {
+            sensor.name == "rail0-regulator"
+                && sensor
+                    .temperature
+                    .map(Temperature::as_degrees_c)
+                    .is_some_and(|value| (value - 47.0).abs() < 0.001)
+        }));
+        assert!(state.powers.iter().any(|power| {
+            power.name == "rail0-input"
+                && power
+                    .voltage_v
+                    .is_some_and(|value| (value - 12.0).abs() < 0.001)
+        }));
+        assert!(state.powers.iter().any(|power| {
+            power.name == "rail0-output"
+                && power
+                    .voltage_v
+                    .is_some_and(|value| (value - 0.85).abs() < 0.001)
+                && power
+                    .current_a
+                    .is_some_and(|value| (value - 1.5).abs() < 0.001)
+                && power
+                    .power_w
+                    .is_some_and(|value| (value - 1.275).abs() < 0.001)
+        }));
+
+        board.shutdown().await.unwrap();
+
+        let _ = fs::remove_file(vin_path);
+        let _ = fs::remove_file(vout_path);
+        let _ = fs::remove_file(current_path);
+        let _ = fs::remove_file(power_path);
+        let _ = fs::remove_file(temp_path);
+        drop(pty);
     }
 }

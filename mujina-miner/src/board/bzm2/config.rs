@@ -6,11 +6,60 @@ use std::time::Duration;
 
 use crate::types::Difficulty;
 
+use super::bringup::Bzm2BringupConfig;
+use super::telemetry::Bzm2TelemetryConfig;
+
 pub(super) const DEFAULT_BAUD_RATE: u32 = 5_000_000;
 const DEFAULT_DISPATCH_INTERVAL_MS: u64 = 500;
 pub(super) const DEFAULT_NOMINAL_HASHRATE_THS: f64 = 40.0;
-
+pub(super) const DEFAULT_TELEMETRY_INTERVAL_SECS: u64 = 5;
+pub(super) const DEFAULT_ASIC_TEMP_SCALE: f32 = 0.001;
+pub(super) const DEFAULT_BOARD_TEMP_SCALE: f32 = 0.001;
+/// RPM = raw `alt_tacho` sysfs speed count * this factor.
+///
+/// This is a HYPOTHESIS, not a confirmed calibration: it assumes two tach
+/// pulses per FPGA-counted revolution, inferred from one paired reading
+/// against a vendor-reported RPM at a different duty point that landed in
+/// the right neighborhood but was not a same-instant confirmation. To
+/// confirm on real hardware: read a fan's sysfs `speed` and the
+/// vendor-reported RPM for that same fan at the same instant and duty, and
+/// check that speed * 30 lands within a few percent of the vendor figure;
+/// if it does not, override via MUJINA_BZM2_FAN_RPM_SCALES (or the singular
+/// MUJINA_BZM2_FAN_RPM_SCALE for a one-fan override).
+pub(super) const ASSUMED_FAN_TACHO_RPM_SCALE: f32 = 30.0;
+/// Duty-cycle sysfs value scaled to a percent: `percent = duty_cycle * 100 /
+/// period`, with the fixed PWM period on this hardware being 40000 (so this
+/// is 100 / 40000). The usable range is roughly 11000 (27.5%) to 40000
+/// (100%); `Bzm2TelemetryConfig::snapshot` clamps the scaled read to
+/// [0, 100] before publishing it, so out-of-range raw values cannot leak
+/// through as an out-of-range percent.
+pub(super) const DEFAULT_FAN_PERCENT_SCALE: f32 = 100.0 / 40_000.0;
+/// Control-board fan tachometer sysfs paths, one per physical fan: four FPGA
+/// `alt_tacho` tach blocks show up as four `hwmon` instances on this
+/// platform, measured on hardware. Every entry is independently overridable
+/// via MUJINA_BZM2_FAN_RPM_PATHS.
+pub(super) const DEFAULT_FAN_RPM_PATHS: [&str; 4] = [
+    "/sys/class/hwmon/hwmon0/speed",
+    "/sys/class/hwmon/hwmon1/speed",
+    "/sys/class/hwmon/hwmon2/speed",
+    "/sys/class/hwmon/hwmon3/speed",
+];
+/// Control-board fan PWM duty-cycle sysfs paths, one per physical fan,
+/// pairing index-for-index with [`DEFAULT_FAN_RPM_PATHS`]. Overridable via
+/// MUJINA_BZM2_FAN_PERCENT_PATHS.
+pub(super) const DEFAULT_FAN_PERCENT_PATHS: [&str; 4] = [
+    "/sys/class/pwm/pwmchip0/pwm0/duty_cycle",
+    "/sys/class/pwm/pwmchip1/pwm0/duty_cycle",
+    "/sys/class/pwm/pwmchip2/pwm0/duty_cycle",
+    "/sys/class/pwm/pwmchip3/pwm0/duty_cycle",
+];
+pub(super) const DEFAULT_VOLTAGE_SCALE: f32 = 0.001;
+pub(super) const DEFAULT_CURRENT_SCALE: f32 = 0.001;
+pub(super) const DEFAULT_POWER_SCALE: f32 = 0.000001;
 pub(super) const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
+pub(super) const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
+pub(super) const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
+pub(super) const DEFAULT_BRINGUP_RELEASE_RESET_MS: u64 = 25;
 
 #[derive(Debug, Clone)]
 pub struct Bzm2RuntimeConfig {
@@ -24,8 +73,10 @@ pub struct Bzm2RuntimeConfig {
     pub dispatch_interval: Duration,
     pub nominal_hashrate_ths: f64,
     pub dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration,
+    pub telemetry: Bzm2TelemetryConfig,
     pub calibration: Bzm2CalibrationConfig,
     pub enumeration: Bzm2EnumerationConfig,
+    pub bringup: Bzm2BringupConfig,
 }
 
 impl Bzm2RuntimeConfig {
@@ -77,6 +128,7 @@ impl Bzm2RuntimeConfig {
             .and_then(crate::asic::bzm2::protocol::DtsVsGeneration::from_env_value)
             .unwrap_or(crate::asic::bzm2::protocol::DtsVsGeneration::Gen2);
         let calibration = Bzm2CalibrationConfig::from_env(serial_paths.len());
+        let bringup = Bzm2BringupConfig::from_env();
 
         Some(Self {
             serial_paths: serial_paths.clone(),
@@ -87,7 +139,9 @@ impl Bzm2RuntimeConfig {
             dispatch_interval,
             nominal_hashrate_ths,
             dts_vs_generation,
+            telemetry: Bzm2TelemetryConfig::from_env(),
             enumeration: Bzm2EnumerationConfig::from_env(serial_paths.len(), &calibration),
+            bringup,
             calibration,
         })
     }
@@ -212,6 +266,19 @@ pub(super) fn env_var_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok())
 }
 
+pub(super) fn env_csv_strings_any(keys: &[&str]) -> Vec<String> {
+    env_var_any(keys)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 pub(super) fn env_flag_any(keys: &[&str]) -> bool {
     env_var_any(keys).as_deref().is_some_and(|value| {
         matches!(
@@ -219,6 +286,17 @@ pub(super) fn env_flag_any(keys: &[&str]) -> bool {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+pub(super) fn env_flag_default_any(keys: &[&str], default: bool) -> bool {
+    env_var_any(keys)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 pub(super) fn parse_u32(value: &str) -> Option<u32> {
@@ -242,6 +320,13 @@ where
         .map(|value| value.parse().ok())
         .collect::<Option<Vec<_>>>()?;
     Some(parsed)
+}
+
+pub(super) fn parse_csv_numbers_any<T>(keys: &[&str]) -> Option<Vec<T>>
+where
+    T: std::str::FromStr,
+{
+    keys.iter().find_map(|key| parse_csv_numbers::<T>(key))
 }
 
 /// Split a chain port, installing the read-only veto when dry run is asked for.
