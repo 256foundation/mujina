@@ -75,7 +75,7 @@ const DISCOVERED_ENGINE_END_NONCE: u32 = 0xffff_fffe;
 ///
 /// ```rust,no_run
 /// # async fn demo(mut uart: mujina_miner::asic::bzm2::Bzm2UartController) -> Result<(), Box<dyn std::error::Error>> {
-/// use mujina_miner::asic::bzm2::{Bzm2UartController, NOTCH_REG};
+/// use mujina_miner::asic::bzm2::{Bzm2Pll, Bzm2UartController, NOTCH_REG};
 ///
 /// // Unicast: write one ASIC-local register.
 /// uart.write_local_reg_u32(0x02, 0x12, 1).await?;
