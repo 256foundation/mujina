@@ -6,7 +6,9 @@
 use anyhow::Result;
 use tokio::sync::oneshot;
 
-use crate::api_client::types::{Bzm2ChainSummaryResponse, Bzm2ClockReportResponse};
+use crate::api_client::types::{
+    Bzm2AsicSummaryResponse, Bzm2ChainSummaryResponse, Bzm2ClockReportResponse,
+};
 
 /// Commands from the API to the scheduler.
 pub enum SchedulerCommand {
@@ -47,6 +49,17 @@ pub enum BoardCommand {
     /// Report the board's bus/ASIC layout and tuning status.
     QueryBzm2ChainSummary {
         reply: oneshot::Sender<Result<Bzm2ChainSummaryResponse>>,
+    },
+
+    /// Summarise per-ASIC die temperature and rail voltage from telemetry
+    /// the board already holds.
+    ///
+    /// Answered from memory: this command must never reach the wire. It
+    /// exists to be polled, and the board command channel is served one
+    /// command at a time, so a summary that cost a chain round-trip would
+    /// queue behind every diagnostic on the board and hang its caller.
+    QueryBzm2AsicSummary {
+        reply: oneshot::Sender<Result<Bzm2AsicSummaryResponse>>,
     },
 
     /// Read PLL/DLL clock status registers from a BZM2 ASIC.

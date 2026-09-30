@@ -17,11 +17,12 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::commands::{BoardCommand, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, Bzm2ChainSummaryResponse, Bzm2ClockReportRequest, Bzm2ClockReportResponse,
-    Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest, Bzm2LoopbackRequest, Bzm2LoopbackResponse,
-    Bzm2NoopRequest, Bzm2NoopResponse, Bzm2RegisterReadRequest, Bzm2RegisterReadResponse,
-    Bzm2RegisterWriteRequest, Bzm2RegisterWriteResponse, MinerPatchRequest, MinerTelemetry,
-    SetFanTargetRequest, SourceTelemetry,
+    BoardTelemetry, Bzm2AsicSummaryResponse, Bzm2ChainSummaryResponse, Bzm2ClockReportRequest,
+    Bzm2ClockReportResponse, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
+    Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
+    Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
+    Bzm2RegisterWriteResponse, MinerPatchRequest, MinerTelemetry, SetFanTargetRequest,
+    SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -39,6 +40,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(write_bzm2_register))
         .routes(routes!(query_bzm2_clock_report))
         .routes(routes!(get_bzm2_chain_summary))
+        .routes(routes!(get_bzm2_asic_summary))
         .routes(routes!(discover_bzm2_engines))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
@@ -567,6 +569,52 @@ async fn get_bzm2_chain_summary(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let summary = await_command_reply(&name, "QueryBzm2ChainSummary", rx).await?;
+
+    Ok(Json(summary))
+}
+
+/// Return computed per-ASIC die temperature and rail voltage figures for a board.
+///
+/// Safe to poll: the board answers it from telemetry it already holds, without
+/// touching the chain.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/bzm2/asic-summary",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Computed per-ASIC thermal and voltage summary", body = Bzm2AsicSummaryResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 per-ASIC summaries"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn get_bzm2_asic_summary(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<Bzm2AsicSummaryResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2AsicSummary { reply: tx })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary = await_command_reply(&name, "QueryBzm2AsicSummary", rx).await?;
 
     Ok(Json(summary))
 }
