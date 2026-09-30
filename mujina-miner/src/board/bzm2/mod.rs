@@ -32,8 +32,10 @@ mod calibration;
 mod config;
 pub mod fans;
 mod monitor;
+mod operating_point;
 pub mod platform;
 mod post;
+mod profile;
 mod scram;
 pub mod stored_calibration;
 mod telemetry;
@@ -93,6 +95,10 @@ pub struct Bzm2Board {
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
     heartbeat_shutdown: Option<watch::Sender<bool>>,
+    /// Each driven board's serial, read once before bring-up while the MCU has
+    /// no other owner. Empty until then, which is why the identity check
+    /// treats an absent serial as unverifiable rather than as a mismatch.
+    board_serials: Vec<Option<String>>,
     heartbeat_tasks: Vec<JoinHandle<()>>,
     fan_shutdown: Option<watch::Sender<bool>>,
     fan_task: Option<JoinHandle<()>>,
@@ -110,6 +116,7 @@ impl Bzm2Board {
             monitor_shutdown: None,
             monitor_task: None,
             heartbeat_shutdown: None,
+            board_serials: Vec::new(),
             heartbeat_tasks: Vec::new(),
             fan_shutdown: None,
             fan_task: None,
@@ -570,7 +577,8 @@ impl Bzm2Board {
     /// which is why `drain_faults` hands back what it took alongside why it
     /// stopped, and why everything it took is logged even when it stopped for
     /// a bad reason.
-    async fn drain_board_faults_before_bringup(&mut self) {
+    async fn drain_board_faults_before_bringup(&mut self) -> Vec<Option<String>> {
+        let mut serials: Vec<Option<String>> = Vec::new();
         // Bounded against an MCU queueing faults faster than we drain. Hitting
         // it is itself a finding and is reported as one.
         const LIMIT: usize = 32;
@@ -578,6 +586,7 @@ impl Bzm2Board {
         let platform = platform::DEFAULT;
         for board_index in self.driven_board_indices() {
             let Some(bus_path) = platform.i2c_bus_path(board_index) else {
+                serials.push(None);
                 continue;
             };
             let bus = match crate::hw_trait::i2c::linux::LinuxI2c::open(&bus_path) {
@@ -588,6 +597,7 @@ impl Bzm2Board {
                         "Cannot open this board's MCU to read its fault history or identity; \
                          starting without knowing what it had queued or which board it is"
                     );
+                    serials.push(None);
                     continue;
                 }
             };
@@ -610,6 +620,7 @@ impl Bzm2Board {
                              this board's identity"
                         ),
                     }
+                    serials.push(serial);
                 }
                 Err(err) => {
                     warn!(
@@ -617,6 +628,7 @@ impl Bzm2Board {
                         "Could not read this board's identity; a stored calibration cannot \
                          be confirmed to belong to it"
                     );
+                    serials.push(None);
                 }
             }
 
@@ -656,6 +668,7 @@ impl Bzm2Board {
                 ),
             }
         }
+        serials
     }
 
     async fn shutdown(&mut self) -> AnyhowResult<()> {
@@ -764,7 +777,7 @@ impl Bzm2Board {
         // real fault and returns a stale word as the queue's answer. The
         // heartbeat becomes that MCU's sole owner later in this function, so
         // before it starts is the only safe window.
-        self.drain_board_faults_before_bringup().await;
+        self.board_serials = self.drain_board_faults_before_bringup().await;
         self.apply_bringup_sequence().await?;
         // Arm the silicon's own thermal/voltage protection before the long
         // bring-up stress, not after: the sensors come up powered down and

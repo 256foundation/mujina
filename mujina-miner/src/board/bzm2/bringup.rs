@@ -10,14 +10,15 @@ use crate::board::power::{
     FileGpioPin, FilePowerRail, GpioResetLine, PowerRail, VoltageStackBringupPlan, VoltageStackStep,
 };
 use crate::tracing::prelude::*;
+use crate::tuning::calibration_planner::Bzm2SavedOperatingPoint;
 use crate::types::Temperature;
 
 use super::calibration::Bzm2BusLayout;
 use super::config::{
     DEFAULT_BOARD_TEMP_SCALE, DEFAULT_BRINGUP_POST_POWER_MS, DEFAULT_BRINGUP_PRE_POWER_MS,
-    DEFAULT_BRINGUP_RELEASE_RESET_MS, DEFAULT_CURRENT_SCALE, DEFAULT_POWER_SCALE,
-    DEFAULT_VOLTAGE_SCALE, env_csv_strings_any, env_flag_any, env_flag_default_any, env_var_any,
-    parse_csv_numbers, parse_csv_numbers_any,
+    DEFAULT_BRINGUP_RELEASE_RESET_MS, DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ, DEFAULT_CURRENT_SCALE,
+    DEFAULT_POWER_SCALE, DEFAULT_VOLTAGE_SCALE, average_f32, env_csv_strings_any, env_flag_any,
+    env_flag_default_any, env_var_any, parse_csv_numbers, parse_csv_numbers_any,
 };
 use super::telemetry::{Bzm2TelemetrySnapshot, SensorSpec, sensor_specs_from_env};
 use super::{BoardError, Bzm2Board};
@@ -357,6 +358,36 @@ impl Bzm2Board {
         // The setpoints are written. Whether the rails fell is a different
         // question, and it is the one that matters.
         self.confirm_rails_dark().await;
+        Ok(())
+    }
+
+    /// Apply an already-selected operating point.
+    ///
+    /// Takes the point rather than the profile it came from: the caller picks
+    /// it, because on a temperature-indexed profile there is more than one and
+    /// the right one depends on how warm the dies currently are.
+    pub(super) async fn apply_saved_operating_point(
+        &self,
+        bus_layouts: &[Bzm2BusLayout],
+        point: &Bzm2SavedOperatingPoint,
+    ) -> Result<(), BoardError> {
+        self.apply_domain_voltage_map(&point.per_domain_voltage_mv)
+            .await?;
+        for bus in bus_layouts {
+            if bus.asic_count == 0 {
+                continue;
+            }
+            let initial_frequencies = [0usize, 1usize].map(|pll_index| {
+                average_f32(
+                    (bus.asic_start..bus.asic_start + bus.asic_count)
+                        .filter_map(|asic_id| point.per_asic_pll_mhz.get(&asic_id))
+                        .map(|frequencies| frequencies[pll_index]),
+                )
+                .unwrap_or(DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ)
+            });
+            self.apply_bus_frequency_map(bus, initial_frequencies, &point.per_asic_pll_mhz)
+                .await?;
+        }
         Ok(())
     }
 

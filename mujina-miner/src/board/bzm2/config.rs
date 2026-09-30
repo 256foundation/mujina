@@ -1,7 +1,7 @@
 //! Environment-driven configuration for the BZM2 board driver.
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tuning::calibration_planner::{
@@ -121,6 +121,7 @@ pub(super) const DEFAULT_CALIBRATION_SITE_TEMP_C: f32 = 20.0;
 pub(super) const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
 const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
 const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
+pub(super) const DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ: f32 = 800.0;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
@@ -356,6 +357,7 @@ impl Bzm2EnumerationConfig {
 #[derive(Debug, Clone)]
 pub struct Bzm2CalibrationConfig {
     pub enabled: bool,
+    pub apply_saved_operating_point: bool,
     pub discover_engine_topology: bool,
     pub operating_class: Bzm2OperatingClass,
     pub performance_mode: Bzm2PerformanceMode,
@@ -365,6 +367,7 @@ pub struct Bzm2CalibrationConfig {
     pub asics_per_bus: Vec<u16>,
     pub asics_per_domain: Vec<u16>,
     pub domain_voltage_offsets_mv: Vec<i32>,
+    pub profile_path: Option<PathBuf>,
     pub site_temp_c: Option<f32>,
     pub pll_post1_divider: u8,
     pub skip_lock_check: bool,
@@ -379,6 +382,7 @@ impl Default for Bzm2CalibrationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            apply_saved_operating_point: true,
             discover_engine_topology: true,
             operating_class: Bzm2OperatingClass::Generic,
             performance_mode: Bzm2PerformanceMode::Standard,
@@ -388,6 +392,7 @@ impl Default for Bzm2CalibrationConfig {
             asics_per_bus: vec![1],
             asics_per_domain: vec![1],
             domain_voltage_offsets_mv: Vec::new(),
+            profile_path: None,
             site_temp_c: None,
             pll_post1_divider: DEFAULT_CALIBRATION_POST1_DIVIDER,
             skip_lock_check: false,
@@ -406,6 +411,13 @@ impl Bzm2CalibrationConfig {
     fn from_env(serial_count: usize) -> Self {
         let mut config = Self {
             enabled: env_flag("MUJINA_BZM2_CALIBRATE") || env_flag("MUJINA_BZM2_ENABLE_PNP"),
+            apply_saved_operating_point: env_flag_default_any(
+                &[
+                    "MUJINA_BZM2_APPLY_SAVED_OPERATING_POINT",
+                    "MUJINA_BZM2_REPLAY_STORED_CALIBRATION",
+                ],
+                true,
+            ),
             discover_engine_topology: env_flag_default_any(
                 &[
                     "MUJINA_BZM2_CALIBRATION_DISCOVER_ENGINES",
@@ -451,6 +463,11 @@ impl Bzm2CalibrationConfig {
                 "MUJINA_BZM2_DOMAIN_VOLTAGE_OFFSETS_MV",
             )
             .unwrap_or_default(),
+            profile_path: env_var_any(&[
+                "MUJINA_BZM2_SAVED_OPERATING_POINT_PATH",
+                "MUJINA_BZM2_CALIBRATION_PROFILE",
+            ])
+            .map(PathBuf::from),
             site_temp_c: env_f32_any(&["MUJINA_BZM2_SITE_TEMP_C", "MUJINA_BZM2_AMBIENT_TEMP_C"]),
             pll_post1_divider: env::var("MUJINA_BZM2_CALIBRATION_POST1_DIVIDER")
                 .ok()
@@ -670,6 +687,46 @@ pub(super) fn parse_performance_mode(value: &str) -> Option<Bzm2PerformanceMode>
         "standard" | "balanced" => Some(Bzm2PerformanceMode::Standard),
         "efficiency" | "low" | "low-power" | "low_power" => Some(Bzm2PerformanceMode::Efficiency),
         _ => None,
+    }
+}
+
+pub(super) fn average_u32(values: impl Iterator<Item = u32>) -> Option<u32> {
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for value in values {
+        total += value as u64;
+        count += 1;
+    }
+    (count > 0).then_some((total / count) as u32)
+}
+
+pub(super) fn average_f32(values: impl Iterator<Item = f32>) -> Option<f32> {
+    let mut total = 0.0f32;
+    let mut count = 0usize;
+    for value in values {
+        total += value;
+        count += 1;
+    }
+    (count > 0).then_some(total / count as f32)
+}
+
+pub(super) fn operating_class_name(operating_class: Bzm2OperatingClass) -> &'static str {
+    match operating_class {
+        Bzm2OperatingClass::Generic => "generic",
+        Bzm2OperatingClass::EarlyValidation => "early-validation",
+        Bzm2OperatingClass::ProductionValidation => "production-validation",
+        Bzm2OperatingClass::StackTunedA => "stack-tuned-a",
+        Bzm2OperatingClass::StackTunedB => "stack-tuned-b",
+        Bzm2OperatingClass::ExtendedHeadroom => "extended-headroom",
+        Bzm2OperatingClass::ExtendedHeadroomB => "extended-headroom-b",
+    }
+}
+
+pub(super) fn performance_mode_name(performance_mode: Bzm2PerformanceMode) -> &'static str {
+    match performance_mode {
+        Bzm2PerformanceMode::MaxThroughput => "max-throughput",
+        Bzm2PerformanceMode::Standard => "standard",
+        Bzm2PerformanceMode::Efficiency => "efficiency",
     }
 }
 

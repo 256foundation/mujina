@@ -205,6 +205,24 @@ pub struct EngineCoordinate {
     pub col: u8,
 }
 
+/// Validation status of a saved BZM2 operating point.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Bzm2SavedOperatingPointStatus {
+    #[default]
+    Pending,
+    Validated,
+    Invalidated,
+}
+
+/// How a BZM2 board reached its current operating point at startup.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Bzm2StartupPath {
+    SavedReplay,
+    LiveCalibration,
+}
+
 /// Writable fields for `PATCH /api/v0/miner`.
 ///
 /// All fields are optional; only those present in the request body are
