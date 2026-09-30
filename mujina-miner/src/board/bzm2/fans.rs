@@ -284,6 +284,20 @@ impl Bzm2Fans {
         false
     }
 
+    pub async fn command_and_measure(
+        &self,
+        index: usize,
+        duty_pct: u8,
+    ) -> anyhow::Result<FanOutcome> {
+        self.command(index, duty_pct).await?;
+        tokio::time::sleep(SETTLE).await;
+        Ok(FanOutcome {
+            index,
+            commanded_pct: duty_pct,
+            measured_rpm: self.read_rpm(index).await,
+        })
+    }
+
     pub async fn command_all_and_measure(&self, duty_pct: u8) -> Vec<FanOutcome> {
         for fan in 0..self.count() {
             if let Err(err) = self.command(fan, duty_pct).await {

@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::{
+    api::commands::BoardCommand,
     api_client::types::{BoardTelemetry, ThreadTelemetry},
     asic::{
         bzm2::{Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle},
@@ -30,6 +31,7 @@ pub mod board_mcu;
 pub mod board_power;
 mod bringup;
 mod calibration;
+mod commands;
 mod config;
 pub mod fans;
 mod monitor;
@@ -95,8 +97,11 @@ pub struct Bzm2Board {
     applied_operating_state: Arc<Mutex<Bzm2AppliedOperatingState>>,
     runtime_measurements: Arc<Mutex<Bzm2RuntimeMeasurementCache>>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
+    command_rx: Option<mpsc::Receiver<BoardCommand>>,
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
+    command_shutdown: Option<watch::Sender<bool>>,
+    command_task: Option<JoinHandle<()>>,
     heartbeat_shutdown: Option<watch::Sender<bool>>,
     /// Each driven board's serial, read once before bring-up while the MCU has
     /// no other owner. Empty until then, which is why the identity check
@@ -108,7 +113,11 @@ pub struct Bzm2Board {
 }
 
 impl Bzm2Board {
-    pub fn new(config: Bzm2RuntimeConfig, telemetry_tx: watch::Sender<BoardTelemetry>) -> Self {
+    pub fn new(
+        config: Bzm2RuntimeConfig,
+        telemetry_tx: watch::Sender<BoardTelemetry>,
+        command_rx: mpsc::Receiver<BoardCommand>,
+    ) -> Self {
         Self {
             config,
             bringup_applied: false,
@@ -118,8 +127,11 @@ impl Bzm2Board {
             applied_operating_state: Arc::new(Mutex::new(Bzm2AppliedOperatingState::default())),
             runtime_measurements: Arc::new(Mutex::new(Bzm2RuntimeMeasurementCache::default())),
             telemetry_tx,
+            command_rx: Some(command_rx),
             monitor_shutdown: None,
             monitor_task: None,
+            command_shutdown: None,
+            command_task: None,
             heartbeat_shutdown: None,
             board_serials: Vec::new(),
             heartbeat_tasks: Vec::new(),
@@ -696,7 +708,13 @@ impl Bzm2Board {
         if let Some(tx) = self.monitor_shutdown.take() {
             let _ = tx.send(true);
         }
+        if let Some(tx) = self.command_shutdown.take() {
+            let _ = tx.send(true);
+        }
         if let Some(handle) = self.monitor_task.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.command_task.take() {
             let _ = handle.await;
         }
         // A deliberate shutdown, so a refused stop is still worth saying: it
@@ -714,6 +732,7 @@ impl Bzm2Board {
         }
         self.shutdown_handles.clear();
         self.serial_controls.clear();
+        self.command_rx = None;
         self.telemetry_tx.send_modify(|state| {
             for thread in &mut state.threads {
                 thread.is_active = false;
@@ -888,6 +907,7 @@ impl Bzm2Board {
         self.spawn_heartbeats();
         self.spawn_thermal_fan_control();
         self.spawn_monitor();
+        self.spawn_command_loop();
         Ok(threads)
     }
 }
@@ -1030,8 +1050,9 @@ async fn create_bzm2_board() -> AnyhowResult<BackplaneConnector> {
         ..Default::default()
     };
     let (telemetry_tx, telemetry_rx) = watch::channel(initial_state);
+    let (command_tx, command_rx) = mpsc::channel(16);
 
-    let mut board = Bzm2Board::new(config, telemetry_tx);
+    let mut board = Bzm2Board::new(config, telemetry_tx, command_rx);
     let info = board.board_info();
 
     // Bring-up, enumeration, calibration, and the monitor/command loops
@@ -1048,7 +1069,7 @@ async fn create_bzm2_board() -> AnyhowResult<BackplaneConnector> {
         info,
         threads,
         telemetry_rx,
-        command_tx: None,
+        command_tx: Some(command_tx),
         shutdown: Some(shutdown),
     })
 }
@@ -1225,7 +1246,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let mut board = Bzm2Board::new(config, telemetry_tx);
+        let mut board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
 
         let _threads = board.create_hash_threads().await.unwrap();
 
@@ -1340,7 +1361,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let mut board = Bzm2Board::new(config, telemetry_tx);
+        let mut board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
 
         let _threads = board.create_hash_threads().await.unwrap();
         let state = telemetry_rx.borrow().clone();

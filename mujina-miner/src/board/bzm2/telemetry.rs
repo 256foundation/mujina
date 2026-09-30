@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::api_client::types::{
-    AsicState, BoardTelemetry, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor,
+    AsicState, BoardTelemetry, Bzm2ClockReportResponse, Bzm2DllClockStatus, Bzm2PllClockStatus,
+    EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor,
 };
 use crate::asic::bzm2::Bzm2DiscoveredEngineMap;
 use crate::asic::hash_thread::{
@@ -605,6 +606,44 @@ pub(super) fn merge_power_readings(
         } else {
             existing.push(update.clone());
         }
+    }
+}
+
+pub(super) fn map_clock_report(
+    report: crate::asic::bzm2::Bzm2ClockDebugReport,
+) -> Bzm2ClockReportResponse {
+    Bzm2ClockReportResponse {
+        asic: report.asic,
+        pll0: Bzm2PllClockStatus {
+            enable_register: report.pll0.enable_register,
+            misc_register: report.pll0.misc_register,
+            enabled: report.pll0.enabled,
+            locked: report.pll0.locked,
+        },
+        pll1: Bzm2PllClockStatus {
+            enable_register: report.pll1.enable_register,
+            misc_register: report.pll1.misc_register,
+            enabled: report.pll1.enabled,
+            locked: report.pll1.locked,
+        },
+        dll0: Bzm2DllClockStatus {
+            control2: report.dll0.control2,
+            control5: report.dll0.control5,
+            coarsecon: report.dll0.coarsecon,
+            fincon: report.dll0.fincon,
+            freeze_valid: report.dll0.freeze_valid,
+            locked: report.dll0.locked,
+            fincon_valid: report.dll0.fincon_valid,
+        },
+        dll1: Bzm2DllClockStatus {
+            control2: report.dll1.control2,
+            control5: report.dll1.control5,
+            coarsecon: report.dll1.coarsecon,
+            fincon: report.dll1.fincon,
+            freeze_valid: report.dll1.freeze_valid,
+            locked: report.dll1.locked,
+            fincon_valid: report.dll1.fincon_valid,
+        },
     }
 }
 

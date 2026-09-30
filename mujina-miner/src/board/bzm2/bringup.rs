@@ -5,7 +5,7 @@ use std::env;
 use std::time::Duration;
 
 use crate::api_client::types::{
-    Bzm2SavedOperatingPointStatus, PowerMeasurement, TemperatureSensor,
+    Bzm2SavedOperatingPointStatus, Bzm2StartupPath, PowerMeasurement, TemperatureSensor,
 };
 use crate::asic::bzm2::{Bzm2ClockController, Bzm2Pll};
 use crate::board::power::{
@@ -397,6 +397,7 @@ impl Bzm2Board {
             &point.per_domain_voltage_mv,
             &point.per_asic_pll_mhz,
             Some(point.clone()),
+            Some(Bzm2StartupPath::SavedReplay),
             Some(status),
             reasons,
         );

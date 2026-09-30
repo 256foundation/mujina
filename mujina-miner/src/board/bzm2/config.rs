@@ -132,6 +132,7 @@ pub(super) const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 pub(super) const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 pub(super) const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
 pub(super) const DEFAULT_BRINGUP_RELEASE_RESET_MS: u64 = 25;
+pub(super) const DEFAULT_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct Bzm2RuntimeConfig {

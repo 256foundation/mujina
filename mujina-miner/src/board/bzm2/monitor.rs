@@ -1447,7 +1447,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::api_client::types::BoardTelemetry;
-    use crate::api_client::types::PowerMeasurement;
+    use crate::api_client::types::{Bzm2StartupPath, PowerMeasurement};
     use crate::tuning::calibration_planner::Bzm2SavedOperatingPoint;
     #[cfg(unix)]
     use nix::pty::openpty;
@@ -1458,7 +1458,7 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
     #[cfg(unix)]
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     #[test]
     fn a_chain_is_named_as_its_die_rows_are() {
@@ -1727,7 +1727,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let mut board = Bzm2Board::new(config, telemetry_tx);
+        let mut board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
 
         let mut threads = board.create_hash_threads().await.unwrap();
         let mut event_rx = threads[0].take_event_receiver().unwrap();
@@ -1807,6 +1807,7 @@ mod tests {
             saved_operating_point: None,
             saved_operating_point_status: None,
             saved_operating_point_reasons: Vec::new(),
+            startup_path: None,
         };
         let thread_metrics = BTreeMap::from([(
             0usize,
@@ -1905,6 +1906,7 @@ mod tests {
             saved_operating_point: None,
             saved_operating_point_status: None,
             saved_operating_point_reasons: Vec::new(),
+            startup_path: None,
         };
         let thread_metrics = BTreeMap::from([(
             0usize,
@@ -1976,6 +1978,7 @@ mod tests {
                 per_asic_engine_topology: BTreeMap::new(),
                 per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
             }),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
             saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
             saved_operating_point_reasons: Vec::new(),
         };
@@ -2106,6 +2109,7 @@ mod tests {
             per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
             per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
             saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::LiveCalibration),
             saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Pending),
             saved_operating_point_reasons: vec!["awaiting runtime validation".into()],
         }));
@@ -2162,6 +2166,7 @@ mod tests {
             per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
             per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
             saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
             saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
             saved_operating_point_reasons: Vec::new(),
         }));
@@ -2238,6 +2243,7 @@ mod tests {
             per_domain_voltage_mv: saved_state.per_domain_voltage_mv.clone(),
             per_asic_pll_mhz: saved_state.per_asic_pll_mhz.clone(),
             saved_operating_point: Some(saved_state),
+            startup_path: Some(Bzm2StartupPath::SavedReplay),
             saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
             saved_operating_point_reasons: Vec::new(),
         }));

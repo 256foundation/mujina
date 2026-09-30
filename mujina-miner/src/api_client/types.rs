@@ -333,6 +333,170 @@ pub struct Bzm2AsicTuningState {
     pub plls: Vec<Bzm2PllTuningState>,
 }
 
+/// Per-bus BZM2 chain layout summary.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2BusSummary {
+    pub thread_index: usize,
+    pub serial_path: String,
+    pub asic_start: u16,
+    pub asic_count: u16,
+}
+
+/// Current BZM2 chain summary for a live board.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ChainSummaryResponse {
+    pub total_asics: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_path: Option<Bzm2StartupPath>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buses: Vec<Bzm2BusSummary>,
+}
+
+/// One PLL status block in a BZM2 clock report.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2PllClockStatus {
+    pub enable_register: u32,
+    pub misc_register: u32,
+    pub enabled: bool,
+    pub locked: bool,
+}
+
+/// One DLL status block in a BZM2 clock report.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DllClockStatus {
+    pub control2: u8,
+    pub control5: u8,
+    pub coarsecon: u8,
+    pub fincon: u8,
+    pub freeze_valid: bool,
+    pub locked: bool,
+    pub fincon_valid: bool,
+}
+
+/// Response body for a live BZM2 clock-report query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ClockReportResponse {
+    pub asic: u8,
+    pub pll0: Bzm2PllClockStatus,
+    pub pll1: Bzm2PllClockStatus,
+    pub dll0: Bzm2DllClockStatus,
+    pub dll1: Bzm2DllClockStatus,
+}
+
+/// Request body for an explicit BZM2 ASIC DTS/VS query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DtsVsQueryRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
+/// Request body for an explicit BZM2 ASIC engine-discovery scan.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2EngineDiscoveryRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Raw TDM pre-divider value written into `LOCAL_REG_UART_TDM_CTL`.
+    pub tdm_prediv_raw: u32,
+    /// TDM counter value written into `LOCAL_REG_UART_TDM_CTL`.
+    pub tdm_counter: u8,
+    /// Optional per-engine probe timeout in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u32>,
+}
+
+/// Request body for a live BZM2 NOOP diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2NoopRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
+/// Response body for a live BZM2 NOOP diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2NoopResponse {
+    /// Hex-encoded three-byte NOOP payload returned by the ASIC.
+    pub payload_hex: String,
+}
+
+/// Request body for a live BZM2 loopback diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2LoopbackRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Hex-encoded payload to round-trip through the ASIC loopback opcode.
+    pub payload_hex: String,
+}
+
+/// Response body for a live BZM2 loopback diagnostic query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2LoopbackResponse {
+    /// Hex-encoded payload returned by the ASIC.
+    pub payload_hex: String,
+}
+
+/// Request body for a live BZM2 register read.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterReadRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Engine or local-register address.
+    pub engine_address: u16,
+    /// Register offset within the selected engine or local block.
+    pub offset: u8,
+    /// Number of bytes to read.
+    pub count: u8,
+}
+
+/// Response body for a live BZM2 register read.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterReadResponse {
+    /// Hex-encoded register payload.
+    pub value_hex: String,
+}
+
+/// Request body for a live BZM2 register write.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterWriteRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+    /// Engine or local-register address.
+    pub engine_address: u16,
+    /// Register offset within the selected engine or local block.
+    pub offset: u8,
+    /// Hex-encoded bytes to write.
+    pub value_hex: String,
+}
+
+/// Response body for a live BZM2 register write.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2RegisterWriteResponse {
+    /// Number of bytes written to the requested register.
+    pub bytes_written: usize,
+}
+
+/// Request body for a live BZM2 clock-report query.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2ClockReportRequest {
+    /// Index of the BZM2 UART thread/bus to query.
+    pub thread_index: usize,
+    /// ASIC id on that UART bus.
+    pub asic: u8,
+}
+
 /// Writable fields for `PATCH /api/v0/miner`.
 ///
 /// All fields are optional; only those present in the request body are

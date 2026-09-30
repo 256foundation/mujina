@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api_client::types::Bzm2SavedOperatingPointStatus;
+use crate::api_client::types::{Bzm2SavedOperatingPointStatus, Bzm2StartupPath};
 use crate::asic::bzm2::{Bzm2DiscoveredEngineMap, Bzm2TdmControl, Bzm2UartController};
 use crate::tracing::prelude::*;
 use crate::tuning::calibration_planner::{
@@ -235,6 +235,7 @@ pub(super) struct Bzm2AppliedOperatingState {
     pub(super) per_domain_voltage_mv: BTreeMap<u16, u32>,
     pub(super) per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
     pub(super) saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    pub(super) startup_path: Option<Bzm2StartupPath>,
     pub(super) saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
     pub(super) saved_operating_point_reasons: Vec<String>,
 }
@@ -596,6 +597,7 @@ impl Bzm2Board {
             &per_domain_voltage_mv,
             &per_asic_pll_mhz,
             Some(current_saved_operating_point.clone()),
+            Some(Bzm2StartupPath::LiveCalibration),
             Some(Bzm2SavedOperatingPointStatus::Pending),
             &[],
         );
@@ -833,6 +835,7 @@ pub(super) fn store_applied_operating_state(
     per_domain_voltage_mv: &BTreeMap<u16, u32>,
     per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
     saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    startup_path: Option<Bzm2StartupPath>,
     saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
     saved_operating_point_reasons: &[String],
 ) {
@@ -840,6 +843,7 @@ pub(super) fn store_applied_operating_state(
     guard.per_domain_voltage_mv = per_domain_voltage_mv.clone();
     guard.per_asic_pll_mhz = per_asic_pll_mhz.clone();
     guard.saved_operating_point = saved_operating_point;
+    guard.startup_path = startup_path;
     guard.saved_operating_point_status = saved_operating_point_status;
     guard.saved_operating_point_reasons = saved_operating_point_reasons.to_vec();
 }
@@ -1286,7 +1290,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     /// A profile freshly written for this board, in this room, by this build.
     fn valid_profile() -> Bzm2PersistedCalibrationProfile {
@@ -1698,7 +1702,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, telemetry_tx);
+        let board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
         let bus_layouts = board.resolve_bus_layouts().await.unwrap();
 
         board.execute_live_calibration(&bus_layouts).await.unwrap();
@@ -1833,7 +1837,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, telemetry_tx);
+        let board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
         let bus_layouts = board.resolve_bus_layouts().await.unwrap();
 
         board.execute_live_calibration(&bus_layouts).await.unwrap();
@@ -1895,7 +1899,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, telemetry_tx);
+        let board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
 
         let layouts = board.resolve_bus_layouts().await.unwrap();
         assert_eq!(layouts.len(), 1);
@@ -1958,7 +1962,7 @@ mod tests {
             serial: Some("bzm2-test".into()),
             ..Default::default()
         });
-        let board = Bzm2Board::new(config, telemetry_tx);
+        let board = Bzm2Board::new(config, telemetry_tx, mpsc::channel(1).1);
 
         let layouts = board.resolve_bus_layouts().await.unwrap();
         assert_eq!(layouts.len(), 1);
