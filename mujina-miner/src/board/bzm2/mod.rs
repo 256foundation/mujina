@@ -19,6 +19,7 @@ use crate::{
 
 use telemetry::{merge_power_readings, merge_temperature_readings};
 
+mod abort;
 pub mod board_heartbeat;
 pub mod board_mcu;
 pub mod board_power;
@@ -29,6 +30,7 @@ pub mod fans;
 mod monitor;
 pub mod platform;
 mod post;
+mod scram;
 mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;

@@ -55,6 +55,18 @@ pub(super) const DEFAULT_FAN_PERCENT_PATHS: [&str; 4] = [
 ];
 pub(super) const DEFAULT_VOLTAGE_SCALE: f32 = 0.001;
 pub(super) const DEFAULT_CURRENT_SCALE: f32 = 0.001;
+/// Die maximum, in degrees C, used when nothing configures one.
+///
+/// Measured, not chosen: this is the limit the platform enforces on itself,
+/// carried in our own captured safety envelope for `asic_die_max_c`. A
+/// default equal to the machine's own limit cannot be more permissive than
+/// the machine, and the alternative -- no thermal trip at all unless an
+/// operator sets an environment variable -- is worse.
+pub(super) const DEFAULT_MAX_ASIC_TEMP_C: f32 = 100.0;
+
+/// See `Bzm2TelemetryConfig::from_env` for why this can be defaulted safely.
+pub(super) const DEFAULT_MIN_FAN_RPM: u32 = 300;
+
 pub(super) const DEFAULT_POWER_SCALE: f32 = 0.000001;
 pub(super) const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 pub(super) const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
@@ -365,6 +377,14 @@ pub(super) fn env_flag_default_any(keys: &[&str], default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+pub(super) fn env_f32(key: &str) -> Option<f32> {
+    env_f32_any(&[key])
+}
+
+pub(super) fn env_f32_any(keys: &[&str]) -> Option<f32> {
+    env_var_any(keys).and_then(|value| value.parse().ok())
 }
 
 pub(super) fn parse_u32(value: &str) -> Option<u32> {

@@ -232,6 +232,10 @@ impl Bzm2BringupConfig {
             fans: Vec::new(),
             temperatures,
             powers,
+            trip_reason: None,
+            // Rail telemetry carries no configured limit, so it is never blind:
+            // there is nothing here for a missing reading to disarm.
+            blind: Vec::new(),
         }
     }
     fn build_rails(&self) -> Vec<FilePowerRail> {

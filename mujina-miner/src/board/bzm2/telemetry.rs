@@ -17,8 +17,9 @@ use crate::types::Temperature;
 use super::config::{
     ASSUMED_FAN_TACHO_RPM_SCALE, DEFAULT_ASIC_TEMP_SCALE, DEFAULT_BOARD_TEMP_SCALE,
     DEFAULT_CURRENT_SCALE, DEFAULT_FAN_PERCENT_PATHS, DEFAULT_FAN_PERCENT_SCALE,
-    DEFAULT_FAN_RPM_PATHS, DEFAULT_POWER_SCALE, DEFAULT_TELEMETRY_INTERVAL_SECS,
-    DEFAULT_VOLTAGE_SCALE, env_csv_strings_any, parse_csv_numbers_any,
+    DEFAULT_FAN_RPM_PATHS, DEFAULT_MAX_ASIC_TEMP_C, DEFAULT_MIN_FAN_RPM, DEFAULT_POWER_SCALE,
+    DEFAULT_TELEMETRY_INTERVAL_SECS, DEFAULT_VOLTAGE_SCALE, env_csv_strings_any, env_f32,
+    parse_csv_numbers_any,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +37,14 @@ pub struct Bzm2TelemetryConfig {
     pub input_voltage: Option<SensorSpec>,
     pub input_current: Option<SensorSpec>,
     pub input_power: Option<SensorSpec>,
+    pub max_asic_temp_c: Option<f32>,
+    pub max_board_temp_c: Option<f32>,
+    pub max_input_power_w: Option<f32>,
+    /// A tachometer below this, and not at zero, is a fan that is failing
+    /// rather than one that has stopped. Zero needs no threshold.
+    pub min_fan_rpm: Option<u32>,
+    /// Regulator output ceiling, in volts.
+    pub max_rail_v: Option<f32>,
 }
 impl Bzm2TelemetryConfig {
     pub(super) fn from_env() -> Self {
@@ -93,7 +102,81 @@ impl Bzm2TelemetryConfig {
                 "MUJINA_BZM2_INPUT_POWER_SCALE",
                 DEFAULT_POWER_SCALE,
             ),
+            // A DEFAULT, because a trip nobody configures is a trip that does
+            // not exist. Arming the ASIC limit took an environment variable no
+            // packaged unit file, config or script in the tree ever set, and
+            // the single variable required to mine at all is the serial path --
+            // so the ordinary way to run this driver was with no thermal
+            // protection and nothing said about it.
+            //
+            // The value is not invented. It is the die maximum the platform
+            // itself enforces, parsed from our own captures and recorded in
+            // our own captured safety envelope (vendor_limit column,
+            // asic_die_max_c). Defaulting to the limit the machine already
+            // holds itself to cannot be more permissive than the machine.
+            //
+            // The other two stay unset on purpose and are REPORTED as unset
+            // (see `unarmed_limits`): board temperature and input power are
+            // properties of a chassis, and this file knows about a hashboard.
+            // Defaulting them from a three-board system figure would be a
+            // number with the wrong denominator, which is worse than none.
+            max_asic_temp_c: env_f32("MUJINA_BZM2_MAX_ASIC_TEMP_C")
+                .or(Some(DEFAULT_MAX_ASIC_TEMP_C)),
+            max_board_temp_c: env_f32("MUJINA_BZM2_MAX_BOARD_TEMP_C"),
+            max_input_power_w: env_f32("MUJINA_BZM2_MAX_INPUT_POWER_W"),
+            // A DEFAULT, and a safe one to default: the lowest commanded fan
+            // speed we have measured on this chassis is ~1,050 rpm at 25 %
+            // duty, and a fan whose gate is shut free-runs at ~5,430 rpm
+            // (both measured on hardware). 300 rpm is below every state a working
+            // fan can be in, so this cannot fire on a healthy machine -- it
+            // fires on one that is stalling. Zero rpm needs no threshold and
+            // is caught without this.
+            min_fan_rpm: env_f32("MUJINA_BZM2_MIN_FAN_RPM")
+                .map(|v| v.max(0.0) as u32)
+                .or(Some(DEFAULT_MIN_FAN_RPM)),
+            // NOT defaulted, and reported as unarmed. We have no measured
+            // ceiling for a regulator output, and a number chosen to look
+            // reasonable is the same error as a board limit taken from a
+            // three-board figure: it would fire on the wrong evidence.
+            max_rail_v: env_f32("MUJINA_BZM2_MAX_RAIL_V"),
         }
+    }
+
+    /// Limits this board is NOT protected by, for the caller to say out loud.
+    ///
+    /// `is_enabled()` answers "will this publish telemetry", which is not the
+    /// same question as "is anything protecting this board" and was being read
+    /// as though it were. Since the fan list gained defaults, `is_enabled()` is
+    /// unconditionally true -- so the monitor spawns, publishes fans, and
+    /// evaluates trips that may all be unconfigured. Protection that looks
+    /// present from the outside is the worst of the three states.
+    pub(super) fn unarmed_limits(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.max_asic_temp_c.is_none() {
+            out.push("ASIC temperature");
+        }
+        if self.max_board_temp_c.is_none() {
+            out.push("board temperature");
+        }
+        if self.max_rail_v.is_none() {
+            out.push("rail over-voltage");
+        }
+        // Board current has no entry here because it has no sensor to be
+        // unarmed against: opcode 20 and opcode 42 both return rail
+        // millivolts, not current, so per-board current is NOT READABLE
+        // rather than unconfigured. Listing it as "unset" would imply setting
+        // it would help.
+        if self.max_input_power_w.is_none() {
+            out.push("input power");
+        }
+        out
+    }
+
+    /// Does any trip exist at all? Distinct from [`Self::is_enabled`].
+    pub(super) fn any_trip_armed(&self) -> bool {
+        self.max_asic_temp_c.is_some()
+            || self.max_board_temp_c.is_some()
+            || self.max_input_power_w.is_some()
     }
 
     /// Whether telemetry will be PUBLISHED. Says nothing about protection --
@@ -106,6 +189,9 @@ impl Bzm2TelemetryConfig {
             || self.input_voltage.is_some()
             || self.input_current.is_some()
             || self.input_power.is_some()
+            || self.max_asic_temp_c.is_some()
+            || self.max_board_temp_c.is_some()
+            || self.max_input_power_w.is_some()
     }
 
     pub(super) fn snapshot(&self) -> Bzm2TelemetrySnapshot {
@@ -174,11 +260,73 @@ impl Bzm2TelemetryConfig {
         } else {
             Vec::new()
         };
+
+        let trip_reason = self.trip_reason(board_temp, power_w);
+        let blind = self.blind_limits(board_temp, power_w);
         Bzm2TelemetrySnapshot {
             fans,
             temperatures,
             powers,
+            trip_reason,
+            blind,
         }
+    }
+
+    /// Limits that are configured but had no reading this cycle.
+    ///
+    /// THE TRIP USED TO FAIL OPEN, and this is the missing fact that let it.
+    /// `trip_reason` is three `if let (Some(limit), Some(value))` arms over a
+    /// bare `None` fall-through, and every value comes from a read that turns
+    /// an I/O error, a vanished node, a permissions change or unparseable
+    /// content into `None` with no log and no counter. The sole consumer reads
+    /// `Some` as "shut everything down" and `None` as "keep mining", so a
+    /// sensor that stopped answering and a sensor answering safely were the
+    /// same value at the call site: a limit could be configured, its sensor
+    /// could disappear, and the machine would mine on with the protection
+    /// silently gone.
+    ///
+    /// Our own rule is the opposite of that -- no sample inside the window is a
+    /// TRIP, not a pass -- and it is stated here as a separate fact rather than
+    /// folded into `trip_reason` because the two need different policies. An
+    /// over-limit reading is true now. Blindness has to persist before it means
+    /// anything, or one dropped read halts a 3 kW machine; the monitor holds
+    /// that policy because the monitor is what has a loop.
+    ///
+    /// The die ceiling is absent for the reason given on [`Self::trip_reason`]:
+    /// its sensor is not a file, so its blindness is not measurable from here
+    /// and the monitor computes it from the DTS rows instead.
+    fn blind_limits(&self, _board_temp: Option<f32>, input_power_w: Option<f32>) -> Vec<String> {
+        let mut out = Vec::new();
+        for (limit, value, what) in [(self.max_input_power_w, input_power_w, "input power")] {
+            if limit.is_some() && value.is_none() {
+                out.push(what.to_string());
+            }
+        }
+        out
+    }
+
+    /// Trips this file can evaluate: the ones whose sensor is a sysfs read.
+    ///
+    /// THE DIE CEILING IS NOT HERE, deliberately. `max_asic_temp_c` is still
+    /// the config home for the number, but the sensor that answers it is the
+    /// per-ASIC DTS stream the hash threads publish into `BoardTelemetry`, not
+    /// a file. Evaluating it here meant evaluating it against
+    /// `MUJINA_BZM2_ASIC_TEMP_PATH` -- a path nothing in this tree sets and
+    /// which does not exist on this platform -- so the one limit armed by
+    /// default was permanently blind, and every run tripped itself
+    /// at 45 s on a board that was never measured. `board/bzm2/abort.rs` owns
+    /// every condition computed from published telemetry; this owns the ones
+    /// computed from sysfs. A limit lives in exactly one of the two.
+    fn trip_reason(&self, _board_temp: Option<f32>, input_power_w: Option<f32>) -> Option<String> {
+        if let (Some(limit), Some(value)) = (self.max_input_power_w, input_power_w)
+            && value > limit
+        {
+            return Some(format!(
+                "Input power {:.1}W exceeded limit {:.1}W",
+                value, limit
+            ));
+        }
+        None
     }
 }
 
@@ -209,6 +357,11 @@ pub(super) struct Bzm2TelemetrySnapshot {
     pub(super) fans: Vec<Fan>,
     pub(super) temperatures: Vec<TemperatureSensor>,
     pub(super) powers: Vec<PowerMeasurement>,
+    pub(super) trip_reason: Option<String>,
+    /// Configured limits with no reading this cycle. Empty is the healthy case;
+    /// a non-empty list means protection is ABSENT for those limits, which is
+    /// not the same as protection reporting nothing to worry about.
+    pub(super) blind: Vec<String>,
 }
 
 pub(super) fn publish_thread_status(
@@ -629,6 +782,169 @@ mod tests {
         for path in rpm_paths.into_iter().chain(duty_paths) {
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn telemetry_trip_detects_thresholds() {
+        let telemetry = Bzm2TelemetryConfig {
+            max_input_power_w: Some(1200.0),
+            ..Default::default()
+        };
+        assert!(
+            telemetry
+                .trip_reason(None, Some(1250.0))
+                .unwrap()
+                .contains("Input power")
+        );
+        assert!(telemetry.trip_reason(None, Some(1100.0)).is_none());
+    }
+
+    /// THE DIE CEILING IS NOT EVALUATED HERE, and that is the fix rather than
+    /// an omission. Its sensor is the DTS stream, not a file, so a config
+    /// carrying the limit and no sysfs reading must report NOTHING from this
+    /// file -- neither a trip nor a blindness. Reporting blindness is exactly
+    /// what tripped every run at 45 s.
+    #[test]
+    fn the_die_ceiling_is_not_a_sysfs_limit_and_is_never_blind_here() {
+        let telemetry = Bzm2TelemetryConfig {
+            max_asic_temp_c: Some(80.0),
+            ..Default::default()
+        };
+        assert!(telemetry.trip_reason(None, None).is_none());
+        assert!(
+            telemetry.blind_limits(None, None).is_empty(),
+            "an armed die ceiling must not read as a blind SYSFS limit"
+        );
+    }
+
+    /// A configured limit whose sensor says nothing is NOT a limit within range.
+    ///
+    /// The old test passed `None` against a configured limit and asserted
+    /// nothing about it, so the fail-open behaviour had a test walk straight
+    /// past it. These assert the distinction that was missing: `trip_reason`
+    /// still reports only genuine over-limits, and blindness is reported
+    /// separately so the monitor can require it to persist.
+    #[test]
+    fn a_configured_limit_with_no_reading_is_reported_blind() {
+        let telemetry = Bzm2TelemetryConfig {
+            max_input_power_w: Some(1200.0),
+            ..Default::default()
+        };
+        // Configured, not readable: blind.
+        let blind = telemetry.blind_limits(None, None);
+        assert_eq!(blind.len(), 1, "got {blind:?}");
+        assert!(blind.iter().any(|b| b.contains("input power")));
+        // And it is NOT a trip on its own -- one dropped read must not halt a
+        // 3 kW machine. The monitor requires it to persist.
+        assert!(telemetry.trip_reason(None, None).is_none());
+        // Readable and within limits: nothing blind, nothing tripped.
+        assert!(telemetry.blind_limits(None, Some(900.0)).is_empty());
+        // A limit that is NOT configured cannot be blind: there is no
+        // protection for a missing reading to disarm.
+        let unconfigured = Bzm2TelemetryConfig::default();
+        assert!(unconfigured.blind_limits(None, None).is_empty());
+        // One readable, one not: only the unreadable one is blind.
+        let partial = telemetry.blind_limits(None, None);
+        assert_eq!(partial.len(), 1, "got {partial:?}");
+        assert!(partial[0].contains("input power"));
+    }
+
+    /// A TRIP IS A LIMIT AND A SENSOR. This is the gate for the class.
+    ///
+    /// The defect this exists to prevent shipped and ran: `max_asic_temp_c`
+    /// was armed by default, its sensor was bound to a sysfs path nothing in
+    /// this tree sets, and the pair was never checked together. The limit
+    /// could not be measured, blindness is a trip, and every run
+    /// stopped itself at 45 s on a board that was never over temperature.
+    ///
+    /// The old test asserted `max_asic_temp_c.is_some()` and passed the whole
+    /// time -- it checked the half that was easy to check. This checks the
+    /// pair, for every limit this file evaluates. The die ceiling is absent
+    /// because this file no longer evaluates it; `abort.rs` does, from the
+    /// DTS rows, and its own tests hold that end.
+    #[test]
+    fn no_sysfs_limit_is_armed_without_a_sensor_to_answer_it() {
+        let cfg = Bzm2TelemetryConfig::from_env();
+        let power_readable = cfg.input_power.is_some()
+            || (cfg.input_voltage.is_some() && cfg.input_current.is_some());
+        // Board temperature is absent for the same reason the die ceiling is:
+        // its sensor is the board MCU's platform-thermal channels, published by
+        // the heartbeat, not a file. `abort.rs` owns it.
+        for (armed, readable, what) in [(
+            cfg.max_input_power_w.is_some(),
+            power_readable,
+            "input power",
+        )] {
+            assert!(
+                !armed || readable,
+                "{what} is armed with no sensor bound to answer it. An armed limit \
+                 nothing can measure is not protection -- it is a guaranteed \
+                 blindness trip. Bind the sensor or do not arm the limit."
+            );
+        }
+    }
+
+    /// The ordinary way to run this driver must not be unprotected.
+    ///
+    /// The only variable required to mine is the serial path. Before this, that
+    /// binary had no thermal trip, no over-power trip, and said nothing about
+    /// either -- and once the fan list gained defaults it also spawned a
+    /// monitor, so it looked protected from outside.
+    #[test]
+    fn a_default_config_has_a_thermal_trip() {
+        let telemetry = Bzm2TelemetryConfig::from_env();
+        assert!(
+            telemetry.max_asic_temp_c.is_some(),
+            "a default build must carry a die temperature limit"
+        );
+        assert!(
+            telemetry.any_trip_armed(),
+            "a default build must have at least one trip armed"
+        );
+        // And the limits that are genuinely unknowable from here are REPORTED
+        // rather than silently absent: they are chassis properties and this
+        // file knows about a hashboard.
+        let unarmed = telemetry.unarmed_limits();
+        assert!(unarmed.contains(&"board temperature"), "got {unarmed:?}");
+        assert!(unarmed.contains(&"input power"), "got {unarmed:?}");
+        assert!(!unarmed.contains(&"ASIC temperature"), "got {unarmed:?}");
+    }
+
+    /// Publishing telemetry is not the same question as being protected, and
+    /// reading one for the other is how a monitor that cannot fire looked fine.
+    #[test]
+    fn publishing_is_not_protection() {
+        let publishes_nothing_armed = Bzm2TelemetryConfig {
+            max_asic_temp_c: None,
+            max_board_temp_c: None,
+            max_input_power_w: None,
+            ..Default::default()
+        };
+        assert!(!publishes_nothing_armed.any_trip_armed());
+        let unarmed = publishes_nothing_armed.unarmed_limits();
+        assert_eq!(unarmed.len(), 4, "got {unarmed:?}");
+        assert!(unarmed.contains(&"rail over-voltage"), "got {unarmed:?}");
+    }
+
+    /// The snapshot must carry it, or the monitor cannot act on it.
+    #[test]
+    fn the_snapshot_carries_blindness() {
+        // Input power: the last limit whose sensor really is a file.
+        let telemetry = Bzm2TelemetryConfig {
+            max_input_power_w: Some(1200.0),
+            ..Default::default()
+        };
+        // No sensor paths are configured, so every read returns None -- which
+        // is exactly the shape of a node that has vanished.
+        let snap = telemetry.snapshot();
+        assert!(
+            !snap.blind.is_empty(),
+            "a configured limit with no sensor must reach the monitor as blind"
+        );
+        assert!(
+            snap.trip_reason.is_none(),
+            "blindness is not itself an over-limit"
+        );
     }
 
     #[test]
