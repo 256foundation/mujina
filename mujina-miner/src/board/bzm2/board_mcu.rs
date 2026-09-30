@@ -251,6 +251,7 @@ impl<I: I2c> Bzm2BoardMcu<I> {
     #[cfg(test)]
     async fn state(&mut self) -> Result<BoardState, BoardMcuError> {
         Ok(BoardState {
+            power: PowerStatus(self.query(Query::PowerStatus, 0).await?),
             rail_millivolts: self.query(Query::VddTotal, 0).await?,
             inlet: ThermalReading(self.query(Query::PlatformThermal, THERMAL_INLET).await?),
             outlet: ThermalReading(self.query(Query::PlatformThermal, THERMAL_OUTLET).await?),
@@ -380,6 +381,8 @@ pub struct BoardIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(test)]
 pub struct BoardState {
+    /// Power flags, as read.
+    pub power: PowerStatus,
     /// Board rail voltage in millivolts.
     ///
     /// Near zero is a measurement, not a failure: it is what a board with its
@@ -391,6 +394,79 @@ pub struct BoardState {
     /// Outlet platform thermal channel.
     pub outlet: ThermalReading,
 }
+
+/// The MCU's power flags.
+///
+/// Holds the word the MCU returned and computes each flag from it, so there is
+/// no second copy of a flag to fall out of step with the word it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerStatus(u16);
+
+impl PowerStatus {
+    /// Build one from the two-byte word the MCU returned.
+    ///
+    /// Public so the actuator can verify a power-down through the same decode
+    /// the sensor layer uses. One decode, one home: a second reading of these
+    /// flags would be free to disagree with this one, and the flag layout has
+    /// already been wrong once -- engine power was read as bit 1 when it is the
+    /// high BYTE, and it reported false unconditionally.
+    pub fn from_raw(word: u16) -> Self {
+        Self(word)
+    }
+
+    /// Whether the board's LDO/board power is on.
+    ///
+    /// The bit this reads has not been confirmed against a board observed
+    /// once with its rails known down and once with them known up, so until
+    /// that check exists this is a reading of the interface rather than of
+    /// the board, and must not carry a safety decision. [`raw`] is the part
+    /// of this type that is only a measurement.
+    ///
+    /// [`raw`]: Self::raw
+    pub fn board_power_on(self) -> bool {
+        self.0 & FLAG_BOARD_POWER != 0
+    }
+
+    /// Whether engine power is on. Carries the same caveat as
+    /// [`board_power_on`](Self::board_power_on).
+    pub fn engine_power_on(self) -> bool {
+        self.0 & FLAG_ENGINE_POWER != 0
+    }
+
+    /// The word as received, including any bits this module does not decode.
+    #[cfg(test)]
+    pub fn raw(self) -> u16 {
+        self.0
+    }
+}
+
+/// Board/LDO power in the power-status word.
+///
+/// The two flags are ONE PER BYTE, not adjacent bits: the reply decodes as
+/// `board | (engine << 8)`, so a fully powered board reads `0x0101` and a dark
+/// one reads `0x0000`. Each byte only ever holds 0 or 1.
+const FLAG_BOARD_POWER: u16 = 1 << 0;
+
+/// Engine power in the power-status word -- the HIGH byte. See [`FLAG_BOARD_POWER`].
+///
+/// This was `1 << 1` until 2026-09-16. Because the low byte only ever holds 0
+/// or 1, bit 1 is never set, so `engine_power_on()` returned false
+/// UNCONDITIONALLY -- and it failed in the DANGEROUS direction: "engine power is
+/// off" is exactly what a shutdown verification wants to hear, so a killswitch
+/// checking this would have passed against a board whose engines were still
+/// energised.
+const FLAG_ENGINE_POWER: u16 = 1 << 8;
+
+/// What a fully powered board reports, and what a dark one reports.
+///
+/// Named because the killswitch verifies against these directly, and a
+/// bare `0x0101` in a stop path is the kind of constant that gets mistyped once
+/// and never noticed.
+#[cfg(test)]
+pub const POWER_STATUS_ALL_ON: u16 = 0x0101;
+/// See [`POWER_STATUS_ALL_ON`].
+#[cfg(test)]
+pub const POWER_STATUS_ALL_OFF: u16 = 0x0000;
 
 /// One platform thermal channel, as the MCU reports it.
 ///
@@ -545,6 +621,9 @@ enum Query {
     PlatformThermal = 6,
     /// Pop one entry from the fault queue. See `Bzm2BoardMcu::take_fault`.
     Error = 7,
+    /// Board and engine power flags.
+    #[cfg(test)]
+    PowerStatus = 17,
     /// The board's position identifier in the stack.
     StackId = 18,
     /// Board rail voltage, millivolts.
@@ -622,6 +701,29 @@ mod tests {
     const ALLOWED_OPCODES: [u8; 8] = [1, 6, 7, 17, 18, 23, 41, 44];
 
     #[tokio::test]
+    async fn a_query_is_a_two_byte_selector_and_a_two_byte_reply() {
+        let mut mcu = Bzm2BoardMcu::new(FakeMcu::new().answering(23, 0, [0x34, 0x12]));
+
+        let state = mcu.read_state().await.unwrap().present().unwrap();
+
+        assert_eq!(
+            mcu.bus.log[1],
+            Transaction::WriteRead {
+                addr: 0x76,
+                wrote: vec![23, 0],
+                read_len: 2,
+            }
+        );
+        // 0x34 arrived first and is the low half: 0x1234 == 4660.
+        assert_eq!(state.rail_millivolts, 4660);
+        assert_eq!(
+            mcu.bus.log.len(),
+            4,
+            "a state sample costs the transactions read_state documents"
+        );
+    }
+
+    #[tokio::test]
     async fn information_splits_into_firmware_board_and_protocol_revisions() {
         // 0xad == 0b1010_1101 -> revision 0b101011 (43), protocol 0b01 (1).
         let mut mcu = Bzm2BoardMcu::new(FakeMcu::new().answering(1, 0, [0x2a, 0xad]).answering(
@@ -651,6 +753,37 @@ mod tests {
         assert_eq!(state.inlet.raw(), 16);
         assert_eq!(state.outlet.raw(), 32);
         assert_eq!(mcu.bus.params_for(6), vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn power_flags_are_computed_from_the_word() {
+        // The reply is [board_byte, engine_byte], little-endian -- one flag per
+        // byte.
+        for (word, board, engine) in [
+            ([0x00, 0x00], false, false),
+            ([0x01, 0x00], true, false),
+            ([0x00, 0x01], false, true),
+            ([0x01, 0x01], true, true),
+        ] {
+            let mut mcu = Bzm2BoardMcu::new(FakeMcu::new().answering(17, 0, word));
+            let state = mcu.read_state().await.unwrap().present().unwrap();
+
+            assert_eq!(state.power.board_power_on(), board, "word {word:?}");
+            assert_eq!(state.power.engine_power_on(), engine, "word {word:?}");
+            assert_eq!(state.power.raw(), u16::from_le_bytes(word));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dark_board_reports_a_zero_rail_rather_than_an_error() {
+        // Every query answers zero, which is what a board with its rails down
+        // looks like.
+        let mut mcu = Bzm2BoardMcu::new(FakeMcu::new());
+
+        let state = mcu.read_state().await.unwrap().present().unwrap();
+
+        assert_eq!(state.rail_millivolts, 0);
+        assert!(!state.power.board_power_on());
     }
 
     #[tokio::test]
@@ -919,6 +1052,42 @@ mod tests {
                 wrote[0]
             );
         }
+    }
+
+    #[test]
+    fn power_status_flags_are_one_per_byte_not_adjacent_bits() {
+        // Expected values come from the WIRE LAYOUT -- two bytes, little-endian,
+        // board flag in the low byte and engine flag in the high byte -- not
+        // from the constants under test.
+        let on = PowerStatus(u16::from_le_bytes([1, 1]));
+        assert!(on.board_power_on(), "board flag is the low byte");
+        assert!(on.engine_power_on(), "engine flag is the HIGH byte");
+        assert_eq!(on.raw(), POWER_STATUS_ALL_ON);
+
+        let off = PowerStatus(u16::from_le_bytes([0, 0]));
+        assert!(!off.board_power_on());
+        assert!(!off.engine_power_on());
+        assert_eq!(off.raw(), POWER_STATUS_ALL_OFF);
+
+        // The half-states the MCU can genuinely be in. The first is the one the
+        // old `1 << 1` decode could never see, and not seeing it reads as
+        // "engines are off".
+        let engine_only = PowerStatus(u16::from_le_bytes([0, 1]));
+        assert!(!engine_only.board_power_on());
+        assert!(
+            engine_only.engine_power_on(),
+            "engines up with the board flag clear must be visible"
+        );
+
+        let board_only = PowerStatus(u16::from_le_bytes([1, 0]));
+        assert!(board_only.board_power_on());
+        assert!(!board_only.engine_power_on());
+
+        // Bit 1 must decode as nothing: it is what the old constant read, and
+        // the low byte never sets it.
+        let stray = PowerStatus(0b10);
+        assert!(!stray.board_power_on());
+        assert!(!stray.engine_power_on(), "bit 1 is not a flag");
     }
 
     #[test]

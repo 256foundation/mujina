@@ -21,11 +21,14 @@ use telemetry::{merge_power_readings, merge_temperature_readings};
 
 pub mod board_heartbeat;
 pub mod board_mcu;
+pub mod board_power;
 mod bringup;
 mod calibration;
 mod config;
+pub mod fans;
 mod monitor;
 pub mod platform;
+mod post;
 mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -285,6 +288,153 @@ impl Bzm2Board {
         }
     }
 
+    /// Power-on self test: compare this machine against what its variant says
+    /// it should be, and let the DECLARATION decide whether to start.
+    ///
+    /// This used to decide its own policy: absent fan nodes warned, present
+    /// ones that would not turn refused. That heuristic was invented here, and
+    /// it could not express the case that matters — an immersion chassis has
+    /// no fans *by design*, and from a probe that is identical to an
+    /// air-cooled machine with four dead ones. The difference is not
+    /// observable; it is declared. See `board/bzm2/post.rs`.
+    ///
+    /// No retry. A fan that did not turn when told to is a mechanical or
+    /// control fault, and a retry converts a hard fault into an intermittent
+    /// one and loses the evidence.
+    async fn power_on_self_test(&self) -> AnyhowResult<()> {
+        let def =
+            match post::PlatformDef::parse(include_str!("../../../../platforms/rds-dvt2.json")) {
+                Ok(def) => def,
+                Err(err) => {
+                    // The definition is compiled in, so this is a build-time
+                    // mistake reaching runtime. Refuse: a POST that cannot read
+                    // its own contract has no verdict to give, and proceeding
+                    // would be proceeding unjudged.
+                    return Err(anyhow::anyhow!(
+                        "platform definition did not parse, so this machine cannot be judged \
+                     against anything: {err}"
+                    ));
+                }
+            };
+        let variant = std::env::var("MUJINA_BZM2_VARIANT")
+            .unwrap_or_else(|_| def.default_variant().to_string());
+
+        let fans = fans::Bzm2Fans::new(platform::DEFAULT);
+        // EXPORT BEFORE PROBING. Without this the fan paths do not exist on a
+        // freshly booted unit, every fan reads absent, and the POST blocks a
+        // healthy machine for a reason that is ours rather than the rig's.
+        fans.ensure_exported().await;
+        let mut observed = Vec::new();
+
+        // Fans, commanded to FULL and confirmed by TACHO -- the only witness
+        // available, because the gate node is write-only and the duty node
+        // echoes writes whether or not they drive anything.
+        if fans.count() > 0 && fans.any_present().await {
+            info!(
+                fans = fans.count(),
+                expect_rpm = platform::DEFAULT.fan_rpm_at_full / 2,
+                settle_s = fans::SETTLE.as_secs(),
+                %variant,
+                "POST: commanding every fan to FULL and reading the tacho back"
+            );
+            // COMMANDED FULL MEANS CONFIRMED NEAR FULL.
+            //
+            // The floor used here was DEFAULT_MIN_FAN_RPM, 300 -- a runtime
+            // stall threshold, and the wrong question for a preflight that
+            // commands 100 %. Measured 2026-09-22: a fan whose PWM channel was
+            // never enabled sat at 1,020 rpm under a 100 % duty and PASSED,
+            // because 1,020 clears 300 comfortably. It was delivering 15 % of
+            // what it had been asked for.
+            //
+            // Half of the measured full speed: generous enough for fan-to-fan
+            // spread and a warm chassis, tight enough that a channel which is
+            // not actually driving cannot pass.
+            let expect_rpm = platform::DEFAULT.fan_rpm_at_full / 2;
+            for outcome in fans.command_all_and_measure(100).await {
+                let (state, detail) = match outcome.measured_rpm {
+                    Some(rpm) if outcome.confirmed(expect_rpm) => {
+                        (post::State::Present, format!("{rpm} rpm"))
+                    }
+                    Some(rpm) => (
+                        post::State::Failed,
+                        format!(
+                            "{rpm} rpm at 100% duty, under the {expect_rpm} rpm this chassis \
+                             should reach; the channel may not be driving"
+                        ),
+                    ),
+                    None => (post::State::Failed, "tacho UNREADABLE".to_string()),
+                };
+                observed.push(post::Observation {
+                    kind: "fan".into(),
+                    index: outcome.index,
+                    parent_index: None,
+                    state,
+                    detail,
+                });
+            }
+        } else {
+            // Nothing answered. Whether that is a fault or the shape of the
+            // machine is the declaration's call, not ours.
+            for index in 0..fans.count() {
+                observed.push(post::Observation {
+                    kind: "fan".into(),
+                    index,
+                    parent_index: None,
+                    state: post::State::Absent,
+                    detail: "no fan node on this host".into(),
+                });
+            }
+        }
+
+        info!(
+            class = %def.class,
+            %variant,
+            variant_title = def.variant_title(&variant).unwrap_or("UNKNOWN"),
+            platform = %def.title,
+            "POST: judging this machine against its declared fitment"
+        );
+        let findings = def.evaluate(&variant, &observed)?;
+        for f in &findings {
+            let line = format!(
+                "POST {}: {} {} is {} — {} ({})",
+                f.verdict.label(),
+                f.kind,
+                f.index,
+                f.state.label(),
+                f.detail,
+                f.why
+            );
+            match f.verdict {
+                post::Verdict::Block => error!(variant = %variant, "{line}"),
+                post::Verdict::Warn => warn!(variant = %variant, "{line}"),
+                post::Verdict::Note => info!(variant = %variant, "{line}"),
+            }
+        }
+        match post::worst(&findings) {
+            Some(post::Verdict::Block) => Err(anyhow::anyhow!(
+                "POST BLOCKED the start: {} finding(s) against variant {variant} of {}, \
+                 {} of them blocking. Change the variant if this machine is a different \
+                 configuration; do not retry.",
+                findings.len(),
+                def.class,
+                findings
+                    .iter()
+                    .filter(|f| f.verdict == post::Verdict::Block)
+                    .count(),
+            )),
+            other => {
+                info!(
+                    variant = %variant,
+                    class = %def.class,
+                    findings = findings.len(),
+                    worst = other.map(|v| v.label()).unwrap_or("clean"),
+                    "POST passed"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Empty each board's MCU fault queue and record what was in it.
     ///
     /// NEVER FAILS THE BRING-UP. A fault the board queued before we arrived is
@@ -431,6 +581,46 @@ impl Bzm2Board {
     async fn create_hash_threads(&mut self) -> AnyhowResult<Vec<Box<dyn HashThread>>> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
+        // JUDGE THE MACHINE AGAINST ITS DECLARATION BEFORE MAKING HEAT.
+        //
+        // Runs before the rails, because a fan that will not turn is a reason
+        // not to energise at all -- and because this is the one moment the
+        // check is free: nothing is hot yet, so a refusal costs a cold start
+        // rather than a run.
+        //
+        // Commanded and CONFIRMED BY TACHO, not by the write returning Ok.
+        // The gate node is write-only and the duty node echoes whatever was
+        // written whether or not it drives anything, so the tachometer is the
+        // only witness available.
+        // NEVER WALK AWAY FROM AN ENERGISED BOARD.
+        //
+        // In a handover the vendor stack has already powered the boards and is
+        // gone, and nothing is beating their MCUs yet. A POST refusal used to
+        // return straight out of here: no heartbeat, no monitor, no ladder, and
+        // fans left at the POST's 100 % -- the board kept energised only until
+        // its MCU shed it 74-80 s later, unwatched the whole time.
+        //
+        // So a refusal de-energises, through the same path the scram uses --
+        // heartbeat first (there is none yet), then opcode 14 and a rail read
+        // from the MCU's ADC -- proved on hardware. On a
+        // cold start the boards are already dark and it reports so. A false
+        // refusal costs nothing extra: without a heartbeat the board was going
+        // to shed anyway, and this only removes the unmonitored interval.
+        if let Err(post_refusal) = self.power_on_self_test().await {
+            error!(
+                board = %self.config.device_id(),
+                error = %post_refusal,
+                "POST refused the start. De-energising now rather than leaving the boards \
+                 to shed on their own, unmonitored, 74-80 s from the last heartbeat."
+            );
+            monitor::scram(
+                &self.config.device_id(),
+                &None,
+                &self.driven_board_indices(),
+            )
+            .await;
+            return Err(post_refusal);
+        }
         // READ THE BOARD'S FAULT HISTORY BEFORE WE CAUSE ANY OF IT.
         //
         // The stock stack fetches MCU error and resets the MCU to init during
@@ -794,6 +984,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_hash_threads_applies_bringup_and_shutdown_sequences() {
+        // THIS IS A BENCH, AND THE VARIANT HAS TO SAY SO.
+        //
+        // The POST judges against rds-dvt2's default variant, air-3b, which
+        // declares four fans that must turn. A workstation has none, and the
+        // whole point of post.rs is that absent-by-design and absent-by-fault
+        // are indistinguishable from a probe -- so a test host declares
+        // itself rather than being guessed at.
+        unsafe { std::env::set_var("MUJINA_BZM2_VARIANT", "bench") };
         let pty = openpty(None, None).unwrap();
         let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
             .unwrap()
@@ -910,6 +1108,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_hash_threads_publishes_rail_telemetry() {
+        // THIS IS A BENCH, AND THE VARIANT HAS TO SAY SO.
+        //
+        // The POST judges against rds-dvt2's default variant, air-3b, which
+        // declares four fans that must turn. A workstation has none, and the
+        // whole point of post.rs is that absent-by-design and absent-by-fault
+        // are indistinguishable from a probe -- so a test host declares
+        // itself rather than being guessed at.
+        unsafe { std::env::set_var("MUJINA_BZM2_VARIANT", "bench") };
         let pty = openpty(None, None).unwrap();
         let serial_path = fs::read_link(format!("/proc/self/fd/{}", pty.slave.as_raw_fd()))
             .unwrap()

@@ -126,6 +126,19 @@ impl Bzm2Platform {
         (0..self.board_count).find(|&index| self.chain_port(index).as_deref() == Some(path))
     }
 
+    /// Paths for one fan, or `None` past the last fan.
+    pub fn fan_paths(&self, fan: usize) -> Option<FanPaths> {
+        (fan < self.fan_count).then(|| {
+            let at = |pat: &str| PathBuf::from(pat.replace("{}", &fan.to_string()));
+            FanPaths {
+                duty: at(self.fan_duty_pattern),
+                period: at(self.fan_period_pattern),
+                gate: at(self.fan_gate_pattern),
+                tacho: at(self.fan_tacho_pattern),
+            }
+        })
+    }
+
     /// The chain UART for one board, or `None` past the last board.
     pub fn chain_port(&self, board_index: usize) -> Option<PathBuf> {
         (board_index < self.board_count).then(|| {
@@ -135,6 +148,15 @@ impl Bzm2Platform {
             )
         })
     }
+}
+
+/// Where one fan's four control nodes live.
+#[derive(Debug, Clone)]
+pub struct FanPaths {
+    pub duty: PathBuf,
+    pub period: PathBuf,
+    pub gate: PathBuf,
+    pub tacho: PathBuf,
 }
 
 /// RDS 2.0 control board: Cyclone V, three hashboards.
