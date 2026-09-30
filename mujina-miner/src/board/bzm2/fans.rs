@@ -404,3 +404,115 @@ mod tests {
         assert_eq!(181 * RDS_2_0.fan_rpm_per_count, 5_430);
     }
 }
+
+/// What the fan loop is trying to hold, and the bounds it may not leave.
+#[derive(Debug, Clone, Copy)]
+pub struct ThermalFanConfig {
+    /// Die temperature the loop aims to hold.
+    pub target_c: f32,
+    /// Below `target_c - band_c` the loop may ease off; above `target_c` it
+    /// pushes. The band exists so the fans are not hunting either side of a
+    /// single number.
+    pub band_c: f32,
+    /// Never command below this.
+    ///
+    /// NOT ZERO, and not a comfort setting. With the gate shut these fans
+    /// free-run at about 5,430 rpm while 25% duty gives about 1,050 — so a low
+    /// commanded duty is *worse* than no control at all, and a floor is what
+    /// stops the loop being actively harmful at idle.
+    pub min_duty_pct: u8,
+    pub max_duty_pct: u8,
+}
+
+impl Default for ThermalFanConfig {
+    fn default() -> Self {
+        Self {
+            // Conservative against the 115 °C the on-die trip is armed at, and
+            // against the 59-80 °C the vendor stack runs these dies at under
+            // load. Sits below both with room to respond.
+            target_c: 75.0,
+            band_c: 8.0,
+            min_duty_pct: 40,
+            max_duty_pct: 100,
+        }
+    }
+}
+
+/// Choose a fan duty from the hottest die we can see.
+///
+/// PURE, so the policy can be argued with in tests rather than on a 3 kW
+/// machine. Proportional with clamps, deliberately NOT a PID: an integral term
+/// needs the thermal time constants of this chassis and we have not measured
+/// them, and an integrator tuned by guesswork on a machine with a ten-minute
+/// thermal mass is how you build an oscillator. We now log per-ASIC die
+/// temperature at 1 Hz, so those constants are measurable and this can become
+/// a PID once they are.
+///
+/// **`None` means full.** Not the last value, not the floor — full. The fans
+/// free-run slower than they run commanded, so "we cannot see the dies" must
+/// not resolve to "leave things as they are".
+pub fn duty_for(hottest_c: Option<f32>, cfg: &ThermalFanConfig) -> u8 {
+    let Some(hot) = hottest_c else {
+        return cfg.max_duty_pct;
+    };
+    if !hot.is_finite() {
+        return cfg.max_duty_pct;
+    }
+    let span = cfg.band_c.max(0.1);
+    // 0.0 at the bottom of the band, 1.0 at the target and beyond.
+    let demand = ((hot - (cfg.target_c - span)) / span).clamp(0.0, 1.0);
+    let lo = f32::from(cfg.min_duty_pct);
+    let hi = f32::from(cfg.max_duty_pct.max(cfg.min_duty_pct));
+    (lo + demand * (hi - lo)).round().clamp(0.0, 100.0) as u8
+}
+
+#[cfg(test)]
+mod thermal_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_temperature_means_full_not_last_and_not_floor() {
+        // THE SAFETY PROPERTY. These fans free-run slower than they run
+        // commanded, so "we cannot see the dies" must never resolve to
+        // "leave things alone" or to the floor.
+        let cfg = ThermalFanConfig::default();
+        assert_eq!(duty_for(None, &cfg), cfg.max_duty_pct);
+        assert_eq!(duty_for(Some(f32::NAN), &cfg), cfg.max_duty_pct);
+        assert_eq!(duty_for(Some(f32::INFINITY), &cfg), cfg.max_duty_pct);
+    }
+
+    #[test]
+    fn it_never_commands_below_the_floor_however_cold() {
+        // A low duty is worse than no control: 25% gives about 1,050 rpm
+        // against roughly 5,430 free-running.
+        let cfg = ThermalFanConfig::default();
+        for c in [-40.0, 0.0, 20.0, 50.0] {
+            assert_eq!(duty_for(Some(c), &cfg), cfg.min_duty_pct, "at {c} C");
+        }
+    }
+
+    #[test]
+    fn it_reaches_full_at_and_above_target() {
+        let cfg = ThermalFanConfig::default();
+        assert_eq!(duty_for(Some(cfg.target_c), &cfg), cfg.max_duty_pct);
+        assert_eq!(duty_for(Some(cfg.target_c + 30.0), &cfg), cfg.max_duty_pct);
+        // And well before the on-die trip at 115 C, which must never be the
+        // thing that saves us.
+        assert_eq!(duty_for(Some(110.0), &cfg), cfg.max_duty_pct);
+    }
+
+    #[test]
+    fn it_rises_monotonically_across_the_band() {
+        // No dips: a hotter die must never ask for less air than a cooler one.
+        let cfg = ThermalFanConfig::default();
+        let mut last = 0u8;
+        let mut c = cfg.target_c - cfg.band_c - 5.0;
+        while c <= cfg.target_c + 5.0 {
+            let d = duty_for(Some(c), &cfg);
+            assert!(d >= last, "duty fell from {last} to {d} at {c} C");
+            last = d;
+            c += 0.5;
+        }
+        assert_eq!(last, cfg.max_duty_pct);
+    }
+}

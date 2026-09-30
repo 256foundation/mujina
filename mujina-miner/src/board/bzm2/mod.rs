@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
@@ -92,6 +93,8 @@ pub struct Bzm2Board {
     monitor_task: Option<JoinHandle<()>>,
     heartbeat_shutdown: Option<watch::Sender<bool>>,
     heartbeat_tasks: Vec<JoinHandle<()>>,
+    fan_shutdown: Option<watch::Sender<bool>>,
+    fan_task: Option<JoinHandle<()>>,
 }
 
 impl Bzm2Board {
@@ -107,7 +110,118 @@ impl Bzm2Board {
             monitor_task: None,
             heartbeat_shutdown: None,
             heartbeat_tasks: Vec::new(),
+            fan_shutdown: None,
+            fan_task: None,
         }
+    }
+
+    /// Run the thermal fan loop for as long as this board is up.
+    ///
+    /// Reads the hottest die we can currently see, asks the policy for a duty,
+    /// commands it, and confirms by tacho. The policy is pure and tested
+    /// separately; this is only the part that has to touch hardware.
+    ///
+    /// ON SHUTDOWN IT COMMANDS FULL RATHER THAN STOPPING. These fans free-run
+    /// slower than they run commanded, so simply ceasing to command them makes
+    /// the machine cool WORSE at exactly the moment nobody is watching it.
+    fn spawn_thermal_fan_control(&mut self) {
+        let telemetry_rx = self.telemetry_tx.subscribe();
+        let (tx, mut rx) = watch::channel(false);
+        let cfg = fans::ThermalFanConfig::default();
+        // THE SAME AGE LIMIT THE ABORT PATH USES, derived the same way, so the
+        // two readers of one fact cannot come to different conclusions about
+        // whether a die reading is still a measurement. This loop ticks every
+        // 10 s; the floor keeps it sane if the telemetry poll is ever set slow.
+        let die_max_age = std::cmp::max(
+            self.config.telemetry.poll_interval.saturating_mul(3),
+            Duration::from_secs(15),
+        );
+        info!(
+            die_max_age_s = die_max_age.as_secs(),
+            target_c = cfg.target_c,
+            min_duty_pct = cfg.min_duty_pct,
+            "Thermal fan control starting: unknown die temperature commands FULL, \
+             and the floor is not zero because these fans free-run faster than a low duty"
+        );
+        self.fan_task = Some(tokio::spawn(async move {
+            let fans = fans::Bzm2Fans::new(platform::DEFAULT);
+            // Slower than the thermal mass it is steering. A chassis this size
+            // does not change temperature in seconds, and commanding faster
+            // than it responds is how a loop starts chasing its own wake.
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_duty: Option<u8> = None;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // ONE HOME FOR "WHAT COUNTS AS A USABLE DIE READING".
+                        //
+                        // This used to fold the max over EVERY temperature row
+                        // and accept any age, which was wrong twice over. It
+                        // included board and regulator sensors, so a warm rail
+                        // could stand in for a die; and board state never
+                        // prunes, so once any row existed the reading could
+                        // never go absent -- which made the `None => FULL`
+                        // branch below unreachable and the documented "unknown
+                        // means full air" rule undeliverable. A die that
+                        // stopped reporting two minutes ago governed the fans
+                        // at whatever duty its last frame implied.
+                        //
+                        // The abort path already decides this question, and two
+                        // consumers of one fact diverge. So it is asked once,
+                        // here, through the same function.
+                        let hottest = {
+                            let state = telemetry_rx.borrow();
+                            abort::hottest_die_at(
+                                &state.temperatures,
+                                std::time::Instant::now(),
+                                die_max_age,
+                            )
+                            .map(|(_, c)| c)
+                        };
+                        let duty = fans::duty_for(hottest, &cfg);
+                        if last_duty != Some(duty) {
+                            match hottest {
+                                Some(c) => info!(hottest_c = c, duty_pct = duty,
+                                    "Thermal fan control adjusting"),
+                                None => warn!(duty_pct = duty,
+                                    "No die temperature visible; commanding FULL"),
+                            }
+                        }
+                        for fan in 0..fans.count() {
+                            if let Err(err) = fans.command(fan, duty).await {
+                                warn!(fan, %err, "could not command this fan");
+                            }
+                        }
+                        // Confirm one fan per tick rather than all four: the
+                        // tacho is the only witness there is, and checking
+                        // every fan every tick would cost more than it buys on
+                        // a loop this slow. Over four ticks all four are seen.
+                        let watch_fan = (ticker.period().as_secs() as usize)
+                            .wrapping_add(last_duty.unwrap_or(0) as usize)
+                            % fans.count().max(1);
+                        if let Some(rpm) = fans.read_rpm(watch_fan).await
+                            && duty > 0 && rpm == 0
+                        {
+                            error!(fan = watch_fan, duty_pct = duty,
+                                "FAN COMMANDED AND NOT TURNING");
+                        }
+                        last_duty = Some(duty);
+                    }
+                    _ = rx.changed() => {
+                        if *rx.borrow() {
+                            // Full, not off. See the note on this function.
+                            for fan in 0..fans.count() {
+                                let _ = fans.command(fan, cfg.max_duty_pct).await;
+                            }
+                            info!("Thermal fan control stopping; fans commanded FULL");
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
+        self.fan_shutdown = Some(tx);
     }
 
     /// Start feeding each driven board's MCU, if the operator asked for it.
@@ -548,6 +662,12 @@ impl Bzm2Board {
         // stop; a deliberate one takes the rails down itself below, and
         // leaving beats going while that happens would have two mechanisms
         // acting on the same board.
+        if let Some(tx) = self.fan_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.fan_task.take() {
+            let _ = handle.await;
+        }
         if let Some(tx) = self.heartbeat_shutdown.take() {
             let _ = tx.send(true);
         }
@@ -737,6 +857,7 @@ impl Bzm2Board {
         });
 
         self.spawn_heartbeats();
+        self.spawn_thermal_fan_control();
         self.spawn_monitor();
         Ok(threads)
     }
