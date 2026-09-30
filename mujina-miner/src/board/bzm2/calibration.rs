@@ -52,6 +52,18 @@ impl Bzm2BusLayout {
             .then_some((global_asic_id - self.asic_start) as u8)
     }
 
+    /// `global_asic_id` (above) takes a bus-LOCAL, 0-based id.
+    /// A caller holding the id an ASIC answers to ON THE WIRE -- which starts
+    /// at `enumeration.start_id`, not 0 -- must subtract that offset first,
+    /// or a non-zero start_id either drops the chip (`local_asic_id` ends up
+    /// `>= asic_count`) or, worse, lands on the wrong local slot and reports
+    /// another device's commanded frequency under this one's id. This is
+    /// that conversion, done in the one place, so no caller can skip it.
+    pub(super) fn global_asic_id_from_wire(&self, wire_asic_id: u8, start_id: u8) -> Option<u16> {
+        let local_asic_id = wire_asic_id.checked_sub(start_id)?;
+        self.global_asic_id(local_asic_id)
+    }
+
     /// The ASIC ids that appear **on this bus's wire**.
     ///
     /// `asic_start` is a global index accumulated across buses, and exists so
@@ -1179,6 +1191,40 @@ fn should_fallback_to_configured_bus_layouts(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// `global_asic_id` takes a bus-LOCAL, 0-based id, but the
+    /// id an `AsicState` carries is the WIRE id, which starts at
+    /// `enumeration.start_id`, not 0. `global_asic_id_from_wire` is the one
+    /// place that subtracts the offset before the bus-local lookup.
+    ///
+    /// A wire id below `start_id` has no local id at all (`checked_sub`
+    /// underflows) and must be `None`, not a wrapped/garbage value; a wire id
+    /// at exactly `start_id` must land on local id 0, the first chip on the
+    /// chain.
+    #[test]
+    fn global_asic_id_from_wire_subtracts_the_start_id_before_the_lookup() {
+        let bus = Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0,
+            asic_count: 4,
+        };
+
+        assert_eq!(
+            bus.global_asic_id_from_wire(7, 7),
+            Some(0),
+            "the wire id equal to start_id must map to local id 0"
+        );
+        assert_eq!(
+            bus.global_asic_id_from_wire(9, 7),
+            Some(2),
+            "a wire id two past start_id must map to local id 2"
+        );
+        assert_eq!(
+            bus.global_asic_id_from_wire(6, 7),
+            None,
+            "a wire id below start_id has no local id and must not underflow to one"
+        );
+    }
 
     /// A PROFILE REFUSED FOR ITS VOLTAGES IS REFUSED FOR ITS SHAPE TOO.
     ///

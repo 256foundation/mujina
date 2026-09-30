@@ -60,6 +60,8 @@ impl Bzm2Board {
         let telemetry = self.config.telemetry.clone();
         let rail_telemetry = self.config.bringup.clone();
         let calibration = self.config.calibration.clone();
+        // The wire id every `AsicState` carries starts here.
+        let enumeration_start_id = self.config.enumeration.start_id;
         let telemetry_tx = self.telemetry_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
         let serial_controls = self.serial_controls.clone();
@@ -205,6 +207,7 @@ impl Bzm2Board {
                             &rail_snapshot,
                             &applied_operating_snapshot,
                             &thread_metrics,
+                            enumeration_start_id,
                         );
                         let tuning_state = apply_runtime_tuning_plan(
                             tuning_state,
@@ -215,6 +218,7 @@ impl Bzm2Board {
                                 &calibration,
                                 &applied_operating_snapshot,
                                 &measurement_cache,
+                                enumeration_start_id,
                             ),
                         );
                         let tuning_state = apply_runtime_retune_triggers(
@@ -893,6 +897,8 @@ fn build_runtime_tuning_state(
     rail_snapshot: &Bzm2TelemetrySnapshot,
     applied_operating_state: &Bzm2AppliedOperatingState,
     thread_metrics: &BTreeMap<usize, Bzm2ThreadRuntimeMetrics>,
+    // The wire id an `AsicState` carries starts here, not at 0.
+    enumeration_start_id: u8,
 ) -> (Bzm2TuningState, Bzm2RuntimeMeasurementCache) {
     let total_asics = bus_layouts.iter().map(|bus| bus.asic_count).sum::<u16>();
     let (domains, _domain_lookup) = build_voltage_domains(
@@ -958,7 +964,8 @@ fn build_runtime_tuning_state(
         let Some(bus) = bus_layouts.get(thread_index) else {
             continue;
         };
-        let Some(global_asic_id) = bus.global_asic_id(asic.id) else {
+        let Some(global_asic_id) = bus.global_asic_id_from_wire(asic.id, enumeration_start_id)
+        else {
             continue;
         };
         let runtime_asic = thread_metrics
@@ -1234,6 +1241,8 @@ fn evaluate_runtime_tuning_plan(
     calibration: &Bzm2CalibrationConfig,
     applied_operating_state: &Bzm2AppliedOperatingState,
     measurement_cache: &Bzm2RuntimeMeasurementCache,
+    // Threaded through to `saved_engine_topology_from_state`.
+    enumeration_start_id: u8,
 ) -> Option<crate::tuning::calibration_planner::Bzm2CalibrationPlan> {
     if bus_layouts.is_empty() {
         return None;
@@ -1249,7 +1258,8 @@ fn evaluate_runtime_tuning_plan(
         &calibration.asics_per_domain,
         &calibration.domain_voltage_offsets_mv,
     );
-    let engine_topology = saved_engine_topology_from_state(asics, bus_layouts);
+    let engine_topology =
+        saved_engine_topology_from_state(asics, bus_layouts, enumeration_start_id);
     let voltage_domains = build_voltage_domains(
         total_asics,
         &calibration.asics_per_domain,
@@ -1341,6 +1351,8 @@ fn evaluate_runtime_tuning_plan(
 fn saved_engine_topology_from_state(
     asics: &[AsicState],
     bus_layouts: &[Bzm2BusLayout],
+    // See `build_runtime_tuning_state`.
+    enumeration_start_id: u8,
 ) -> BTreeMap<u16, Bzm2SavedEngineTopology> {
     let mut topology = BTreeMap::new();
     for asic in asics {
@@ -1350,7 +1362,8 @@ fn saved_engine_topology_from_state(
         let Some(bus) = bus_layouts.get(thread_index) else {
             continue;
         };
-        let Some(global_asic_id) = bus.global_asic_id(asic.id) else {
+        let Some(global_asic_id) = bus.global_asic_id_from_wire(asic.id, enumeration_start_id)
+        else {
             continue;
         };
         topology.insert(
@@ -1842,6 +1855,7 @@ mod tests {
             &rail_snapshot,
             &applied,
             &thread_metrics,
+            0,
         );
 
         assert_eq!(tuning.board_throughput_hs, Some(358_720_000_000));
@@ -1874,6 +1888,69 @@ mod tests {
         );
         assert_eq!(cache.domain_measurements[&0].measured_voltage_mv, Some(900));
         assert_eq!(cache.domain_measurements[&0].measured_power_w, Some(40.0));
+    }
+
+    /// `AsicState::id` is the WIRE id -- what the chip answers
+    /// to -- which starts at `enumeration.start_id`, not 0. With a non-zero
+    /// start_id, a single-bus chain (`bus.asic_start == 0` always) must
+    /// still map wire id 7 to global id 0, not drop it because
+    /// `7 >= asic_count`. Fails on the unmodified code, which fed the wire
+    /// id straight into `global_asic_id` and either dropped the chip
+    /// outright or, on a board where it happened to stay in range,
+    /// reported another device's commanded frequency under this one's id.
+    #[test]
+    fn build_runtime_tuning_state_maps_a_nonzero_start_id() {
+        let asics = vec![AsicState {
+            id: 7, // the wire id, with enumeration.start_id == 7
+            thread_index: Some(0),
+            serial_path: Some("/dev/ttyUSB0".into()),
+            discovered_engine_count: Some(236),
+            missing_engines: Vec::new(),
+            ..Default::default()
+        }];
+        let bus_layouts = vec![Bzm2BusLayout {
+            serial_path: "/dev/ttyUSB0".into(),
+            asic_start: 0, // a single bus always starts its GLOBAL id at 0
+            asic_count: 1,
+        }];
+        let applied = Bzm2AppliedOperatingState {
+            per_domain_voltage_mv: BTreeMap::new(),
+            // Keyed by GLOBAL id (0), as every other consumer of this map is.
+            per_asic_pll_mhz: BTreeMap::from([(0, [1_200.0, 1_200.0])]),
+            saved_operating_point: None,
+            startup_path: None,
+            saved_operating_point_status: None,
+            saved_operating_point_reasons: Vec::new(),
+        };
+
+        let (tuning, cache) = build_runtime_tuning_state(
+            &asics,
+            &[],
+            &bus_layouts,
+            &Bzm2CalibrationConfig::default(),
+            &Bzm2BringupConfig::default(),
+            &Bzm2TelemetrySnapshot::default(),
+            &applied,
+            &BTreeMap::new(),
+            7, // enumeration.start_id
+        );
+
+        assert_eq!(
+            tuning.asics.len(),
+            1,
+            "a non-zero start_id must not drop the only chip on the bus"
+        );
+        assert_eq!(
+            tuning.asics[0].plls[0].frequency_mhz,
+            Some(1_200.0),
+            "the commanded frequency must be found under the chip's GLOBAL id, not silently \
+             missing because the WIRE id was used as the lookup key"
+        );
+        assert!(
+            cache.asic_measurements.contains_key(&0),
+            "the measurement cache must be keyed by global id 0, not left empty or keyed by \
+             the wire id 7"
+        );
     }
 
     /// `Bzm2PllTuningState::frequency_mhz` must be a pure passthrough of
@@ -1941,6 +2018,7 @@ mod tests {
             &Bzm2TelemetrySnapshot::default(),
             &applied,
             &thread_metrics,
+            0,
         );
 
         assert_eq!(tuning.asics[0].plls[0].frequency_mhz, Some(777.0));
@@ -2010,6 +2088,7 @@ mod tests {
             &calibration,
             &applied,
             &measurement_cache,
+            0,
         )
         .unwrap();
 
