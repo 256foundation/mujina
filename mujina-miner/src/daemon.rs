@@ -117,7 +117,7 @@ impl Daemon {
         // transport events, so its threads register ahead of the
         // initial-enumeration-complete signal and count toward the startup
         // hold.
-        if let Some(config) = Bzm2RuntimeConfig::from_env() {
+        if let Some(config) = Bzm2RuntimeConfig::from_env()? {
             info!(
                 serials = config.serial_paths.len(),
                 baud = config.baud_rate,

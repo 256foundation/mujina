@@ -1440,7 +1440,7 @@ mod tests {
     use super::super::calibration::load_saved_operating_point_profile;
     #[cfg(unix)]
     use super::super::config::{
-        Bzm2EnumerationConfig, Bzm2RuntimeConfig, DEFAULT_BAUD_RATE, DEFAULT_NOMINAL_HASHRATE_THS,
+        Bzm2EnumerationConfig, Bzm2RuntimeConfig, DEFAULT_BAUD_RATE, TEST_NOMINAL_HASHRATE_THS,
     };
     #[cfg(unix)]
     use super::super::telemetry::{Bzm2TelemetryConfig, SensorSpec};
@@ -1702,7 +1702,7 @@ mod tests {
             nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
             result_min_difficulty: None,
             dispatch_interval: Duration::from_millis(50),
-            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig {
                 poll_interval: Duration::from_millis(20),

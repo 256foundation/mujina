@@ -1277,7 +1277,7 @@ mod tests {
     use super::super::bringup::Bzm2BringupConfig;
     use super::super::config::{
         Bzm2EnumerationConfig, Bzm2RuntimeConfig, DEFAULT_BAUD_RATE,
-        DEFAULT_CALIBRATION_POST1_DIVIDER, DEFAULT_NOMINAL_HASHRATE_THS,
+        DEFAULT_CALIBRATION_POST1_DIVIDER, TEST_NOMINAL_HASHRATE_THS,
     };
     use super::super::telemetry::Bzm2TelemetryConfig;
     use super::super::test_support::spawn_chain_emulator;
@@ -1674,7 +1674,7 @@ mod tests {
             nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
             result_min_difficulty: None,
             dispatch_interval: Duration::from_millis(50),
-            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
@@ -1776,7 +1776,7 @@ mod tests {
             nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
             result_min_difficulty: None,
             dispatch_interval: Duration::from_millis(50),
-            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig::default(),
@@ -1882,7 +1882,7 @@ mod tests {
             nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
             result_min_difficulty: None,
             dispatch_interval: Duration::from_millis(50),
-            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig {
@@ -1942,7 +1942,7 @@ mod tests {
             nonce_gap: crate::asic::bzm2::protocol::DEFAULT_NONCE_GAP,
             result_min_difficulty: None,
             dispatch_interval: Duration::from_millis(50),
-            nominal_hashrate_ths: DEFAULT_NOMINAL_HASHRATE_THS,
+            nominal_hashrate_ths: TEST_NOMINAL_HASHRATE_THS,
             dts_vs_generation: crate::asic::bzm2::protocol::DtsVsGeneration::Gen2,
             telemetry: Bzm2TelemetryConfig::default(),
             enumeration: Bzm2EnumerationConfig {

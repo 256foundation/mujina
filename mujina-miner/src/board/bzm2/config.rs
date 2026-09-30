@@ -14,7 +14,11 @@ use super::telemetry::Bzm2TelemetryConfig;
 
 pub(super) const DEFAULT_BAUD_RATE: u32 = 5_000_000;
 const DEFAULT_DISPATCH_INTERVAL_MS: u64 = 500;
-pub(super) const DEFAULT_NOMINAL_HASHRATE_THS: f64 = 40.0;
+/// No default: a per-ASIC nameplate rate is a property of the hardware, not
+/// something we may guess at silently. `from_env` treats it as required once
+/// a chain is being configured at all.
+#[cfg(test)]
+pub(super) const TEST_NOMINAL_HASHRATE_THS: f64 = 55.0;
 pub(super) const DEFAULT_TELEMETRY_INTERVAL_SECS: u64 = 5;
 pub(super) const DEFAULT_ASIC_TEMP_SCALE: f32 = 0.001;
 pub(super) const DEFAULT_BOARD_TEMP_SCALE: f32 = 0.001;
@@ -227,10 +231,21 @@ impl Default for Bzm2HeartbeatConfig {
 }
 
 impl Bzm2RuntimeConfig {
-    pub fn from_env() -> Option<Self> {
-        let raw_paths = env::var("MUJINA_BZM2_SERIAL")
+    /// `Ok(None)`: no BZM2 board is configured at all (`MUJINA_BZM2_SERIAL`
+    /// unset) -- not an error, just nothing to build.
+    ///
+    /// `Err`: a chain IS configured (a serial path was named) but a value
+    /// with no safe default is missing or unparseable. This must surface as
+    /// a startup error the caller can report and exit on, never a panic: a
+    /// panic loses the caller's own context (which board, which env var)
+    /// and looks like a crash rather than a configuration mistake.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let Some(raw_paths) = env::var("MUJINA_BZM2_SERIAL")
             .ok()
-            .or_else(|| env::var("MUJINA_BZM2_SERIAL_PATHS").ok())?;
+            .or_else(|| env::var("MUJINA_BZM2_SERIAL_PATHS").ok())
+        else {
+            return Ok(None);
+        };
 
         let serial_paths: Vec<String> = raw_paths
             .split(',')
@@ -239,7 +254,7 @@ impl Bzm2RuntimeConfig {
             .map(ToOwned::to_owned)
             .collect();
         if serial_paths.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let baud_rate = env::var("MUJINA_BZM2_BAUD")
@@ -265,10 +280,8 @@ impl Bzm2RuntimeConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEFAULT_DISPATCH_INTERVAL_MS),
         );
-        let nominal_hashrate_ths = env::var("MUJINA_BZM2_HASHRATE_THS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_NOMINAL_HASHRATE_THS);
+        let nominal_hashrate_ths =
+            resolve_nominal_hashrate_ths(env::var("MUJINA_BZM2_HASHRATE_THS").ok().as_deref())?;
         let dts_vs_generation = env::var("MUJINA_BZM2_DTS_VS_GEN")
             .ok()
             .as_deref()
@@ -277,7 +290,7 @@ impl Bzm2RuntimeConfig {
         let calibration = Bzm2CalibrationConfig::from_env(serial_paths.len());
         let bringup = Bzm2BringupConfig::from_env();
 
-        Some(Self {
+        Ok(Some(Self {
             serial_paths: serial_paths.clone(),
             baud_rate,
             timestamp_count,
@@ -292,7 +305,7 @@ impl Bzm2RuntimeConfig {
             calibration,
             stored_calibration: load_stored_calibration(),
             heartbeat: Bzm2HeartbeatConfig::from_env(),
-        })
+        }))
     }
 
     pub fn device_id(&self) -> String {
@@ -584,6 +597,20 @@ fn resolve_asics_per_bus(explicit: Option<Vec<u16>>, serial_count: usize) -> Vec
          (e.g. \"100,100\"). There is no safe default: silently defaulting to 1 \
          ASIC per bus has previously been mistaken for a fully dark chain."
     );
+}
+
+/// Not tested through real environment variables for the same reason as
+/// `resolve_asics_per_bus`: this process runs its tests in parallel threads,
+/// and mutating `MUJINA_BZM2_HASHRATE_THS` from a test would race every
+/// other test that reads BZM2 env config. `from_env` passes the already-read
+/// value in.
+fn resolve_nominal_hashrate_ths(raw: Option<&str>) -> anyhow::Result<f64> {
+    raw.and_then(|value| value.parse().ok()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MUJINA_BZM2_HASHRATE_THS is required once MUJINA_BZM2_SERIAL names a chain: \
+             the per-ASIC nameplate rate has no default"
+        )
+    })
 }
 
 pub(super) fn env_var_any(keys: &[&str]) -> Option<String> {
@@ -880,5 +907,40 @@ mod tests {
         // not fall back to a silent 1, which was the second of the two
         // silent-default sites this closes.
         resolve_asics_per_bus(Some(Vec::new()), 3);
+    }
+
+    // resolve_nominal_hashrate_ths is exercised directly on its
+    // already-read input for the same reason as resolve_asics_per_bus:
+    // real env vars would race other tests running in parallel.
+
+    /// A missing MUJINA_BZM2_HASHRATE_THS is an ERROR, not the 40.0 silent
+    /// default this used to fall back to: a per-ASIC nameplate rate is a
+    /// property of the hardware, and a wrong guess here corrupts every
+    /// hashrate and efficiency figure the board reports without any signal
+    /// that it happened.
+    #[test]
+    fn resolve_nominal_hashrate_ths_errors_when_missing() {
+        let err = resolve_nominal_hashrate_ths(None).unwrap_err();
+        assert!(
+            err.to_string().contains("MUJINA_BZM2_HASHRATE_THS"),
+            "error does not name the missing variable: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_nominal_hashrate_ths_errors_when_unparseable() {
+        let err = resolve_nominal_hashrate_ths(Some("not-a-number")).unwrap_err();
+        assert!(
+            err.to_string().contains("MUJINA_BZM2_HASHRATE_THS"),
+            "error does not name the malformed variable: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_nominal_hashrate_ths_passes_through_an_explicit_value() {
+        // A deliberately synthetic value distinct from both the removed
+        // 40.0 default and TEST_NOMINAL_HASHRATE_THS, so this test cannot
+        // pass by accidentally matching either.
+        assert_eq!(resolve_nominal_hashrate_ths(Some("63.5")).unwrap(), 63.5);
     }
 }
