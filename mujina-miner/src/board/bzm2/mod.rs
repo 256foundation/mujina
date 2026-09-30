@@ -19,10 +19,13 @@ use crate::{
 
 use telemetry::{merge_power_readings, merge_temperature_readings};
 
+pub mod board_heartbeat;
+pub mod board_mcu;
 mod bringup;
 mod calibration;
 mod config;
 mod monitor;
+pub mod platform;
 mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -78,6 +81,8 @@ pub struct Bzm2Board {
     telemetry_tx: watch::Sender<BoardTelemetry>,
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
+    heartbeat_shutdown: Option<watch::Sender<bool>>,
+    heartbeat_tasks: Vec<JoinHandle<()>>,
 }
 
 impl Bzm2Board {
@@ -90,7 +95,184 @@ impl Bzm2Board {
             telemetry_tx,
             monitor_shutdown: None,
             monitor_task: None,
+            heartbeat_shutdown: None,
+            heartbeat_tasks: Vec::new(),
         }
+    }
+
+    /// Start feeding each driven board's MCU, if the operator asked for it.
+    ///
+    /// One task per board, on its own adapter, so a board whose bus is
+    /// wedged cannot stop the others being fed. Only boards whose chain we
+    /// are actually driving are beaten: the MCU answers with its rails
+    /// down, so beating an idle board would arm a countdown against a board
+    /// nobody is using and buy nothing.
+    fn spawn_heartbeats(&mut self) {
+        if !self.config.heartbeat.enabled {
+            return;
+        }
+        let platform = platform::DEFAULT;
+        let interval = self.config.heartbeat.interval;
+        let (tx, rx) = watch::channel(false);
+
+        for serial_path in &self.config.serial_paths {
+            let Some(board_index) =
+                platform.board_index_for_chain(std::path::Path::new(serial_path))
+            else {
+                warn!(
+                    serial_path,
+                    platform = platform.name,
+                    "No board index for this chain, so its MCU will not be fed. If this chain is \
+                     real, the platform descriptor is wrong and the board will shed."
+                );
+                continue;
+            };
+            let Some(bus_path) = platform.i2c_bus_path(board_index) else {
+                continue;
+            };
+
+            let bus = match crate::hw_trait::i2c::linux::LinuxI2c::open(&bus_path) {
+                Ok(bus) => bus,
+                Err(err) => {
+                    // Refusing to start is not an option here: the board is
+                    // already powered by whoever brought it up, and failing to
+                    // beat it simply means it sheds. Say so loudly instead.
+                    error!(
+                        board_index,
+                        bus = %bus_path.display(),
+                        error = %err,
+                        "Cannot open this board's MCU bus, so it will NOT be fed and will shed"
+                    );
+                    continue;
+                }
+            };
+
+            let mut rx = rx.clone();
+            let telemetry_tx = self.telemetry_tx.clone();
+            // Announce the intent, not the outcome: nothing is armed until a
+            // beat has actually landed, announced below.
+            info!(
+                board_index,
+                bus = %bus_path.display(),
+                interval_ms = interval.as_millis(),
+                "Starting to feed this board's MCU. Nothing is armed until a beat lands."
+            );
+            self.heartbeat_tasks.push(tokio::spawn(async move {
+                let mut heartbeat = board_heartbeat::Bzm2BoardHeartbeat::new(bus);
+                let mut ticker = tokio::time::interval(interval);
+                // Skip, never burst: a stalled task must not try to "catch up"
+                // by sending several values at once. The MCU only cares that
+                // the newest value is new, so a burst buys nothing and a burst
+                // after a stall is exactly when the bus is least free.
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut consecutive_failures = 0u32;
+                // A beat returning Ok means the I2C layer took it, not that the
+                // MCU was satisfied, so the rail is read periodically as an
+                // independent witness -- often enough to catch a shed within a
+                // few seconds, rarely enough that it does not itself become the
+                // bus contention it is watching for.
+                const VERIFY_EVERY_BEATS: u64 = 5;
+                let mut announced = false;
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            match heartbeat.beat().await {
+                                Ok(_) => {
+                                    consecutive_failures = 0;
+                                    if !announced {
+                                        announced = true;
+                                        info!(
+                                            board_index,
+                                            "First heartbeat landed. This board's shed timer is \
+                                             now ARMED: it goes dark shortly after we stop \
+                                             beating, which is what we want if we stop \
+                                             unexpectedly."
+                                        );
+                                    }
+                                    if heartbeat.beats() % VERIFY_EVERY_BEATS == 0 {
+                                        // Publish the board's own thermals on
+                                        // the same beat that reads the rail:
+                                        // this MCU has one owner and this is
+                                        // it. Only what was actually read is
+                                        // published: a channel that did not
+                                        // answer leaves its row absent rather
+                                        // than writing a zero, because the
+                                        // board-temperature limit reads these
+                                        // rows and a fabricated cool value is
+                                        // the failure this layer exists to
+                                        // prevent.
+                                        let (inlet, outlet) = heartbeat.read_thermals().await;
+                                        if inlet.is_some() || outlet.is_some() {
+                                            let now = std::time::Instant::now();
+                                            let rows: Vec<_> = [
+                                                (format!("board{board_index}-inlet"), inlet),
+                                                (format!("board{board_index}-outlet"), outlet),
+                                            ]
+                                            .into_iter()
+                                            .filter_map(|(name, c)| {
+                                                c.map(|c| crate::api_client::types::TemperatureSensor {
+                                                    name,
+                                                    temperature: Some(crate::types::Temperature::from_celsius(c)),
+                                                    observed_at: Some(now),
+                                                })
+                                            })
+                                            .collect();
+                                            telemetry_tx.send_modify(|state| {
+                                                merge_temperature_readings(
+                                                    &mut state.temperatures,
+                                                    &rows,
+                                                );
+                                            });
+                                        }
+                                        match heartbeat.verify_still_energised().await {
+                                            Some(false) => error!(
+                                                board_index,
+                                                beats = heartbeat.beats(),
+                                                "BOARD DE-ENERGISED WHILE WE ARE BEATING IT. \
+                                                 Every write was accepted, so the beat is being \
+                                                 sent and is not being honoured. Treat this \
+                                                 board as unprotected."
+                                            ),
+                                            None => warn!(
+                                                board_index,
+                                                "Cannot read this board's rail, so whether the \
+                                                 heartbeat is working is UNMEASURED -- not \
+                                                 confirmed."
+                                            ),
+                                            Some(true) => {}
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    consecutive_failures += 1;
+                                    // Loud from the first one: there is no
+                                    // recovery to wait for, every missed beat
+                                    // spends the shed budget, and an operator
+                                    // who sees this has a bounded time to act.
+                                    error!(
+                                        board_index,
+                                        consecutive_failures,
+                                        error = %err,
+                                        "Heartbeat NOT delivered; this board sheds if this continues"
+                                    );
+                                }
+                            }
+                        }
+                        _ = rx.changed() => {
+                            if *rx.borrow() {
+                                info!(
+                                    board_index,
+                                    beats = heartbeat.beats(),
+                                    "Stopped feeding this board's MCU"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        self.heartbeat_shutdown = Some(tx);
     }
 }
 
@@ -103,7 +285,118 @@ impl Bzm2Board {
         }
     }
 
+    /// Empty each board's MCU fault queue and record what was in it.
+    ///
+    /// NEVER FAILS THE BRING-UP. A fault the board queued before we arrived is
+    /// history, not a verdict on this run: the machine may have been power
+    /// cycled, reseated, or simply left with a stale entry. Refusing to start
+    /// on it would make a board unusable until someone cleared a queue by hand.
+    /// It is reported loudly and in full, and the POST is what decides whether
+    /// to start.
+    ///
+    /// Popping is destructive -- each entry exists nowhere else once read --
+    /// which is why `drain_faults` hands back what it took alongside why it
+    /// stopped, and why everything it took is logged even when it stopped for
+    /// a bad reason.
+    async fn drain_board_faults_before_bringup(&mut self) {
+        // Bounded against an MCU queueing faults faster than we drain. Hitting
+        // it is itself a finding and is reported as one.
+        const LIMIT: usize = 32;
+
+        let platform = platform::DEFAULT;
+        for board_index in self.driven_board_indices() {
+            let Some(bus_path) = platform.i2c_bus_path(board_index) else {
+                continue;
+            };
+            let bus = match crate::hw_trait::i2c::linux::LinuxI2c::open(&bus_path) {
+                Ok(bus) => bus,
+                Err(err) => {
+                    warn!(
+                        board_index, bus = %bus_path.display(), %err,
+                        "Cannot open this board's MCU to read its fault history or identity; \
+                         starting without knowing what it had queued or which board it is"
+                    );
+                    continue;
+                }
+            };
+            let mut mcu = board_mcu::Bzm2BoardMcu::new(bus);
+
+            // IDENTITY IN THE SAME PASS. One bus open, two facts, and this is
+            // the only window in which the MCU has no other owner -- the
+            // heartbeat takes it later in this function. Reading the serial
+            // here is what lets a stored calibration be checked against the
+            // board actually in the slot, rather than against a slot number.
+            match mcu.read_identity().await {
+                Ok(presence) => {
+                    let serial = presence.present().and_then(|id| id.serial);
+                    match &serial {
+                        Some(sn) => info!(board_index, serial = %sn, "board identified"),
+                        None => warn!(
+                            board_index,
+                            "MCU answered but its serial field is blank, which is what an \
+                             unprogrammed board looks like; calibration cannot be bound to \
+                             this board's identity"
+                        ),
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        board_index, %err,
+                        "Could not read this board's identity; a stored calibration cannot \
+                         be confirmed to belong to it"
+                    );
+                }
+            }
+
+            let drain = mcu.drain_faults(LIMIT).await;
+            for fault in &drain.faults {
+                warn!(
+                    board_index,
+                    ?fault,
+                    "MCU had a fault queued BEFORE this bring-up: it predates anything we \
+                     did and is history, not a verdict on this run"
+                );
+            }
+            match &drain.stopped {
+                board_mcu::DrainStop::Empty => info!(
+                    board_index,
+                    drained = drain.faults.len(),
+                    "MCU fault queue read and empty"
+                ),
+                board_mcu::DrainStop::Absent => info!(
+                    board_index,
+                    drained = drain.faults.len(),
+                    "MCU reports no board in this slot"
+                ),
+                board_mcu::DrainStop::Limit => error!(
+                    board_index,
+                    drained = drain.faults.len(),
+                    limit = LIMIT,
+                    "MCU fault queue did not empty within the limit -- entries REMAIN, and \
+                     the queue is producing faster than a bounded drain can read it"
+                ),
+                board_mcu::DrainStop::Failed(err) => error!(
+                    board_index,
+                    drained = drain.faults.len(),
+                    %err,
+                    "MCU fault queue read FAILED part-way; the entries above were taken and \
+                     exist nowhere else, and the rest are unread"
+                ),
+            }
+        }
+    }
+
     async fn shutdown(&mut self) -> AnyhowResult<()> {
+        // Stop beating first. The MCU's shed is a backstop for an unexpected
+        // stop; a deliberate one takes the rails down itself below, and
+        // leaving beats going while that happens would have two mechanisms
+        // acting on the same board.
+        if let Some(tx) = self.heartbeat_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        for handle in self.heartbeat_tasks.drain(..) {
+            let _ = handle.await;
+        }
         if let Some(tx) = self.monitor_shutdown.take() {
             let _ = tx.send(true);
         }
@@ -138,6 +431,22 @@ impl Bzm2Board {
     async fn create_hash_threads(&mut self) -> AnyhowResult<Vec<Box<dyn HashThread>>> {
         let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
         let mut thread_states = Vec::new();
+        // READ THE BOARD'S FAULT HISTORY BEFORE WE CAUSE ANY OF IT.
+        //
+        // The stock stack fetches MCU error and resets the MCU to init during
+        // prepare-power-on, and reads it AGAIN as its own step before enabling
+        // trip protection. The ordering is the point: a fault read before the
+        // ramp stays distinguishable from anything the ramp itself causes.
+        // Read it afterwards and the two are one pile.
+        //
+        // Here for two more reasons. The MCU answers with the rails down -- it
+        // runs from its own supply -- so nothing has to be energised first.
+        // And the fault queue demands an EXCLUSIVE reader: a concurrent query
+        // shifts the MCU's counter parity, after which this handle discards a
+        // real fault and returns a stale word as the queue's answer. The
+        // heartbeat becomes that MCU's sole owner later in this function, so
+        // before it starts is the only safe window.
+        self.drain_board_faults_before_bringup().await;
         self.apply_bringup_sequence().await?;
         // Arm the silicon's own thermal/voltage protection before the long
         // bring-up stress, not after: the sensors come up powered down and
@@ -229,6 +538,7 @@ impl Bzm2Board {
             state.threads = thread_states.clone();
         });
 
+        self.spawn_heartbeats();
         self.spawn_monitor();
         Ok(threads)
     }
@@ -548,6 +858,7 @@ mod tests {
                     ..Default::default()
                 },
             },
+            heartbeat: Default::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
@@ -653,6 +964,7 @@ mod tests {
                 }],
                 ..Default::default()
             },
+            heartbeat: Default::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {

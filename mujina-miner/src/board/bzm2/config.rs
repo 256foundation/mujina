@@ -77,6 +77,73 @@ pub struct Bzm2RuntimeConfig {
     pub calibration: Bzm2CalibrationConfig,
     pub enumeration: Bzm2EnumerationConfig,
     pub bringup: Bzm2BringupConfig,
+    /// Whether to feed the board MCU's heartbeat, and how often.
+    pub heartbeat: Bzm2HeartbeatConfig,
+}
+
+/// Feeding the board MCU so it does not shed the board.
+///
+/// OFF BY DEFAULT, and that default is the careful direction rather than the
+/// lazy one. Sending a heartbeat ARMS the MCU's shed timer: until the first
+/// beat the countdown cannot start, so a daemon that only reads is safe to run
+/// against a powered rig indefinitely. Turning this on takes on the duty of
+/// beating continuously, and a controller that stops — wedged, killed,
+/// suspended — drops the board a short time later.
+///
+/// That is the failure direction we want once we own the rig, and it is not
+/// one to acquire by accident, which is why it is opt-in rather than inferred
+/// from something else being configured.
+#[derive(Debug, Clone)]
+pub struct Bzm2HeartbeatConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+}
+
+impl Bzm2HeartbeatConfig {
+    /// The shed window is the safety budget, and the beat period spends it.
+    ///
+    /// MEASURED 2026-09-21, twice, agreeing to within one sample: the board
+    /// goes dark **74 to 80 seconds** after the last heartbeat
+    /// (measured on hardware). Our own notes had said about thirty seconds,
+    /// in two places, and were wrong by a factor of two and a half.
+    ///
+    /// Beating every three seconds therefore leaves about twenty-five beats of
+    /// margin rather than the ten we thought — room to lose a run of them to a
+    /// bus retry, a scheduling stall or a slow I2C transaction — while costing
+    /// one transaction per board per three seconds across three independent
+    /// adapters.
+    ///
+    /// The period stays at three rather than being relaxed to match the larger
+    /// window. The margin is not spare budget to spend: a starved bus has
+    /// already been measured silently swallowing beats, and the cheapest
+    /// defence against that is beating more often than strictly required.
+    const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
+
+    pub fn from_env() -> Self {
+        let enabled = env::var("MUJINA_BZM2_HEARTBEAT")
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes" || v == "on"
+            })
+            .unwrap_or(false);
+        let interval = env::var("MUJINA_BZM2_HEARTBEAT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(Self::DEFAULT_INTERVAL);
+        Self { enabled, interval }
+    }
+}
+
+impl Default for Bzm2HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Self::DEFAULT_INTERVAL,
+        }
+    }
 }
 
 impl Bzm2RuntimeConfig {
@@ -143,6 +210,7 @@ impl Bzm2RuntimeConfig {
             enumeration: Bzm2EnumerationConfig::from_env(serial_paths.len(), &calibration),
             bringup,
             calibration,
+            heartbeat: Bzm2HeartbeatConfig::from_env(),
         })
     }
 

@@ -223,6 +223,7 @@ mod tests {
                 max_asics_per_bus: vec![4],
             },
             bringup: Default::default(),
+            heartbeat: Default::default(),
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
@@ -280,6 +281,7 @@ mod tests {
                 max_asics_per_bus: vec![4],
             },
             bringup: Default::default(),
+            heartbeat: Default::default(),
             calibration: Bzm2CalibrationConfig {
                 asics_per_bus: vec![3],
                 ..Default::default()

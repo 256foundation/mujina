@@ -331,6 +331,9 @@ impl Bzm2Board {
                 BoardError::HardwareControl(format!("BZM2 shutdown sequence failed: {err}"))
             })?;
         self.bringup_applied = false;
+        // The setpoints are written. Whether the rails fell is a different
+        // question, and it is the one that matters.
+        self.confirm_rails_dark().await;
         Ok(())
     }
 
@@ -424,6 +427,89 @@ impl Bzm2Board {
                 Err(err) => warn!(
                     serial_path, %err,
                     "Sensors were configured before the ramp and no device reported them in                      force, so the stack is about to come up UNVERIFIED"
+                ),
+            }
+        }
+    }
+
+    /// Read one board's rail from its MCU, or `None` if it cannot be read.
+    ///
+    /// The one home for reaching the witness. Both the bring-up confirmation
+    /// and the shutdown confirmation need it, and a second copy of how to find
+    /// a board's MCU is a second thing to get wrong when platform two arrives.
+    async fn read_board_rail_mv(&self, board_index: usize) -> Option<u16> {
+        use crate::hw_trait::i2c::I2c;
+        let platform = super::platform::DEFAULT;
+        let bus_path = platform.i2c_bus_path(board_index)?;
+        let mut bus = crate::hw_trait::i2c::linux::LinuxI2c::open(&bus_path).ok()?;
+        let selector = [super::board_mcu::OP_GET_VDD_TOTAL, 0];
+        let mut reply = [0u8; 2];
+        bus.write_read(super::board_mcu::MCU_I2C_ADDRESS, &selector, &mut reply)
+            .await
+            .ok()
+            .map(|()| u16::from_le_bytes(reply))
+    }
+
+    /// Board indices whose chains this driver is actually driving.
+    pub(super) fn driven_board_indices(&self) -> Vec<usize> {
+        let platform = super::platform::DEFAULT;
+        self.config
+            .serial_paths
+            .iter()
+            .filter_map(|p| platform.board_index_for_chain(std::path::Path::new(p)))
+            .collect()
+    }
+
+    /// Confirm the rails actually fell after a shutdown.
+    ///
+    /// THE MOST IMPORTANT CONFIRMATION IN THIS FILE. `plan.shutdown` zeroes
+    /// every setpoint and de-asserts every enable through write-only sysfs
+    /// nodes and returns Ok -- so a regulator that ignored the write, a path
+    /// that did not exist, and a stack that genuinely went dark were
+    /// indistinguishable, and the caller was told the machine was safe.
+    ///
+    /// Reports rather than fails, because there is nothing further this layer
+    /// can do: the setpoints are already written. What it must never do is stay
+    /// silent, which leaves a process exiting in the belief it de-energised a
+    /// board it did not.
+    async fn confirm_rails_dark(&self) {
+        // Rails fall fast, but not instantly, and a shutdown that is merely
+        // slow must not read as one that failed.
+        const SETTLE_ATTEMPTS: usize = 10;
+        const SETTLE_GAP: Duration = Duration::from_millis(300);
+
+        for board_index in self.driven_board_indices() {
+            let mut last = None;
+            for _ in 0..SETTLE_ATTEMPTS {
+                match self.read_board_rail_mv(board_index).await {
+                    Some(mv) => {
+                        last = Some(mv);
+                        if mv < super::board_mcu::RAIL_DARK_MV {
+                            break;
+                        }
+                    }
+                    None => last = None,
+                }
+                tokio::time::sleep(SETTLE_GAP).await;
+            }
+            match last {
+                Some(mv) if mv < super::board_mcu::RAIL_DARK_MV => {
+                    info!(
+                        board_index,
+                        rail_mv = mv,
+                        "Rail confirmed dark after shutdown"
+                    )
+                }
+                Some(mv) => error!(
+                    board_index,
+                    rail_mv = mv,
+                    "RAIL IS STILL UP AFTER SHUTDOWN. Every setpoint was written and the stack \
+                     did not de-energise. Do not treat this board as safe."
+                ),
+                None => warn!(
+                    board_index,
+                    "Could not read this board's rail after shutdown, so whether it de-energised \
+                     is UNMEASURED -- not confirmed, and not known to have failed"
                 ),
             }
         }
