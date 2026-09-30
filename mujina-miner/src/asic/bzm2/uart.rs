@@ -343,15 +343,22 @@ impl Bzm2UartController {
 
     /// Enumerate a fresh chain using a bounded NOOP probe so the walk can stop
     /// cleanly when the last default-id device has been assigned.
+    ///
+    /// The whole layout is checked BEFORE any probe or write goes to the
+    /// wire. `start_id..start_id+max_asics` must land entirely below the
+    /// reserved ids (the default id `0xfa` and the broadcast id `0xff`),
+    /// with no duplicate from wrapping past `u8::MAX` -- a layout that would
+    /// assign either reserved id, or repeat one, diverges the enumerated
+    /// chain from `wire_asic_ids` in ways later code cannot detect.
     pub async fn enumerate_chain_with_timeout(
         &mut self,
         max_asics: u8,
         start_id: u8,
         probe_timeout: Duration,
     ) -> Result<Vec<u8>, Bzm2UartError> {
+        let planned = validate_enumeration_layout(start_id, max_asics)?;
         let mut assigned = Vec::new();
-        for offset in 0..max_asics {
-            let next_id = start_id.saturating_add(offset);
+        for next_id in planned {
             if self
                 .verify_noop_signature_with_timeout(DEFAULT_ASIC_ID, probe_timeout)
                 .await
@@ -609,6 +616,13 @@ pub enum Bzm2UartError {
         asic: u8,
         engine_address: u16,
         offset: u8,
+    },
+
+    #[error("enumeration layout refused: start_id={start_id:#04x} max_asics={max_asics} {reason}")]
+    InvalidEnumerationLayout {
+        start_id: u8,
+        max_asics: u8,
+        reason: String,
     },
 }
 
@@ -1357,6 +1371,50 @@ fn encode_tdm_control(prediv_raw: u32, counter: u8, enable: bool) -> u32 {
     (prediv_raw << 9) | ((counter as u32) << 1) | u32::from(enable)
 }
 
+/// Compute the ids a chain enumeration would assign, refusing the whole
+/// layout before any probe or write reaches the wire when it would touch a
+/// reserved id or repeat one.
+///
+/// Checked (not saturating) arithmetic: a layout whose walk would wrap past
+/// `u8::MAX` is refused with the same reason as one that lands ON a reserved
+/// id, rather than silently duplicating the last valid id.
+fn validate_enumeration_layout(start_id: u8, max_asics: u8) -> Result<Vec<u8>, Bzm2UartError> {
+    let mut planned = Vec::with_capacity(max_asics as usize);
+    for offset in 0..max_asics {
+        let next_id =
+            start_id
+                .checked_add(offset)
+                .ok_or(Bzm2UartError::InvalidEnumerationLayout {
+                    start_id,
+                    max_asics,
+                    reason: "would wrap past the id space".to_string(),
+                })?;
+        if next_id == DEFAULT_ASIC_ID {
+            return Err(Bzm2UartError::InvalidEnumerationLayout {
+                start_id,
+                max_asics,
+                reason: format!("would assign the default id {DEFAULT_ASIC_ID:#04x}"),
+            });
+        }
+        if next_id == BROADCAST_GROUP_ASIC {
+            return Err(Bzm2UartError::InvalidEnumerationLayout {
+                start_id,
+                max_asics,
+                reason: format!("would assign the broadcast id {BROADCAST_GROUP_ASIC:#04x}"),
+            });
+        }
+        if planned.contains(&next_id) {
+            return Err(Bzm2UartError::InvalidEnumerationLayout {
+                start_id,
+                max_asics,
+                reason: format!("would assign id {next_id:#04x} twice"),
+            });
+        }
+        planned.push(next_id);
+    }
+    Ok(planned)
+}
+
 fn validate_response_header(
     expected_asic: u8,
     expected_opcode: u8,
@@ -1427,6 +1485,48 @@ mod tests {
     #[test]
     fn default_asic_id_matches_legacy_value() {
         assert_eq!(DEFAULT_ASIC_ID, 0xfa);
+    }
+
+    /// Reported by @j-kon in review of #117: a layout that would assign the
+    /// default id (0xfa) to a live chip must be refused before enumeration
+    /// starts, not discovered after the chain diverges from wire_asic_ids.
+    #[test]
+    fn enumeration_layout_reaching_default_id_is_refused() {
+        // start_id=0xf6, max_asics=8 walks 0xf6..=0xfd, which crosses 0xfa.
+        let err = validate_enumeration_layout(0xf6, 8).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Bzm2UartError::InvalidEnumerationLayout {
+                    start_id: 0xf6,
+                    max_asics: 8,
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Reported by @j-kon in review of #117: a layout that would reach the
+    /// broadcast id (0xff) is refused the same way.
+    #[test]
+    fn enumeration_layout_reaching_broadcast_id_is_refused() {
+        let err = validate_enumeration_layout(0xfd, 4).unwrap_err();
+        assert!(matches!(
+            err,
+            Bzm2UartError::InvalidEnumerationLayout {
+                start_id: 0xfd,
+                max_asics: 4,
+                ..
+            }
+        ));
+    }
+
+    /// A layout that fits entirely below the reserved ids is accepted and
+    /// returns the planned ids, unchanged from the pre-fix behaviour.
+    #[test]
+    fn enumeration_layout_within_bounds_is_accepted() {
+        assert_eq!(validate_enumeration_layout(0, 4).unwrap(), vec![0, 1, 2, 3]);
     }
 
     /// A register read must not be able to block forever.
