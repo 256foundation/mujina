@@ -284,18 +284,21 @@ impl Bzm2Fans {
         false
     }
 
-    pub async fn command_and_measure(
-        &self,
-        index: usize,
-        duty_pct: u8,
-    ) -> anyhow::Result<FanOutcome> {
-        self.command(index, duty_pct).await?;
+    /// The second half of a one-fan command: wait out the settle, then read
+    /// the fan's tachometer. The caller has already written the duty and
+    /// gate through [`Self::command`].
+    ///
+    /// Split from the write so a caller can free whatever serialises fan
+    /// commands -- the BZM2 board's own command loop -- for the write
+    /// alone, and run this off it. It writes nothing, so
+    /// nothing here can undo a write that lands while it is running.
+    pub async fn settle_and_measure(&self, index: usize, duty_pct: u8) -> FanOutcome {
         tokio::time::sleep(SETTLE).await;
-        Ok(FanOutcome {
+        FanOutcome {
             index,
             commanded_pct: duty_pct,
             measured_rpm: self.read_rpm(index).await,
-        })
+        }
     }
 
     pub async fn command_all_and_measure(&self, duty_pct: u8) -> Vec<FanOutcome> {

@@ -328,63 +328,7 @@ impl Bzm2Board {
                                 // the rpm that resulted, not that a write
                                 // succeeded.
                                 let fans = super::fans::Bzm2Fans::new(super::platform::DEFAULT);
-                                let result = async {
-                                    let Some(pct) = percent else {
-                                        anyhow::bail!(
-                                            "automatic fan control is the thermal loop's job;                                              set an explicit percent to override it"
-                                        );
-                                    };
-                                    let index: usize = fan
-                                        .trim_start_matches("fan")
-                                        .parse()
-                                        .map_err(|_| anyhow::anyhow!("no fan named {fan}"))?;
-                                    // ONE fan. This used to call the
-                                    // all-fans helper, so a request for fan2
-                                    // at 20% set every fan to 20% and then
-                                    // reported fan2 -- and nothing in the
-                                    // reply said the other three had moved.
-                                    let outcome = fans.command_and_measure(index, pct).await?;
-                                    let Some(rpm) = outcome.measured_rpm else {
-                                        // Unreadable is not success. Saying so
-                                        // is the whole point of measuring.
-                                        anyhow::bail!(
-                                            "fan{index} was commanded {pct}% and its tacho could \
-                                             not be read, so whether it is turning is UNMEASURED"
-                                        );
-                                    };
-                                    // A NUMBER IS NOT A CONFIRMATION. This
-                                    // used to accept any rpm the tacho gave,
-                                    // zero included, so a dead fan commanded
-                                    // to 80% replied Ok. `confirmed` is the
-                                    // check that existed for exactly this and
-                                    // had no caller.
-                                    //
-                                    // Only when something was asked for: 0% is
-                                    // a legitimate command and 0 rpm is its
-                                    // correct outcome.
-                                    if pct > 0 && !outcome.confirmed(super::config::DEFAULT_MIN_FAN_RPM) {
-                                        anyhow::bail!(
-                                            "fan{index} was commanded {pct}% and measured {rpm} \
-                                             rpm, below the {} rpm floor. It is not turning as \
-                                             asked; treat it as a mechanical or control fault.",
-                                            super::config::DEFAULT_MIN_FAN_RPM
-                                        );
-                                    }
-                                    // Report the PAIR, not just success. The
-                                    // reply channel carries only Result<()>,
-                                    // so the record is where the numbers land.
-                                    tracing::info!(
-                                        fan = index,
-                                        commanded_pct = pct,
-                                        measured_rpm = rpm,
-                                        "fan commanded and confirmed by tacho"
-                                    );
-                                    Ok(format!(
-                                        "fan{index} commanded {pct}%, measured {rpm} rpm"
-                                    ))
-                                }
-                                .await;
-                                let _ = reply.send(result.map(|_| ()));
+                                handle_set_fan_target(fans, fan, percent, reply).await;
                             }
                         }
                     }
@@ -397,6 +341,88 @@ impl Bzm2Board {
             }
         }));
     }
+}
+
+/// Handle one `SetFanTarget` command: write the duty and gate, then judge
+/// whether the fan took it, by its tachometer, after the settle.
+///
+/// `Bzm2Fans::command` (the write) is awaited here, on the caller's own
+/// await point, so this function returns as soon as the write lands; the
+/// settle and the read run in a spawned task that sends the reply when it is
+/// done, off the caller entirely, so the command loop is not held for the
+/// settle and tacho read.
+async fn handle_set_fan_target(
+    fans: super::fans::Bzm2Fans,
+    fan: String,
+    percent: Option<u8>,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+) {
+    let written = async {
+        let Some(pct) = percent else {
+            anyhow::bail!(
+                "automatic fan control is the thermal loop's job; set an explicit percent to \
+                 override it"
+            );
+        };
+        let index: usize = fan
+            .trim_start_matches("fan")
+            .parse()
+            .map_err(|_| anyhow::anyhow!("no fan named {fan}"))?;
+        // ONE fan. This used to call the all-fans helper, so a request for
+        // fan2 at 20% set every fan to 20% and then reported fan2 -- and
+        // nothing in the reply said the other three had moved.
+        fans.command(index, pct).await?;
+        Ok((index, pct))
+    }
+    .await;
+    let (index, pct) = match written {
+        Ok(written) => written,
+        Err(err) => {
+            let _ = reply.send(Err(err));
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let outcome = fans.settle_and_measure(index, pct).await;
+        let _ = reply.send(confirm_fan_outcome(outcome).map(|_| ()));
+    });
+}
+
+/// Judge a settled fan command by its tachometer, off the command loop.
+///
+/// It says the named fan was turning at or above the rpm floor once the
+/// settle had passed. A NUMBER IS NOT A CONFIRMATION: this used to accept
+/// any rpm the tacho gave, zero included, so a dead fan commanded to 80%
+/// replied Ok. `confirmed` is the check that existed for exactly this and
+/// had no caller. Only when something was asked for: 0% is a legitimate
+/// command and 0 rpm is its correct outcome.
+fn confirm_fan_outcome(outcome: super::fans::FanOutcome) -> anyhow::Result<String> {
+    let index = outcome.index;
+    let pct = outcome.commanded_pct;
+    let Some(rpm) = outcome.measured_rpm else {
+        // Unreadable is not success. Saying so is the whole point of
+        // measuring.
+        anyhow::bail!(
+            "fan{index} was commanded {pct}% and its tacho could not be read, so whether it is \
+             turning is UNMEASURED"
+        );
+    };
+    if pct > 0 && !outcome.confirmed(super::config::DEFAULT_MIN_FAN_RPM) {
+        anyhow::bail!(
+            "fan{index} was commanded {pct}% and measured {rpm} rpm, below the {} rpm floor. It \
+             is not turning as asked; treat it as a mechanical or control fault.",
+            super::config::DEFAULT_MIN_FAN_RPM
+        );
+    }
+    // Report the PAIR, not just success. The reply channel carries only
+    // Result<()>, so the record is where the numbers land.
+    tracing::info!(
+        fan = index,
+        commanded_pct = pct,
+        measured_rpm = rpm,
+        "fan commanded and confirmed by tacho"
+    );
+    Ok(format!("fan{index} commanded {pct}%, measured {rpm} rpm"))
 }
 
 /// Configured-vs-discovered ASIC counts for one chain summary. See the
@@ -1049,6 +1075,157 @@ impl SensorSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the command loop is held only for the fan write ----
+
+    /// One simulated fan as plain files in a fresh directory: a synthetic
+    /// period, a duty and gate to be written, and a tacho that reads
+    /// turning. Not the RDS's real `/sys` nodes, so the write and read can
+    /// run in a test without hardware.
+    fn simulated_fan(
+        tag: &str,
+        tacho_counts: &str,
+    ) -> (super::super::fans::Bzm2Fans, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bzm2-252-item8-{tag}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("period0"), "1000").unwrap();
+        std::fs::write(dir.join("duty0"), "0").unwrap();
+        std::fs::write(dir.join("gate0"), "0").unwrap();
+        std::fs::write(dir.join("speed0"), tacho_counts).unwrap();
+        let pattern = |node: &str| -> &'static str {
+            Box::leak(format!("{}/{node}{{}}", dir.display()).into_boxed_str())
+        };
+        let fans = super::super::fans::Bzm2Fans::new(super::super::platform::Bzm2Platform {
+            fan_count: 1,
+            fan_duty_pattern: pattern("duty"),
+            fan_period_pattern: pattern("period"),
+            fan_gate_pattern: pattern("gate"),
+            fan_tacho_pattern: pattern("speed"),
+            ..super::super::platform::DEFAULT
+        });
+        (fans, dir)
+    }
+
+    /// HANDLING A FAN COMMAND MUST NOT WAIT OUT THE SETTLE.
+    ///
+    /// `handle_set_fan_target`'s own future must resolve as soon as the
+    /// write lands, well under `fans::SETTLE`, with the reply arriving later
+    /// from a task spawned off it -- so the command loop's `select!` arm can
+    /// move on to its next iteration (another command, a shutdown) without
+    /// waiting out a fan command's full settle.
+    #[tokio::test(start_paused = true)]
+    async fn handling_a_fan_command_returns_before_the_settle() {
+        let (fans, _dir) = simulated_fan("returns-before-settle", "20");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            super::super::fans::SETTLE,
+            handle_set_fan_target(fans, "fan0".into(), Some(50), reply_tx),
+        )
+        .await
+        .expect(
+            "handle_set_fan_target did not return within one settle: it is holding its caller \
+             for the settle and tacho read, not only the write",
+        );
+        assert!(
+            started.elapsed() < super::super::fans::SETTLE,
+            "handle_set_fan_target waited {:?}, at least one settle, before returning",
+            started.elapsed()
+        );
+
+        // The reply still carries the tacho's verdict, confirmed after the
+        // settle -- moving the wait off the caller does not drop it.
+        let reply = tokio::time::timeout(super::super::fans::SETTLE * 2, reply_rx)
+            .await
+            .expect("no reply arrived even after the settle")
+            .unwrap();
+        assert_eq!(reply.unwrap(), ());
+    }
+
+    /// A duty below the rpm floor is refused -- the same judgment
+    /// `confirm_fan_outcome` makes standalone, now exercised through the
+    /// split handler. SYNTHETIC rpm: the simulated tacho here
+    /// reads 5 counts, 150 rpm at this platform's `fan_rpm_per_count`, below
+    /// the 300 rpm floor.
+    #[tokio::test(start_paused = true)]
+    async fn handling_a_fan_command_carries_the_tachos_verdict() {
+        let (fans, _dir) = simulated_fan("verdict", "5");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(
+            super::super::fans::SETTLE * 2,
+            handle_set_fan_target(fans, "fan0".into(), Some(80), reply_tx),
+        )
+        .await
+        .unwrap();
+        let err = tokio::time::timeout(super::super::fans::SETTLE * 2, reply_rx)
+            .await
+            .expect("no reply arrived")
+            .unwrap()
+            .expect_err("a fan below the rpm floor must not confirm");
+        assert!(
+            err.to_string().contains("below the"),
+            "the refusal does not name the floor: {err}"
+        );
+    }
+
+    // ---- confirm_fan_outcome, the tacho's verdict alone ----
+
+    fn outcome(commanded_pct: u8, measured_rpm: Option<u32>) -> super::super::fans::FanOutcome {
+        super::super::fans::FanOutcome {
+            index: 2,
+            commanded_pct,
+            measured_rpm,
+        }
+    }
+
+    #[test]
+    fn an_unreadable_tacho_is_unmeasured_not_confirmed() {
+        for pct in [0, 50] {
+            let err = confirm_fan_outcome(outcome(pct, None))
+                .expect_err("an unreadable tacho confirmed a fan command");
+            assert!(
+                err.to_string().contains("UNMEASURED"),
+                "the refusal does not say UNMEASURED: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_turning_command_below_the_rpm_floor_is_refused() {
+        let floor = super::super::config::DEFAULT_MIN_FAN_RPM;
+        for synthetic_rpm in [0, floor - 1] {
+            let err = confirm_fan_outcome(outcome(50, Some(synthetic_rpm)))
+                .expect_err("a fan below the rpm floor confirmed");
+            assert!(
+                err.to_string().contains("below the"),
+                "the refusal does not name the floor: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_duty_command_at_zero_rpm_is_confirmed() {
+        assert_eq!(
+            confirm_fan_outcome(outcome(0, Some(0))).unwrap(),
+            "fan2 commanded 0%, measured 0 rpm"
+        );
+    }
+
+    #[test]
+    fn a_turning_command_at_or_above_the_rpm_floor_is_confirmed() {
+        let floor = super::super::config::DEFAULT_MIN_FAN_RPM;
+        for synthetic_rpm in [floor, floor + 1000] {
+            assert_eq!(
+                confirm_fan_outcome(outcome(50, Some(synthetic_rpm))).unwrap(),
+                format!("fan2 commanded 50%, measured {synthetic_rpm} rpm")
+            );
+        }
+    }
 
     fn bus(serial_path: &str, asic_start: u16, asic_count: u16) -> Bzm2BusLayout {
         Bzm2BusLayout {
