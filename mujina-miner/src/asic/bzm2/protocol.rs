@@ -700,6 +700,74 @@ fn parse_dts_vs_gen2(asic: u8, payload: &[u8]) -> TdmDtsVsGen2Frame {
     }
 }
 
+/// Refuses every frame that would change the part's state.
+///
+/// Installed on the transport so that no call site can bypass it: `thread.rs`
+/// alone writes registers from about ten places, and a guard applied at call
+/// sites is a guard the eleventh forgets.
+///
+/// **Why this is not the same as observer mode.** Observer mode withholds the
+/// job source, so the chain is never given work. It still attaches, still
+/// enumerates -- and enumeration *assigns ASIC ids*, which is a register write
+/// to live silicon. Bring-up is gated separately and turns itself on implicitly
+/// when rail paths are configured. So "observe" means "does not mine", and this
+/// means "does not write". They are different guarantees and the second is the
+/// one you want before the first contact with a powered part.
+///
+/// **Fail closed.** Anything this cannot positively identify as a read is
+/// refused: a short buffer, a length that disagrees with the buffer, an opcode
+/// it does not recognise. A safety guard that passes what it cannot parse is
+/// not a safety guard.
+#[derive(Debug, Default)]
+pub struct ReadOnlyPolicy;
+
+impl ReadOnlyPolicy {
+    /// Decide a frame, and say why when refusing. Separated from the trait so
+    /// it can be tested without a serial port.
+    pub fn decide(frame: &[u8]) -> Result<(), String> {
+        if frame.len() < 4 {
+            return Err(format!(
+                "refused: {} bytes is too short to carry an opcode",
+                frame.len()
+            ));
+        }
+        let declared = u16::from_le_bytes([frame[0], frame[1]]) as usize;
+        if declared != frame.len() {
+            return Err(format!(
+                "refused: frame declares {declared} bytes but the buffer holds {}; \
+                 cannot identify it, so it is not passed",
+                frame.len()
+            ));
+        }
+        let opcode = frame[3] >> 4;
+        match opcode {
+            OPCODE_UART_READRESULT
+            | OPCODE_UART_READREG
+            | OPCODE_UART_DTS_VS
+            | OPCODE_UART_LOOPBACK
+            | OPCODE_UART_NOOP => Ok(()),
+            OPCODE_UART_WRITEJOB => Err("refused: WRITEJOB would give the part work".into()),
+            OPCODE_UART_WRITEREG => Err(format!(
+                "refused: WRITEREG to asic {:#04x} would change its state",
+                frame[2]
+            )),
+            OPCODE_UART_MULTICAST_WRITE => Err(format!(
+                "refused: MULTICAST_WRITE from asic {:#04x} would change a whole row group",
+                frame[2]
+            )),
+            other => Err(format!(
+                "refused: opcode {other:#x} is not a known read, and unknown means no"
+            )),
+        }
+    }
+}
+
+impl crate::transport::serial::OutboundFramePolicy for ReadOnlyPolicy {
+    fn allow(&self, frame: &[u8]) -> Result<(), String> {
+        Self::decide(frame)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1112,5 +1180,67 @@ mod tests {
     #[test]
     fn block_hdr_opcode_is_not_accepted_as_a_frame_boundary() {
         assert!(!is_known_opcode(OPCODE_UART_BLOCK_HDR));
+    }
+
+    use crate::asic::bzm2::uart::{DEFAULT_ASIC_ID, NOTCH_REG};
+
+    /// Reads pass. These are the whole point: a probe that cannot read is not a
+    /// probe, and every one of these leaves the part exactly as it found it.
+    #[test]
+    fn read_only_policy_admits_reads() {
+        for frame in [
+            encode_noop(0x11),
+            encode_loopback(0x11, &[1, 2, 3, 4]),
+            encode_read_register(0x11, NOTCH_REG, 0x0b, 4),
+        ] {
+            assert!(
+                ReadOnlyPolicy::decide(&frame).is_ok(),
+                "a read was refused: {frame:02x?}"
+            );
+        }
+    }
+
+    /// Writes are refused, and the reason names what would have happened.
+    #[test]
+    fn read_only_policy_refuses_every_write() {
+        let reg = encode_write_register(0x11, NOTCH_REG, 0x0b, &42u32.to_le_bytes());
+        let err = ReadOnlyPolicy::decide(&reg).unwrap_err();
+        assert!(err.contains("WRITEREG"), "unhelpful reason: {err}");
+
+        let mc = encode_multicast_write(0x11, 0, 0x0b, &[0, 0, 0, 0]);
+        assert!(ReadOnlyPolicy::decide(&mc).is_err());
+    }
+
+    /// Enumeration is the case that matters. It reads like a discovery step and
+    /// it is not: assigning an id is a register write to live silicon, and it is
+    /// what observer mode lets through today.
+    #[test]
+    fn read_only_policy_refuses_the_id_assignment_enumeration_performs() {
+        let assign =
+            encode_write_register(DEFAULT_ASIC_ID, NOTCH_REG, 0x0b, &(0x10u32).to_le_bytes());
+        assert!(
+            ReadOnlyPolicy::decide(&assign).is_err(),
+            "enumeration's id assignment was admitted as if it were a read"
+        );
+    }
+
+    /// Fail closed. A guard that passes what it cannot parse is not a guard, so
+    /// a truncated frame, a length that disagrees with the buffer, and an opcode
+    /// outside the attested set are all refused rather than waved through.
+    #[test]
+    fn read_only_policy_fails_closed_on_anything_unidentifiable() {
+        assert!(ReadOnlyPolicy::decide(&[]).is_err());
+        assert!(ReadOnlyPolicy::decide(&[4, 0, 0x11]).is_err());
+
+        let mut short = encode_noop(0x11);
+        short.pop();
+        assert!(
+            ReadOnlyPolicy::decide(&short).is_err(),
+            "a frame whose declared length disagreed with its buffer was admitted"
+        );
+
+        // 0x5 is the unattested opcode; unknown means no, here as elsewhere.
+        let unknown = vec![4u8, 0, 0x11, OPCODE_UART_BLOCK_HDR << 4];
+        assert!(ReadOnlyPolicy::decide(&unknown).is_err());
     }
 }
