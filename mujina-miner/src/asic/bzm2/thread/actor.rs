@@ -1,5 +1,5 @@
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -16,6 +16,8 @@ use super::super::uart::{
 use super::dispatch::*;
 use super::engine::*;
 use super::interlock::*;
+use super::metrics::*;
+use super::results::*;
 use super::telemetry::*;
 use super::*;
 
@@ -133,6 +135,22 @@ pub(super) async fn bzm2_thread_actor(
         warn!(path = %config.serial_path, error = %err, "Failed to set BZM2 baud rate");
     }
 
+    // Run metadata. Every result this thread reports has its nonce corrected
+    // by `nonce_gap`, its ntime rebuilt from `timestamp_count`, and its
+    // version looked up from the candidate set. Those are properties of the
+    // run, fixed for the thread's lifetime (`config` is immutable here), and
+    // any dataset built from the result log is uninterpretable without them.
+    // A restart with different values starts a new run and logs a new line.
+    info!(
+        path = %config.serial_path,
+        nonce_gap = format!("{:#x}", config.nonce_gap),
+        timestamp_count = config.timestamp_count,
+        version_candidates = ?VERSION_CANDIDATES,
+        result_min_difficulty = config.result_min_difficulty.map(|d| d.as_f64()),
+        dispatch_ms = config.dispatch_interval.as_millis(),
+        "BZM2 result reconstruction parameters"
+    );
+
     let _ = event_tx
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
@@ -181,6 +199,9 @@ pub(super) async fn bzm2_thread_actor(
     let mut ntime_tick = tokio::time::interval(Duration::from_secs(1));
     ntime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut status_tick = tokio::time::interval(Duration::from_secs(5));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut read_buf = [0u8; 4096];
     let mut dts_vs = DtsVsStream::default();
     // A second handle on the same device, used only to suspend/resume the sensor
@@ -188,6 +209,8 @@ pub(super) async fn bzm2_thread_actor(
     // permits the diagnostic closure to hold `writer` at the same time; both are
     // `Arc`-backed views of one port and are never written concurrently.
     let mut control_writer = writer.clone();
+
+    let mut runtime_measurements = ThreadRuntimeMeasurementState::new();
 
     // Bring DTS/VS streaming up here rather than lazily on the first operator
     // telemetry query. Without this a default boot has no per-ASIC die
@@ -485,6 +508,12 @@ pub(super) async fn bzm2_thread_actor(
                             dispatch_deferred = false;
                             set_active(&status, true, config.expected_chain_hashrate_ths());
 
+                            refresh_status_hashrate(
+                                &status,
+                                &mut runtime_measurements,
+                                config.expected_chain_hashrate_ths(),
+                            );
+
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -566,6 +595,12 @@ pub(super) async fn bzm2_thread_actor(
                             dispatch_deferred = false;
                             set_active(&status, true, config.expected_chain_hashrate_ths());
 
+                            refresh_status_hashrate(
+                                &status,
+                                &mut runtime_measurements,
+                                config.expected_chain_hashrate_ths(),
+                            );
+
                             let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         }
                         let _ = response_tx.send(Ok(old));
@@ -582,8 +617,18 @@ pub(super) async fn bzm2_thread_actor(
                         let old = current_task.take();
                         set_active(&status, false, config.expected_chain_hashrate_ths());
 
+                        refresh_status_hashrate(
+                            &status,
+                            &mut runtime_measurements,
+                            config.expected_chain_hashrate_ths(),
+                        );
+
                         let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
                         let _ = response_tx.send(Ok(old));
+                    }
+
+                    ThreadCommand::QueryRuntimeMetrics { response_tx } => {
+                        let _ = response_tx.send(Ok(runtime_measurements.snapshot_at(Instant::now())));
                     }
 
                     ThreadCommand::Shutdown => break,
@@ -597,7 +642,20 @@ pub(super) async fn bzm2_thread_actor(
                         let mut should_shutdown = false;
                         for frame in parser.push(&read_buf[..n]) {
                             match frame {
-                                TdmFrame::Result(_) => {}
+
+                                TdmFrame::Result(frame) => {
+                                    handle_result_frame(
+                                        &frame,
+                                        &engine_dispatches,
+                                        &engine_layout,
+                                        &config,
+                                        &status,
+                                        &event_tx,
+                                        &mut runtime_measurements,
+                                    )
+                                    .await;
+
+                                }
                                 TdmFrame::DtsVs(frame) => {
                                     should_shutdown = handle_dts_vs_frame(&frame, &config, &status, &event_tx, Some(&mut interlock), &mut corroborator, &mut dts_vs_diagnostics, &mut telemetry_coalescer).await;
                                     if should_shutdown {
@@ -695,6 +753,12 @@ pub(super) async fn bzm2_thread_actor(
                                 dispatch_deferred = false;
                                 set_active(&status, true, config.expected_chain_hashrate_ths());
 
+                                refresh_status_hashrate(
+                                    &status,
+                                    &mut runtime_measurements,
+                                    config.expected_chain_hashrate_ths(),
+                                );
+
                                 let _ = event_tx
                                     .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
                                     .await;
@@ -715,6 +779,15 @@ pub(super) async fn bzm2_thread_actor(
                 if let Some(ref mut task) = current_task {
                     task.ntime = task.ntime.wrapping_add(1);
                 }
+            }
+
+            _ = status_tick.tick() => {
+                refresh_status_hashrate(
+                    &status,
+                    &mut runtime_measurements,
+                    config.expected_chain_hashrate_ths(),
+                );
+                let _ = event_tx.send(HashThreadEvent::StatusUpdate(snapshot_status(&status))).await;
             }
 
         }
@@ -750,6 +823,12 @@ pub(super) async fn bzm2_thread_actor(
 
     set_active(&status, false, config.expected_chain_hashrate_ths());
 
+    refresh_status_hashrate(
+        &status,
+        &mut runtime_measurements,
+        config.expected_chain_hashrate_ths(),
+    );
+
     let _ = event_tx
         .send(HashThreadEvent::StatusUpdate(snapshot_status(&status)))
         .await;
@@ -760,9 +839,10 @@ mod tests {
     use super::super::super::protocol::{self, encode_write_register};
     use super::super::test_support::*;
     use super::*;
+    use crate::asic::hash_thread::Share;
 
     use crate::transport::{SerialConfig, SerialStream};
-
+    use bitcoin::pow::Target;
     use nix::pty::openpty;
     use std::os::unix::io::IntoRawFd;
     use tokio::io::AsyncWriteExt;
@@ -1425,6 +1505,166 @@ mod tests {
             frames.last().map(Vec::as_slice),
             Some(off.as_slice()),
             "the sensor-off frame must stay the last thing on the bus"
+        );
+    }
+
+    /// AN UPDATE KEEPS EARLIER WORK SUBMITTABLE; A REPLACE OR AN IDLE
+    /// INVALIDATES IT.
+    ///
+    /// Stratum's `clean_jobs` is the pool saying which jobs it will still
+    /// take. The scheduler sends UpdateTask for `clean_jobs=false` (earlier
+    /// jobs stay valid) and ReplaceTask for `clean_jobs=true` (they do not).
+    /// So a hit for an earlier task, read after an UPDATE, is a share on that
+    /// task's own channel -- an earlier version lost exactly these as stale_sequence -- and
+    /// a hit for anything dispatched before a REPLACE is a share on nobody's
+    /// channel, not even the new task's. GoIdle stops the chain and drops
+    /// its tasks, so nothing sent before it is forwarded after it either,
+    /// not even the task that was live until then.
+    ///
+    /// Driven through the actor's real command paths, with results injected
+    /// on the bus. The injection for the live task, just before the idle, is
+    /// the null check: that hit must arrive, or the silences around it prove
+    /// nothing.
+    #[tokio::test]
+    async fn an_update_keeps_earlier_work_submittable_and_a_replace_or_idle_invalidates_it() {
+        let pty = openpty(None, None).unwrap();
+        let _bus_outlives_the_handle = rustix::io::dup(&pty.master).unwrap();
+        let inject_fd = rustix::io::dup(&pty.slave).unwrap();
+        let thread_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let host_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let inject_side =
+            SerialStream::from_fd(inject_fd.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (reader, writer, control) = thread_side.split();
+        let (host_reader, host_writer, _host_control) = host_side.split();
+        let (_inject_reader, mut inject, _inject_control) = inject_side.split();
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = vec![70, 71];
+        // Only the commands dispatch here (bar the interval's immediate first
+        // tick); each job's sequence byte is read back off the bus anyway.
+        config.dispatch_interval = Duration::from_secs(3600);
+        let mut thread = Bzm2Thread::new("BZM2 test".into(), reader, writer, control, config);
+        let handle = thread.shutdown_handle();
+        let mut event_rx = thread.take_event_receiver().unwrap();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut frames_rx =
+            spawn_config_modelling_part(host_reader, host_writer, live.clone(), None);
+
+        // Every hash meets this, so WHICH channel a share reaches is the
+        // whole observation. Tasks are told apart on the bus by ntime.
+        let task = |ntime: u32| {
+            let mut t = test_task();
+            t.share_target = Target::from_be_bytes([0xff; 32]);
+            t.ntime = ntime;
+            let (tx, rx) = tokio_mpsc::channel(8);
+            t.share_tx = tx;
+            (t, rx)
+        };
+        let (ntime_a, ntime_b, ntime_c) = (1_700_000_000u32, 1_700_001_000, 1_700_002_000);
+        let (a, mut a_rx) = task(ntime_a);
+        let (b, mut b_rx) = task(ntime_b);
+        let (c, mut c_rx) = task(ntime_c);
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        // The sequence byte of the last micro-job-0 job the bus has seen for
+        // the task whose ntime starts at `base`, waiting for it to arrive.
+        async fn last_sequence_for(
+            frames: &mut Vec<Vec<u8>>,
+            frames_rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+            base: u32,
+        ) -> u8 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                while let Ok(f) = frames_rx.try_recv() {
+                    frames.push(f);
+                }
+                let found = frames.iter().rev().find(|f| {
+                    f.len() == 48
+                        && f[3] >> 4 == protocol::OPCODE_UART_WRITEJOB
+                        && f[46] & 0x3 == 0
+                        && (base..base + 100)
+                            .contains(&u32::from_be_bytes([f[42], f[43], f[44], f[45]]))
+                });
+                if let Some(f) = found {
+                    return f[46];
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the task was never dispatched"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        let (row, col) = protocol::default_engine_coordinates()[0];
+        let hit = |sequence_id: u8| {
+            let header = (0x8u16 << 12) | protocol::logical_engine_address(row, col);
+            let mut raw = vec![70, protocol::OPCODE_UART_READRESULT];
+            raw.extend_from_slice(&header.to_be_bytes());
+            raw.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+            raw.push(sequence_id);
+            raw.push(DEFAULT_TIMESTAMP_COUNT);
+            raw
+        };
+        let arrives = |rx: &mut tokio_mpsc::Receiver<Share>| {
+            let got = rx.try_recv().is_ok();
+            while rx.try_recv().is_ok() {}
+            got
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(300));
+
+        tokio::time::sleep(Duration::from_millis(1500)).await; // attach
+        thread.update_task(a).await.unwrap();
+        settle().await; // the interval's first tick dispatches A again
+        let seq_a = last_sequence_for(&mut frames, &mut frames_rx, ntime_a).await;
+
+        // clean_jobs=false: B dispatched, A still live at the pool.
+        thread.update_task(b).await.unwrap();
+        let seq_b = last_sequence_for(&mut frames, &mut frames_rx, ntime_b).await;
+        inject.write_all(&hit(seq_a)).await.unwrap();
+        settle().await;
+        let a_after_update = arrives(&mut a_rx);
+        let b_after_update = arrives(&mut b_rx);
+
+        // clean_jobs=true: C replaces both.
+        thread.replace_task(c).await.unwrap();
+        let seq_c = last_sequence_for(&mut frames, &mut frames_rx, ntime_c).await;
+        inject.write_all(&hit(seq_a)).await.unwrap();
+        inject.write_all(&hit(seq_b)).await.unwrap();
+        settle().await;
+        let after_replace = [arrives(&mut a_rx), arrives(&mut b_rx), arrives(&mut c_rx)];
+
+        // The null check.
+        inject.write_all(&hit(seq_c)).await.unwrap();
+        settle().await;
+        let c_live = arrives(&mut c_rx);
+
+        // Idle: the same hit for C, read after the chain was told to stop.
+        thread.go_idle().await.unwrap();
+        inject.write_all(&hit(seq_c)).await.unwrap();
+        settle().await;
+        let c_after_idle = arrives(&mut c_rx);
+        let _ = handle.shutdown();
+
+        assert!(
+            c_live,
+            "a hit for the live task never arrived: the injection proves nothing"
+        );
+        assert!(
+            !c_after_idle,
+            "after GoIdle, a hit for C still reached C: work dispatched before the idle was forwarded"
+        );
+        assert!(
+            a_after_update,
+            "a hit for A read after an UPDATE to B was lost; A is still live at the pool"
+        );
+        assert!(!b_after_update, "A's hit was credited to B");
+        assert_eq!(
+            after_replace,
+            [false, false, false],
+            "after a REPLACE, hits for A and B reached [A, B, C]: invalidated work was forwarded"
         );
     }
 

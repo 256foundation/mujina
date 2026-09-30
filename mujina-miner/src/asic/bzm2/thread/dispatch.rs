@@ -16,6 +16,7 @@ use super::super::protocol::{
 };
 use super::engine::*;
 use super::interlock::*;
+use super::metrics::*;
 use super::*;
 
 const TIMESTAMP_COUNT_AUTO_CLOCK_UNGATE: u8 = 0x80;
@@ -84,6 +85,10 @@ impl AsicSet {
         set
     }
 
+    fn contains(&self, id: u8) -> bool {
+        self.0[usize::from(id / 64)] & (1u64 << (id % 64)) != 0
+    }
+
     fn intersects(&self, other: &Self) -> bool {
         self.0.iter().zip(other.0.iter()).any(|(a, b)| a & b != 0)
     }
@@ -93,6 +98,9 @@ impl AsicSet {
 /// the dispatch is shared by every engine and lives once, in [`Dispatch`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct EngineWork {
+    /// The extranonce2 this engine's header was built from: what a share
+    /// from it must name.
+    pub(super) en2: Option<crate::job_source::Extranonce2>,
     pub(super) merkle_root: bitcoin::TxMerkleNode,
 }
 
@@ -104,6 +112,10 @@ pub(super) struct EngineWork {
 /// dispatch, twice a second.
 pub(super) struct Dispatch {
     pub(super) tag: u8,
+    /// The task as dispatched, ntime included. Each engine's own
+    /// extranonce2 is in `engines`, not here.
+    pub(super) task: HashTask,
+    pub(super) versions: [bitcoin::block::Version; 4],
     asics: AsicSet,
     engines: HashMap<u16, EngineWork>,
 }
@@ -127,7 +139,14 @@ impl DispatchRing {
     /// are written. The oldest dispatch leaves when the ring is full, and so
     /// does any earlier one under the same tag to the same chips -- a failed
     /// dispatch is retried under its tag, and the chips now hold the retry.
-    pub(super) fn begin(&mut self, tag: u8, asics: AsicSet, engine_count: usize) {
+    pub(super) fn begin(
+        &mut self,
+        tag: u8,
+        task: &HashTask,
+        versions: [bitcoin::block::Version; 4],
+        asics: AsicSet,
+        engine_count: usize,
+    ) {
         self.dispatches
             .retain(|d| !(d.tag == tag && d.asics.intersects(&asics)));
         while self.dispatches.len() >= DISPATCH_RING_DEPTH {
@@ -135,6 +154,8 @@ impl DispatchRing {
         }
         self.dispatches.push_back(Dispatch {
             tag,
+            task: task.clone(),
+            versions,
             asics,
             engines: HashMap::with_capacity(engine_count),
         });
@@ -153,6 +174,38 @@ impl DispatchRing {
     /// of them is discarded from here on; none can be forwarded.
     pub(super) fn invalidate(&mut self) {
         self.dispatches.clear();
+    }
+
+    /// The dispatch, and the engine's work in it, that a result from `asic`'s
+    /// `engine_id` tagged `tag` was found on.
+    ///
+    /// `NoDispatch` when no held dispatch reached that engine on that chip
+    /// at all; `StaleSequence` when some did, but none under this tag: its
+    /// dispatch has left the ring, or was invalidated.
+    pub(super) fn resolve(
+        &self,
+        asic: u8,
+        engine_id: u16,
+        tag: u8,
+    ) -> Result<(&Dispatch, &EngineWork), ResultDiscard> {
+        let mut reached = false;
+        for dispatch in self.dispatches.iter().rev() {
+            if !dispatch.asics.contains(asic) {
+                continue;
+            }
+            let Some(work) = dispatch.engines.get(&engine_id) else {
+                continue;
+            };
+            if dispatch.tag == tag {
+                return Ok((dispatch, work));
+            }
+            reached = true;
+        }
+        Err(if reached {
+            ResultDiscard::StaleSequence
+        } else {
+            ResultDiscard::NoDispatch
+        })
     }
 }
 
@@ -213,7 +266,13 @@ pub(super) async fn dispatch_task_to_board(
     // The job is broadcast, so every chip on the bus holds it; results are
     // resolved by the chips this thread addresses, as before.
     let tag = dispatch_tag(base_sequence);
-    engine_dispatches.begin(tag, AsicSet::of(&config.asic_ids), engine_count);
+    engine_dispatches.begin(
+        tag,
+        task,
+        versions,
+        AsicSet::of(&config.asic_ids),
+        engine_count,
+    );
     for (index, &(row, col)) in engine_layout.active_coordinates().iter().enumerate() {
         let engine_address = logical_engine_address(row, col);
         let work = work_for_engine(task, *en2_cursor, index)?;
@@ -318,7 +377,10 @@ fn work_for_engine(
 ) -> Result<EngineWork, HashThreadError> {
     let template = match &task.template.merkle_root {
         MerkleRootKind::Fixed(root) => {
-            return Ok(EngineWork { merkle_root: *root });
+            return Ok(EngineWork {
+                en2: task.en2,
+                merkle_root: *root,
+            });
         }
         MerkleRootKind::Computed(template) => template,
     };
@@ -342,7 +404,10 @@ fn work_for_engine(
     let merkle_root = task.template.compute_merkle_root(&en2).map_err(|err| {
         HashThreadError::WorkAssignmentFailed(format!("BZM2 merkle root computation failed: {err}"))
     })?;
-    Ok(EngineWork { merkle_root })
+    Ok(EngineWork {
+        en2: Some(en2),
+        merkle_root,
+    })
 }
 
 /// Per-ASIC nonce slices: disjoint, even-aligned, covering the 32-bit space.
@@ -448,6 +513,10 @@ impl DispatchRing {
         self.dispatches.back().expect("a dispatch was recorded")
     }
 
+    pub(super) fn newest_mut(&mut self) -> &mut Dispatch {
+        self.dispatches.back_mut().expect("a dispatch was recorded")
+    }
+
     pub(super) fn len(&self) -> usize {
         self.dispatches.len()
     }
@@ -457,7 +526,7 @@ impl DispatchRing {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::job_source::GeneralPurposeBits;
+    use crate::job_source::{GeneralPurposeBits, JobTemplate, VersionTemplate};
     use crate::transport::{SerialConfig, SerialStream};
     use bitcoin::hashes::Hash;
 
@@ -547,6 +616,84 @@ mod tests {
             hex_32("9fd177e1d1c00a0bb92227f3fc01ac91a73d9b5caaa74d885cdd99e888ee6d00"),
             "state words must be little-endian on the wire (big-endian reads e177d19f...)"
         );
+    }
+
+    /// The last three header words go out byte-swapped, as the engine hashes
+    /// them: merkle residue, ntime and nBits all big-endian on the wire.
+    #[tokio::test]
+    async fn the_job_goes_out_in_the_byte_order_the_silicon_hashes() {
+        let pty = openpty(None, None).unwrap();
+        let writer_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let reader_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader_a, mut writer, _control_a) = writer_side.split();
+        let (mut reader, _writer_b, _control_b) = reader_side.split();
+
+        let (task, merkle_root) = public_vector_task();
+        let mut engine_dispatches = DispatchRing::default();
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        let engine_layout = Bzm2EngineLayout::from_active_coordinates(vec![(0, 0)]);
+        dispatch_task_to_board(
+            &mut writer,
+            &task,
+            0,
+            &engine_layout,
+            &mut engine_dispatches,
+            &config,
+            &mut satisfied_interlock(),
+            &EngineGate::Ready,
+            &mut 0,
+        )
+        .await
+        .unwrap();
+
+        // Everything one engine's dispatch writes, whatever its length.
+        let mut bytes = Vec::new();
+        let mut buf = vec![0u8; 512];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(150), reader.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+
+        // Walk the length-prefixed frames rather than assume offsets.
+        let mut frames = Vec::new();
+        let mut i = 0;
+        while i + 2 <= bytes.len() {
+            let len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+            frames.push(&bytes[i..i + len]);
+            i += len;
+        }
+        let target = frames
+            .iter()
+            .find(|f| f.len() == 11 && f[5] == ENGINE_REG_TARGET)
+            .expect("dispatch writes the target register");
+        assert_eq!(
+            &target[7..11],
+            &[0x17, 0x02, 0x36, 0x9d],
+            "nBits big-endian"
+        );
+
+        let jobs: Vec<_> = frames.iter().filter(|f| f.len() == 48).collect();
+        assert_eq!(jobs.len(), 4);
+        let dispatch = engine_dispatches.newest();
+        for (slot, job) in jobs.iter().enumerate() {
+            assert_eq!(
+                &job[6..38],
+                &compute_midstate(&task, merkle_root, dispatch.versions[slot]),
+                "slot {slot} carries its own version's midstate"
+            );
+            assert_eq!(
+                &job[38..42],
+                &[0x13, 0xa1, 0x96, 0x6c],
+                "merkle residue big-endian"
+            );
+            assert_eq!(&job[42..46], &[0x6a, 0x5d, 0xcd, 0x19], "ntime big-endian");
+        }
     }
 
     #[tokio::test]
@@ -662,6 +809,68 @@ mod tests {
         assert_eq!(layout.logical_engine_id(0, 1), None);
     }
 
+    #[tokio::test]
+    async fn dispatch_uses_runtime_engine_layout() {
+        let pty = openpty(None, None).unwrap();
+        let writer_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let reader_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader_a, mut writer, _control_a) = writer_side.split();
+        let (mut reader, _writer_b, _control_b) = reader_side.split();
+
+        let task = test_task();
+        let mut engine_dispatches = DispatchRing::default();
+        let config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        let engine_layout = Bzm2EngineLayout::from_active_coordinates([(0, 0), (19, 10)]);
+
+        dispatch_task_to_board(
+            &mut writer,
+            &task,
+            1,
+            &engine_layout,
+            &mut engine_dispatches,
+            &config,
+            &mut satisfied_interlock(),
+            &EngineGate::Ready,
+            &mut 0,
+        )
+        .await
+        .unwrap();
+
+        let mut buf = vec![0u8; 512];
+        let mut bytes = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        // ZEROS, TIMESTAMP_COUNT, TARGET, four jobs. No START/END: the nonce
+        // slices are per ASIC, set at attach, and never broadcast.
+        let expected_bytes_per_engine = 8 + 8 + 11 + (48 * 4);
+        while bytes.len() < expected_bytes_per_engine * engine_layout.active_engine_count() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(remaining, reader.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+
+        let first_engine = logical_engine_address(0, 0);
+        let second_engine = logical_engine_address(19, 10);
+        let touched_engines = bytes
+            .chunks_exact(expected_bytes_per_engine)
+            .map(|chunk| u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]))
+            .map(|header| ((header >> 8) & 0x0fff) as u16)
+            .collect::<Vec<_>>();
+        assert!(touched_engines.contains(&first_engine));
+        assert!(touched_engines.contains(&second_engine));
+        assert!(!touched_engines.contains(&logical_engine_address(0, 1)));
+        assert_eq!(engine_dispatches.newest().engines.len(), 2);
+        assert!(engine_dispatches.resolve(0, 0, dispatch_tag(1)).is_ok());
+        assert!(engine_dispatches.resolve(0, 1, dispatch_tag(1)).is_ok());
+    }
+
     /// THE SEQUENCE BYTE IS `tag << 2 | micro_job`, and the tag runs on
     /// across the dispatch counter's wrap. Tags 0 and 1 give the bytes the
     /// one-bit encoding did (0-7), which is all a run had ever put on the
@@ -680,6 +889,136 @@ mod tests {
             .collect();
         let distinct: std::collections::HashSet<_> = tags.iter().collect();
         assert_eq!(distinct.len(), SEQUENCE_TAGS as usize);
+    }
+
+    /// THE HISTORY IS BOUNDED, AND IT FORGETS OLDEST FIRST. Driven as the
+    /// dispatch tick drives it, twice a second for as long as the chain
+    /// mines, and across the counter's wrap: the ring never holds more than
+    /// DISPATCH_RING_DEPTH dispatches, the ones it holds are the newest, and
+    /// a hit from any dispatch older than those is stale, not resolved.
+    #[test]
+    fn the_dispatch_history_never_exceeds_its_depth_and_forgets_oldest_first() {
+        let task = test_task();
+        let versions = compute_micro_versions(&task);
+        let work = work_for_engine(&task, 0, 0).unwrap();
+        let mut ring = DispatchRing::default();
+        let mut base = 0u8;
+        let mut sent: Vec<u8> = Vec::new();
+        for _ in 0..600 {
+            ring.begin(dispatch_tag(base), &task, versions, AsicSet::of(&[0]), 1);
+            ring.record_engine(0, work);
+            sent.push(dispatch_tag(base));
+            base = base.wrapping_add(1);
+            assert!(
+                ring.len() <= DISPATCH_RING_DEPTH,
+                "{} dispatches held after {}",
+                ring.len(),
+                sent.len()
+            );
+            // Any tag sent in the last SEQUENCE_TAGS dispatches names one
+            // dispatch only, so each is either held or gone.
+            for (age, &tag) in sent.iter().rev().take(SEQUENCE_TAGS as usize).enumerate() {
+                let outcome = ring.resolve(0, 0, tag).map(|(dispatch, _)| dispatch.tag);
+                if age < DISPATCH_RING_DEPTH {
+                    assert_eq!(outcome, Ok(tag), "dispatch {age} back is still held");
+                } else {
+                    assert_eq!(
+                        outcome,
+                        Err(ResultDiscard::StaleSequence),
+                        "dispatch {age} back has left the history"
+                    );
+                }
+            }
+        }
+        assert_eq!(ring.len(), DISPATCH_RING_DEPTH);
+    }
+
+    /// NOTHING DISPATCHED BEFORE AN INVALIDATION RESOLVES AFTER IT, WHATEVER
+    /// ITS TAG. ReplaceTask (`clean_jobs`) and GoIdle invalidate the history,
+    /// and a share is only ever built from the work its result resolves to,
+    /// so this is the property that keeps a share for invalidated work from
+    /// being built at all. The tags the invalidated dispatches carried come
+    /// round again within SEQUENCE_TAGS dispatches, so it is checked for
+    /// every tag through two full cycles of them.
+    #[test]
+    fn no_result_resolves_to_work_dispatched_before_an_invalidation() {
+        let before = test_task();
+        let mut after = test_task();
+        after.ntime = before.ntime + 9_000;
+        let versions = compute_micro_versions(&before);
+        let work = work_for_engine(&before, 0, 0).unwrap();
+        let mut ring = DispatchRing::default();
+        let mut base = 0u8;
+        for _ in 0..DISPATCH_RING_DEPTH {
+            ring.begin(dispatch_tag(base), &before, versions, AsicSet::of(&[0]), 1);
+            ring.record_engine(0, work);
+            base = base.wrapping_add(1);
+        }
+        ring.invalidate();
+        assert_eq!(ring.len(), 0);
+        for tag in 0..SEQUENCE_TAGS {
+            assert_eq!(
+                ring.resolve(0, 0, tag).map(|(dispatch, _)| dispatch.tag),
+                Err(ResultDiscard::NoDispatch),
+                "tag {tag} resolved after the invalidation"
+            );
+        }
+        let mut resolved = 0;
+        for _ in 0..2 * SEQUENCE_TAGS as usize {
+            ring.begin(dispatch_tag(base), &after, versions, AsicSet::of(&[0]), 1);
+            ring.record_engine(0, work);
+            base = base.wrapping_add(1);
+            for tag in 0..SEQUENCE_TAGS {
+                if let Ok((dispatch, _)) = ring.resolve(0, 0, tag) {
+                    resolved += 1;
+                    assert_eq!(
+                        dispatch.task.ntime, after.ntime,
+                        "tag {tag} resolved to work dispatched before the invalidation"
+                    );
+                }
+            }
+        }
+        assert!(
+            resolved > 0,
+            "nothing resolved at all: the check proves nothing"
+        );
+    }
+
+    /// A RETRY TAKES THE PLACE OF THE ATTEMPT IT RETRIES. The counter
+    /// advances only when a dispatch succeeds, so one that fails part way is
+    /// retried under the same tag, and the chips then hold the retry. The
+    /// failed attempt leaves the history instead of taking a slot from a
+    /// dispatch whose hits may still be in flight.
+    #[test]
+    fn a_retried_dispatch_replaces_its_failed_attempt_in_the_history() {
+        let task = test_task();
+        let versions = compute_micro_versions(&task);
+        let work = work_for_engine(&task, 0, 0).unwrap();
+        let mut ring = DispatchRing::default();
+        let last = DISPATCH_RING_DEPTH as u8 - 1;
+        for tag in 0..last {
+            ring.begin(tag, &task, versions, AsicSet::of(&[0]), 2);
+            ring.record_engine(0, work);
+            ring.record_engine(1, work);
+        }
+        // Fails after engine 0 is written; retried in full.
+        ring.begin(last, &task, versions, AsicSet::of(&[0]), 2);
+        ring.record_engine(0, work);
+        ring.begin(last, &task, versions, AsicSet::of(&[0]), 2);
+        ring.record_engine(0, work);
+        ring.record_engine(1, work);
+
+        assert_eq!(ring.len(), DISPATCH_RING_DEPTH);
+        assert!(
+            ring.resolve(0, 1, 0).is_ok(),
+            "the failed attempt cost the oldest dispatch its place in the history"
+        );
+        assert_eq!(
+            ring.resolve(0, 1, last)
+                .map(|(dispatch, _)| dispatch.engines.len()),
+            Ok(2),
+            "the tag resolves to the retry, which reached both engines"
+        );
     }
 
     #[test]
@@ -725,5 +1064,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// EVERY ENGINE ADDRESS GETS ITS OWN HEADER, AND NO DISPATCH REPEATS ONE.
+    ///
+    /// The silicon does not split work (measured on hardware: the same job on different
+    /// ASICs and engines returns the same nonce), so identical headers are
+    /// identical hashing. This used to give every engine one header, and
+    /// every dispatch of a task the same header again within the same second.
+    #[tokio::test]
+    async fn every_engine_gets_its_own_header_and_no_dispatch_repeats_one() {
+        let pty = openpty(None, None).unwrap();
+        let writer_side =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        let reader_side =
+            SerialStream::from_fd(pty.slave.into_raw_fd(), SerialConfig::default()).unwrap();
+        let (_reader_a, mut writer, _control_a) = writer_side.split();
+        let (mut reader, _writer_b, _control_b) = reader_side.split();
+
+        // A real coinbase: block 881,423's, whose merkle root is known.
+        use crate::job_source::test_blocks::block_881423;
+        let en2_size = block_881423::EXTRANONCE2.size();
+        let range = crate::job_source::Extranonce2Range::new(en2_size).unwrap();
+        let mut task = test_task();
+        task.template = Arc::new(JobTemplate {
+            id: "computed".into(),
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                bitcoin::block::Version::from_consensus(0x2000_0000),
+                GeneralPurposeBits::full(),
+            )
+            .unwrap(),
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x1d00_ffff),
+            share_target: task.share_target,
+            time: task.ntime,
+            merkle_root: MerkleRootKind::Computed(crate::job_source::MerkleRootTemplate {
+                coinbase1: block_881423::coinbase1_bytes().to_vec(),
+                extranonce1: block_881423::extranonce1_bytes().to_vec(),
+                extranonce2_range: range.clone(),
+                coinbase2: block_881423::coinbase2_bytes().to_vec(),
+                merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
+            }),
+        });
+        task.en2_range = Some(range.clone());
+        task.en2 = Some(crate::job_source::Extranonce2::new(7, en2_size).unwrap());
+
+        let mut config = Bzm2ThreadConfig::new("/dev/null".into(), 5_000_000, 55.0);
+        config.asic_ids = vec![0, 1];
+        let engine_layout = Bzm2EngineLayout::from_active_coordinates(vec![(0, 0), (1, 0), (2, 0)]);
+        let mut engine_dispatches = DispatchRing::default();
+        let mut cursor = 0u64;
+        let mut midstates_by_dispatch = Vec::new();
+        for base_sequence in 0..2u8 {
+            dispatch_task_to_board(
+                &mut writer,
+                &task,
+                base_sequence,
+                &engine_layout,
+                &mut engine_dispatches,
+                &config,
+                &mut satisfied_interlock(),
+                &EngineGate::Ready,
+                &mut cursor,
+            )
+            .await
+            .unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = vec![0u8; 1024];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(150), reader.read(&mut buf)).await
+            {
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            let mut midstates = Vec::new();
+            let mut i = 0;
+            while i + 2 <= bytes.len() {
+                let len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+                if len == 48 {
+                    midstates.push(bytes[i + 6..i + 38].to_vec());
+                }
+                i += len;
+            }
+            assert_eq!(midstates.len(), 3 * 4, "three engines, four slots each");
+            let distinct: std::collections::HashSet<_> = midstates.iter().collect();
+            assert_eq!(
+                distinct.len(),
+                midstates.len(),
+                "two engine slots got the same header in one dispatch"
+            );
+            // Each engine's record carries the extranonce2 it hashed, and the
+            // merkle root that extranonce2 gives -- what a share must name.
+            let dispatch = engine_dispatches.newest();
+            for work in dispatch.engines.values() {
+                let en2 = work.en2.as_ref().unwrap();
+                assert_eq!(
+                    work.merkle_root,
+                    dispatch.task.template.compute_merkle_root(en2).unwrap()
+                );
+            }
+            midstates_by_dispatch.push(midstates);
+        }
+        let first: std::collections::HashSet<_> = midstates_by_dispatch[0].iter().collect();
+        assert!(
+            midstates_by_dispatch[1].iter().all(|m| !first.contains(m)),
+            "a second dispatch at the same ntime repeated a header"
+        );
+        assert_eq!(
+            cursor, 6,
+            "the cursor advances one extranonce2 per engine per dispatch"
+        );
     }
 }

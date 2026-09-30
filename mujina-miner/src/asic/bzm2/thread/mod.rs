@@ -19,6 +19,8 @@ mod diagnostics;
 mod dispatch;
 mod engine;
 mod interlock;
+mod metrics;
+mod results;
 pub(crate) mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -29,6 +31,11 @@ pub use interlock::{
     DEFAULT_THERMAL_ESCALATION, DtsVsDiagnostics, FaultCorroborator, ThermalInterlock,
     ThermalRefusal,
 };
+pub use metrics::{
+    Bzm2AsicRuntimeMetrics, Bzm2PllRuntimeMetrics, Bzm2ResultCounters, Bzm2ThreadRuntimeMetrics,
+    ResultDiscard,
+};
+pub use results::DecodedResult;
 
 /// Die temperature at or above which dispatch is refused. The shipped stack
 /// controls toward the high sixties and its own configuration tops out at
@@ -302,6 +309,18 @@ impl Bzm2ThreadHandle {
             Err(mpsc::error::TrySendError::Full(_)) => ShutdownAsk::Refused,
         }
     }
+
+    pub async fn runtime_metrics(&self) -> Result<Bzm2ThreadRuntimeMetrics, HashThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ThreadCommand::QueryRuntimeMetrics { response_tx })
+            .await
+            .map_err(|_| HashThreadError::ChannelClosed("command channel closed".into()))?;
+
+        response_rx
+            .await
+            .map_err(|_| HashThreadError::DiagnosticsFailed("thread dropped response".into()))?
+    }
 }
 
 #[derive(Debug)]
@@ -318,6 +337,9 @@ enum ThreadCommand {
     },
     GoIdle {
         response_tx: oneshot::Sender<Result<Option<HashTask>, HashThreadError>>,
+    },
+    QueryRuntimeMetrics {
+        response_tx: oneshot::Sender<Result<Bzm2ThreadRuntimeMetrics, HashThreadError>>,
     },
     Shutdown,
 }
