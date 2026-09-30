@@ -17,6 +17,7 @@
 //! threads publish into and the monitor already holds -- rather than from a
 //! second set of sysfs reads that may name nothing.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::api_client::types::{
@@ -255,6 +256,229 @@ pub(super) fn fans_blind(fans: &[Fan], min_rpm: Option<u32>) -> bool {
     min_rpm.is_some() && !fans.is_empty() && fans.iter().all(|fan| fan.rpm.is_none())
 }
 
+/// Has a chain stopped returning results while we are still giving it work?
+///
+/// THE ONE FAILURE THE THERMAL LADDER CANNOT SEE. Everything else in this file
+/// watches whether we can SEE the chain or whether it is HOT. A chain that has
+/// stopped producing results while still streaming DTS/VS frames is neither —
+/// and it is worse than neutral, because **the dies read cool precisely
+/// because nothing is hashing**. Every thermal check passes, the interlock
+/// keeps permitting dispatch, the ladder never arms, and the machine sits at
+/// its operating point consuming power and producing nothing.
+///
+/// The stock stack powers the system off in this state. We had nothing.
+///
+/// **`decoded`, not `accepted`.** `accepted` counts results that met the
+/// target, so it is luck-dependent and a quiet run is indistinguishable from a
+/// dead one over short windows. `decoded` counts every result frame the chain
+/// returned at all, which advances steadily while the chain is working and
+/// stops dead when it is not. Liveness is about whether the chain is talking
+/// back about work, not about whether the work was any good.
+#[derive(Debug, Default)]
+pub(super) struct StallWatch {
+    /// Per chain: the last `decoded` value seen, and when it last CHANGED --
+    /// not when it was last read. A counter read a thousand times without
+    /// moving has not been alive a thousand times.
+    per_thread: BTreeMap<usize, (u64, Instant)>,
+}
+
+impl StallWatch {
+    /// Fold one poll's counters in.
+    ///
+    /// `dispatching` is what makes this honest: a thread that is not being
+    /// given work is not expected to return results, and observing mode
+    /// dispatches nothing at all. A stall condition that fired whenever a
+    /// board was idle would fire on every observation run we have ever done.
+    pub(super) fn observe(&mut self, thread: usize, decoded: u64, dispatching: bool, now: Instant) {
+        if !dispatching {
+            self.per_thread.remove(&thread);
+            return;
+        }
+        match self.per_thread.get_mut(&thread) {
+            Some(entry) if entry.0 != decoded => *entry = (decoded, now),
+            Some(_) => {}
+            None => {
+                self.per_thread.insert(thread, (decoded, now));
+            }
+        }
+    }
+
+    /// Chains whose result counter has not moved for longer than `budget`.
+    pub(super) fn stalled(&self, now: Instant, budget: Duration) -> Vec<(usize, Duration)> {
+        self.per_thread
+            .iter()
+            .map(|(t, (_, at))| (*t, now.saturating_duration_since(*at)))
+            .filter(|(_, age)| *age >= budget)
+            .collect()
+    }
+}
+
+/// A chain that is being given work and has stopped answering.
+///
+/// Arms rather than scrams. The first response to a chain that stopped
+/// producing is to stop giving it work, which is cheap and removes the load;
+/// if it does not come back, the ladder escalates on its own clock like
+/// everything else.
+pub(super) fn stall_condition(
+    stalled: &[(usize, Duration)],
+    budget: Duration,
+) -> Option<AbortCondition> {
+    if stalled.is_empty() {
+        return None;
+    }
+    let worst = stalled.iter().map(|(_, age)| *age).max().unwrap_or(budget);
+    Some(AbortCondition::arm(format!(
+        "{} chain(s) have returned no result for up to {:.0}s, past the {:.0}s budget, while \
+         still being given work ({}). A chain that stopped producing reads COOL because \
+         nothing is hashing, so no thermal check will ever notice it.",
+        stalled.len(),
+        worst.as_secs_f32(),
+        budget.as_secs_f32(),
+        stalled
+            .iter()
+            .map(|(t, age)| format!("chain {t}: {:.0}s", age.as_secs_f32()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )))
+}
+
+/// What this board can see, and what it is acting on.
+///
+/// DERIVED, NEVER TYPED. A hand-maintained inventory document is a
+/// hand-maintained answer to this question, and it drifted exactly as a second
+/// copy of a fact does: it recorded board inlet and outlet as covered because
+/// the *harness* wrote them to disk, while the miner had never read them and
+/// the board ceiling could not fire. It recorded per-ASIC die temperature as
+/// uncaptured while the miner was publishing a hundred rows of it.
+///
+/// So the miner answers for itself, from the telemetry it actually holds and
+/// the limits it actually armed, and the run record captures that answer. A
+/// document cannot disagree with a machine that reports its own coverage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Coverage {
+    /// A limit is armed and something fresh is answering it.
+    Protected { rows: usize, fresh: usize },
+    /// A limit is armed and NOTHING can make it fire. The dangerous one: from
+    /// outside it is indistinguishable from a board within limits.
+    ArmedButBlind { rows: usize, fresh: usize },
+    /// Readings are present and no limit is set, so nothing will act on them.
+    ObservedNotArmed { rows: usize, fresh: usize },
+    /// No limit and no readings.
+    Absent,
+}
+
+impl Coverage {
+    fn of(armed: bool, rows: usize, fresh: usize) -> Self {
+        match (armed, fresh > 0, rows > 0) {
+            (true, true, _) => Coverage::Protected { rows, fresh },
+            (true, false, _) => Coverage::ArmedButBlind { rows, fresh },
+            (false, _, true) => Coverage::ObservedNotArmed { rows, fresh },
+            (false, _, false) => Coverage::Absent,
+        }
+    }
+
+    pub(super) fn is_armed_but_blind(&self) -> bool {
+        matches!(self, Coverage::ArmedButBlind { .. })
+    }
+
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Coverage::Protected { .. } => "protected",
+            Coverage::ArmedButBlind { .. } => "ARMED-BUT-BLIND",
+            Coverage::ObservedNotArmed { .. } => "observed, not armed",
+            Coverage::Absent => "absent",
+        }
+    }
+
+    pub(super) fn counts(&self) -> (usize, usize) {
+        match *self {
+            Coverage::Protected { rows, fresh }
+            | Coverage::ArmedButBlind { rows, fresh }
+            | Coverage::ObservedNotArmed { rows, fresh } => (rows, fresh),
+            Coverage::Absent => (0, 0),
+        }
+    }
+}
+
+/// One row per signal class this board could protect itself with.
+pub(super) fn coverage(
+    telemetry: &BoardTelemetry,
+    limits: &AbortLimits,
+    now: Instant,
+    max_age: Duration,
+) -> Vec<(&'static str, Coverage)> {
+    let fresh = |s: &TemperatureSensor| {
+        s.observed_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= max_age)
+    };
+    let count = |pred: &dyn Fn(&TemperatureSensor) -> bool| {
+        let rows = telemetry.temperatures.iter().filter(|s| pred(s)).count();
+        let f = telemetry
+            .temperatures
+            .iter()
+            .filter(|s| pred(s) && fresh(s) && s.temperature.is_some())
+            .count();
+        (rows, f)
+    };
+
+    let (die_rows, die_fresh) = count(&|s: &TemperatureSensor| s.name.ends_with("-dts"));
+    let (board_rows, board_fresh) =
+        count(&|s: &TemperatureSensor| s.name.contains("-inlet") || s.name.contains("-outlet"));
+
+    let fan_rows = telemetry.fans.len();
+    let fan_fresh = telemetry.fans.iter().filter(|f| f.rpm.is_some()).count();
+
+    let rail_rows = telemetry
+        .powers
+        .iter()
+        .filter(|p| p.name.ends_with("-output"))
+        .count();
+    let rail_fresh = telemetry
+        .powers
+        .iter()
+        .filter(|p| p.name.ends_with("-output") && p.voltage_v.is_some())
+        .count();
+
+    // The silicon's own fault bits need no limit of ours, so they are armed
+    // whenever any ASIC is reporting them at all -- and aged like every other
+    // reading. Counting `faults.is_some()` alone read 100/100 PROTECTED on
+    // hardware 37 s after the stream carrying the bits had stopped:
+    // held is not the same as still being sent.
+    let fault_rows = telemetry.asics.len();
+    let fault_fresh = telemetry
+        .asics
+        .iter()
+        .filter(|a| {
+            a.faults.is_some()
+                && a.observed_at
+                    .is_some_and(|at| now.saturating_duration_since(at) <= max_age)
+        })
+        .count();
+
+    vec![
+        (
+            "asic die temperature",
+            Coverage::of(limits.max_die_c.is_some(), die_rows, die_fresh),
+        ),
+        (
+            "silicon self-reported faults",
+            Coverage::of(true, fault_rows, fault_fresh),
+        ),
+        (
+            "board inlet/outlet",
+            Coverage::of(limits.max_board_c.is_some(), board_rows, board_fresh),
+        ),
+        (
+            "fan tachometers",
+            Coverage::of(limits.min_fan_rpm.is_some(), fan_rows, fan_fresh),
+        ),
+        (
+            "rail output voltage",
+            Coverage::of(limits.max_rail_v.is_some(), rail_rows, rail_fresh),
+        ),
+    ]
+}
+
 /// How many `-dts` rows exist at all, fresh or not.
 ///
 /// Reported beside the fresh count so an operator can tell "this board has no
@@ -329,6 +553,144 @@ fn rail_over_voltage(
                 ))
             })
         })
+}
+
+/// Render ids compactly, and say when the list was cut rather than cutting it
+/// silently -- a truncated list that looks complete under-reports a fault.
+/// What asking a chain's thread for its counters returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ThreadAnswer {
+    Answered,
+    /// The command channel is closed: the thread's actor has exited. Nothing
+    /// will ever answer on it again, so this needs no budget.
+    Closed,
+    /// No answer inside the bound, or an error that is not a closed channel.
+    /// A busy actor can miss one; one that keeps missing is lost.
+    Unanswered,
+}
+
+/// A CHAIN THAT HAS GONE AWAY WHILE ITS BOARD STAYS POWERED.
+///
+/// Every other blindness here is board-wide: the die ceiling counts as blind
+/// only when EVERY die row is stale, so a board with three chains stays
+/// "measured" while one of them is dark. Measured on hardware:
+/// thread 1 stopped itself, and for five minutes the
+/// monitor logged `die_rows_fresh=200` of 300 with nothing armed. Observing,
+/// harmless. Mining, it is a chain that stops hashing unnoticed -- or one
+/// whose dies nobody is reading while its board is still fed.
+///
+/// Two independent signs, either of which is enough:
+///
+/// - **every die row of the chain is stale**, or the chain has none, for the
+///   blindness budget (the chain's name is its rows' prefix, the serial
+///   port's file name, so a chain the board configured and never heard from
+///   is found too);
+/// - **its thread does not answer**: a closed command channel at once (the
+///   actor has exited, and that cannot heal), or no answer for the budget.
+///
+/// Both ARM. Stopping dispatch is right for a lost chain, and a chain that
+/// cannot come back in this process escalates to a scram on the ladder's own
+/// clock.
+///
+/// **After any Arm, every chain reads lost.** The arm's `stop_dispatch` shuts
+/// every thread down, so each channel is closed from then on and this stays
+/// true until the scram. That changes no outcome: the ladder disarms only
+/// after 300 s clear, and with the threads stopped the die rows go stale in
+/// 15 s and board-wide die blindness returns 30 s later, so an arm that
+/// stopped the threads never reached disarm before this existed either. A
+/// board nobody can measure is not one to leave powered.
+#[derive(Debug, Default)]
+pub(super) struct ChainWatch {
+    dies_blind_since: BTreeMap<String, Instant>,
+    unanswered_since: BTreeMap<usize, Instant>,
+    closed: std::collections::BTreeSet<usize>,
+}
+
+impl ChainWatch {
+    /// Fold one poll's die rows in, for the chains the board configured.
+    pub(super) fn observe_dies(
+        &mut self,
+        chains: &[String],
+        temperatures: &[TemperatureSensor],
+        now: Instant,
+        max_age: Duration,
+    ) {
+        for chain in chains {
+            let prefix = format!("{chain}-asic-");
+            let fresh = temperatures.iter().any(|t| {
+                t.name.starts_with(&prefix)
+                    && t.name.ends_with("-dts")
+                    && t.temperature.is_some()
+                    && t.observed_at
+                        .is_some_and(|at| now.saturating_duration_since(at) <= max_age)
+            });
+            if fresh {
+                self.dies_blind_since.remove(chain);
+            } else {
+                self.dies_blind_since.entry(chain.clone()).or_insert(now);
+            }
+        }
+    }
+
+    /// Fold in what one thread's metrics query returned.
+    pub(super) fn observe_thread(&mut self, thread: usize, answer: ThreadAnswer, now: Instant) {
+        match answer {
+            ThreadAnswer::Answered => {
+                self.unanswered_since.remove(&thread);
+                self.closed.remove(&thread);
+            }
+            ThreadAnswer::Closed => {
+                self.closed.insert(thread);
+            }
+            ThreadAnswer::Unanswered => {
+                self.unanswered_since.entry(thread).or_insert(now);
+            }
+        }
+    }
+
+    /// The condition, if any chain is lost. `die_armed` is whether the die
+    /// ceiling is configured: blind dies are a lost limit only when a limit
+    /// reads them, but a thread that is gone is a lost chain regardless.
+    pub(super) fn condition(
+        &self,
+        now: Instant,
+        budget: Duration,
+        die_armed: bool,
+    ) -> Option<AbortCondition> {
+        let mut lost: Vec<String> = Vec::new();
+        for thread in &self.closed {
+            lost.push(format!("chain {thread}: its thread has exited"));
+        }
+        for (thread, since) in &self.unanswered_since {
+            let age = now.saturating_duration_since(*since);
+            if age >= budget && !self.closed.contains(thread) {
+                lost.push(format!(
+                    "chain {thread}: its thread has not answered for {:.0}s",
+                    age.as_secs_f32()
+                ));
+            }
+        }
+        if die_armed {
+            for (chain, since) in &self.dies_blind_since {
+                let age = now.saturating_duration_since(*since);
+                if age >= budget {
+                    lost.push(format!(
+                        "{chain}: no fresh die reading for {:.0}s",
+                        age.as_secs_f32()
+                    ));
+                }
+            }
+        }
+        if lost.is_empty() {
+            return None;
+        }
+        Some(AbortCondition::arm(format!(
+            "a chain is lost while its board stays powered ({}). The other chains are still \
+             measured, so no board-wide check sees this; the {:.0}s budget is the blindness one.",
+            lost.join("; "),
+            budget.as_secs_f32(),
+        )))
+    }
 }
 
 fn id_list(ids: &[u8]) -> String {
@@ -493,6 +855,181 @@ mod tests {
             observed_at: None,
         }];
         assert_eq!(hottest_die_at(&rows, Instant::now(), MAX_AGE), None);
+    }
+
+    /// A stale row must not mask a live one. If one chain dies and another
+    /// keeps talking, the ceiling is still answerable -- by the chain that is
+    /// still answering.
+    ///
+    /// Still true, and still the ceiling's job: a frozen row is not a
+    /// measurement and must not trip it. What this test does NOT show is the
+    /// frozen chain being noticed at all -- nothing did, until `ChainWatch`
+    /// (measured that gap on hardware; see the tests below).
+    #[test]
+    fn one_live_chain_still_answers_when_another_has_frozen() {
+        let mut t = telemetry();
+        t.temperatures = vec![
+            die_aged("dead-asic-1-dts", 130.0, Duration::from_secs(3600)),
+            die("live-asic-1-dts", 70.0),
+        ];
+        let hottest = hottest_die_at(&t.temperatures, Instant::now(), MAX_AGE);
+        assert_eq!(hottest.map(|(n, _)| n), Some("live-asic-1-dts"));
+        // And the frozen 130C row must NOT trip a 105C ceiling: it is not a
+        // measurement, and acting on it would be acting on an hour-old number.
+        let limits = AbortLimits {
+            max_die_c: Some(105.0),
+            ..Default::default()
+        };
+        assert_eq!(evaluate(&t, &limits), None);
+    }
+
+    fn chains() -> Vec<String> {
+        vec!["tty9bit00".into(), "tty9bit10".into(), "tty9bit20".into()]
+    }
+
+    /// Three chains, one of them frozen: a shape measured on hardware.
+    fn one_chain_frozen() -> Vec<TemperatureSensor> {
+        let mut rows = Vec::new();
+        for (chain, ago) in [
+            ("tty9bit00", Duration::ZERO),
+            ("tty9bit10", Duration::from_secs(300)),
+            ("tty9bit20", Duration::ZERO),
+        ] {
+            for i in 0..100 {
+                rows.push(die_aged(&format!("{chain}-asic-{i}-dts"), 40.0, ago));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn a_chain_whose_dies_all_went_stale_is_lost_while_the_others_are_fresh() {
+        let rows = one_chain_frozen();
+        let now = Instant::now();
+        let budget = Duration::from_secs(30);
+        // What the board-wide checks say about exactly this telemetry: the
+        // ceiling has a fresh hottest die, so nothing is blind and nothing is
+        // over. This is why this class sat unarmed for five minutes.
+        let mut t = telemetry();
+        t.temperatures = rows.clone();
+        assert!(hottest_die_at(&rows, now, MAX_AGE).is_some());
+        let limits = AbortLimits {
+            max_die_c: Some(90.0),
+            ..Default::default()
+        };
+        assert_eq!(super::evaluate(&t, &limits, now, MAX_AGE), None);
+
+        let mut watch = ChainWatch::default();
+        watch.observe_dies(&chains(), &rows, now, MAX_AGE);
+        assert_eq!(
+            watch.condition(now, budget, true),
+            None,
+            "not before the budget"
+        );
+        let later = now + budget;
+        watch.observe_dies(&chains(), &rows, later, MAX_AGE);
+        let c = watch
+            .condition(later, budget, true)
+            .expect("lost after the budget");
+        assert_eq!(c.severity, AbortSeverity::Arm);
+        assert!(
+            c.reason.contains("tty9bit10: no fresh die reading"),
+            "{}",
+            c.reason
+        );
+        assert!(!c.reason.contains("tty9bit00"), "{}", c.reason);
+    }
+
+    #[test]
+    fn a_chain_the_board_configured_and_never_heard_from_is_lost() {
+        let rows: Vec<_> = (0..100)
+            .map(|i| die(&format!("tty9bit00-asic-{i}-dts"), 40.0))
+            .collect();
+        let now = Instant::now();
+        let mut watch = ChainWatch::default();
+        watch.observe_dies(&chains(), &rows, now, MAX_AGE);
+        let c = watch
+            .condition(now + Duration::from_secs(30), Duration::from_secs(30), true)
+            .unwrap();
+        assert!(
+            c.reason.contains("tty9bit10") && c.reason.contains("tty9bit20"),
+            "{}",
+            c.reason
+        );
+    }
+
+    #[test]
+    fn a_chain_that_speaks_again_clears_its_clock() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(30);
+        let mut watch = ChainWatch::default();
+        watch.observe_dies(&chains(), &one_chain_frozen(), now, MAX_AGE);
+        let all_fresh: Vec<_> = chains()
+            .iter()
+            .flat_map(|c| (0..100).map(move |i| die(&format!("{c}-asic-{i}-dts"), 40.0)))
+            .collect();
+        watch.observe_dies(
+            &chains(),
+            &all_fresh,
+            now + Duration::from_secs(10),
+            MAX_AGE,
+        );
+        assert_eq!(watch.condition(now + budget * 2, budget, true), None);
+    }
+
+    #[test]
+    fn a_thread_whose_actor_exited_is_lost_at_once() {
+        let now = Instant::now();
+        let mut watch = ChainWatch::default();
+        watch.observe_thread(1, ThreadAnswer::Closed, now);
+        let c = watch
+            .condition(now, Duration::from_secs(30), false)
+            .expect("no budget for a closed channel");
+        assert_eq!(c.severity, AbortSeverity::Arm);
+        assert!(
+            c.reason.contains("chain 1: its thread has exited"),
+            "{}",
+            c.reason
+        );
+    }
+
+    #[test]
+    fn a_thread_that_misses_one_answer_is_not_lost_one_that_keeps_missing_is() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(30);
+        let mut watch = ChainWatch::default();
+        watch.observe_thread(2, ThreadAnswer::Unanswered, now);
+        assert_eq!(
+            watch.condition(now + Duration::from_secs(5), budget, false),
+            None
+        );
+        watch.observe_thread(2, ThreadAnswer::Answered, now + Duration::from_secs(5));
+        watch.observe_thread(2, ThreadAnswer::Unanswered, now + Duration::from_secs(10));
+        assert_eq!(
+            watch.condition(now + Duration::from_secs(35), budget, false),
+            None,
+            "the clock restarts when it answers"
+        );
+        let c = watch
+            .condition(now + Duration::from_secs(40), budget, false)
+            .unwrap();
+        assert!(
+            c.reason
+                .contains("chain 2: its thread has not answered for 30s"),
+            "{}",
+            c.reason
+        );
+    }
+
+    #[test]
+    fn blind_dies_need_an_armed_ceiling_a_gone_thread_does_not() {
+        let now = Instant::now();
+        let budget = Duration::from_secs(30);
+        let mut watch = ChainWatch::default();
+        watch.observe_dies(&chains(), &one_chain_frozen(), now, MAX_AGE);
+        assert_eq!(watch.condition(now + budget, budget, false), None);
+        watch.observe_thread(1, ThreadAnswer::Closed, now);
+        assert!(watch.condition(now + budget, budget, false).is_some());
     }
 
     /// HOTTEST, not mean. Ninety-nine cool parts must not average away the
@@ -790,6 +1327,217 @@ mod tests {
              it armed {armed}. If a default was deliberately removed, change this number and \
              say why -- silently shipping with fewer trips is the thing to notice."
         );
+    }
+
+    /// COVERAGE MUST NAME THE DANGEROUS CASE DISTINCTLY. "Armed and nothing
+    /// answering" is the state the die ceiling sat in for days and the board
+    /// ceiling sat in for longer, and from outside it looked exactly like a
+    /// board within limits. It must not collapse into "observed" or "absent".
+    #[test]
+    fn coverage_separates_armed_but_blind_from_every_other_state() {
+        let now = Instant::now();
+        let mut t = telemetry();
+
+        // Armed die ceiling, no rows at all: the original defect.
+        let limits = AbortLimits {
+            max_die_c: Some(100.0),
+            ..Default::default()
+        };
+        let rows = coverage(&t, &limits, now, MAX_AGE);
+        let row = rows
+            .iter()
+            .find(|(n, _)| *n == "asic die temperature")
+            .unwrap();
+        assert!(row.1.is_armed_but_blind(), "got {:?}", row.1);
+        assert_eq!(row.1.label(), "ARMED-BUT-BLIND");
+
+        // Rows present but ALL STALE is still blind -- a frozen reading is not
+        // an answer, which is the shape this fix closed.
+        t.temperatures = vec![die_aged("c-asic-1-dts", 60.0, Duration::from_secs(3600))];
+        let rows = coverage(&t, &limits, now, MAX_AGE);
+        let row = rows
+            .iter()
+            .find(|(n, _)| *n == "asic die temperature")
+            .unwrap();
+        assert!(row.1.is_armed_but_blind(), "stale rows are not coverage");
+        assert_eq!(row.1.counts(), (1, 0), "one row, none usable");
+
+        // Fresh rows: protected.
+        t.temperatures = vec![die("c-asic-1-dts", 60.0)];
+        let rows = coverage(&t, &limits, now, MAX_AGE);
+        let row = rows
+            .iter()
+            .find(|(n, _)| *n == "asic die temperature")
+            .unwrap();
+        assert_eq!(row.1, Coverage::Protected { rows: 1, fresh: 1 });
+
+        // Readings with no limit are NOT protection and must say so.
+        let rows = coverage(&t, &AbortLimits::default(), now, MAX_AGE);
+        let row = rows
+            .iter()
+            .find(|(n, _)| *n == "asic die temperature")
+            .unwrap();
+        assert_eq!(row.1.label(), "observed, not armed");
+        assert!(!row.1.is_armed_but_blind());
+    }
+
+    /// The exact divergence the inventory hid: the harness recording a sensor
+    /// says nothing about whether the miner can act on it. Coverage is
+    /// computed from the miner's own telemetry, so a board with no inlet rows
+    /// reports blind however much the harness has written to disk.
+    #[test]
+    fn coverage_answers_for_the_miner_not_for_the_evidence() {
+        let mut t = telemetry();
+        t.temperatures = vec![die("c-asic-1-dts", 60.0)];
+        let limits = AbortLimits {
+            max_board_c: Some(65.0),
+            ..Default::default()
+        };
+        let rows = coverage(&t, &limits, Instant::now(), MAX_AGE);
+        let board = rows
+            .iter()
+            .find(|(n, _)| *n == "board inlet/outlet")
+            .unwrap();
+        assert!(
+            board.1.is_armed_but_blind(),
+            "a board ceiling with no board rows in the MINER's telemetry is blind, \
+             whatever mcu.tsv contains"
+        );
+    }
+
+    /// FAULT BITS AGE LIKE EVERY OTHER READING.
+    ///
+    /// Measured on hardware: 37 s after the
+    /// stream carrying them stopped, this class read 100 rows, 100 fresh,
+    /// PROTECTED. The bits were still held; the parts were no longer sending
+    /// them. The die class caught the same blindness and scrammed, so nothing
+    /// was unsafe -- but a coverage verdict that says protected while blind is
+    /// the one thing this table exists to prevent.
+    #[test]
+    fn stale_fault_bits_are_not_coverage() {
+        let now = Instant::now();
+        let mut t = telemetry();
+        let limits = AbortLimits::default();
+        let faults = |t: &BoardTelemetry| {
+            coverage(t, &limits, now, MAX_AGE)
+                .into_iter()
+                .find(|(n, _)| *n == "silicon self-reported faults")
+                .unwrap()
+                .1
+        };
+
+        let mut stale = asic(0, Some(AsicFaultBits::default()));
+        stale.observed_at = Some(now - Duration::from_secs(37));
+        t.asics = vec![stale];
+        let blind = faults(&t);
+        assert!(
+            blind.is_armed_but_blind(),
+            "37 s old fault bits read {blind:?}"
+        );
+        assert_eq!(blind.counts(), (1, 0), "one row, none usable");
+
+        let mut fresh = asic(0, Some(AsicFaultBits::default()));
+        fresh.observed_at = Some(now);
+        t.asics = vec![fresh];
+        assert_eq!(faults(&t), Coverage::Protected { rows: 1, fresh: 1 });
+
+        // Bits with no arrival time cannot be told from ones an hour old.
+        t.asics = vec![asic(0, Some(AsicFaultBits::default()))];
+        assert!(
+            faults(&t).is_armed_but_blind(),
+            "an undated bit is not fresh"
+        );
+    }
+
+    /// THE FAILURE NO THERMAL CHECK CAN SEE. A chain being given work that has
+    /// stopped returning results, while its telemetry keeps flowing — the dies
+    /// read cool BECAUSE nothing is hashing, so every thermal rule passes.
+    #[test]
+    fn a_chain_that_stops_returning_results_is_a_condition() {
+        let t0 = Instant::now();
+        let budget = Duration::from_secs(120);
+        let mut w = StallWatch::default();
+        w.observe(0, 5_000, true, t0);
+        // The counter is read many times and never moves. Reading it is not
+        // evidence of life; CHANGING is.
+        for k in 1..=10 {
+            w.observe(0, 5_000, true, t0 + Duration::from_secs(k * 20));
+        }
+        let stalled = w.stalled(t0 + Duration::from_secs(200), budget);
+        assert_eq!(stalled.len(), 1, "one chain silent for 200 s");
+        let c = stall_condition(&stalled, budget).expect("a stall is a condition");
+        assert_eq!(
+            c.severity,
+            AbortSeverity::Arm,
+            "stop the work first, then escalate"
+        );
+        assert!(c.reason.contains("COOL"), "{}", c.reason);
+    }
+
+    /// A chain that is still answering is not stalled, however slowly the
+    /// counter climbs.
+    #[test]
+    fn a_chain_still_returning_results_is_not_stalled() {
+        let t0 = Instant::now();
+        let budget = Duration::from_secs(120);
+        let mut w = StallWatch::default();
+        for k in 0..20u64 {
+            w.observe(0, 5_000 + k, true, t0 + Duration::from_secs(k * 30));
+        }
+        assert!(w.stalled(t0 + Duration::from_secs(600), budget).is_empty());
+    }
+
+    /// THE CASE THAT MAKES THIS HONEST. Observation runs dispatch nothing, so
+    /// no chain returns results and every one of them would look stalled. A
+    /// condition that fired on an idle board would have fired on every run we
+    /// have ever done.
+    #[test]
+    fn a_chain_that_is_not_being_given_work_cannot_stall() {
+        let t0 = Instant::now();
+        let budget = Duration::from_secs(120);
+        let mut w = StallWatch::default();
+        w.observe(0, 0, false, t0);
+        w.observe(0, 0, false, t0 + Duration::from_secs(600));
+        assert!(
+            w.stalled(t0 + Duration::from_secs(600), budget).is_empty(),
+            "an idle board is idle, not stalled"
+        );
+    }
+
+    /// And the clock starts when work starts, not when the process did: a
+    /// chain that has just been given work has not been silent for an hour.
+    #[test]
+    fn the_stall_clock_starts_when_dispatch_does() {
+        let t0 = Instant::now();
+        let budget = Duration::from_secs(120);
+        let mut w = StallWatch::default();
+        w.observe(0, 0, false, t0);
+        // ...an hour of observing...
+        let t1 = t0 + Duration::from_secs(3600);
+        w.observe(0, 0, true, t1);
+        assert!(
+            w.stalled(t1 + Duration::from_secs(60), budget).is_empty(),
+            "60 s into dispatch is not past a 120 s budget"
+        );
+        assert_eq!(w.stalled(t1 + Duration::from_secs(130), budget).len(), 1);
+    }
+
+    /// Several chains stall independently and the reason names each.
+    #[test]
+    fn each_stalled_chain_is_named() {
+        let t0 = Instant::now();
+        let budget = Duration::from_secs(120);
+        let mut w = StallWatch::default();
+        w.observe(0, 1, true, t0);
+        w.observe(2, 1, true, t0);
+        w.observe(1, 1, true, t0);
+        w.observe(1, 2, true, t0 + Duration::from_secs(150));
+        let stalled = w.stalled(t0 + Duration::from_secs(200), budget);
+        assert_eq!(stalled.len(), 2, "chains 0 and 2, not 1");
+        let reason = stall_condition(&stalled, budget).unwrap().reason;
+        assert!(reason.contains("chain 0"), "{reason}");
+        assert!(reason.contains("chain 2"), "{reason}");
+        assert!(!reason.contains("chain 1"), "{reason}");
     }
 
     #[test]

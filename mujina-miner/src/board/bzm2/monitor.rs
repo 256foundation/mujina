@@ -1,5 +1,7 @@
 //! Runtime monitor loop and tuning evaluation for the BZM2 board.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::watch;
@@ -7,10 +9,14 @@ use tokio::sync::watch;
 use crate::tracing::prelude::*;
 
 use crate::asic::bzm2::Bzm2ThreadHandle;
+use crate::asic::bzm2::Bzm2ThreadRuntimeMetrics;
 use crate::asic::bzm2::thread::ShutdownAsk;
+use crate::asic::bzm2::thread::telemetry::sensor_prefix;
+use crate::asic::hash_thread::HashThreadError;
 
 use super::Bzm2Board;
 use super::abort::{self, AbortCondition, AbortLimits, AbortSeverity};
+use super::calibration::Bzm2BusLayout;
 use super::scram::{ScramAction, ScramLadder};
 use super::telemetry::{merge_power_readings, merge_temperature_readings};
 
@@ -27,6 +33,7 @@ impl Bzm2Board {
         let telemetry_tx = self.telemetry_tx.clone();
         let shutdown_handles = self.shutdown_handles.clone();
         let serial_controls = self.serial_controls.clone();
+        let bus_layouts = Arc::clone(&self.bus_layouts);
         let board_name = self.config.device_id();
         // THE SCRAM HANDLER'S TWO LEVERS, captured here because the monitor is
         // a detached task and cannot reach `&mut self` when it needs them.
@@ -93,6 +100,28 @@ impl Bzm2Board {
             // because all three can go blind independently and a shared clock
             // lets one mask another's recovery.
             let mut fan_blind_since: Option<Instant> = None;
+            let mut stall_watch = abort::StallWatch::default();
+            // Per chain, not per board: see `abort::ChainWatch`.
+            let mut chain_watch = abort::ChainWatch::default();
+            // HOW LONG MAY A CHAIN BE SILENT AND STILL BE WORKING?
+            //
+            // NOT MEASURED. We have never dispatched work to this hardware, so
+            // nothing in this tree knows the rate at which a healthy chain
+            // returns result frames. This number is therefore deliberately
+            // generous and deliberately labelled: it is a placeholder that
+            // refuses to halt a slow-but-live chain, not a limit derived from
+            // anything.
+            //
+            // A real dispatch is where it gets a real value. The first run that
+            // dispatches work will show the actual inter-result interval, and
+            // that measurement replaces this -- the same way the die ceiling
+            // and the thermal scale were settled.
+            let stall_budget = std::time::Duration::from_secs(
+                std::env::var("MUJINA_BZM2_STALL_BUDGET_S")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(120),
+            );
             // HOW OLD MAY A DIE READING BE AND STILL BE A MEASUREMENT?
             //
             // Derived from the poll interval rather than fixed, so it stays
@@ -128,6 +157,10 @@ impl Bzm2Board {
                         let now = Instant::now();
                         let snapshot = telemetry.snapshot();
                         let rail_snapshot = rail_telemetry.snapshot_telemetry();
+                        let (thread_metrics, thread_answers) =
+                            collect_thread_runtime_metrics(&shutdown_handles).await;
+                        let bus_layouts = bus_layouts.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let current_state = telemetry_tx.borrow().clone();
                         let total_stats = serial_controls.iter().fold((0u64, 0u64), |acc, control| {
                             let stats = control.stats();
                             (acc.0 + stats.bytes_read, acc.1 + stats.bytes_written)
@@ -189,9 +222,48 @@ impl Bzm2Board {
                                 )
                             })
                         };
+                        // CONDITIONS COMPUTED FROM PUBLISHED TELEMETRY: the
+                        // per-ASIC die temperatures, the silicon's own fault
+                        // bits, the fan tachometers and the regulator outputs.
+                        // These are read from the same `BoardTelemetry` the
+                        // tuning pass above already consumes -- the state that
+                        // was sitting unread while the one armed limit was
+                        // bound to a sysfs path this platform does not have.
+                        // A CHAIN THAT STOPPED PRODUCING IS NOT VISIBLE TO ANY
+                        // THERMAL CHECK. Folded in here, from the counters the
+                        // metrics pass above already collected, so there is no
+                        // second poll and no second source for the same fact.
+                        for (index, metrics) in &thread_metrics {
+                            // `is_active` is the board's own statement that
+                            // this thread is being given work; an observation
+                            // run dispatches nothing and must never stall.
+                            let dispatching = current_state
+                                .threads
+                                .get(*index)
+                                .map(|t| t.is_active)
+                                .unwrap_or(false);
+                            stall_watch.observe(
+                                *index,
+                                metrics.results.decoded,
+                                dispatching,
+                                now,
+                            );
+                        }
+                        let stalled = stall_watch.stalled(now, stall_budget);
 
                         let published = telemetry_tx.borrow().clone();
+                        // Chains by the name their die rows carry: the serial
+                        // port's file name, the same prefix the threads publish.
+                        let chain_names = chain_names(&bus_layouts);
+                        chain_watch.observe_dies(&chain_names, &published.temperatures, now, die_max_age);
+                        for (index, answer) in &thread_answers {
+                            chain_watch.observe_thread(*index, *answer, now);
+                        }
                         let condition = abort::evaluate(&published, &abort_limits, now, die_max_age)
+                            .or_else(|| abort::stall_condition(&stalled, stall_budget))
+                            .or_else(|| {
+                                chain_watch.condition(now, blind_budget, abort_limits.max_die_c.is_some())
+                            })
                             // A sysfs trip is true now and needs no budget.
                             .or_else(|| {
                                 snapshot
@@ -231,6 +303,32 @@ impl Bzm2Board {
                             last_liveness = Some(now);
                             let hottest =
                                 abort::hottest_die_at(&published.temperatures, now, die_max_age);
+                            // WHAT THIS BOARD CAN SEE, AND WHAT IT IS ACTING ON.
+                            //
+                            // Derived from the telemetry actually held and the
+                            // limits actually armed, then written into the run
+                            // record -- so nobody has to consult a document
+                            // that can disagree with the machine. The document
+                            // did disagree, in both directions, on the two
+                            // sensors that mattered most.
+                            for (signal, cover) in
+                                abort::coverage(&published, &abort_limits, now, die_max_age)
+                            {
+                                let (rows, fresh) = cover.counts();
+                                if cover.is_armed_but_blind() {
+                                    warn!(
+                                        board = %board_name, signal, rows, fresh,
+                                        verdict = cover.label(),
+                                        "COVERAGE: a limit is armed and nothing can make it fire"
+                                    );
+                                } else {
+                                    info!(
+                                        board = %board_name, signal, rows, fresh,
+                                        verdict = cover.label(),
+                                        "COVERAGE"
+                                    );
+                                }
+                            }
                             info!(
                                 board = %board_name,
                                 polls = polls_since_liveness,
@@ -551,6 +649,81 @@ pub(super) async fn scram(
         }
     }
 }
+
+/// Each chain by the name its die rows carry: `sensor_prefix`, the same
+/// function that names them, so a port whose file name has any character
+/// other than a letter or digit is not a chain that is never fresh.
+fn chain_names(bus_layouts: &[Bzm2BusLayout]) -> Vec<String> {
+    bus_layouts
+        .iter()
+        .map(|bus| sensor_prefix(&bus.serial_path))
+        .collect()
+}
+
+async fn collect_thread_runtime_metrics(
+    handles: &[Bzm2ThreadHandle],
+) -> (
+    BTreeMap<usize, Bzm2ThreadRuntimeMetrics>,
+    Vec<(usize, abort::ThreadAnswer)>,
+) {
+    collect_bounded(
+        handles.len(),
+        |i| handles[i].runtime_metrics(),
+        THREAD_ANSWER_BOUND,
+    )
+    .await
+}
+
+/// How long one thread may take to answer the monitor.
+///
+/// The query was awaited unbounded, so one actor that stopped reading its
+/// channel without closing it would stop the monitor's whole poll -- every
+/// limit on every chain -- behind one silent thread. A second is generous for
+/// a counter snapshot and short beside the poll interval.
+const THREAD_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Ask each of `count` threads, each bounded, and say how each answered.
+///
+/// Generic over the query so the bound can be tested against a thread that
+/// never answers without constructing one.
+async fn collect_bounded<M, F, Fut>(
+    count: usize,
+    query: F,
+    bound: std::time::Duration,
+) -> (BTreeMap<usize, M>, Vec<(usize, abort::ThreadAnswer)>)
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<M, HashThreadError>>,
+{
+    let mut metrics = BTreeMap::new();
+    let mut answers = Vec::with_capacity(count);
+    for thread_index in 0..count {
+        let answer = match tokio::time::timeout(bound, query(thread_index)).await {
+            Ok(Ok(snapshot)) => {
+                metrics.insert(thread_index, snapshot);
+                abort::ThreadAnswer::Answered
+            }
+            Ok(Err(HashThreadError::ChannelClosed(err))) => {
+                warn!(thread_index, error = %err, "Failed to query BZM2 runtime metrics: the thread has exited");
+                abort::ThreadAnswer::Closed
+            }
+            Ok(Err(err)) => {
+                warn!(thread_index, error = %err, "Failed to query BZM2 runtime metrics");
+                abort::ThreadAnswer::Unanswered
+            }
+            Err(_) => {
+                warn!(
+                    thread_index,
+                    bound_ms = bound.as_millis() as u64,
+                    "BZM2 thread did not answer the monitor inside the bound"
+                );
+                abort::ThreadAnswer::Unanswered
+            }
+        };
+        answers.push((thread_index, answer));
+    }
+    (metrics, answers)
+}
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -575,6 +748,74 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     #[cfg(unix)]
     use tokio::sync::watch;
+
+    #[test]
+    fn a_chain_is_named_as_its_die_rows_are() {
+        let layouts = vec![
+            Bzm2BusLayout {
+                serial_path: "/dev/tty9bit10".into(),
+                asic_start: 0,
+                asic_count: 100,
+            },
+            Bzm2BusLayout {
+                serial_path: "/dev/ttyS_1".into(),
+                asic_start: 100,
+                asic_count: 4,
+            },
+        ];
+        assert_eq!(
+            chain_names(&layouts),
+            vec!["tty9bit10".to_string(), "ttyS-1".to_string()]
+        );
+        assert_eq!(
+            sensor_prefix("/dev/ttyS_1"),
+            "ttyS-1",
+            "the rows' own prefix"
+        );
+    }
+
+    /// A thread that stops reading its channel without closing it held the
+    /// monitor's whole poll -- every limit, every chain -- for as long as it
+    /// stayed silent. Bounded now, and the silence is named per thread.
+    #[tokio::test(start_paused = true)]
+    async fn a_thread_that_never_answers_cannot_hold_the_monitor() {
+        // What an unbounded await of this query does: it does not return.
+        let unbounded = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            std::future::pending::<Result<u8, HashThreadError>>(),
+        )
+        .await;
+        assert!(
+            unbounded.is_err(),
+            "an unbounded await of a silent thread never returns"
+        );
+
+        let started = tokio::time::Instant::now();
+        let (metrics, answers) = collect_bounded(
+            3,
+            |i| async move {
+                match i {
+                    0 => Ok(7u8),
+                    1 => std::future::pending().await,
+                    _ => Err(HashThreadError::ChannelClosed(
+                        "command channel closed".into(),
+                    )),
+                }
+            },
+            THREAD_ANSWER_BOUND,
+        )
+        .await;
+        assert_eq!(tokio::time::Instant::now() - started, THREAD_ANSWER_BOUND);
+        assert_eq!(metrics.get(&0), Some(&7));
+        assert_eq!(
+            answers,
+            vec![
+                (0, abort::ThreadAnswer::Answered),
+                (1, abort::ThreadAnswer::Unanswered),
+                (2, abort::ThreadAnswer::Closed),
+            ]
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use tokio::task::JoinHandle;
 
 use anyhow::Result as AnyhowResult;
@@ -16,6 +18,7 @@ use crate::{
     tracing::prelude::*,
     transport::SerialControl,
 };
+use calibration::Bzm2BusLayout;
 
 use telemetry::{merge_power_readings, merge_temperature_readings};
 
@@ -83,6 +86,7 @@ pub struct Bzm2Board {
     bringup_applied: bool,
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
+    bus_layouts: Arc<Mutex<Vec<Bzm2BusLayout>>>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
@@ -97,6 +101,7 @@ impl Bzm2Board {
             bringup_applied: false,
             shutdown_handles: Vec::new(),
             serial_controls: Vec::new(),
+            bus_layouts: Arc::new(Mutex::new(Vec::new())),
             telemetry_tx,
             monitor_shutdown: None,
             monitor_task: None,
@@ -661,6 +666,7 @@ impl Bzm2Board {
             );
         }
         let bus_layouts = self.resolve_bus_layouts().await?;
+        *self.bus_layouts.lock().unwrap_or_else(|e| e.into_inner()) = bus_layouts.clone();
         let initial_snapshot = self.config.telemetry.snapshot();
         let initial_rail_snapshot = self.config.bringup.snapshot_telemetry();
         self.telemetry_tx.send_modify(|state| {
