@@ -370,6 +370,11 @@ async fn query_bzm2_loopback(
 }
 
 /// Perform a live BZM2 register read through a board-owned UART thread.
+///
+/// Gated by `MUJINA_API_RAW_REGISTERS` (off by default) and
+/// `MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE`: this reads raw silicon state
+/// with no higher-level guard in front of it, so it needs its own explicit
+/// opt-in beyond whatever exposed the rest of the API.
 #[utoipa::path(
     post,
     path = "/boards/{name}/bzm2/register-read",
@@ -380,6 +385,7 @@ async fn query_bzm2_loopback(
     request_body = Bzm2RegisterReadRequest,
     responses(
         (status = OK, description = "Register payload", body = Bzm2RegisterReadResponse),
+        (status = FORBIDDEN, description = "Raw register access is not enabled"),
         (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
@@ -390,6 +396,9 @@ async fn read_bzm2_register(
     Path(name): Path<String>,
     Json(req): Json<Bzm2RegisterReadRequest>,
 ) -> Result<Json<Bzm2RegisterReadResponse>, StatusCode> {
+    if !state.raw_registers_permitted {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let (board_exists, command_tx) = {
         let mut registry = state
             .board_registry
@@ -424,6 +433,11 @@ async fn read_bzm2_register(
 }
 
 /// Perform a live BZM2 register write through a board-owned UART thread.
+///
+/// Gated by `MUJINA_API_RAW_REGISTERS` (off by default) and
+/// `MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE`: this writes raw silicon state
+/// with no higher-level guard in front of it, so it needs its own explicit
+/// opt-in beyond whatever exposed the rest of the API.
 #[utoipa::path(
     post,
     path = "/boards/{name}/bzm2/register-write",
@@ -434,6 +448,7 @@ async fn read_bzm2_register(
     request_body = Bzm2RegisterWriteRequest,
     responses(
         (status = OK, description = "Register write acknowledgement", body = Bzm2RegisterWriteResponse),
+        (status = FORBIDDEN, description = "Raw register access is not enabled"),
         (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics or request payload is invalid"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
@@ -444,6 +459,9 @@ async fn write_bzm2_register(
     Path(name): Path<String>,
     Json(req): Json<Bzm2RegisterWriteRequest>,
 ) -> Result<Json<Bzm2RegisterWriteResponse>, StatusCode> {
+    if !state.raw_registers_permitted {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let value = decode_hex_payload(&req.value_hex)?;
     let bytes_written = value.len();
     let (board_exists, command_tx) = {

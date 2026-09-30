@@ -316,7 +316,20 @@ impl Daemon {
                     Ok(addr) => format!("{addr}:{API_PORT}"),
                     Err(_) => format!("127.0.0.1:{API_PORT}"),
                 };
-                let config = ApiConfig { bind_addr };
+                let env_flag = |key: &str| {
+                    env::var(key)
+                        .ok()
+                        .map(|v| {
+                            let v = v.trim().to_ascii_lowercase();
+                            v == "1" || v == "true" || v == "yes" || v == "on"
+                        })
+                        .unwrap_or(false)
+                };
+                let config = ApiConfig {
+                    bind_addr,
+                    raw_registers_enabled: env_flag("MUJINA_API_RAW_REGISTERS"),
+                    raw_registers_allow_remote: env_flag("MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE"),
+                };
                 if let Err(e) = api::serve(
                     config,
                     shutdown,
