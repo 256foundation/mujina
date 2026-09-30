@@ -125,6 +125,9 @@ pub(super) const DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ: f32 = 800.0;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
 const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
+const DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS: u8 = 3;
+const DEFAULT_RUNTIME_RETUNE_THERMAL_C: f32 = 85.0;
+const DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV: u32 = 150;
 pub(super) const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 pub(super) const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 pub(super) const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
@@ -376,6 +379,10 @@ pub struct Bzm2CalibrationConfig {
     pub engine_discovery_tdm_prediv_raw: u32,
     pub engine_discovery_tdm_counter: u8,
     pub engine_discovery_timeout: Duration,
+    pub runtime_retune_enabled: bool,
+    pub runtime_retune_persistence_polls: u8,
+    pub runtime_retune_thermal_c: f32,
+    pub runtime_retune_voltage_imbalance_mv: u32,
 }
 
 impl Default for Bzm2CalibrationConfig {
@@ -403,6 +410,10 @@ impl Default for Bzm2CalibrationConfig {
             engine_discovery_timeout: Duration::from_millis(
                 DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS,
             ),
+            runtime_retune_enabled: true,
+            runtime_retune_persistence_polls: DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS,
+            runtime_retune_thermal_c: DEFAULT_RUNTIME_RETUNE_THERMAL_C,
+            runtime_retune_voltage_imbalance_mv: DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV,
         }
     }
 }
@@ -509,6 +520,32 @@ impl Bzm2CalibrationConfig {
                 .and_then(parse_u64_any_radix)
                 .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS),
             ),
+            runtime_retune_enabled: env_flag_default_any(
+                &[
+                    "MUJINA_BZM2_RUNTIME_RETUNE",
+                    "MUJINA_BZM2_ENABLE_RUNTIME_RETUNE",
+                ],
+                true,
+            ),
+            runtime_retune_persistence_polls: env_var_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_PERSISTENCE_POLLS",
+                "MUJINA_BZM2_RETUNE_PERSISTENCE_POLLS",
+            ])
+            .as_deref()
+            .and_then(parse_u8_any_radix)
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_PERSISTENCE_POLLS),
+            runtime_retune_thermal_c: env_f32_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_THERMAL_C",
+                "MUJINA_BZM2_RETUNE_THERMAL_C",
+            ])
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_THERMAL_C),
+            runtime_retune_voltage_imbalance_mv: env_var_any(&[
+                "MUJINA_BZM2_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV",
+                "MUJINA_BZM2_RETUNE_VOLTAGE_IMBALANCE_MV",
+            ])
+            .as_deref()
+            .and_then(parse_u32_any_radix)
+            .unwrap_or(DEFAULT_RUNTIME_RETUNE_VOLTAGE_IMBALANCE_MV),
         };
 
         if config.asics_per_domain.is_empty() {

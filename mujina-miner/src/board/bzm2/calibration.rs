@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,11 @@ pub(super) struct Bzm2BusLayout {
 impl Bzm2BusLayout {
     pub(super) fn contains(&self, global_asic_id: u16) -> bool {
         global_asic_id >= self.asic_start && global_asic_id < self.asic_start + self.asic_count
+    }
+
+    pub(super) fn global_asic_id(&self, local_asic_id: u8) -> Option<u16> {
+        (u16::from(local_asic_id) < self.asic_count)
+            .then_some(self.asic_start + u16::from(local_asic_id))
     }
 
     pub(super) fn local_asic_id(&self, global_asic_id: u16) -> Option<u8> {
@@ -224,6 +230,15 @@ pub(super) struct Bzm2LoadedCalibrationProfile {
     pub(super) saved_state: Bzm2SavedOperatingPoint,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct Bzm2AppliedOperatingState {
+    pub(super) per_domain_voltage_mv: BTreeMap<u16, u32>,
+    pub(super) per_asic_pll_mhz: BTreeMap<u16, [f32; 2]>,
+    pub(super) saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    pub(super) saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    pub(super) saved_operating_point_reasons: Vec<String>,
+}
+
 impl Bzm2Board {
     pub(super) async fn resolve_bus_layouts(&self) -> Result<Vec<Bzm2BusLayout>, BoardError> {
         let configured = build_bus_layouts(
@@ -382,8 +397,13 @@ impl Bzm2Board {
             let die_temp_c = snapshot_temperature(&telemetry, "asic").or(ambient_c);
             match resolve_replay_point(profile, die_temp_c) {
                 Ok(point) if reasons.is_empty() => {
-                    self.apply_saved_operating_point(bus_layouts, &point)
-                        .await?;
+                    self.apply_saved_operating_point(
+                        bus_layouts,
+                        &point,
+                        profile.saved_operating_point_status,
+                        &profile.saved_operating_point_reasons,
+                    )
+                    .await?;
                     info!(
                         board = %self.config.device_id(),
                         asic_count = point.per_asic_pll_mhz.len(),
@@ -571,6 +591,14 @@ impl Bzm2Board {
             per_asic_engine_topology: engine_topology.clone(),
             per_asic_pll_mhz: per_asic_pll_mhz.clone(),
         };
+        store_applied_operating_state(
+            &self.applied_operating_state,
+            &per_domain_voltage_mv,
+            &per_asic_pll_mhz,
+            Some(current_saved_operating_point.clone()),
+            Some(Bzm2SavedOperatingPointStatus::Pending),
+            &[],
+        );
 
         if let Some(profile_path) = calibration.profile_path.as_deref() {
             // Carry forward whatever the board has already learned at other
@@ -800,6 +828,22 @@ pub(super) fn default_saved_engine_topology() -> Bzm2SavedEngineTopology {
     }
 }
 
+pub(super) fn store_applied_operating_state(
+    state: &Arc<Mutex<Bzm2AppliedOperatingState>>,
+    per_domain_voltage_mv: &BTreeMap<u16, u32>,
+    per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
+    saved_operating_point: Option<Bzm2SavedOperatingPoint>,
+    saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    saved_operating_point_reasons: &[String],
+) {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.per_domain_voltage_mv = per_domain_voltage_mv.clone();
+    guard.per_asic_pll_mhz = per_asic_pll_mhz.clone();
+    guard.saved_operating_point = saved_operating_point;
+    guard.saved_operating_point_status = saved_operating_point_status;
+    guard.saved_operating_point_reasons = saved_operating_point_reasons.to_vec();
+}
+
 pub(super) fn load_saved_operating_point_profile(
     path: Option<&Path>,
 ) -> Result<Option<Bzm2LoadedCalibrationProfile>, String> {
@@ -838,6 +882,53 @@ pub(super) fn load_saved_operating_point_profile(
                 err
             )
         })
+}
+
+/// Update a stored profile's lifecycle status in place.
+///
+/// The existing file is read first and only the status, reasons and operating
+/// point are replaced. Rebuilding the profile from the config instead would
+/// silently drop the identity, ambient and timestamp recorded when it was
+/// calibrated — and a profile that loses its binding every time the monitor
+/// marks it Validated is a profile with no binding at all.
+pub(super) fn store_saved_operating_point_status(
+    path: &Path,
+    calibration: &Bzm2CalibrationConfig,
+    bus_layouts: &[Bzm2BusLayout],
+    saved_state: &Bzm2SavedOperatingPoint,
+    status: Bzm2SavedOperatingPointStatus,
+    reasons: &[String],
+) -> Result<(), String> {
+    let existing = load_saved_operating_point_profile(Some(path))
+        .ok()
+        .flatten()
+        .and_then(|loaded| loaded.persisted);
+
+    let profile = match existing {
+        Some(mut profile) => {
+            profile.saved_operating_point_status = status;
+            profile.saved_operating_point_reasons = reasons.to_vec();
+            profile.saved_state = saved_state.clone();
+            profile
+        }
+        None => Bzm2PersistedCalibrationProfile {
+            schema_version: Bzm2PersistedCalibrationProfile::SCHEMA_VERSION,
+            operating_class: operating_class_name(calibration.operating_class).into(),
+            performance_mode: performance_mode_name(calibration.performance_mode).into(),
+            asics_per_bus: bus_layouts.iter().map(|bus| bus.asic_count).collect(),
+            pll_post1_divider: calibration.pll_post1_divider,
+            identity: Bzm2ProfileIdentity::default(),
+            written_at_epoch_s: now_epoch_s(),
+            written_at_ambient_c: None,
+            checksum: None,
+            saved_operating_point_status: status,
+            saved_operating_point_reasons: reasons.to_vec(),
+            operating_points: Bzm2OperatingPointTable::default(),
+            thermal: None,
+            saved_state: saved_state.clone(),
+        },
+    };
+    store_calibration_profile(path, &profile)
 }
 
 fn estimate_planned_hashrate(
@@ -1442,6 +1533,50 @@ mod tests {
     }
 
     #[test]
+    fn a_characterised_heatsink_survives_a_status_update() {
+        // theta costs a power step and minutes of settling. Losing it every
+        // time the monitor marks a profile Validated would mean re-measuring
+        // the heatsink to record an unrelated fact about the voltage.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bzm2-thermal-{unique}.json"));
+
+        let mut profile = valid_profile();
+        profile.thermal = Some(characterisation());
+        store_calibration_profile(&path, &profile).unwrap();
+
+        store_saved_operating_point_status(
+            &path,
+            &Bzm2CalibrationConfig {
+                asics_per_bus: vec![2],
+                ..Default::default()
+            },
+            &validation_bus_layouts(),
+            &profile.saved_state,
+            Bzm2SavedOperatingPointStatus::Validated,
+            &[],
+        )
+        .unwrap();
+
+        let reloaded = load_saved_operating_point_profile(Some(&path))
+            .unwrap()
+            .unwrap()
+            .persisted
+            .unwrap();
+        let thermal = reloaded.thermal.expect("theta must survive the rewrite");
+        assert_eq!(thermal, characterisation());
+        assert!(
+            (thermal.theta.degrees_c_per_watt() - 0.45).abs() < 1e-6,
+            "18 C of rise on a 40 W step is 0.45 C/W"
+        );
+        assert!(thermal.theta.is_settled());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn an_edited_theta_breaks_the_checksum() {
         // theta gates every voltage grant through the runaway precondition, so
         // a hand-edited one is a way to talk the miner into an unsafe point.
@@ -1461,6 +1596,49 @@ mod tests {
             tampered.checksum_mismatch().is_some(),
             "a doctored heatsink figure must not pass validation"
         );
+    }
+
+    #[test]
+    fn status_updates_preserve_the_binding() {
+        // The monitor marks a profile Validated long after calibration wrote
+        // it. If that rewrite rebuilt the profile from config, the identity and
+        // the ambient it was learned at would be lost, and the next restart
+        // would have nothing to validate against.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("bzm2-binding-{unique}.json"));
+        store_calibration_profile(&path, &valid_profile()).unwrap();
+
+        let calibration = Bzm2CalibrationConfig {
+            asics_per_bus: vec![2],
+            ..Default::default()
+        };
+        let saved_state = valid_profile().saved_state.clone();
+        store_saved_operating_point_status(
+            &path,
+            &calibration,
+            &validation_bus_layouts(),
+            &saved_state,
+            Bzm2SavedOperatingPointStatus::Validated,
+            &[],
+        )
+        .unwrap();
+
+        let reloaded = load_saved_operating_point_profile(Some(&path))
+            .unwrap()
+            .unwrap()
+            .persisted
+            .unwrap();
+        assert_eq!(reloaded.identity, valid_profile().identity);
+        assert_eq!(reloaded.written_at_ambient_c, Some(21.0));
+        assert!(
+            reloaded.checksum_mismatch().is_none(),
+            "the rewrite must reseal, not carry the stale digest"
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     #[tokio::test]

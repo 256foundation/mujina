@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
-use crate::api_client::types::{PowerMeasurement, TemperatureSensor};
+use crate::api_client::types::{
+    Bzm2SavedOperatingPointStatus, PowerMeasurement, TemperatureSensor,
+};
 use crate::asic::bzm2::{Bzm2ClockController, Bzm2Pll};
 use crate::board::power::{
     FileGpioPin, FilePowerRail, GpioResetLine, PowerRail, VoltageStackBringupPlan, VoltageStackStep,
@@ -13,7 +15,7 @@ use crate::tracing::prelude::*;
 use crate::tuning::calibration_planner::Bzm2SavedOperatingPoint;
 use crate::types::Temperature;
 
-use super::calibration::Bzm2BusLayout;
+use super::calibration::{Bzm2BusLayout, store_applied_operating_state};
 use super::config::{
     DEFAULT_BOARD_TEMP_SCALE, DEFAULT_BRINGUP_POST_POWER_MS, DEFAULT_BRINGUP_PRE_POWER_MS,
     DEFAULT_BRINGUP_RELEASE_RESET_MS, DEFAULT_CALIBRATION_REPLAY_FREQ_MHZ, DEFAULT_CURRENT_SCALE,
@@ -370,6 +372,8 @@ impl Bzm2Board {
         &self,
         bus_layouts: &[Bzm2BusLayout],
         point: &Bzm2SavedOperatingPoint,
+        status: Bzm2SavedOperatingPointStatus,
+        reasons: &[String],
     ) -> Result<(), BoardError> {
         self.apply_domain_voltage_map(&point.per_domain_voltage_mv)
             .await?;
@@ -388,6 +392,14 @@ impl Bzm2Board {
             self.apply_bus_frequency_map(bus, initial_frequencies, &point.per_asic_pll_mhz)
                 .await?;
         }
+        store_applied_operating_state(
+            &self.applied_operating_state,
+            &point.per_domain_voltage_mv,
+            &point.per_asic_pll_mhz,
+            Some(point.clone()),
+            Some(status),
+            reasons,
+        );
         Ok(())
     }
 

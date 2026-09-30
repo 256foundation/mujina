@@ -730,6 +730,7 @@ mod tests {
             threads: Vec::new(),
             efficiency: Vec::new(),
             asics: Vec::new(),
+            bzm2_tuning: None,
         }
     }
 

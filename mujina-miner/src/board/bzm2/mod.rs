@@ -19,7 +19,8 @@ use crate::{
     tracing::prelude::*,
     transport::SerialControl,
 };
-use calibration::Bzm2BusLayout;
+use calibration::{Bzm2AppliedOperatingState, Bzm2BusLayout};
+use monitor::Bzm2RuntimeMeasurementCache;
 
 use telemetry::{merge_power_readings, merge_temperature_readings};
 
@@ -91,6 +92,8 @@ pub struct Bzm2Board {
     shutdown_handles: Vec<Bzm2ThreadHandle>,
     serial_controls: Vec<SerialControl>,
     bus_layouts: Arc<Mutex<Vec<Bzm2BusLayout>>>,
+    applied_operating_state: Arc<Mutex<Bzm2AppliedOperatingState>>,
+    runtime_measurements: Arc<Mutex<Bzm2RuntimeMeasurementCache>>,
     telemetry_tx: watch::Sender<BoardTelemetry>,
     monitor_shutdown: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
@@ -112,6 +115,8 @@ impl Bzm2Board {
             shutdown_handles: Vec::new(),
             serial_controls: Vec::new(),
             bus_layouts: Arc::new(Mutex::new(Vec::new())),
+            applied_operating_state: Arc::new(Mutex::new(Bzm2AppliedOperatingState::default())),
+            runtime_measurements: Arc::new(Mutex::new(Bzm2RuntimeMeasurementCache::default())),
             telemetry_tx,
             monitor_shutdown: None,
             monitor_task: None,

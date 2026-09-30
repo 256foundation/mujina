@@ -41,6 +41,9 @@ pub struct BoardTelemetry {
     /// Per-ASIC topology/diagnostics state (multi-ASIC boards only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asics: Vec<AsicState>,
+    /// BZM2 runtime tuning state (BZM2 boards only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bzm2_tuning: Option<Bzm2TuningState>,
 }
 
 /// Fan status.
@@ -221,6 +224,113 @@ pub enum Bzm2SavedOperatingPointStatus {
 pub enum Bzm2StartupPath {
     SavedReplay,
     LiveCalibration,
+}
+
+/// BZM2 runtime tuning state (BZM2 boards only).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2TuningState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_saved_operating_point: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_retune: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_clock_mhz: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_accept_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retune_pending: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retune_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_operating_point_status: Option<Bzm2SavedOperatingPointStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_operating_point_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner_notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<Bzm2DomainTuningState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asics: Vec<Bzm2AsicTuningState>,
+}
+
+/// Per-domain live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2DomainTuningState {
+    pub domain_id: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rail_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_power_w: Option<f32>,
+}
+
+/// Per-PLL live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2PllTuningState {
+    pub pll_index: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_mhz: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_rate: Option<f32>,
+}
+
+/// Outcome tally for the result frames one ASIC has returned.
+///
+/// `decoded` is the number of frames that reconstructed to a block header,
+/// accepted or not; the remaining fields partition every frame by why it
+/// was, or was not, forwarded as a share.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct Bzm2ResultCounts {
+    pub decoded: u64,
+    pub accepted: u64,
+    pub invalid_nonce: u64,
+    pub unknown_engine: u64,
+    pub no_dispatch: u64,
+    pub stale_sequence: u64,
+    pub below_target: u64,
+}
+
+impl From<crate::asic::bzm2::Bzm2ResultCounters> for Bzm2ResultCounts {
+    fn from(counters: crate::asic::bzm2::Bzm2ResultCounters) -> Self {
+        Self {
+            decoded: counters.decoded,
+            accepted: counters.accepted,
+            invalid_nonce: counters.invalid_nonce,
+            unknown_engine: counters.unknown_engine,
+            no_dispatch: counters.no_dispatch,
+            stale_sequence: counters.stale_sequence,
+            below_target: counters.below_target,
+        }
+    }
+}
+
+/// Per-ASIC live tuning measurement.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct Bzm2AsicTuningState {
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_engine_count: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_hs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_pass_rate: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler_share_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Bzm2ResultCounts>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plls: Vec<Bzm2PllTuningState>,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.
