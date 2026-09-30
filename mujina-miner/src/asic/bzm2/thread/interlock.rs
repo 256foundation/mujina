@@ -373,13 +373,7 @@ impl ThermalInterlock {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::job_source::{GeneralPurposeBits, JobTemplate, VersionTemplate};
-    use crate::transport::{SerialConfig, SerialStream};
-    use bitcoin::hashes::Hash;
-    use bitcoin::pow::Target;
-    use nix::pty::openpty;
-    use std::os::unix::io::IntoRawFd;
-    use tokio::sync::mpsc as tokio_mpsc;
+
     /// A HUNDRED DEVICES, ONE CEILING, AND THE CEILING MUST SEE THE WORST.
     ///
     /// The interlock held a single scalar, overwritten by whichever ASIC spoke

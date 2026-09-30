@@ -9,8 +9,8 @@ pub use clock::{
 };
 pub use protocol::Bzm2EngineLayout;
 pub use thread::{
-    DEFAULT_THERMAL_ESCALATION, DtsVsDiagnostics, FaultCorroborator, ThermalInterlock,
-    ThermalRefusal,
+    Bzm2Thread, Bzm2ThreadConfig, Bzm2ThreadHandle, DEFAULT_THERMAL_ESCALATION, DtsVsDiagnostics,
+    FaultCorroborator, ThermalInterlock, ThermalRefusal,
 };
 pub use uart::{
     BROADCAST_GROUP_ASIC, Bzm2DiscoveredEngineMap, Bzm2DtsVsConfig, Bzm2EngineCoordinate,
