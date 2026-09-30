@@ -1,20 +1,23 @@
 //! Power-rail bring-up, reset sequencing, and voltage/frequency application for the BZM2 board.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;
 
 use crate::api_client::types::{PowerMeasurement, TemperatureSensor};
+use crate::asic::bzm2::{Bzm2ClockController, Bzm2Pll};
 use crate::board::power::{
-    FileGpioPin, FilePowerRail, GpioResetLine, VoltageStackBringupPlan, VoltageStackStep,
+    FileGpioPin, FilePowerRail, GpioResetLine, PowerRail, VoltageStackBringupPlan, VoltageStackStep,
 };
 use crate::tracing::prelude::*;
 use crate::types::Temperature;
 
+use super::calibration::Bzm2BusLayout;
 use super::config::{
     DEFAULT_BOARD_TEMP_SCALE, DEFAULT_BRINGUP_POST_POWER_MS, DEFAULT_BRINGUP_PRE_POWER_MS,
     DEFAULT_BRINGUP_RELEASE_RESET_MS, DEFAULT_CURRENT_SCALE, DEFAULT_POWER_SCALE,
     DEFAULT_VOLTAGE_SCALE, env_csv_strings_any, env_flag_any, env_flag_default_any, env_var_any,
-    parse_csv_numbers,
+    parse_csv_numbers, parse_csv_numbers_any,
 };
 use super::telemetry::{Bzm2TelemetrySnapshot, SensorSpec, sensor_specs_from_env};
 use super::{BoardError, Bzm2Board};
@@ -24,6 +27,7 @@ pub struct Bzm2BringupConfig {
     pub enabled: bool,
     pub rail_set_paths: Vec<String>,
     pub rail_write_scales: Vec<f32>,
+    pub domain_rail_indices: Vec<usize>,
     pub rail_enable_paths: Vec<String>,
     pub rail_enable_values: Vec<String>,
     pub rail_vin: Vec<SensorSpec>,
@@ -42,6 +46,7 @@ impl Default for Bzm2BringupConfig {
             enabled: false,
             rail_set_paths: Vec::new(),
             rail_write_scales: Vec::new(),
+            domain_rail_indices: Vec::new(),
             rail_enable_paths: Vec::new(),
             rail_enable_values: Vec::new(),
             rail_vin: Vec::new(),
@@ -73,6 +78,9 @@ impl Bzm2BringupConfig {
         let rail_write_scales = parse_csv_numbers::<f32>("MUJINA_BZM2_RAIL_WRITE_SCALES")
             .or_else(|| parse_csv_numbers::<f32>("MUJINA_BZM2_BRINGUP_RAIL_WRITE_SCALES"))
             .unwrap_or_default();
+        let domain_rail_indices =
+            parse_csv_numbers_any::<usize>(&["MUJINA_BZM2_DOMAIN_RAIL_INDICES"])
+                .unwrap_or_default();
         let rail_enable_paths = env_csv_strings_any(&[
             "MUJINA_BZM2_RAIL_ENABLE_PATHS",
             "MUJINA_BZM2_BRINGUP_RAIL_ENABLE_PATHS",
@@ -156,6 +164,7 @@ impl Bzm2BringupConfig {
             enabled,
             rail_set_paths,
             rail_write_scales,
+            domain_rail_indices,
             rail_enable_paths,
             rail_enable_values,
             rail_vin,
@@ -167,6 +176,16 @@ impl Bzm2BringupConfig {
             reset_active_low: env_flag_default_any(&["MUJINA_BZM2_RESET_ACTIVE_LOW"], true),
             plan,
         }
+    }
+
+    pub(super) fn rail_index_for_domain(&self, domain_id: u16) -> Option<usize> {
+        self.domain_rail_indices
+            .get(domain_id as usize)
+            .copied()
+            .or_else(|| {
+                let fallback = domain_id as usize;
+                (fallback < self.rail_set_paths.len()).then_some(fallback)
+            })
     }
 
     pub(super) fn has_telemetry(&self) -> bool {
@@ -338,6 +357,91 @@ impl Bzm2Board {
         // The setpoints are written. Whether the rails fell is a different
         // question, and it is the one that matters.
         self.confirm_rails_dark().await;
+        Ok(())
+    }
+
+    pub(super) async fn apply_domain_voltage_map(
+        &self,
+        per_domain_voltage_mv: &BTreeMap<u16, u32>,
+    ) -> Result<(), BoardError> {
+        if per_domain_voltage_mv.is_empty() {
+            return Ok(());
+        }
+        if self.config.bringup.rail_set_paths.is_empty() {
+            warn!(
+                board = %self.config.device_id(),
+                ?per_domain_voltage_mv,
+                "planner produced per-domain voltages, but no BZM2 rail control path is configured"
+            );
+            return Ok(());
+        }
+
+        let mut rail_targets_mv = BTreeMap::<usize, u32>::new();
+        for (&domain_id, &voltage_mv) in per_domain_voltage_mv {
+            let rail_index = self
+                .config
+                .bringup
+                .rail_index_for_domain(domain_id)
+                .ok_or_else(|| {
+                    BoardError::HardwareControl(format!(
+                        "BZM2 domain {domain_id} has no mapped rail index"
+                    ))
+                })?;
+            if rail_index >= self.config.bringup.rail_set_paths.len() {
+                return Err(BoardError::HardwareControl(format!(
+                    "BZM2 domain {domain_id} mapped to rail {rail_index}, but only {} rail set paths are configured",
+                    self.config.bringup.rail_set_paths.len()
+                )));
+            }
+            match rail_targets_mv.entry(rail_index) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(voltage_mv);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if *entry.get() != voltage_mv =>
+                {
+                    return Err(BoardError::HardwareControl(format!(
+                        "BZM2 rail {rail_index} received conflicting domain voltages: {}mV vs {}mV",
+                        entry.get(),
+                        voltage_mv
+                    )));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+
+        let mut rails = self.config.bringup.build_rails();
+        for (&rail_index, &voltage_mv) in &rail_targets_mv {
+            let rail = rails.get_mut(rail_index).ok_or_else(|| {
+                BoardError::HardwareControl(format!(
+                    "BZM2 rail {rail_index} is missing from configured rail controls"
+                ))
+            })?;
+            rail.set_voltage(voltage_mv as f32 / 1000.0)
+                .await
+                .map_err(|err| {
+                    BoardError::HardwareControl(format!(
+                        "Failed to apply BZM2 domain voltage {voltage_mv}mV on rail {rail_index}: {err}"
+                    ))
+                })?;
+        }
+
+        // CONFIRM IT THROUGH AN INSTRUMENT THAT CAN ACTUALLY SEE THE RAIL.
+        //
+        // Every write above went to a sysfs setpoint that is WRITE-ONLY:
+        // FilePowerRail::telemetry() refuses by design rather than returning
+        // zeros, because zeros are a reading that says the rail is dark. So
+        // the commanded voltage had no confirmation of any kind -- a regulator
+        // that ignored the write, a path that did not exist, and a rail that
+        // came up exactly as asked were indistinguishable.
+        //
+        // The board MCU reads the rail with its own ADC, over I2C. That shares
+        // nothing with a sysfs write to a regulator driver, which is what makes
+        // it a witness rather than an echo.
+        let commanded_mv = rail_targets_mv.values().copied().max().unwrap_or(0);
+        if commanded_mv > 0 {
+            self.confirm_rail_reached(commanded_mv).await;
+        }
         Ok(())
     }
 
@@ -518,4 +622,185 @@ impl Bzm2Board {
             }
         }
     }
+
+    /// Read each driven board's rail from its MCU and say whether it arrived.
+    ///
+    /// Reports rather than fails. A board that did not reach its commanded
+    /// voltage is a serious finding, but bring-up is already past the point
+    /// where refusing helps -- the rails are up or they are not -- and the
+    /// caller that can act on it is the monitor, which reads the same MCU.
+    /// What this must not do is stay silent, which is what it did before.
+    async fn confirm_rail_reached(&self, commanded_mv: u32) {
+        // Rails do not step. Poll rather than sleeping once and judging.
+        const SETTLE_ATTEMPTS: usize = 10;
+        const SETTLE_GAP: Duration = Duration::from_millis(300);
+        // Generous: a loaded rail sags, and the failure worth catching is a
+        // rail at zero or at half, not one a few percent low.
+        const TOLERANCE: f32 = 0.15;
+
+        for board_index in self.driven_board_indices() {
+            let mut measured = None;
+            for _ in 0..SETTLE_ATTEMPTS {
+                if let Some(mv) = self.read_board_rail_mv(board_index).await {
+                    measured = Some(mv);
+                    let want = commanded_mv as f32;
+                    if (mv as f32 - want).abs() / want <= TOLERANCE {
+                        break;
+                    }
+                }
+                tokio::time::sleep(SETTLE_GAP).await;
+            }
+
+            match measured {
+                Some(mv) if mv < super::board_mcu::RAIL_DARK_MV => error!(
+                    board_index,
+                    commanded_mv,
+                    measured_mv = mv,
+                    "RAIL IS DARK after being commanded to a live voltage. The setpoint write                      succeeded and the rail did not come up."
+                ),
+                Some(mv) => {
+                    let off = (mv as f32 - commanded_mv as f32).abs() / commanded_mv as f32;
+                    if off <= TOLERANCE {
+                        info!(
+                            board_index,
+                            commanded_mv,
+                            measured_mv = mv,
+                            "Rail confirmed at the commanded voltage by the board MCU"
+                        );
+                    } else {
+                        warn!(
+                            board_index,
+                            commanded_mv,
+                            measured_mv = mv,
+                            "Rail is up but not at the commanded voltage"
+                        );
+                    }
+                }
+                None => warn!(
+                    board_index,
+                    commanded_mv,
+                    "Could not read this board's rail, so the commanded voltage is UNMEASURED                      -- not confirmed, and not known to have failed"
+                ),
+            }
+        }
+    }
+
+    pub(super) async fn apply_frequency_map(
+        &self,
+        bus_layouts: &[Bzm2BusLayout],
+        initial_frequencies_mhz: [f32; 2],
+        per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
+    ) -> Result<(), BoardError> {
+        for bus in bus_layouts {
+            self.apply_bus_frequency_map(bus, initial_frequencies_mhz, per_asic_pll_mhz)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn apply_bus_frequency_map(
+        &self,
+        bus: &Bzm2BusLayout,
+        initial_frequencies_mhz: [f32; 2],
+        per_asic_pll_mhz: &BTreeMap<u16, [f32; 2]>,
+    ) -> Result<(), BoardError> {
+        if bus.asic_count == 0 {
+            return Ok(());
+        }
+        let stream = crate::transport::serial::open_with_platform_cflag(
+            &bus.serial_path,
+            self.config.baud_rate,
+        )
+        .map_err(|err| {
+            BoardError::InitializationFailed(format!(
+                "Failed to open BZM2 calibration transport {}: {}",
+                bus.serial_path, err
+            ))
+        })?;
+        let (reader, writer, _control) = super::config::split_chain_port(stream);
+        let mut clock = Bzm2ClockController::new(reader, writer);
+
+        for (pll, frequency_mhz) in [Bzm2Pll::Pll0, Bzm2Pll::Pll1]
+            .into_iter()
+            .zip(initial_frequencies_mhz)
+        {
+            clock
+                .broadcast_pll_frequency(
+                    pll,
+                    frequency_mhz,
+                    self.config.calibration.pll_post1_divider,
+                )
+                .await
+                .map_err(|err| calibration_error(&bus.serial_path, err))?;
+            clock
+                .broadcast_enable_pll(pll)
+                .await
+                .map_err(|err| calibration_error(&bus.serial_path, err))?;
+        }
+
+        if !self.config.calibration.skip_lock_check {
+            for local_asic in 0..bus.asic_count {
+                for pll in [Bzm2Pll::Pll0, Bzm2Pll::Pll1] {
+                    clock
+                        .wait_for_pll_lock(
+                            local_asic as u8,
+                            pll,
+                            self.config.calibration.lock_timeout,
+                            self.config.calibration.lock_poll_interval,
+                        )
+                        .await
+                        .map_err(|err| calibration_error(&bus.serial_path, err))?;
+                }
+            }
+        }
+
+        for asic_id in bus.asic_start..bus.asic_start + bus.asic_count {
+            let Some(frequencies_mhz) = per_asic_pll_mhz.get(&asic_id) else {
+                continue;
+            };
+            let local_asic = bus
+                .local_asic_id(asic_id)
+                .expect("bus layout must contain loop asic id");
+            for (index, frequency_mhz) in frequencies_mhz.iter().enumerate() {
+                let pll = if index == 0 {
+                    Bzm2Pll::Pll0
+                } else {
+                    Bzm2Pll::Pll1
+                };
+                clock
+                    .set_pll_frequency(
+                        local_asic,
+                        pll,
+                        *frequency_mhz,
+                        self.config.calibration.pll_post1_divider,
+                    )
+                    .await
+                    .map_err(|err| calibration_error(&bus.serial_path, err))?;
+                clock
+                    .enable_pll(local_asic, pll)
+                    .await
+                    .map_err(|err| calibration_error(&bus.serial_path, err))?;
+                if !self.config.calibration.skip_lock_check {
+                    clock
+                        .wait_for_pll_lock(
+                            local_asic,
+                            pll,
+                            self.config.calibration.lock_timeout,
+                            self.config.calibration.lock_poll_interval,
+                        )
+                        .await
+                        .map_err(|err| calibration_error(&bus.serial_path, err))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn calibration_error(serial_path: &str, err: impl std::fmt::Display) -> BoardError {
+    BoardError::InitializationFailed(format!(
+        "BZM2 calibration failed on {}: {}",
+        serial_path, err
+    ))
 }

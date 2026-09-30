@@ -7,11 +7,13 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::api_client::types::{
-    AsicState, BoardTelemetry, Fan, PowerMeasurement, TemperatureSensor,
+    AsicState, BoardTelemetry, EngineCoordinate, Fan, PowerMeasurement, TemperatureSensor,
 };
+use crate::asic::bzm2::Bzm2DiscoveredEngineMap;
 use crate::asic::hash_thread::{
     HashThreadAsicObservation, HashThreadStatus, HashThreadTelemetryUpdate,
 };
+use crate::tuning::calibration_planner::Bzm2SavedEngineTopology;
 use crate::types::Temperature;
 
 use super::config::{
@@ -521,6 +523,53 @@ fn sort_asic_rows(state: &mut BoardTelemetry) {
         .sort_by_key(|asic| (asic.thread_index.unwrap_or(usize::MAX), asic.id));
 }
 
+pub(super) fn publish_discovered_engine_map(
+    telemetry_tx: &watch::Sender<BoardTelemetry>,
+    thread_index: usize,
+    serial_path: &str,
+    discovery: &Bzm2DiscoveredEngineMap,
+) {
+    upsert_asic_state(
+        telemetry_tx,
+        thread_index,
+        serial_path,
+        discovery.asic,
+        discovery.present_count() as u16,
+        discovery
+            .missing
+            .iter()
+            .map(|engine| EngineCoordinate {
+                row: engine.row,
+                col: engine.col,
+            })
+            .collect(),
+    );
+}
+
+pub(super) fn publish_saved_engine_topology(
+    telemetry_tx: &watch::Sender<BoardTelemetry>,
+    thread_index: usize,
+    serial_path: &str,
+    asic_id: u8,
+    topology: &Bzm2SavedEngineTopology,
+) {
+    upsert_asic_state(
+        telemetry_tx,
+        thread_index,
+        serial_path,
+        asic_id,
+        topology.active_engine_count,
+        topology
+            .missing_engines
+            .iter()
+            .map(|engine| EngineCoordinate {
+                row: engine.row,
+                col: engine.col,
+            })
+            .collect(),
+    );
+}
+
 pub(super) fn merge_temperature_readings(
     existing: &mut Vec<TemperatureSensor>,
     updates: &[TemperatureSensor],
@@ -557,6 +606,22 @@ pub(super) fn merge_power_readings(
             existing.push(update.clone());
         }
     }
+}
+
+pub(super) fn snapshot_temperature(snapshot: &Bzm2TelemetrySnapshot, name: &str) -> Option<f32> {
+    snapshot
+        .temperatures
+        .iter()
+        .find(|sensor| sensor.name == name)
+        .and_then(|sensor| sensor.temperature.map(Temperature::as_degrees_c))
+}
+
+pub(super) fn snapshot_input_power(snapshot: &Bzm2TelemetrySnapshot) -> Option<f32> {
+    snapshot
+        .powers
+        .iter()
+        .find(|power| power.name == "input")
+        .and_then(|power| power.power_w)
 }
 
 pub(super) fn sensor_specs_from_env(
@@ -641,6 +706,37 @@ pub(super) fn parse_sysfs_number<T: std::str::FromStr>(raw: &str) -> Option<T> {
 
 fn parse_scaled_sensor_value(raw: &str, scale: f32) -> Option<f32> {
     parse_sysfs_number::<f32>(raw).map(|value| value * scale)
+}
+
+fn upsert_asic_state(
+    telemetry_tx: &watch::Sender<BoardTelemetry>,
+    thread_index: usize,
+    serial_path: &str,
+    asic_id: u8,
+    active_engine_count: u16,
+    missing_engines: Vec<EngineCoordinate>,
+) {
+    telemetry_tx.send_modify(
+        |state| match asic_row_index(&state.asics, thread_index, asic_id) {
+            Some(index) => {
+                let asic = &mut state.asics[index];
+                asic.serial_path = Some(serial_path.to_owned());
+                asic.discovered_engine_count = Some(active_engine_count);
+                asic.missing_engines = missing_engines.clone();
+            }
+            None => {
+                state.asics.push(AsicState {
+                    id: asic_id,
+                    thread_index: Some(thread_index),
+                    serial_path: Some(serial_path.to_owned()),
+                    discovered_engine_count: Some(active_engine_count),
+                    missing_engines: missing_engines.clone(),
+                    ..Default::default()
+                });
+                sort_asic_rows(state);
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1209,6 +1305,48 @@ mod tests {
     }
 
     #[test]
+    fn an_observation_and_a_discovery_share_one_row() {
+        // Two writers, one row per ASIC. If they kept separate rows, a
+        // reader joining "what this ASIC is" to "when it last spoke" would
+        // find two answers for one device.
+        let (telemetry_tx, telemetry_rx) = watch::channel(board_state());
+        let observed_at = Instant::now();
+
+        publish_discovered_engine_map(
+            &telemetry_tx,
+            0,
+            "/dev/ttyUSB0",
+            &Bzm2DiscoveredEngineMap {
+                asic: 5,
+                present: vec![crate::asic::bzm2::Bzm2EngineCoordinate::new(0, 0)],
+                missing: Vec::new(),
+            },
+        );
+        publish_thread_telemetry(
+            &telemetry_tx,
+            0,
+            &asic_update(
+                "ttyUSB0-asic-5",
+                Some(66.0),
+                Some(0.72),
+                HashThreadAsicObservation {
+                    asic_id: 5,
+                    observed_at,
+                    faults: Some(AsicFaultBits::default()),
+                },
+            ),
+        );
+
+        let state = telemetry_rx.borrow().clone();
+        assert_eq!(state.asics.len(), 1);
+        let row = &state.asics[0];
+        assert_eq!(row.discovered_engine_count, Some(1), "discovery's field");
+        assert_eq!(row.serial_path.as_deref(), Some("/dev/ttyUSB0"));
+        assert_eq!(row.observed_at, Some(observed_at), "telemetry's field");
+        assert_eq!(row.faults, Some(AsicFaultBits::default()));
+    }
+
+    #[test]
     fn rows_stay_in_bus_then_id_order_however_the_frames_arrive() {
         // The order is maintained where rows are ADDED, not on every frame:
         // an update in place cannot change it. This is the test that would
@@ -1308,5 +1446,46 @@ mod tests {
             crate::types::HashRate::from_terahashes(42.0).0
         );
         assert!(state.threads[0].is_active);
+    }
+
+    #[test]
+    fn publish_discovered_engine_map_updates_board_state() {
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            serial: Some("bzm2-test".into()),
+            ..Default::default()
+        });
+
+        publish_discovered_engine_map(
+            &telemetry_tx,
+            1,
+            "/dev/ttyUSB1",
+            &Bzm2DiscoveredEngineMap {
+                asic: 2,
+                present: vec![
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(0, 0),
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(0, 1),
+                ],
+                missing: vec![
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(3, 7),
+                    crate::asic::bzm2::Bzm2EngineCoordinate::new(5, 11),
+                ],
+            },
+        );
+
+        let state = telemetry_rx.borrow().clone();
+        assert_eq!(state.asics.len(), 1);
+        assert_eq!(state.asics[0].id, 2);
+        assert_eq!(state.asics[0].thread_index, Some(1));
+        assert_eq!(state.asics[0].serial_path.as_deref(), Some("/dev/ttyUSB1"));
+        assert_eq!(state.asics[0].discovered_engine_count, Some(2));
+        assert_eq!(
+            state.asics[0].missing_engines,
+            vec![
+                EngineCoordinate { row: 3, col: 7 },
+                EngineCoordinate { row: 5, col: 11 },
+            ]
+        );
     }
 }

@@ -4,6 +4,9 @@ use std::env;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::tuning::calibration_planner::{
+    Bzm2CalibrationMode, Bzm2OperatingClass, Bzm2PerformanceMode,
+};
 use crate::types::Difficulty;
 
 use super::bringup::Bzm2BringupConfig;
@@ -67,7 +70,60 @@ pub(super) const DEFAULT_MAX_ASIC_TEMP_C: f32 = 100.0;
 /// See `Bzm2TelemetryConfig::from_env` for why this can be defaulted safely.
 pub(super) const DEFAULT_MIN_FAN_RPM: u32 = 300;
 
+/// How far from the ambient a stored tuning was taken at it may still be used.
+///
+/// Not a tolerance on correctness -- tuning is a measurement and a measurement
+/// has a context. Two degrees is inside the drift of a temperature-stable room
+/// and well under the spread this hardware shows between devices, so it admits
+/// a re-run on another day and refuses a different thermal environment.
+pub(super) const STORED_CALIBRATION_AMBIENT_TOLERANCE_C: f32 = 2.0;
+
+/// Read the per-device tuning this unit holds, if an operator asked for it.
+///
+/// Opt-in by path rather than discovered, and silent when unset: a driver that
+/// went looking for tuning files would eventually find one belonging to another
+/// board or another run, and applying the wrong board's frequencies is a worse
+/// outcome than applying none. A named path is a decision somebody made.
+fn load_stored_calibration() -> Option<super::stored_calibration::StoredCalibration> {
+    let path = env::var("MUJINA_BZM2_STORED_CALIBRATION").ok()?;
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            match super::stored_calibration::StoredCalibration::parse(std::io::BufReader::new(file))
+            {
+                Ok(cal) => {
+                    tracing::info!(
+                        path = %path,
+                        devices = cal.device_count(),
+                        mean_mhz = cal.mean_mhz(),
+                        "BZM2 loaded stored per-device tuning"
+                    );
+                    Some(cal)
+                }
+                Err(err) => {
+                    // Loudly, and then nothing: a tuning file that will not parse
+                    // must not silently become a uniform frequency nobody asked for.
+                    tracing::warn!(path = %path, error = %err,
+                    "BZM2 stored tuning could not be parsed; running untuned");
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(path = %path, error = %err,
+                "BZM2 stored tuning path is unreadable; running untuned");
+            None
+        }
+    }
+}
+
 pub(super) const DEFAULT_POWER_SCALE: f32 = 0.000001;
+pub(super) const DEFAULT_CALIBRATION_SITE_TEMP_C: f32 = 20.0;
+pub(super) const DEFAULT_CALIBRATION_POST1_DIVIDER: u8 = 0;
+const DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS: u64 = 1_000;
+const DEFAULT_CALIBRATION_LOCK_POLL_MS: u64 = 100;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW: u32 = 0x0f;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER: u8 = 16;
+const DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS: u64 = 100;
 pub(super) const DEFAULT_ENUMERATION_MAX_ASICS_PER_BUS: u16 = 100;
 pub(super) const DEFAULT_BRINGUP_PRE_POWER_MS: u64 = 10;
 pub(super) const DEFAULT_BRINGUP_POST_POWER_MS: u64 = 25;
@@ -89,6 +145,13 @@ pub struct Bzm2RuntimeConfig {
     pub calibration: Bzm2CalibrationConfig,
     pub enumeration: Bzm2EnumerationConfig,
     pub bringup: Bzm2BringupConfig,
+    /// Per-device tuning this unit already holds, when an operator asks for it.
+    ///
+    /// `None` unless `MUJINA_BZM2_STORED_CALIBRATION` names a readable file:
+    /// applying it writes frequencies to silicon, and the map's device ORDER is
+    /// confirmed only for the identity case, so it is opt-in until a per-device
+    /// read-back has agreed with it on a real chain.
+    pub stored_calibration: Option<super::stored_calibration::StoredCalibration>,
     /// Whether to feed the board MCU's heartbeat, and how often.
     pub heartbeat: Bzm2HeartbeatConfig,
 }
@@ -222,6 +285,7 @@ impl Bzm2RuntimeConfig {
             enumeration: Bzm2EnumerationConfig::from_env(serial_paths.len(), &calibration),
             bringup,
             calibration,
+            stored_calibration: load_stored_calibration(),
             heartbeat: Bzm2HeartbeatConfig::from_env(),
         })
     }
@@ -291,25 +355,150 @@ impl Bzm2EnumerationConfig {
 
 #[derive(Debug, Clone)]
 pub struct Bzm2CalibrationConfig {
+    pub enabled: bool,
+    pub discover_engine_topology: bool,
+    pub operating_class: Bzm2OperatingClass,
+    pub performance_mode: Bzm2PerformanceMode,
+    pub mode: Bzm2CalibrationMode,
+    pub per_stack_clocking: bool,
+    pub force_retune: bool,
     pub asics_per_bus: Vec<u16>,
+    pub asics_per_domain: Vec<u16>,
+    pub domain_voltage_offsets_mv: Vec<i32>,
+    pub site_temp_c: Option<f32>,
+    pub pll_post1_divider: u8,
+    pub skip_lock_check: bool,
+    pub lock_timeout: Duration,
+    pub lock_poll_interval: Duration,
+    pub engine_discovery_tdm_prediv_raw: u32,
+    pub engine_discovery_tdm_counter: u8,
+    pub engine_discovery_timeout: Duration,
 }
 
 impl Default for Bzm2CalibrationConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
+            discover_engine_topology: true,
+            operating_class: Bzm2OperatingClass::Generic,
+            performance_mode: Bzm2PerformanceMode::Standard,
+            mode: Bzm2CalibrationMode::default(),
+            per_stack_clocking: false,
+            force_retune: false,
             asics_per_bus: vec![1],
+            asics_per_domain: vec![1],
+            domain_voltage_offsets_mv: Vec::new(),
+            site_temp_c: None,
+            pll_post1_divider: DEFAULT_CALIBRATION_POST1_DIVIDER,
+            skip_lock_check: false,
+            lock_timeout: Duration::from_millis(DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS),
+            lock_poll_interval: Duration::from_millis(DEFAULT_CALIBRATION_LOCK_POLL_MS),
+            engine_discovery_tdm_prediv_raw: DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW,
+            engine_discovery_tdm_counter: DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER,
+            engine_discovery_timeout: Duration::from_millis(
+                DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS,
+            ),
         }
     }
 }
 
 impl Bzm2CalibrationConfig {
     fn from_env(serial_count: usize) -> Self {
-        Self {
+        let mut config = Self {
+            enabled: env_flag("MUJINA_BZM2_CALIBRATE") || env_flag("MUJINA_BZM2_ENABLE_PNP"),
+            discover_engine_topology: env_flag_default_any(
+                &[
+                    "MUJINA_BZM2_CALIBRATION_DISCOVER_ENGINES",
+                    "MUJINA_BZM2_DISCOVER_ENGINES_FOR_CALIBRATION",
+                ],
+                true,
+            ),
+            operating_class: env_var_any(&["MUJINA_BZM2_OPERATING_CLASS", "MUJINA_BZM2_BOARD_BIN"])
+                .as_deref()
+                .and_then(parse_operating_class)
+                .unwrap_or(Bzm2OperatingClass::Generic),
+            performance_mode: env_var_any(&[
+                "MUJINA_BZM2_PERFORMANCE_MODE",
+                "MUJINA_BZM2_MINING_STRATEGY",
+            ])
+            .as_deref()
+            .and_then(parse_performance_mode)
+            .unwrap_or(Bzm2PerformanceMode::Standard),
+            mode: Bzm2CalibrationMode {
+                sweep_strategy: env_flag_any(&[
+                    "MUJINA_BZM2_SWEEP_MODE",
+                    "MUJINA_BZM2_SWEEP_STRATEGY",
+                ]),
+                sweep_voltage: env_flag("MUJINA_BZM2_SWEEP_VOLTAGE"),
+                sweep_frequency: env_flag("MUJINA_BZM2_SWEEP_FREQUENCY"),
+                sweep_pass_rate: env_flag("MUJINA_BZM2_SWEEP_PASS_RATE"),
+            },
+            per_stack_clocking: env_flag_any(&[
+                "MUJINA_BZM2_PER_STACK_CLOCKING",
+                "MUJINA_BZM2_SPLIT_STACK_FREQUENCY",
+            ]),
+            force_retune: env_flag_any(&[
+                "MUJINA_BZM2_FORCE_RETUNE",
+                "MUJINA_BZM2_FORCE_RECALIBRATION",
+            ]),
             asics_per_bus: resolve_asics_per_bus(
                 parse_csv_numbers::<u16>("MUJINA_BZM2_ASICS_PER_BUS"),
                 serial_count,
             ),
+            asics_per_domain: parse_csv_numbers::<u16>("MUJINA_BZM2_ASICS_PER_DOMAIN")
+                .unwrap_or_else(|| vec![1]),
+            domain_voltage_offsets_mv: parse_csv_numbers::<i32>(
+                "MUJINA_BZM2_DOMAIN_VOLTAGE_OFFSETS_MV",
+            )
+            .unwrap_or_default(),
+            site_temp_c: env_f32_any(&["MUJINA_BZM2_SITE_TEMP_C", "MUJINA_BZM2_AMBIENT_TEMP_C"]),
+            pll_post1_divider: env::var("MUJINA_BZM2_CALIBRATION_POST1_DIVIDER")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_CALIBRATION_POST1_DIVIDER),
+            skip_lock_check: env_flag("MUJINA_BZM2_CALIBRATION_SKIP_LOCK_CHECK"),
+            lock_timeout: Duration::from_millis(
+                env::var("MUJINA_BZM2_CALIBRATION_LOCK_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_CALIBRATION_LOCK_TIMEOUT_MS),
+            ),
+            lock_poll_interval: Duration::from_millis(
+                env::var("MUJINA_BZM2_CALIBRATION_LOCK_POLL_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_CALIBRATION_LOCK_POLL_MS),
+            ),
+            engine_discovery_tdm_prediv_raw: env_var_any(&[
+                "MUJINA_BZM2_ENGINE_DISCOVERY_TDM_PREDIV_RAW",
+                "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW",
+            ])
+            .as_deref()
+            .and_then(parse_u32_any_radix)
+            .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_PREDIV_RAW),
+            engine_discovery_tdm_counter: env_var_any(&[
+                "MUJINA_BZM2_ENGINE_DISCOVERY_TDM_COUNTER",
+                "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER",
+            ])
+            .as_deref()
+            .and_then(parse_u8_any_radix)
+            .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TDM_COUNTER),
+            engine_discovery_timeout: Duration::from_millis(
+                env_var_any(&[
+                    "MUJINA_BZM2_ENGINE_DISCOVERY_TIMEOUT_MS",
+                    "MUJINA_BZM2_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS",
+                ])
+                .as_deref()
+                .and_then(parse_u64_any_radix)
+                .unwrap_or(DEFAULT_CALIBRATION_ENGINE_DISCOVERY_TIMEOUT_MS),
+            ),
+        };
+
+        if config.asics_per_domain.is_empty() {
+            config.asics_per_domain = vec![1];
         }
+
+        config
     }
 }
 
@@ -346,6 +535,26 @@ pub(super) fn env_var_any(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| env::var(key).ok())
 }
 
+pub(super) fn parse_u8_any_radix(raw: &str) -> Option<u8> {
+    parse_u64_any_radix(raw).and_then(|value| u8::try_from(value).ok())
+}
+
+pub(super) fn parse_u32_any_radix(raw: &str) -> Option<u32> {
+    parse_u64_any_radix(raw).and_then(|value| u32::try_from(value).ok())
+}
+
+pub(super) fn parse_u64_any_radix(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
 pub(super) fn env_csv_strings_any(keys: &[&str]) -> Vec<String> {
     env_var_any(keys)
         .map(|value| {
@@ -357,6 +566,15 @@ pub(super) fn env_csv_strings_any(keys: &[&str]) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+pub(super) fn env_flag(key: &str) -> bool {
+    env_var_any(&[key]).as_deref().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 pub(super) fn env_flag_any(keys: &[&str]) -> bool {
@@ -415,6 +633,44 @@ where
     T: std::str::FromStr,
 {
     keys.iter().find_map(|key| parse_csv_numbers::<T>(key))
+}
+
+pub(super) fn parse_operating_class(value: &str) -> Option<Bzm2OperatingClass> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "generic" => Some(Bzm2OperatingClass::Generic),
+        "early-validation" | "early_validation" | "dvt1" => {
+            Some(Bzm2OperatingClass::EarlyValidation)
+        }
+        "production-validation" | "production_validation" | "pvt" => {
+            Some(Bzm2OperatingClass::ProductionValidation)
+        }
+        "stack-tuned-a" | "stack_tuned_a" | "dvt2-bin1" | "dvt2_bin1" | "dvt2bin1" | "bin1" => {
+            Some(Bzm2OperatingClass::StackTunedA)
+        }
+        "stack-tuned-b" | "stack_tuned_b" | "dvt2-bin2" | "dvt2_bin2" | "dvt2bin2" | "bin2" => {
+            Some(Bzm2OperatingClass::StackTunedB)
+        }
+        "extended-headroom" | "extended_headroom" | "plus" => {
+            Some(Bzm2OperatingClass::ExtendedHeadroom)
+        }
+        "extended-headroom-b"
+        | "extended_headroom_b"
+        | "plus-ebin2"
+        | "plus_ebin2"
+        | "plusebin2"
+        | "ebin2" => Some(Bzm2OperatingClass::ExtendedHeadroomB),
+        _ => None,
+    }
+}
+
+pub(super) fn parse_performance_mode(value: &str) -> Option<Bzm2PerformanceMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "max-throughput" | "max_throughput" | "high" | "high-performance" | "high_performance"
+        | "performance" => Some(Bzm2PerformanceMode::MaxThroughput),
+        "standard" | "balanced" => Some(Bzm2PerformanceMode::Standard),
+        "efficiency" | "low" | "low-power" | "low_power" => Some(Bzm2PerformanceMode::Efficiency),
+        _ => None,
+    }
 }
 
 /// Split a chain port, installing the read-only veto when dry run is asked for.

@@ -35,6 +35,7 @@ mod monitor;
 pub mod platform;
 mod post;
 mod scram;
+pub mod stored_calibration;
 mod telemetry;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -800,6 +801,16 @@ impl Bzm2Board {
             merge_power_readings(&mut state.powers, &initial_rail_snapshot.powers);
         });
 
+        self.execute_live_calibration(&bus_layouts).await?;
+        let post_calibration_rail_snapshot = self.config.bringup.snapshot_telemetry();
+        self.telemetry_tx.send_modify(|state| {
+            merge_temperature_readings(
+                &mut state.temperatures,
+                &post_calibration_rail_snapshot.temperatures,
+            );
+            merge_power_readings(&mut state.powers, &post_calibration_rail_snapshot.powers);
+        });
+
         for (index, serial_path) in self.config.serial_paths.iter().enumerate() {
             let stream = crate::transport::serial::open_with_platform_cflag(
                 serial_path,
@@ -1154,6 +1165,7 @@ mod tests {
                     rail1_path.to_string_lossy().into_owned(),
                 ],
                 rail_write_scales: vec![1000.0, 1000.0],
+                domain_rail_indices: Vec::new(),
                 rail_enable_paths: vec![
                     enable0_path.to_string_lossy().into_owned(),
                     enable1_path.to_string_lossy().into_owned(),
@@ -1186,6 +1198,7 @@ mod tests {
                 },
             },
             heartbeat: Default::default(),
+            stored_calibration: None,
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, _telemetry_rx) = watch::channel(BoardTelemetry {
@@ -1300,6 +1313,7 @@ mod tests {
                 ..Default::default()
             },
             heartbeat: Default::default(),
+            stored_calibration: None,
             calibration: Bzm2CalibrationConfig::default(),
         };
         let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {

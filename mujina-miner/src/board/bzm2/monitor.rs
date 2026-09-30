@@ -846,6 +846,7 @@ mod tests {
 
         let config = Bzm2RuntimeConfig {
             heartbeat: Default::default(),
+            stored_calibration: None,
             serial_paths: vec![serial_path],
             baud_rate: DEFAULT_BAUD_RATE,
             timestamp_count: crate::asic::bzm2::protocol::DEFAULT_TIMESTAMP_COUNT,
