@@ -97,6 +97,7 @@ Hashimoto and contributors for the pattern!
 
 - [Rust](https://rustup.rs/) toolchain (stable)
 - [just](https://just.systems/) command runner
+- [Python](https://www.python.org/) to run `just checks` (3.11 or later)
 - Git
 - Optional: [Podman](https://podman.io/) for reproducing CI locally
 - Optional: Hardware for testing (Bitaxe boards, etc.)
