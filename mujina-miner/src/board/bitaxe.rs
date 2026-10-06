@@ -60,6 +60,9 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
+mod fan_controller;
+use fan_controller::{FanController, FanControllerConfig};
+
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
@@ -276,6 +279,7 @@ impl BitaxeDevice {
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
             reset_line: self.reset_line.clone(),
+            fan_controller: FanController::new(FanControllerConfig::default()),
         };
         tokio::spawn(monitor.run(telemetry_tx, cancel))
     }
@@ -298,6 +302,8 @@ struct BitaxeMonitor {
     /// above emergency threshold). Triggers emergency shutdown.
     bad_thermal_count: u32,
     reset_line: BitaxeResetLine,
+    /// PI fan speed controller.
+    fan_controller: FanController,
 }
 
 impl BitaxeMonitor {
@@ -434,6 +440,15 @@ impl BitaxeMonitor {
                 "thermal emergency after {} consecutive bad readings",
                 self.bad_thermal_count
             );
+        }
+
+        if let Some(temp_c) = asic_temp {
+            let speed = self
+                .fan_controller
+                .update_speed(temp_c, Duration::from_secs(2));
+            if let Err(e) = self.emc2101.lock().await.set_fan_speed(speed).await {
+                warn!("Failed to set fan speed: {}", e);
+            }
         }
 
         // Publish telemetry
