@@ -18,7 +18,9 @@
 use std::io;
 #[cfg(test)]
 use std::os::unix::io::FromRawFd;
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(test)]
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -102,8 +104,25 @@ pub struct SerialStream {
 }
 
 struct SerialInner {
-    /// File descriptor - immutable after creation
-    fd: AsyncFd<RawFd>,
+    /// File descriptor - immutable after creation.
+    ///
+    /// `OwnedFd`, NOT `RawFd`, and the difference is the whole point.
+    ///
+    /// This held `AsyncFd<RawFd>`, built from `OwnedFd::into_raw_fd()`. A
+    /// `RawFd` is an integer: `AsyncFd` deregisters it from the reactor on
+    /// drop and nothing ever closes it. So EVERY `SerialStream` this transport
+    /// ever dropped leaked its descriptor until the process exited.
+    ///
+    /// On most hardware that is a slow leak. On the RDS chain ports it is a
+    /// hard fault: the vendor tty driver refuses a second opener while its
+    /// per-port counter is raised, so a port that was opened, "closed" by
+    /// dropping, and opened again fails with EBUSY. Measured 2026-09-22 from
+    /// the driver's own open/close log -- the pre-calibration arming opened
+    /// tty9bit00 at 26566.153, the hash thread's open was refused at
+    /// 26566.699, and the arming's descriptor was released at 26620.790, when
+    /// the PROCESS was killed, 54 s after the function that opened it had
+    /// returned. The board never attached.
+    fd: AsyncFd<OwnedFd>,
 
     /// Current configuration - atomic for lock-free reads
     baud_rate: AtomicU32,
@@ -120,16 +139,37 @@ struct SerialInner {
 }
 
 /// Reader half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialReader {
     inner: Arc<SerialInner>,
 }
 
 /// Writer half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialWriter {
     inner: Arc<SerialInner>,
+    /// Optional veto on outbound frames, consulted before every write.
+    ///
+    /// Lives here, at the one point every byte passes through, because a guard
+    /// applied at call sites is a guard that the next call site forgets. The
+    /// transport knows nothing about what it is enforcing -- it asks the policy
+    /// and obeys the answer.
+    policy: Option<Arc<dyn OutboundFramePolicy>>,
+}
+
+/// A veto on outbound frames, installed by whoever knows what the bytes mean.
+///
+/// Implementations must be conservative: this exists to stop writes reaching
+/// hardware that must not be written to, so an implementation that cannot tell
+/// what a buffer is should refuse it rather than pass it.
+pub trait OutboundFramePolicy: Send + Sync + std::fmt::Debug {
+    /// Return `Err(reason)` to refuse the frame. The reason is logged and
+    /// surfaced to the caller as an error; nothing is written.
+    fn allow(&self, frame: &[u8]) -> Result<(), String>;
 }
 
 /// Control handle for a split serial stream.
+#[derive(Clone)]
 pub struct SerialControl {
     inner: Arc<SerialInner>,
 }
@@ -241,9 +281,9 @@ impl SerialStream {
         // Apply serial configuration
         apply_serial_config(&fd, &config)?;
 
-        // Convert OwnedFd to RawFd for AsyncFd
-        let raw_fd = fd.into_raw_fd();
-        let async_fd = AsyncFd::new(raw_fd).map_err(SerialError::IoError)?;
+        // KEEP OWNERSHIP. Handing AsyncFd a bare RawFd is what leaked every
+        // descriptor this transport ever opened: see `SerialInner::fd`.
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
@@ -263,6 +303,20 @@ impl SerialStream {
     ///
     /// This allows concurrent reading and writing while maintaining the ability
     /// to reconfigure the port.
+    /// Split, installing a veto on everything this port will ever send.
+    ///
+    /// Separate from `split` so that guarding is a deliberate act with a
+    /// visible call site, rather than a default someone can forget to override
+    /// -- and so a reader of the call site can see that this port is guarded.
+    pub fn split_guarded(
+        self,
+        policy: Arc<dyn OutboundFramePolicy>,
+    ) -> (SerialReader, SerialWriter, SerialControl) {
+        let (r, mut w, c) = self.split();
+        w.policy = Some(policy);
+        (r, w, c)
+    }
+
     pub fn split(self) -> (SerialReader, SerialWriter, SerialControl) {
         (
             SerialReader {
@@ -270,6 +324,7 @@ impl SerialStream {
             },
             SerialWriter {
                 inner: self.inner.clone(),
+                policy: None,
             },
             SerialControl {
                 inner: self.inner.clone(),
@@ -295,7 +350,9 @@ impl SerialStream {
         fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
             .map_err(|e| SerialError::ConfigError(format!("Failed to set fd flags: {}", e)))?;
 
-        let async_fd = AsyncFd::new(fd.into_raw_fd()).map_err(SerialError::IoError)?;
+        // KEEP OWNERSHIP. Handing AsyncFd a bare RawFd is what leaked every
+        // descriptor this transport ever opened: see `SerialInner::fd`.
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
@@ -365,6 +422,16 @@ impl AsyncWrite for SerialWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(policy) = self.policy.as_ref()
+            && let Err(reason) = policy.allow(buf)
+        {
+            tracing::warn!(
+                bytes = buf.len(),
+                %reason,
+                "outbound frame REFUSED by policy; nothing was written"
+            );
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::PermissionDenied, reason)));
+        }
         loop {
             let mut guard = ready!(self.inner.fd.poll_write_ready(cx))?;
 
@@ -524,6 +591,67 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A DROPPED STREAM MUST CLOSE ITS DESCRIPTOR.
+    ///
+    /// It did not. The fd was handed to `AsyncFd` as a bare `RawFd`, which is
+    /// an integer with no `Drop`, so every stream this transport ever dropped
+    /// leaked its descriptor until process exit. On the RDS chain ports the
+    /// vendor driver refuses a second opener while its counter is raised, so a
+    /// port opened, dropped and reopened failed with EBUSY and the board never
+    /// attached -- measured from the driver's own open/close log, where the
+    /// dropped stream's close appeared only when the process was killed.
+    #[tokio::test]
+    async fn dropping_a_stream_closes_its_descriptor() {
+        use nix::pty::openpty;
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+        use rustix::io::Errno;
+        use std::os::unix::io::FromRawFd;
+
+        // Observed from the FAR side of the pty, not by probing the descriptor
+        // number. The first form of this test asked whether the number was
+        // still open, and failed under the full suite: another test thread
+        // reused the freed number before it looked. A closed master is visible
+        // on the slave as a hangup, and nothing another thread opens can fake
+        // that.
+        fn slave_read(slave: &OwnedFd) -> Result<usize, Errno> {
+            let flags = fcntl_getfl(slave).unwrap();
+            fcntl_setfl(slave, flags | OFlags::NONBLOCK).unwrap();
+            rustix::io::read(slave, &mut [0u8; 1])
+        }
+
+        // CONTROL: a master deliberately left open. The check below means
+        // something only if it can tell this apart from a close.
+        let leaked = openpty(None, None).unwrap();
+        let leaked_master: RawFd = leaked.master.into_raw_fd();
+        assert_eq!(
+            slave_read(&leaked.slave),
+            Err(Errno::AGAIN),
+            "a live master"
+        );
+
+        let pty = openpty(None, None).unwrap();
+        let stream =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        assert_eq!(
+            slave_read(&pty.slave),
+            Err(Errno::AGAIN),
+            "open while the stream holds it"
+        );
+        drop(stream);
+        let after = slave_read(&pty.slave);
+        assert_ne!(
+            after,
+            Err(Errno::AGAIN),
+            "the master outlived its stream: the slave still sees a live master"
+        );
+        assert!(
+            matches!(after, Err(Errno::IO) | Ok(0)),
+            "a hung-up slave reads EIO or end-of-file, got {after:?}"
+        );
+
+        drop(unsafe { OwnedFd::from_raw_fd(leaked_master) });
+    }
 
     #[test]
     fn test_apply_serial_config_validation() {

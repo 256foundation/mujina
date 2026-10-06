@@ -172,6 +172,7 @@ async fn create_from_usb(device: UsbDeviceInfo) -> Result<BackplaneConnector> {
         threads: Vec::new(),
         telemetry_rx,
         shutdown: Some(shutdown),
+        command_tx: None,
     })
 }
 

@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use std::time::Instant;
+
 use crate::types::Temperature;
 
 /// Full miner telemetry snapshot.
@@ -33,6 +35,9 @@ pub struct BoardTelemetry {
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadTelemetry>,
+    /// Per-ASIC topology/diagnostics state (multi-ASIC boards only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asics: Vec<AsicState>,
 }
 
 /// Fan status.
@@ -72,6 +77,77 @@ pub struct ThreadTelemetry {
     /// Hashrate in hashes per second.
     pub hashrate: u64,
     pub is_active: bool,
+}
+
+/// Per-ASIC runtime topology or diagnostics state.
+///
+/// One row per ASIC, so everything known about that ASIC has one home: the
+/// engines it was discovered with, the fault bits it last reported, and when
+/// it last said anything. Splitting "what it reported" from "when it
+/// reported" across two structures would make them two facts to keep in
+/// step, and the pair is only meaningful together -- a fault bit with no
+/// arrival time cannot be told from one asserted an hour ago.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct AsicState {
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered_engine_count: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_engines: Vec<EngineCoordinate>,
+    /// The fault bits this ASIC last reported, or null where none can be
+    /// believed.
+    ///
+    /// Null is "not available", NOT "none asserted": a chain that has not
+    /// spoken, a generation whose frames carry no fault bits, and an ASIC
+    /// whose last frame was mis-parsed must none of them read as a healthy
+    /// one. All-false is the measured claim that none were asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faults: Option<AsicFaultBits>,
+    /// When this row's telemetry last arrived, on the monotonic clock of the
+    /// process that observed it.
+    ///
+    /// Monotonic rather than wall time: wall time can step (NTP, an RTC
+    /// catching up at boot) and an age measured across a step is not a
+    /// measurement. Never serialised, because an `Instant` names an instant
+    /// only inside the process that took it; what crosses the wire is the
+    /// AGE computed from this at request time, by the reader that holds the
+    /// same clock. A wall-clock stamp here would be a second, steppable copy
+    /// of a fact this field already holds.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub observed_at: Option<Instant>,
+}
+
+/// The fault bits one ASIC reported alongside its readings.
+///
+/// Four independent bits rather than one "faulted" flag: a thermal trip and
+/// a voltage shutdown demand different responses, and a summary that could
+/// only say "something is wrong" would send an operator back to the raw
+/// stream to find out which.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct AsicFaultBits {
+    pub thermal_trip: bool,
+    pub thermal_fault: bool,
+    pub voltage_fault: bool,
+    pub voltage_shutdown: bool,
+}
+
+impl AsicFaultBits {
+    /// Is any bit asserted?
+    pub fn any(&self) -> bool {
+        self.thermal_trip || self.thermal_fault || self.voltage_fault || self.voltage_shutdown
+    }
+}
+
+/// Physical engine coordinate on one ASIC.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct EngineCoordinate {
+    pub row: u8,
+    pub col: u8,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.

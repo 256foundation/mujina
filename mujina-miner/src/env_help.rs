@@ -147,13 +147,26 @@ const GROUPS: &[EnvGroup] = &[
     },
     EnvGroup {
         title: "Hardware",
-        vars: &[EnvVar {
-            name: "MUJINA_USB_DISABLE",
-            summary: "Set to any value to skip USB board discovery, useful for \
-                      CPU-only runs.",
-            default: Some("unset enables USB discovery"),
-            example: None,
-        }],
+        vars: &[
+            EnvVar {
+                name: "MUJINA_USB_DISABLE",
+                summary: "Set to any value to skip USB board discovery, useful for \
+                          CPU-only runs.",
+                default: Some("unset enables USB discovery"),
+                example: None,
+            },
+            EnvVar {
+                name: "MUJINA_OBSERVE",
+                summary: "0/false/no/off/empty or unset mines normally; 1/true/yes/on, or \
+                          any other value, is observer mode: boards are attached, \
+                          enumerated and read, telemetry streams and read-only \
+                          diagnostics work, but no job source is created and mining \
+                          starts paused, so the hardware is never given work. Resume \
+                          through the API to start mining.",
+                default: Some("unset mines normally"),
+                example: None,
+            },
+        ],
     },
     EnvGroup {
         title: "Logging",
