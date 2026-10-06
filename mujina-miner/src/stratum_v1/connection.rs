@@ -74,21 +74,20 @@ impl Connection {
         }
     }
 
-    /// Connect to a Stratum pool.
+    /// Connects to a Stratum pool.
     ///
-    /// Parses the URL, establishes TCP connection, and wraps it in a buffered
-    /// connection. Supports both `stratum+tcp://` and plain `tcp://` schemes.
+    /// Accepts a `stratum+tcp://` URL or a bare `host:port`, with an optional
+    /// path component.  V1 pool URLs often carry the worker name in that path;
+    /// the miner reads the worker from its own config, so the path is dropped
+    /// before resolving the address.
     pub async fn connect(url: &str) -> StratumResult<Self> {
-        // Parse URL
-        let url = url
-            .strip_prefix("stratum+tcp://")
-            .or_else(|| url.strip_prefix("tcp://"))
-            .unwrap_or(url);
+        let host_port = url.strip_prefix("stratum+tcp://").unwrap_or(url);
+        let host_port = host_port.split_once('/').map_or(host_port, |(hp, _)| hp);
 
-        debug!(url = %url, "Connecting to pool");
+        debug!(url = %host_port, "Connecting to pool");
 
         // Connect
-        let stream = TcpStream::connect(url)
+        let stream = TcpStream::connect(host_port)
             .await
             .map_err(|e| StratumError::ConnectionFailed(e.to_string()))?;
 
