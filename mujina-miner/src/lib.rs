@@ -17,5 +17,6 @@ pub mod stratum_v1;
 mod testing;
 pub mod tracing;
 pub mod transport;
+pub mod tuning;
 pub mod types;
 mod u256;
