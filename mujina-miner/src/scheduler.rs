@@ -77,6 +77,113 @@ const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// the first source broadcast forever.
 const STARTUP_GATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a released thread has to return its first share before the
+/// staggered start stops releasing (see [`Stagger`]).
+const STAGGER_SHARE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// START CHAINS ONE AT A TIME, EACH ONCE THE LAST IS PROVEN WORKING.
+///
+/// Opt-in, with `MUJINA_STAGGER_START_S=<spacing in seconds>`. Chains that
+/// share one supply and start hashing together present it with one load step
+/// the size of all of them; started in turn, each step is one chain's, and a
+/// step can be attributed to the chain that made it.
+///
+/// At the first assignment after start or resume the extranonce2 range is
+/// split across every eligible thread exactly as without this, but only the
+/// first thread is given work. Each next thread is released once the one
+/// before it has returned a share and at least `spacing` has passed since
+/// that one was released. A released thread that returns no share within
+/// [`STAGGER_SHARE_TIMEOUT`] holds the rest idle: a chain that cannot show it
+/// is working is no reason to start another. A job that arrives mid-release
+/// goes to the released threads only; the others get the current job, in
+/// their own slice, when they are released.
+///
+/// With one thread there is nothing to stagger. Stops are unaffected.
+struct Stagger {
+    spacing: Duration,
+    share_timeout: Duration,
+    episode: Option<ReleaseEpisode>,
+}
+
+/// STOP CHAINS ONE AT A TIME, WHEN A PAUSE ASKS FOR IT.
+///
+/// Opt-in, with `MUJINA_STAGGER_STOP_S=<spacing in seconds>`. A pause idles
+/// the first thread at once and the rest one per `spacing`, so a supply shared
+/// by several chains sees each chain's load come off as its own step. Only a
+/// deliberate pause is staggered: a safety stop or a shutdown is never delayed.
+/// A pause replies when the first thread is idle; the rest follow on the
+/// scheduler's clock rather than holding the loop.
+struct StopStagger {
+    spacing: Duration,
+    queue: std::collections::VecDeque<ThreadId>,
+    last_at: tokio::time::Instant,
+}
+
+impl StopStagger {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("MUJINA_STAGGER_STOP_S").ok()?;
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(Self {
+                spacing: Duration::from_secs(secs),
+                queue: std::collections::VecDeque::new(),
+                last_at: tokio::time::Instant::now(),
+            }),
+            _ => {
+                warn!(value = %raw, "MUJINA_STAGGER_STOP_S is not a positive whole number of seconds; a pause stops every chain at once");
+                None
+            }
+        }
+    }
+}
+
+/// One start: every thread in it, in release order, and how far it has got.
+struct ReleaseEpisode {
+    /// The split is across all of these, so a thread released late gets the
+    /// slice it would have had at the start.
+    order: Vec<ThreadId>,
+    /// `order[..released]` have work.
+    released: usize,
+    last_release_at: tokio::time::Instant,
+    share_since_release: bool,
+    held: bool,
+    /// The order length the released threads' current slices were cut for.
+    /// A release after the order changed re-cuts all of them, or a late
+    /// thread's slice would overlap an earlier one's.
+    split_len: usize,
+}
+
+impl Stagger {
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("MUJINA_STAGGER_START_S").ok()?;
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Some(Self {
+                spacing: Duration::from_secs(secs),
+                share_timeout: STAGGER_SHARE_TIMEOUT,
+                episode: None,
+            }),
+            _ => {
+                warn!(value = %raw, "MUJINA_STAGGER_START_S is not a positive whole number of seconds; chains start together");
+                None
+            }
+        }
+    }
+}
+
+impl ReleaseEpisode {
+    /// Keep the order to the threads still eligible, first-come for newcomers,
+    /// and keep the released prefix counting only threads still present.
+    fn reconcile(&mut self, eligible: &[ThreadId]) {
+        let released: Vec<ThreadId> = self.order[..self.released].to_vec();
+        self.order.retain(|t| eligible.contains(t));
+        for t in eligible {
+            if !self.order.contains(t) {
+                self.order.push(*t);
+            }
+        }
+        self.released = self.order.iter().filter(|t| released.contains(t)).count();
+    }
+}
+
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).
 ///
@@ -165,7 +272,7 @@ struct SourceEntry {
 }
 
 /// Whether to update alongside existing work or replace it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum AssignMode {
     /// Add new task alongside existing (UpdateJob behavior)
     Update,
@@ -209,10 +316,16 @@ struct Scheduler {
 
     /// Mining paused
     paused: bool,
+
+    /// Staggered start, when configured.
+    stagger: Option<Stagger>,
+
+    /// Staggered stop on pause, when configured.
+    stop_stagger: Option<StopStagger>,
 }
 
 impl Scheduler {
-    fn new() -> Self {
+    fn new(start_paused: bool) -> Self {
         Self {
             sources: SlotMap::new(),
             threads: SlotMap::new(),
@@ -220,7 +333,9 @@ impl Scheduler {
             stats: MiningStats::default(),
             last_thread_count: 0,
             startup_gate: StartupGate::new(),
-            paused: false,
+            paused: start_paused,
+            stagger: None,
+            stop_stagger: None,
         }
     }
 
@@ -389,20 +504,26 @@ impl Scheduler {
         job_template: JobTemplate,
         share_channels: &mut ShareStream,
     ) {
+        // Paused means no work reaches the hardware. Checked here rather than
+        // at the source, so a job arriving while paused is dropped instead of
+        // queued: on resume the scheduler assigns the cached job, which is the
+        // current one, not a stale one.
+        if self.paused {
+            debug!("Mining paused; job not assigned");
+            return;
+        }
+
         let source_name = self
             .sources
             .get(source_id)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Extract EN2 range (only supported for computed merkle roots)
-        let full_en2_range = match &job_template.merkle_root {
-            MerkleRootKind::Computed(template) => template.extranonce2_range.clone(),
-            MerkleRootKind::Fixed(_) => {
-                error!(job_id = %job_template.id, "Header-only jobs not supported");
-                return;
-            }
-        };
+        // Only computed merkle roots carry an EN2 range to split.
+        if let MerkleRootKind::Fixed(_) = &job_template.merkle_root {
+            error!(job_id = %job_template.id, "Header-only jobs not supported");
+            return;
+        }
 
         let template = Arc::new(job_template);
 
@@ -456,61 +577,262 @@ impl Scheduler {
             self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
         }
 
-        // Split the EN2 range evenly across the currently-eligible threads.
-        //
-        // TODO: A thread that becomes eligible later is handed the full EN2
-        // range on its first report, overlapping these slices until the next
-        // job re-splits.
+        self.assign_template(mode, source_id, template, share_channels)
+            .await;
+    }
+
+    /// Hand one job to the threads that should have it, each in its own slice
+    /// of the extranonce2 range.
+    ///
+    /// The split is across every eligible thread. Without a staggered start
+    /// every one of them gets its slice now; with one, only the released ones
+    /// do (see [`Stagger`]).
+    ///
+    /// TODO: A thread that becomes eligible later is handed the full EN2 range
+    /// on its first report, overlapping these slices until the next job
+    /// re-splits.
+    async fn assign_template(
+        &mut self,
+        mode: AssignMode,
+        source_id: SourceId,
+        template: Arc<JobTemplate>,
+        share_channels: &mut ShareStream,
+    ) {
+        let full_en2_range = match &template.merkle_root {
+            MerkleRootKind::Computed(t) => t.extranonce2_range.clone(),
+            MerkleRootKind::Fixed(_) => return,
+        };
         let eligible: Vec<ThreadId> = self.eligible_thread_ids().collect();
         if eligible.is_empty() {
-            debug!(source = %source_name, "No eligible threads yet, job cached for later");
+            debug!(job_id = %template.id, "No eligible threads yet, job cached for later");
             return;
         }
-        let en2_slices = full_en2_range
-            .split(eligible.len())
-            .expect("Failed to split EN2 range among threads");
-
-        for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
-            let starting_en2 = en2_range.iter().next();
-            let entry = self
-                .threads
-                .get_mut(thread_id)
-                .expect("eligible thread present");
-
-            let hashrate = entry
-                .hashrate
-                .settled_hashrate()
-                .or(entry.expected)
-                .unwrap_or_default();
-            let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
-
-            // Create share channel for this task
-            let (share_tx, share_rx) = mpsc::channel(32);
-
-            let hash_task = HashTask {
-                template: template.clone(),
-                en2_range: Some(en2_range),
-                en2: starting_en2,
-                share_target,
-                ntime: template.time,
-                share_tx,
-            };
-
-            let result = match mode {
-                AssignMode::Update => entry.thread.update_task(hash_task).await,
-                AssignMode::Replace => entry.thread.replace_task(hash_task).await,
-            };
-
-            if let Err(e) = result {
-                error!(thread = %entry.thread.name(), error = %e, "Failed to assign task");
-            } else {
-                let task_id = self.tasks.insert(TaskEntry {
-                    source_id,
-                    template: template.clone(),
-                    thread_id,
+        let (order, give) = match self.stagger.as_mut() {
+            None => (eligible.clone(), eligible.len()),
+            Some(stagger) => {
+                let episode = stagger.episode.get_or_insert_with(|| ReleaseEpisode {
+                    order: Vec::new(),
+                    released: 0,
+                    last_release_at: tokio::time::Instant::now(),
+                    share_since_release: false,
+                    held: false,
+                    split_len: 0,
                 });
-                share_channels.insert(task_id, ReceiverStream::new(share_rx));
+                episode.reconcile(&eligible);
+                // A held start releases nothing, on this job or any later one.
+                if episode.released == 0 && !episode.held {
+                    episode.released = 1;
+                    episode.last_release_at = tokio::time::Instant::now();
+                    info!(
+                        thread = %self.threads.get(episode.order[0]).map(|e| e.thread.name()).unwrap_or("?"),
+                        chains = episode.order.len(),
+                        spacing_s = stagger.spacing.as_secs(),
+                        "Staggered start: releasing the first chain; the next waits for its share"
+                    );
+                }
+                episode.split_len = episode.order.len();
+                (episode.order.clone(), episode.released)
             }
+        };
+        let en2_slices = full_en2_range
+            .split(order.len())
+            .expect("Failed to split EN2 range among threads");
+        for (thread_id, en2_range) in order.into_iter().zip(en2_slices).take(give) {
+            self.assign_slice(
+                mode.clone(),
+                source_id,
+                &template,
+                thread_id,
+                en2_range,
+                share_channels,
+            )
+            .await;
+        }
+    }
+
+    /// Give one thread one job, in one slice, and record the task.
+    async fn assign_slice(
+        &mut self,
+        mode: AssignMode,
+        source_id: SourceId,
+        template: &Arc<JobTemplate>,
+        thread_id: ThreadId,
+        en2_range: crate::job_source::Extranonce2Range,
+        share_channels: &mut ShareStream,
+    ) {
+        let starting_en2 = en2_range.iter().next();
+        let Some(entry) = self.threads.get_mut(thread_id) else {
+            return;
+        };
+        let hashrate = entry
+            .hashrate
+            .settled_hashrate()
+            .or(entry.expected)
+            .unwrap_or_default();
+        let share_target = Self::compute_scheduler_target(hashrate, template.share_target);
+        let (share_tx, share_rx) = mpsc::channel(32);
+        let hash_task = HashTask {
+            template: template.clone(),
+            en2_range: Some(en2_range),
+            en2: starting_en2,
+            share_target,
+            ntime: template.time,
+            share_tx,
+        };
+        let result = match mode {
+            AssignMode::Update => entry.thread.update_task(hash_task).await,
+            AssignMode::Replace => entry.thread.replace_task(hash_task).await,
+        };
+        if let Err(e) = result {
+            error!(thread = %entry.thread.name(), error = %e, "Failed to assign task");
+        } else {
+            let task_id = self.tasks.insert(TaskEntry {
+                source_id,
+                template: template.clone(),
+                thread_id,
+            });
+            share_channels.insert(task_id, ReceiverStream::new(share_rx));
+        }
+    }
+
+    /// A share came back from `thread_id`. If it is the thread released last,
+    /// the next one may follow once the spacing has passed.
+    fn note_release_share(&mut self, thread_id: ThreadId) {
+        if let Some(episode) = self.stagger.as_mut().and_then(|s| s.episode.as_mut())
+            && episode.released > 0
+            && episode.order.get(episode.released - 1) == Some(&thread_id)
+            && !episode.share_since_release
+        {
+            episode.share_since_release = true;
+            // Said once per release, so a run's log shows the share each next
+            // release waited for rather than implying it.
+            let waited =
+                tokio::time::Instant::now().saturating_duration_since(episode.last_release_at);
+            let more = episode.order.len() - episode.released;
+            info!(
+                thread = %self.threads.get(thread_id).map(|e| e.thread.name()).unwrap_or("?"),
+                after_s = waited.as_secs_f32(),
+                chains_waiting = more,
+                "Staggered start: the chain released last has returned its first share"
+            );
+        }
+    }
+
+    /// Release the next chain if it is due, or hold the rest if the last one
+    /// never proved it was working. Called on a timer.
+    async fn advance_release(
+        &mut self,
+        now: tokio::time::Instant,
+        share_channels: &mut ShareStream,
+    ) {
+        if self.paused {
+            return;
+        }
+        let Some(stagger) = self.stagger.as_mut() else {
+            return;
+        };
+        let (spacing, share_timeout) = (stagger.spacing, stagger.share_timeout);
+        let Some(episode) = stagger.episode.as_mut() else {
+            return;
+        };
+        if episode.held || episode.released >= episode.order.len() {
+            return;
+        }
+        // THE CHAIN RELEASED FIRST HAS GONE before returning a share (its
+        // thread disconnected). Nothing has shown it is working, which is the
+        // hold's own condition. This used to index order[released - 1] with
+        // released 0 and abort the daemon (the pre-mining review).
+        if episode.released == 0 {
+            episode.held = true;
+            error!(
+                held = episode.order.len(),
+                "STAGGERED START HELD: the chain released first went away before returning a share; the remaining chains stay idle"
+            );
+            return;
+        }
+        let since = now.saturating_duration_since(episode.last_release_at);
+        if !episode.share_since_release {
+            if since >= share_timeout {
+                episode.held = true;
+                let waiting = episode.order[episode.released - 1];
+                let held = episode.order.len() - episode.released;
+                error!(
+                    thread = %self.threads.get(waiting).map(|e| e.thread.name()).unwrap_or("?"),
+                    waited_s = since.as_secs(),
+                    held,
+                    "STAGGERED START HELD: the last chain released has returned no share; the remaining chains stay idle"
+                );
+            }
+            return;
+        }
+        if since < spacing {
+            return;
+        }
+        // No job to give (a source dropped mid-start): wait for one rather
+        // than release a chain with nothing to do and then blame it for
+        // returning no share.
+        let jobs: Vec<(SourceId, Arc<JobTemplate>)> = self
+            .sources
+            .iter()
+            .filter_map(|(id, source)| source.last_job.clone().map(|job| (id, job)))
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let Some(episode) = self.stagger.as_mut().and_then(|s| s.episode.as_mut()) else {
+            return;
+        };
+        let index = episode.released;
+        let next = episode.order[index];
+        let chains = episode.order.len();
+        let resplit = episode.split_len != chains;
+        let already: Vec<ThreadId> = episode.order[..index].to_vec();
+        episode.released += 1;
+        episode.share_since_release = false;
+        episode.last_release_at = now;
+        episode.split_len = chains;
+        info!(
+            thread = %self.threads.get(next).map(|e| e.thread.name()).unwrap_or("?"),
+            chain = index + 1,
+            chains,
+            resplit,
+            "Staggered start: releasing the next chain"
+        );
+        for (source_id, template) in jobs {
+            let MerkleRootKind::Computed(t) = &template.merkle_root else {
+                continue;
+            };
+            let Some(slices) = t.extranonce2_range.split(chains) else {
+                continue;
+            };
+            // THE ORDER CHANGED SINCE THE RELEASED CHAINS WERE CUT THEIR
+            // SLICES (a thread joined late, or one went away): re-cut theirs
+            // too, so the new chain's slice cannot lie inside one of them.
+            if resplit {
+                self.remove_tasks_where(share_channels, |e| {
+                    e.source_id == source_id && already.contains(&e.thread_id)
+                });
+                for (i, thread_id) in already.iter().enumerate() {
+                    self.assign_slice(
+                        AssignMode::Replace,
+                        source_id,
+                        &template,
+                        *thread_id,
+                        slices[i].clone(),
+                        share_channels,
+                    )
+                    .await;
+                }
+            }
+            self.assign_slice(
+                AssignMode::Update,
+                source_id,
+                &template,
+                next,
+                slices[index].clone(),
+                share_channels,
+            )
+            .await;
         }
     }
 
@@ -559,9 +881,14 @@ impl Scheduler {
         );
 
         // Feed share work to per-thread hashrate estimator
-        if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
+        let share_thread = task_entry.thread_id;
+        if let Some(entry) = self.threads.get_mut(share_thread) {
             entry.hashrate.record(share.expected_work);
         }
+        self.note_release_share(share_thread);
+        let Some(task_entry) = self.tasks.get(task_id) else {
+            return;
+        };
 
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
@@ -632,6 +959,10 @@ impl Scheduler {
                     active = status.is_active,
                     "Thread status"
                 );
+            }
+
+            HashThreadEvent::TelemetryUpdate(_) => {
+                trace!(thread = %thread_name, "Thread telemetry update");
             }
 
             HashThreadEvent::ExpectedHashRate(rate) => {
@@ -715,6 +1046,41 @@ impl Scheduler {
         thread_name: &str,
         share_channels: &mut ShareStream,
     ) {
+        // A board that attaches while paused stays idle. This is what makes
+        // observer mode safe on a machine whose boards share one PSU rail: an
+        // enumerated board draws no hashing current until mining is resumed.
+        if self.paused {
+            debug!(thread = %thread_name, "Mining paused; thread left idle");
+            return;
+        }
+        // STAGGERED: a thread that reports mid-start joins the queue rather
+        // than taking the whole range at once; with no start under way, the
+        // cached jobs begin one, with this thread first.
+        if self.stagger.is_some() {
+            let joined = self
+                .stagger
+                .as_mut()
+                .and_then(|s| s.episode.as_mut())
+                .map(|episode| {
+                    if !episode.order.contains(&thread_id) {
+                        episode.order.push(thread_id);
+                    }
+                })
+                .is_some();
+            if !joined {
+                let jobs: Vec<(SourceId, Arc<JobTemplate>)> = self
+                    .sources
+                    .iter()
+                    .filter_map(|(id, source)| source.last_job.clone().map(|job| (id, job)))
+                    .collect();
+                for (source_id, template) in jobs {
+                    self.assign_template(AssignMode::Update, source_id, template, share_channels)
+                        .await;
+                }
+            }
+            return;
+        }
+
         let thread_hashrate = {
             let entry = self
                 .threads
@@ -794,6 +1160,15 @@ impl Scheduler {
         // Remove threads that no longer have active event streams
         let active_thread_ids: HashSet<_> = thread_events.keys().collect();
         self.threads.retain(|id, _| active_thread_ids.contains(&id));
+        if let Some(episode) = self.stagger.as_mut().and_then(|s| s.episode.as_mut()) {
+            let live: Vec<ThreadId> = episode
+                .order
+                .iter()
+                .copied()
+                .filter(|t| active_thread_ids.contains(t))
+                .collect();
+            episode.reconcile(&live);
+        }
 
         // Remove tasks for disconnected threads
         self.remove_tasks_where(share_channels, |e| {
@@ -809,25 +1184,146 @@ impl Scheduler {
     ///
     /// Publishes an updated state snapshot before replying so the API
     /// handler's subsequent `borrow()` sees the new value.
-    fn handle_api_command(
+    async fn handle_api_command(
         &mut self,
         cmd: SchedulerCommand,
         miner_telemetry_tx: &watch::Sender<MinerTelemetry>,
+        share_channels: &mut ShareStream,
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
+                // A pause during a staggered stop is an escalation: the chains
+                // still loaded stop now rather than on a restarted clock.
+                let pending: Vec<ThreadId> = self
+                    .stop_stagger
+                    .as_mut()
+                    .map(|stop| stop.queue.drain(..).collect())
+                    .unwrap_or_default();
+                let second = self.paused && !pending.is_empty();
+                for thread_id in pending {
+                    self.idle_thread(thread_id, share_channels).await;
+                }
+                if second {
+                    info!("Mining paused again mid-stop: every remaining chain idled at once");
+                    let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
                 self.paused = true;
-                warn!("Mining paused via API (not yet implemented)");
+                if let Some(stagger) = self.stagger.as_mut() {
+                    stagger.episode = None;
+                }
+                if self.stop_stagger.is_some() && self.threads.len() > 1 {
+                    let mut order: Vec<ThreadId> = self.threads.keys().collect();
+                    let first = order.remove(0);
+                    self.idle_thread(first, share_channels).await;
+                    let spacing = {
+                        let stop = self.stop_stagger.as_mut().expect("checked above");
+                        stop.queue = order.into();
+                        stop.last_at = tokio::time::Instant::now();
+                        stop.spacing
+                    };
+                    info!(
+                        remaining = self.threads.len() - 1,
+                        spacing_s = spacing.as_secs(),
+                        "Mining paused: first chain idled, the rest follow one per spacing"
+                    );
+                } else {
+                    self.idle_all_threads(share_channels).await;
+                    info!("Mining paused: every thread idled, no further work assigned");
+                }
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
+                // A resume mid-stop finishes the stop first, so no chain is
+                // still running its old task when the cached job is re-split.
+                let pending: Vec<ThreadId> = self
+                    .stop_stagger
+                    .as_mut()
+                    .map(|stop| stop.queue.drain(..).collect())
+                    .unwrap_or_default();
+                for thread_id in pending {
+                    self.idle_thread(thread_id, share_channels).await;
+                }
                 self.paused = false;
-                warn!("Mining resumed via API (not yet implemented)");
+                // SPLIT, as a new job is. Handing each thread the cached job
+                // through the new-thread path gave every thread the WHOLE
+                // extranonce2 range, so after a resume every chain hashed the
+                // same space until the next job re-split it.
+                let jobs: Vec<(SourceId, Arc<JobTemplate>)> = self
+                    .sources
+                    .iter()
+                    .filter_map(|(id, source)| source.last_job.clone().map(|job| (id, job)))
+                    .collect();
+                for (source_id, template) in jobs {
+                    self.assign_template(AssignMode::Update, source_id, template, share_channels)
+                        .await;
+                }
+                info!(threads = self.threads.len(), "Mining resumed");
                 let _ = miner_telemetry_tx.send(self.compute_miner_telemetry());
                 let _ = reply.send(Ok(()));
             }
         }
+    }
+
+    /// Idle one thread and drop its tasks.
+    async fn idle_thread(&mut self, thread_id: ThreadId, share_channels: &mut ShareStream) {
+        if let Some(entry) = self.threads.get_mut(thread_id)
+            && let Err(e) = entry.thread.go_idle().await
+        {
+            error!(thread = %entry.thread.name(), error = %e, "Failed to idle thread");
+        }
+        self.remove_tasks_where(share_channels, |e| e.thread_id == thread_id);
+    }
+
+    /// Idle the next chain of a staggered stop when it is due.
+    async fn advance_stop(&mut self, now: tokio::time::Instant, share_channels: &mut ShareStream) {
+        let next = match self.stop_stagger.as_mut() {
+            Some(stop)
+                if !stop.queue.is_empty()
+                    && now.saturating_duration_since(stop.last_at) >= stop.spacing =>
+            {
+                stop.last_at = now;
+                stop.queue.pop_front()
+            }
+            _ => None,
+        };
+        if let Some(thread_id) = next {
+            let name = self
+                .threads
+                .get(thread_id)
+                .map(|e| e.thread.name().to_string());
+            self.idle_thread(thread_id, share_channels).await;
+            info!(thread = %name.as_deref().unwrap_or("?"), "Staggered stop: chain idled");
+        }
+    }
+
+    /// Stop every thread and drop the tasks they were running.
+    ///
+    /// `go_idle` is the thread's own stop: it stops dispatching and returns
+    /// whatever task it held. Their tasks and share channels go with them, so
+    /// a later resume assigns the current job rather than reviving a stale one.
+    ///
+    /// **This is a load step, and on some machines that matters.** Dispatched
+    /// work is what draws current; on a series-stacked hashboard the per-ASIC
+    /// voltage follows each ASIC's draw relative to its neighbours, so taking
+    /// all work away at once moves operating points, not just hashrate. That
+    /// is why such machines keep a floor of work under the ASICs rather than
+    /// letting the pipeline run dry. Pausing a powered, loaded machine is a
+    /// deliberate act with a power consequence; starting paused (observer
+    /// mode) has none, because no work was ever dispatched.
+    async fn idle_all_threads(&mut self, share_channels: &mut ShareStream) {
+        let thread_ids: Vec<ThreadId> = self.threads.keys().collect();
+        for thread_id in thread_ids {
+            let Some(entry) = self.threads.get_mut(thread_id) else {
+                continue;
+            };
+            if let Err(e) = entry.thread.go_idle().await {
+                error!(thread = %entry.thread.name(), error = %e, "Failed to idle thread");
+            }
+        }
+        self.remove_tasks_where(share_channels, |_| true);
     }
 
     /// Main scheduler loop.
@@ -852,6 +1348,10 @@ impl Scheduler {
         // Create interval for periodic API telemetry publishing
         let mut telemetry_interval = tokio::time::interval(Duration::from_secs(10));
         telemetry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // The staggered start's clock: releases are checked once a second.
+        let mut release_interval = tokio::time::interval(Duration::from_secs(1));
+        release_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Deadline for the startup-gate fallback, set when the enumeration-
         // complete signal arrives without immediately opening the gate.
@@ -959,7 +1459,14 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
-                    self.handle_api_command(cmd, &miner_telemetry_tx);
+                    self.handle_api_command(cmd, &miner_telemetry_tx, &mut share_channels).await;
+                }
+
+                // Staggered start: release the next chain when it is due.
+                _ = release_interval.tick(), if self.stagger.is_some() || self.stop_stagger.is_some() => {
+                    let now = tokio::time::Instant::now();
+                    self.advance_release(now, &mut share_channels).await;
+                    self.advance_stop(now, &mut share_channels).await;
                 }
 
                 // Periodic state publishing
@@ -1027,8 +1534,23 @@ pub async fn task(
     source_reg_rx: mpsc::Receiver<SourceRegistration>,
     miner_telemetry_tx: watch::Sender<MinerTelemetry>,
     cmd_rx: mpsc::Receiver<SchedulerCommand>,
+    start_paused: bool,
 ) {
-    let mut scheduler = Scheduler::new();
+    let mut scheduler = Scheduler::new(start_paused);
+    scheduler.stagger = Stagger::from_env();
+    scheduler.stop_stagger = StopStagger::from_env();
+    if let Some(stop) = &scheduler.stop_stagger {
+        info!(
+            spacing_s = stop.spacing.as_secs(),
+            "Staggered stop configured: a pause idles chains one at a time"
+        );
+    }
+    if let Some(stagger) = &scheduler.stagger {
+        info!(
+            spacing_s = stagger.spacing.as_secs(),
+            "Staggered start configured: chains start one at a time"
+        );
+    }
     scheduler
         .run(
             running,
@@ -1170,7 +1692,688 @@ impl MiningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asic::hash_thread::{HashThreadCapabilities, HashThreadStatus};
+    use crate::job_source::{MerkleRootKind, VersionTemplate};
     use crate::types::Difficulty;
+    use bitcoin::hashes::Hash;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::oneshot;
+
+    /// A hash thread that records what the scheduler asked it to do.
+    ///
+    /// The scheduler had no behavioural tests because exercising it needs a
+    /// thread; this is the smallest one that works, and the counters are what
+    /// the pause tests assert on.
+    #[derive(Default)]
+    struct ThreadCalls {
+        updates: AtomicUsize,
+        replaces: AtomicUsize,
+        idles: AtomicUsize,
+        /// The extranonce2 range of every task handed over, in order.
+        ranges: std::sync::Mutex<Vec<Option<crate::job_source::Extranonce2Range>>>,
+    }
+
+    struct RecordingThread {
+        name: String,
+        capabilities: HashThreadCapabilities,
+        calls: Arc<ThreadCalls>,
+    }
+
+    #[async_trait::async_trait]
+    impl HashThread for RecordingThread {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn capabilities(&self) -> &HashThreadCapabilities {
+            &self.capabilities
+        }
+        async fn configure(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.calls.updates.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .ranges
+                .lock()
+                .unwrap()
+                .push(task.en2_range.clone());
+            Ok(None)
+        }
+        async fn replace_task(&mut self, task: HashTask) -> anyhow::Result<Option<HashTask>> {
+            self.calls.replaces.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .ranges
+                .lock()
+                .unwrap()
+                .push(task.en2_range.clone());
+            Ok(None)
+        }
+        async fn go_idle(&mut self) -> anyhow::Result<Option<HashTask>> {
+            self.calls.idles.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn take_event_receiver(&mut self) -> Option<mpsc::Receiver<HashThreadEvent>> {
+            None
+        }
+        fn status(&self) -> HashThreadStatus {
+            HashThreadStatus::default()
+        }
+    }
+
+    fn test_template() -> Arc<JobTemplate> {
+        Arc::new(JobTemplate {
+            id: "job-1".into(),
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            version: VersionTemplate::new(
+                bitcoin::block::Version::from_consensus(0x2000_0000),
+                crate::job_source::GeneralPurposeBits::full(),
+            )
+            .unwrap(),
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x1d00_ffff),
+            share_target: Difficulty::from(1024).to_target(),
+            time: 1_700_000_000,
+            // Computed, not Fixed: the cached-job path skips a fixed merkle
+            // root, so a Fixed fixture would pass the pause tests for the
+            // wrong reason.
+            merkle_root: MerkleRootKind::Computed(crate::job_source::MerkleRootTemplate {
+                coinbase1: vec![0u8; 4],
+                extranonce1: vec![0u8; 4],
+                extranonce2_range: crate::job_source::Extranonce2Range::new(4).unwrap(),
+                coinbase2: vec![0u8; 4],
+                merkle_branches: Vec::new(),
+            }),
+        })
+    }
+
+    /// A scheduler holding one source with a cached job and one thread that
+    /// has reported an expected hashrate, so it is eligible for work.
+    fn scheduler_with_source_and_thread(
+        paused: bool,
+    ) -> (Scheduler, SourceId, ThreadId, Arc<ThreadCalls>) {
+        let mut scheduler = Scheduler::new(paused);
+        let (command_tx, _command_rx) = mpsc::channel(4);
+        let source_id = scheduler.sources.insert(SourceEntry {
+            name: "test".into(),
+            url: None,
+            command_tx,
+            last_job: Some(test_template()),
+            difficulty_alarm: DebouncedAlarm::new(Duration::from_secs(60)),
+        });
+        let calls = Arc::new(ThreadCalls::default());
+        let thread_id = scheduler.threads.insert(ThreadEntry {
+            thread: Box::new(RecordingThread {
+                name: "test-thread".into(),
+                capabilities: HashThreadCapabilities::default(),
+                calls: calls.clone(),
+            }),
+            hashrate: HashrateEstimator::new(Duration::from_secs(60)),
+            expected: Some(HashRate::from_terahashes(1.0)),
+        });
+        (scheduler, source_id, thread_id, calls)
+    }
+
+    /// A scheduler with one source (and its cached job) and `n` eligible
+    /// threads, staggered or not.
+    fn scheduler_with_threads(
+        n: usize,
+        paused: bool,
+        stagger: Option<Duration>,
+    ) -> (Scheduler, SourceId, Vec<(ThreadId, Arc<ThreadCalls>)>) {
+        let (mut scheduler, source_id, first, calls) = scheduler_with_source_and_thread(paused);
+        let mut threads = vec![(first, calls)];
+        for i in 1..n {
+            let calls = Arc::new(ThreadCalls::default());
+            let id = scheduler.threads.insert(ThreadEntry {
+                thread: Box::new(RecordingThread {
+                    name: format!("test-thread-{i}"),
+                    capabilities: HashThreadCapabilities::default(),
+                    calls: calls.clone(),
+                }),
+                hashrate: HashrateEstimator::new(Duration::from_secs(60)),
+                expected: Some(HashRate::from_terahashes(1.0)),
+            });
+            threads.push((id, calls));
+        }
+        scheduler.stagger = stagger.map(|spacing| Stagger {
+            spacing,
+            share_timeout: STAGGER_SHARE_TIMEOUT,
+            episode: None,
+        });
+        (scheduler, source_id, threads)
+    }
+
+    fn tasks_per_thread(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
+        threads
+            .iter()
+            .map(|(_, c)| c.updates.load(Ordering::SeqCst) + c.replaces.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    async fn job_arrives(
+        scheduler: &mut Scheduler,
+        source_id: SourceId,
+        share_channels: &mut ShareStream,
+    ) {
+        let job = (*test_template()).clone();
+        scheduler
+            .assign_job_to_threads(AssignMode::Update, source_id, job, share_channels)
+            .await;
+    }
+
+    /// Three chains on one supply, started together, are one load step the
+    /// size of all three. Staggered, the first job reaches one of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_staggered_start_gives_the_first_job_to_one_chain() {
+        let mut share_channels = ShareStream::new();
+        // Today's behaviour, for contrast: every chain at once.
+        let (mut together, source, threads) = scheduler_with_threads(3, false, None);
+        job_arrives(&mut together, source, &mut share_channels).await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 1, 1]);
+
+        let (mut staggered, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut staggered, source, &mut share_channels).await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_next_chain_follows_a_share_and_the_spacing_and_not_before() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+
+        // The spacing alone is not enough: no share yet.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 0, 0]);
+
+        // A share alone is not enough either, from a fresh release.
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        scheduler.note_release_share(threads[0].0);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 0, 0]);
+
+        // Both: the second chain gets the current job, in ITS slice.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 1, 0]);
+        let full = crate::job_source::Extranonce2Range::new(4).unwrap();
+        let slices = full.split(3).unwrap();
+        assert_eq!(
+            threads[1].1.ranges.lock().unwrap()[0],
+            Some(slices[1].clone())
+        );
+
+        // A share from the FIRST chain does not release the third.
+        scheduler.note_release_share(threads[0].0);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 1, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_arriving_mid_start_reaches_only_the_released_chains() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        scheduler.note_release_share(threads[0].0);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 1, 0]);
+
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        assert_eq!(tasks_per_thread(&threads), vec![2, 2, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_that_returns_no_share_holds_the_rest_idle() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        tokio::time::advance(STAGGER_SHARE_TIMEOUT).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert!(
+            scheduler
+                .stagger
+                .as_ref()
+                .unwrap()
+                .episode
+                .as_ref()
+                .unwrap()
+                .held
+        );
+        // A late share does not undo the hold.
+        scheduler.note_release_share(threads[0].0);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_chain_is_not_staggered() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(1, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        assert_eq!(tasks_per_thread(&threads), vec![1]);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert!(
+            !scheduler
+                .stagger
+                .as_ref()
+                .unwrap()
+                .episode
+                .as_ref()
+                .unwrap()
+                .held
+        );
+    }
+
+    fn idles(threads: &[(ThreadId, Arc<ThreadCalls>)]) -> Vec<usize> {
+        threads
+            .iter()
+            .map(|(_, c)| c.idles.load(Ordering::SeqCst))
+            .collect()
+    }
+
+    async fn pause(scheduler: &mut Scheduler, share_channels: &mut ShareStream) {
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::PauseMining { reply },
+                &telemetry_tx,
+                share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    /// A pause takes every chain's load off at once: one step the size of all
+    /// of them on a shared supply. Staggered, each comes off as its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_staggered_pause_idles_one_chain_per_spacing() {
+        let mut share_channels = ShareStream::new();
+        // Today, for contrast: all at once.
+        let (mut together, source, threads) = scheduler_with_threads(3, false, None);
+        job_arrives(&mut together, source, &mut share_channels).await;
+        pause(&mut together, &mut share_channels).await;
+        assert_eq!(idles(&threads), vec![1, 1, 1]);
+
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        assert_eq!(scheduler.tasks.len(), 3);
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(
+            idles(&threads),
+            vec![1, 0, 0],
+            "the pause idles the first chain only"
+        );
+        assert_eq!(scheduler.tasks.len(), 2);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 0, 0]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 1, 0]);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        scheduler
+            .advance_stop(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(idles(&threads), vec![1, 1, 1]);
+        assert!(scheduler.tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_mid_stop_finishes_the_stop_first() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert_eq!(
+            idles(&threads),
+            vec![1, 1, 1],
+            "every chain stopped before the resume"
+        );
+        assert_eq!(
+            scheduler.tasks.len(),
+            3,
+            "and each holds one task again, not two"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_chain_going_away_holds_the_start_instead_of_aborting() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(3, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        // Chain 0's thread disconnects before any share.
+        scheduler.threads.remove(threads[0].0);
+        let live: Vec<ThreadId> = vec![threads[1].0, threads[2].0];
+        scheduler
+            .stagger
+            .as_mut()
+            .unwrap()
+            .episode
+            .as_mut()
+            .unwrap()
+            .reconcile(&live);
+        tokio::time::advance(STAGGER_SHARE_TIMEOUT).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert!(
+            scheduler
+                .stagger
+                .as_ref()
+                .unwrap()
+                .episode
+                .as_ref()
+                .unwrap()
+                .held
+        );
+        // And a new job does not release anything past the hold.
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        assert_eq!(tasks_per_thread(&threads[1..]), vec![0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_chain_is_released_while_there_is_no_job_to_give_it() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(2, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        scheduler.note_release_share(threads[0].0);
+        scheduler.sources.get_mut(source).unwrap().last_job = None; // the pool went away
+        tokio::time::advance(Duration::from_secs(20)).await;
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 0]);
+        assert!(
+            !scheduler
+                .stagger
+                .as_ref()
+                .unwrap()
+                .episode
+                .as_ref()
+                .unwrap()
+                .held
+        );
+        // The pool is back: the release goes ahead.
+        scheduler.sources.get_mut(source).unwrap().last_job = Some(test_template());
+        scheduler
+            .advance_release(tokio::time::Instant::now(), &mut share_channels)
+            .await;
+        assert_eq!(tasks_per_thread(&threads), vec![1, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chain_joining_mid_start_never_gets_a_slice_inside_another() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) =
+            scheduler_with_threads(2, false, Some(Duration::from_secs(5)));
+        job_arrives(&mut scheduler, source, &mut share_channels).await; // chain 0: split(2)[0]
+        // A third chain reports late and joins the queue.
+        let calls = Arc::new(ThreadCalls::default());
+        let late = scheduler.threads.insert(ThreadEntry {
+            thread: Box::new(RecordingThread {
+                name: "late".into(),
+                capabilities: HashThreadCapabilities::default(),
+                calls: calls.clone(),
+            }),
+            hashrate: HashrateEstimator::new(Duration::from_secs(60)),
+            expected: Some(HashRate::from_terahashes(1.0)),
+        });
+        scheduler
+            .assign_cached_jobs_to_thread(late, "late", &mut share_channels)
+            .await;
+        for _ in 0..2 {
+            let last = {
+                let ep = scheduler
+                    .stagger
+                    .as_ref()
+                    .unwrap()
+                    .episode
+                    .as_ref()
+                    .unwrap();
+                ep.order[ep.released - 1]
+            };
+            scheduler.note_release_share(last);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            scheduler
+                .advance_release(tokio::time::Instant::now(), &mut share_channels)
+                .await;
+        }
+        // Every chain's CURRENT slice, disjoint from every other's.
+        let mut current = Vec::new();
+        for c in threads
+            .iter()
+            .map(|(_, c)| c)
+            .chain(std::iter::once(&calls))
+        {
+            current.push(
+                c.ranges
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .flatten()
+                    .expect("a range"),
+            );
+        }
+        for (i, a) in current.iter().enumerate() {
+            for b in &current[i + 1..] {
+                assert!(
+                    a.max < b.min || b.max < a.min,
+                    "overlapping slices: {a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_pause_mid_stop_stops_every_remaining_chain_at_once() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, source, threads) = scheduler_with_threads(3, false, None);
+        scheduler.stop_stagger = Some(StopStagger {
+            spacing: Duration::from_secs(5),
+            queue: Default::default(),
+            last_at: tokio::time::Instant::now(),
+        });
+        job_arrives(&mut scheduler, source, &mut share_channels).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(idles(&threads), vec![1, 0, 0]);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        pause(&mut scheduler, &mut share_channels).await;
+        assert_eq!(
+            idles(&threads),
+            vec![1, 1, 1],
+            "the second pause must not restart the clock"
+        );
+    }
+
+    /// D7. A resume handed every thread the cached job through the new-thread
+    /// path, which gives each the WHOLE extranonce2 range: after a pause every
+    /// chain hashed the same space until the next job re-split it.
+    #[tokio::test]
+    async fn a_resume_splits_the_range_instead_of_giving_each_chain_all_of_it() {
+        let mut share_channels = ShareStream::new();
+        let (mut scheduler, _source, threads) = scheduler_with_threads(3, true, None);
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+        assert!(reply_rx.await.unwrap().is_ok());
+        let ranges: Vec<_> = threads
+            .iter()
+            .map(|(_, c)| c.ranges.lock().unwrap()[0].clone().expect("a range"))
+            .collect();
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(
+                    a.max < b.min || b.max < a.min,
+                    "overlapping ranges after resume: {a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Observer mode's load-bearing guarantee: a board that attaches while
+    /// paused is left idle. On a machine whose hashboards share one PSU rail,
+    /// an unasked-for job is current nobody budgeted for.
+    #[tokio::test]
+    async fn paused_scheduler_leaves_an_attaching_thread_idle() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_cached_jobs_to_thread(thread_id, "test-thread", &mut share_channels)
+            .await;
+
+        assert_eq!(calls.updates.load(Ordering::SeqCst), 0, "no work assigned");
+        assert_eq!(calls.replaces.load(Ordering::SeqCst), 0, "no work assigned");
+        assert!(scheduler.tasks.is_empty(), "no task recorded");
+    }
+
+    /// The same thread gets the cached job once mining resumes, which is what
+    /// makes observer mode a starting state rather than a dead end.
+    #[tokio::test]
+    async fn resuming_assigns_the_cached_job() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::ResumeMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(!scheduler.paused);
+        assert_eq!(
+            calls.updates.load(Ordering::SeqCst),
+            1,
+            "resume should hand the cached job to the waiting thread"
+        );
+        assert_eq!(scheduler.tasks.len(), 1);
+        let _ = thread_id;
+    }
+
+    /// Pausing has to stop hardware that is already running, not just refuse
+    /// the next job: before this, the API reported `paused` while every thread
+    /// kept mining.
+    #[tokio::test]
+    async fn pausing_idles_running_threads_and_drops_their_tasks() {
+        let (mut scheduler, _source_id, thread_id, calls) = scheduler_with_source_and_thread(false);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_cached_jobs_to_thread(thread_id, "test-thread", &mut share_channels)
+            .await;
+        assert_eq!(
+            calls.updates.load(Ordering::SeqCst),
+            1,
+            "mining before pause"
+        );
+        assert_eq!(scheduler.tasks.len(), 1);
+
+        let (telemetry_tx, _telemetry_rx) = watch::channel(MinerTelemetry::default());
+        let (reply, reply_rx) = oneshot::channel();
+        scheduler
+            .handle_api_command(
+                SchedulerCommand::PauseMining { reply },
+                &telemetry_tx,
+                &mut share_channels,
+            )
+            .await;
+
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(scheduler.paused);
+        assert_eq!(
+            calls.idles.load(Ordering::SeqCst),
+            1,
+            "every thread must be told to go idle"
+        );
+        assert!(scheduler.tasks.is_empty(), "tasks dropped with the work");
+    }
+
+    /// A job arriving while paused reaches no thread.
+    #[tokio::test]
+    async fn paused_scheduler_drops_an_incoming_job() {
+        let (mut scheduler, source_id, _thread_id, calls) = scheduler_with_source_and_thread(true);
+        let mut share_channels = ShareStream::new();
+
+        scheduler
+            .assign_job_to_threads(
+                AssignMode::Replace,
+                source_id,
+                (*test_template()).clone(),
+                &mut share_channels,
+            )
+            .await;
+
+        assert_eq!(calls.updates.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.replaces.load(Ordering::SeqCst), 0);
+        assert!(scheduler.tasks.is_empty());
+    }
 
     #[test]
     fn scheduler_target_zero_hashrate_passthrough() {

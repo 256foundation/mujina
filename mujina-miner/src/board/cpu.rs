@@ -56,5 +56,6 @@ async fn create_cpu_board() -> Result<BackplaneConnector> {
         threads,
         telemetry_rx,
         shutdown: None,
+        command_tx: None,
     })
 }

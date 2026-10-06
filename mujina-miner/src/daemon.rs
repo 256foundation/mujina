@@ -14,6 +14,7 @@ use crate::tracing::prelude::*;
 use crate::{
     api::{self, ApiConfig, commands::SchedulerCommand},
     backplane::Backplane,
+    board::bzm2::Bzm2RuntimeConfig,
     cpu_miner::CpuMinerConfig,
     job_source::{
         SourceCommand, SourceEvent,
@@ -43,6 +44,23 @@ impl Daemon {
 
     /// Run the daemon until shutdown is requested.
     pub async fn run(self) -> anyhow::Result<()> {
+        // Observer mode: attach and enumerate hardware, stream telemetry, serve
+        // read-only diagnostics, and never dispatch work. Intended for a
+        // machine whose hashboards share one PSU rail, where an unasked-for
+        // job would draw current the operator did not budget for. Two
+        // independent guarantees, because one switch that half-works is worse
+        // than none: no job source is created at all, and the scheduler starts
+        // paused, so even a source arriving another way assigns nothing.
+        // READ THE VALUE, NOT THE PRESENCE. This was `.is_ok()`, the only
+        // switch in the tree read that way, so `MUJINA_OBSERVE=0` turned
+        // observer mode ON. The first run planned to dispatch work set exactly
+        // that, and would have dispatched nothing while reporting nothing
+        // wrong -- a mining run that silently cannot mine.
+        let observe = observe_requested(std::env::var("MUJINA_OBSERVE").ok().as_deref());
+        if observe {
+            warn!("Observer mode (MUJINA_OBSERVE): no job source, mining starts paused");
+        }
+
         // Create channels for component communication. Each transport gets its
         // own event channel; the backplane waits for one enumeration completion
         // per channel.
@@ -94,6 +112,22 @@ impl Daemon {
 
         // Create and start backplane
         let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
+
+        // Attach a configured BZM2 board before the backplane starts draining
+        // transport events, so its threads register ahead of the
+        // initial-enumeration-complete signal and count toward the startup
+        // hold.
+        if let Some(config) = Bzm2RuntimeConfig::from_env()? {
+            info!(
+                serials = config.serial_paths.len(),
+                baud = config.baud_rate,
+                "BZM2 board enabled from configured serial paths"
+            );
+            backplane
+                .attach_configured_board("bzm2", config.device_id())
+                .await?;
+        }
+
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
@@ -104,6 +138,24 @@ impl Daemon {
                         }
                     }
                     _ = shutdown.cancelled() => {}
+                }
+
+                // The event loop ending is not the daemon ending.
+                //
+                // `run()` multiplexes per-transport event streams. With no
+                // transports -- the embedded case, where USB discovery is
+                // compiled out or disabled and boards come from configuration
+                // instead -- there is nothing to multiplex, so it returns on
+                // its first poll. Falling straight through to the teardown
+                // below destroyed every configured board a few milliseconds
+                // after it was attached, while the daemon stayed up serving an
+                // empty board list and 404s.
+                //
+                // A board attached by configuration outlives the loop that
+                // never carried it. Only cancellation ends it.
+                if !shutdown.is_cancelled() {
+                    debug!("Backplane event loop finished; holding boards until shutdown");
+                    shutdown.cancelled().await;
                 }
 
                 backplane.shutdown_all_boards().await;
@@ -207,6 +259,8 @@ impl Daemon {
                     }
                 });
             }
+        } else if observe {
+            info!("Observer mode: no job source registered");
         } else {
             // Use DummySource
             info!("Using dummy job source (set MUJINA_POOL_URL to use Stratum v1)");
@@ -247,6 +301,7 @@ impl Daemon {
             source_reg_rx,
             miner_telemetry_tx,
             scheduler_cmd_rx,
+            observe,
         ));
 
         // Start the API server
@@ -261,7 +316,20 @@ impl Daemon {
                     Ok(addr) => format!("{addr}:{API_PORT}"),
                     Err(_) => format!("127.0.0.1:{API_PORT}"),
                 };
-                let config = ApiConfig { bind_addr };
+                let env_flag = |key: &str| {
+                    env::var(key)
+                        .ok()
+                        .map(|v| {
+                            let v = v.trim().to_ascii_lowercase();
+                            v == "1" || v == "true" || v == "yes" || v == "on"
+                        })
+                        .unwrap_or(false)
+                };
+                let config = ApiConfig {
+                    bind_addr,
+                    raw_registers_enabled: env_flag("MUJINA_API_RAW_REGISTERS"),
+                    raw_registers_allow_remote: env_flag("MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE"),
+                };
                 if let Err(e) = api::serve(
                     config,
                     shutdown,
@@ -309,5 +377,69 @@ impl Daemon {
 impl Default for Daemon {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Is observer mode requested, given the raw `MUJINA_OBSERVE` value?
+///
+/// FAILS TOWARD OBSERVING. Unset means dispatch, as it always has, and the
+/// explicit falsy spellings mean dispatch. Anything this does not recognise --
+/// a typo, `O` for `0`, `flase` -- means OBSERVE, loudly. The rest of the tree's
+/// flags treat an unknown value as false, which is right for them and wrong
+/// here: for this switch false means "send work to a 3 kW machine", and a
+/// mistyped value must not be the thing that starts it hashing.
+pub(crate) fn observe_requested(value: Option<&str>) -> bool {
+    let Some(raw) = value else { return false };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" | "" => false,
+        other => {
+            tracing::warn!(
+                value = other,
+                "MUJINA_OBSERVE has a value that is neither on nor off; treating it as ON -- \
+                 observing, dispatching nothing -- because an unreadable switch must not be \
+                 the one that starts the machine hashing"
+            );
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod observe_switch_tests {
+    use super::observe_requested;
+
+    /// The defect: presence, not value. `MUJINA_OBSERVE=0` meant observe.
+    #[test]
+    fn zero_means_dispatch_not_observe() {
+        assert!(
+            !observe_requested(Some("0")),
+            "=0 must NOT enable observer mode"
+        );
+        assert!(!observe_requested(Some("false")));
+        assert!(!observe_requested(Some("off")));
+        assert!(!observe_requested(Some("")));
+    }
+
+    #[test]
+    fn unset_means_dispatch_as_before() {
+        assert!(!observe_requested(None));
+    }
+
+    #[test]
+    fn the_on_spellings_observe() {
+        for v in ["1", "true", "YES", " on "] {
+            assert!(observe_requested(Some(v)), "{v:?}");
+        }
+    }
+
+    /// An unreadable value fails toward NOT making heat.
+    #[test]
+    fn an_unrecognised_value_observes() {
+        assert!(
+            observe_requested(Some("O")),
+            "a typo for 0 must not start hashing"
+        );
+        assert!(observe_requested(Some("flase")));
     }
 }

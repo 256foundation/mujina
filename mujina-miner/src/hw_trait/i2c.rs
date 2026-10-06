@@ -1,5 +1,7 @@
 //! I2C hardware abstraction trait.
 
+pub mod linux;
+
 use super::Result;
 use async_trait::async_trait;
 

@@ -11,12 +11,18 @@ use axum::{
 use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tracing::warn;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::commands::SchedulerCommand;
+use super::commands::{BoardCommand, SchedulerCommand};
 use super::server::SharedState;
 use crate::api_client::types::{
-    BoardTelemetry, MinerPatchRequest, MinerTelemetry, SourceTelemetry,
+    BoardTelemetry, Bzm2AsicSummaryResponse, Bzm2ChainSummaryResponse, Bzm2ClockReportRequest,
+    Bzm2ClockReportResponse, Bzm2DtsVsQueryRequest, Bzm2EngineDiscoveryRequest,
+    Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest, Bzm2NoopResponse,
+    Bzm2RegisterReadRequest, Bzm2RegisterReadResponse, Bzm2RegisterWriteRequest,
+    Bzm2RegisterWriteResponse, MinerPatchRequest, MinerTelemetry, SetFanTargetRequest,
+    SourceTelemetry,
 };
 
 /// Build the v0 API routes with OpenAPI metadata.
@@ -26,6 +32,16 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
+        .routes(routes!(set_fan_target))
+        .routes(routes!(query_bzm2_dts_vs))
+        .routes(routes!(query_bzm2_noop))
+        .routes(routes!(query_bzm2_loopback))
+        .routes(routes!(read_bzm2_register))
+        .routes(routes!(write_bzm2_register))
+        .routes(routes!(query_bzm2_clock_report))
+        .routes(routes!(get_bzm2_chain_summary))
+        .routes(routes!(get_bzm2_asic_summary))
+        .routes(routes!(discover_bzm2_engines))
         .routes(routes!(get_sources))
         .routes(routes!(get_source))
 }
@@ -84,9 +100,7 @@ async fn patch_miner(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         // Result layers: timeout / channel-closed / command-error.
-        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        };
+        await_command_reply("scheduler", "patch_miner", rx).await?;
     }
 
     Ok(Json(state.miner_telemetry()))
@@ -132,9 +146,551 @@ async fn get_board(
         .board_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .boards()
-        .into_iter()
-        .find(|b| b.name == name)
+        .board(&name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Set a fan's target duty cycle on a board, or return it to automatic
+/// control.
+#[utoipa::path(
+    patch,
+    path = "/boards/{name}/fans/{fan}",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+        ("fan" = String, Path, description = "Fan name"),
+    ),
+    request_body = SetFanTargetRequest,
+    responses(
+        (status = OK, description = "Updated board telemetry", body = BoardTelemetry),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = BAD_REQUEST, description = "Board accepts no commands"),
+        (status = INTERNAL_SERVER_ERROR, description = "Command channel error"),
+    ),
+)]
+async fn set_fan_target(
+    State(state): State<SharedState>,
+    Path((name, fan)): Path<(String, String)>,
+    Json(req): Json<SetFanTargetRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::SetFanTarget {
+            board: name.clone(),
+            fan,
+            percent: req.target_percent,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Result layers: timeout / channel-closed / command-error.
+    await_command_reply(&name, "SetFanTarget", rx).await?;
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Trigger an explicit BZM2 DTS/VS query and return the refreshed board state.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/dts-vs-query",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2DtsVsQueryRequest,
+    responses(
+        (status = OK, description = "Refreshed board details", body = BoardTelemetry),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 telemetry queries"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_dts_vs(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2DtsVsQueryRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2DtsVs {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    await_command_reply(&name, "QueryBzm2DtsVs", rx).await?;
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Trigger a live BZM2 NOOP diagnostic through a board-owned UART thread.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/noop",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2NoopRequest,
+    responses(
+        (status = OK, description = "NOOP response payload", body = Bzm2NoopResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_noop(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2NoopRequest>,
+) -> Result<Json<Bzm2NoopResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2Noop {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let payload = await_command_reply(&name, "QueryBzm2Noop", rx).await?;
+
+    Ok(Json(Bzm2NoopResponse {
+        payload_hex: hex::encode(payload),
+    }))
+}
+
+/// Trigger a live BZM2 loopback diagnostic through a board-owned UART thread.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/loopback",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2LoopbackRequest,
+    responses(
+        (status = OK, description = "Loopback response payload", body = Bzm2LoopbackResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics or request payload is invalid"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_loopback(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2LoopbackRequest>,
+) -> Result<Json<Bzm2LoopbackResponse>, StatusCode> {
+    let payload = decode_hex_payload(&req.payload_hex)?;
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2Loopback {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            payload,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let payload = await_command_reply(&name, "QueryBzm2Loopback", rx).await?;
+
+    Ok(Json(Bzm2LoopbackResponse {
+        payload_hex: hex::encode(payload),
+    }))
+}
+
+/// Perform a live BZM2 register read through a board-owned UART thread.
+///
+/// Gated by `MUJINA_API_RAW_REGISTERS` (off by default) and
+/// `MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE`: this reads raw silicon state
+/// with no higher-level guard in front of it, so it needs its own explicit
+/// opt-in beyond whatever exposed the rest of the API.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/register-read",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2RegisterReadRequest,
+    responses(
+        (status = OK, description = "Register payload", body = Bzm2RegisterReadResponse),
+        (status = FORBIDDEN, description = "Raw register access is not enabled"),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn read_bzm2_register(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2RegisterReadRequest>,
+) -> Result<Json<Bzm2RegisterReadResponse>, StatusCode> {
+    if !state.raw_registers_permitted {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::ReadBzm2Register {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            engine_address: req.engine_address,
+            offset: req.offset,
+            count: req.count,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let value = await_command_reply(&name, "ReadBzm2Register", rx).await?;
+
+    Ok(Json(Bzm2RegisterReadResponse {
+        value_hex: hex::encode(value),
+    }))
+}
+
+/// Perform a live BZM2 register write through a board-owned UART thread.
+///
+/// Gated by `MUJINA_API_RAW_REGISTERS` (off by default) and
+/// `MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE`: this writes raw silicon state
+/// with no higher-level guard in front of it, so it needs its own explicit
+/// opt-in beyond whatever exposed the rest of the API.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/register-write",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2RegisterWriteRequest,
+    responses(
+        (status = OK, description = "Register write acknowledgement", body = Bzm2RegisterWriteResponse),
+        (status = FORBIDDEN, description = "Raw register access is not enabled"),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics or request payload is invalid"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn write_bzm2_register(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2RegisterWriteRequest>,
+) -> Result<Json<Bzm2RegisterWriteResponse>, StatusCode> {
+    if !state.raw_registers_permitted {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let value = decode_hex_payload(&req.value_hex)?;
+    let bytes_written = value.len();
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::WriteBzm2Register {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            engine_address: req.engine_address,
+            offset: req.offset,
+            value,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    await_command_reply(&name, "WriteBzm2Register", rx).await?;
+
+    Ok(Json(Bzm2RegisterWriteResponse { bytes_written }))
+}
+
+fn decode_hex_payload(raw: &str) -> Result<Vec<u8>, StatusCode> {
+    hex::decode(raw.trim()).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+/// Return a live BZM2 clock report through a board-owned UART thread.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/clock-report",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2ClockReportRequest,
+    responses(
+        (status = OK, description = "Clock status payload", body = Bzm2ClockReportResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 diagnostics"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn query_bzm2_clock_report(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2ClockReportRequest>,
+) -> Result<Json<Bzm2ClockReportResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2ClockReport {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let report = await_command_reply(&name, "QueryBzm2ClockReport", rx).await?;
+
+    Ok(Json(report))
+}
+
+/// Return the current BZM2 chain summary for a live board.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/bzm2/chain-summary",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Current BZM2 chain summary", body = Bzm2ChainSummaryResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 chain summary"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn get_bzm2_chain_summary(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<Bzm2ChainSummaryResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2ChainSummary { reply: tx })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary = await_command_reply(&name, "QueryBzm2ChainSummary", rx).await?;
+
+    Ok(Json(summary))
+}
+
+/// Return computed per-ASIC die temperature and rail voltage figures for a board.
+///
+/// Safe to poll: the board answers it from telemetry it already holds, without
+/// touching the chain.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/bzm2/asic-summary",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    responses(
+        (status = OK, description = "Computed per-ASIC thermal and voltage summary", body = Bzm2AsicSummaryResponse),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 per-ASIC summaries"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn get_bzm2_asic_summary(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<Bzm2AsicSummaryResponse>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::QueryBzm2AsicSummary { reply: tx })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let summary = await_command_reply(&name, "QueryBzm2AsicSummary", rx).await?;
+
+    Ok(Json(summary))
+}
+
+/// Trigger an explicit BZM2 engine-discovery scan and return the refreshed board state.
+#[utoipa::path(
+    post,
+    path = "/boards/{name}/bzm2/discover-engines",
+    tag = "boards",
+    params(
+        ("name" = String, Path, description = "Board name"),
+    ),
+    request_body = Bzm2EngineDiscoveryRequest,
+    responses(
+        (status = OK, description = "Refreshed board details", body = BoardTelemetry),
+        (status = BAD_REQUEST, description = "Board does not support BZM2 engine discovery"),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = INTERNAL_SERVER_ERROR, description = "Board command failed"),
+    ),
+)]
+async fn discover_bzm2_engines(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    Json(req): Json<Bzm2EngineDiscoveryRequest>,
+) -> Result<Json<BoardTelemetry>, StatusCode> {
+    let (board_exists, command_tx) = {
+        let mut registry = state
+            .board_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (registry.board(&name).is_some(), registry.command_tx(&name))
+    };
+    if !board_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(command_tx) = command_tx else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    let (tx, rx) = oneshot::channel();
+    command_tx
+        .send(BoardCommand::DiscoverBzm2Engines {
+            thread_index: req.thread_index,
+            asic: req.asic,
+            tdm_prediv_raw: req.tdm_prediv_raw,
+            tdm_counter: req.tdm_counter,
+            timeout_ms: req.timeout_ms,
+            reply: tx,
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    await_command_reply(&name, "DiscoverBzm2Engines", rx).await?;
+
+    state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .board(&name)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -178,4 +734,46 @@ async fn get_source(
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// How long a handler waits for a board or the scheduler to answer.
+const COMMAND_REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait for a command's reply, and KEEP THE REASON when there is not one.
+///
+/// Handlers used to match `Ok(Ok(Ok(v)))` and answer everything else with a
+/// bare 500. That discarded three different facts -- the command's own error,
+/// a reply dropped unanswered, and the API giving up while the command may
+/// still be running on the hardware -- and left the log saying only "response
+/// failed". An engine discovery failed that way once and took its reason with it.
+///
+/// The HTTP answer is unchanged. What changes is that the log says why.
+async fn await_command_reply<T>(
+    board: &str,
+    command: &'static str,
+    rx: oneshot::Receiver<anyhow::Result<T>>,
+) -> Result<T, StatusCode> {
+    match tokio::time::timeout(COMMAND_REPLY_WAIT, rx).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(err))) => {
+            warn!(board, command, error = %format!("{err:#}"), "Command failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Ok(Err(_)) => {
+            warn!(
+                board,
+                command, "Command's reply was dropped without an answer"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(_) => {
+            warn!(
+                board,
+                command,
+                wait_s = COMMAND_REPLY_WAIT.as_secs(),
+                "No reply within the API's wait; the command may STILL BE RUNNING on the hardware"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }

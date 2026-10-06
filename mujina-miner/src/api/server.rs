@@ -26,6 +26,15 @@ use crate::api_client::types::MinerTelemetry;
 pub struct ApiConfig {
     /// Address and port to bind the API server to.
     pub bind_addr: String,
+    /// `MUJINA_API_RAW_REGISTERS`: serve the raw BZM2 register read/write
+    /// endpoints at all. Off by default -- they bypass every higher-level
+    /// guard (fan law, calibration, thermal interlock) and drive silicon
+    /// directly.
+    pub raw_registers_enabled: bool,
+    /// `MUJINA_API_RAW_REGISTERS_ALLOW_REMOTE`: also serve them when the API
+    /// is bound to a non-loopback address. Meaningless unless
+    /// `raw_registers_enabled` is also set.
+    pub raw_registers_allow_remote: bool,
 }
 
 /// Shared application state available to all handlers.
@@ -34,6 +43,11 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    /// Whether this server instance may serve the raw BZM2 register
+    /// endpoints: `raw_registers_enabled` AND (bound to loopback OR
+    /// `raw_registers_allow_remote`). Computed once, at bind time -- see
+    /// `serve`.
+    pub raw_registers_permitted: bool,
 }
 
 impl SharedState {
@@ -79,10 +93,21 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
-
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
+
+    // The raw register endpoints need the ACTUAL bound address, not the
+    // configured one: "localhost:0" and "0.0.0.0:7785" both resolve here,
+    // and it is the resolved address that a caller actually reaches.
+    let raw_registers_permitted = config.raw_registers_enabled
+        && (actual_addr.ip().is_loopback() || config.raw_registers_allow_remote);
+
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        raw_registers_permitted,
+    );
 
     info!(url = %format!("http://{}", actual_addr), "API server listening.");
 
@@ -110,11 +135,13 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    raw_registers_permitted: bool,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
+        raw_registers_permitted,
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -140,9 +167,17 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api::commands::SchedulerCommand;
+    use crate::api::commands::{BoardCommand, SchedulerCommand};
     use crate::api::registry::BoardRegistration;
-    use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
+    use crate::api_client::types::{
+        AsicState, BoardTelemetry, Bzm2BusSummary, Bzm2ChainSummaryResponse,
+        Bzm2ClockReportRequest, Bzm2ClockReportResponse, Bzm2DllClockStatus, Bzm2DtsVsQueryRequest,
+        Bzm2EngineDiscoveryRequest, Bzm2LoopbackRequest, Bzm2LoopbackResponse, Bzm2NoopRequest,
+        Bzm2NoopResponse, Bzm2PllClockStatus, Bzm2RegisterReadRequest, Bzm2RegisterReadResponse,
+        Bzm2RegisterWriteRequest, Bzm2RegisterWriteResponse, Bzm2SavedOperatingPointStatus,
+        Bzm2StartupPath, EngineCoordinate, SourceTelemetry, TemperatureSensor,
+    };
+    use crate::types::Temperature;
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -166,12 +201,15 @@ mod tests {
         let mut board_senders = Vec::new();
         for state in board_states {
             let (tx, rx) = watch::channel(state);
-            registry.push(BoardRegistration { telemetry_rx: rx });
+            registry.push(BoardRegistration {
+                telemetry_rx: rx,
+                command_tx: None,
+            });
             board_senders.push(tx);
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx, false),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
@@ -361,5 +399,675 @@ mod tests {
         let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: &T,
+    ) -> (http::StatusCode, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn set_fan_target_round_trips_board_command() {
+        use crate::api::commands::BoardCommand;
+        use crate::api_client::types::{Fan, SetFanTargetRequest};
+
+        let (miner_tx, miner_rx) = watch::channel(MinerTelemetry::default());
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "fan-board".into(),
+            model: "Test".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, mut board_cmd_rx) = mpsc::channel(1);
+        registry.push(BoardRegistration {
+            telemetry_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx, false);
+
+        // Clone for the task; the original must stay alive or the registry
+        // prunes the board before the handler's post-command re-read.
+        let telemetry_tx_for_command = telemetry_tx.clone();
+        tokio::spawn(async move {
+            if let Some(BoardCommand::SetFanTarget {
+                board,
+                fan,
+                percent,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(board, "fan-board");
+                assert_eq!(fan, "fan0");
+                assert_eq!(percent, Some(75));
+                telemetry_tx_for_command.send_modify(|t| {
+                    t.fans.push(Fan {
+                        name: "fan0".into(),
+                        rpm: None,
+                        percent: None,
+                        target_percent: percent,
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "PATCH",
+            "/api/v0/boards/fan-board/fans/fan0",
+            &SetFanTargetRequest {
+                target_percent: Some(75),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
+        assert_eq!(board.fans[0].target_percent, Some(75));
+
+        // A board with no command channel answers 400.
+        let (_keep, no_cmd_rx) = watch::channel(BoardTelemetry {
+            name: "no-commands".into(),
+            model: "Test".into(),
+            ..Default::default()
+        });
+        let (miner_tx2, miner_rx2) = watch::channel(MinerTelemetry::default());
+        let (cmd_tx2, _cmd_rx2) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry2 = BoardRegistry::new();
+        registry2.push(BoardRegistration {
+            telemetry_rx: no_cmd_rx,
+            command_tx: None,
+        });
+        let router2 = build_router(miner_rx2, Arc::new(Mutex::new(registry2)), cmd_tx2, false);
+        let (status, _body) = post_json(
+            router2,
+            "PATCH",
+            "/api/v0/boards/no-commands/fans/fan0",
+            &SetFanTargetRequest {
+                target_percent: Some(50),
+            },
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        drop(miner_tx);
+        drop(miner_tx2);
+        drop(telemetry_tx);
+    }
+
+    /// Build a router with one command-capable BZM2 test board, returning
+    /// the board's telemetry sender and command receiver.
+    ///
+    /// `raw_registers_permitted` is `true` in every existing caller: those
+    /// tests are about the diagnostic protocol round-tripping, not about the
+    /// register-access gate itself, which has its own dedicated tests below
+    /// that build the router directly.
+    fn build_bzm2_test_router(
+        channel_capacity: usize,
+        raw_registers_permitted: bool,
+    ) -> (
+        Router,
+        watch::Sender<BoardTelemetry>,
+        mpsc::Receiver<BoardCommand>,
+        watch::Sender<MinerTelemetry>,
+        mpsc::Receiver<SchedulerCommand>,
+    ) {
+        let (miner_tx, miner_rx) = watch::channel(MinerTelemetry::default());
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
+        let mut registry = BoardRegistry::new();
+        let (telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry {
+            name: "bzm2-test".into(),
+            model: "BZM2".into(),
+            ..Default::default()
+        });
+        let (board_cmd_tx, board_cmd_rx) = mpsc::channel(channel_capacity);
+        registry.push(BoardRegistration {
+            telemetry_rx,
+            command_tx: Some(board_cmd_tx),
+        });
+        let router = build_router(
+            miner_rx,
+            Arc::new(Mutex::new(registry)),
+            cmd_tx,
+            raw_registers_permitted,
+        );
+        (router, telemetry_tx, board_cmd_rx, miner_tx, cmd_rx)
+    }
+
+    #[tokio::test]
+    async fn bzm2_query_endpoint_returns_refreshed_board_state() {
+        let (router, telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+
+        // Clone for the task; the original must stay alive or the registry
+        // prunes the board before the handler's post-command re-read.
+        let telemetry_tx_for_command = telemetry_tx.clone();
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2DtsVs {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                telemetry_tx_for_command.send_modify(|state| {
+                    state.temperatures.push(TemperatureSensor {
+                        name: "ttyUSB0-asic-2-dts".into(),
+                        temperature: Some(Temperature::from_celsius(64.5)),
+                        observed_at: Some(std::time::Instant::now()),
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/dts-vs-query",
+            &Bzm2DtsVsQueryRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
+        assert!(board.temperatures.iter().any(|sensor| {
+            sensor.name == "ttyUSB0-asic-2-dts"
+                && sensor.temperature.map(Temperature::as_degrees_c) == Some(64.5)
+        }));
+    }
+
+    #[tokio::test]
+    async fn bzm2_diagnostic_endpoints_round_trip_payloads() {
+        let (router, _telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(4, true);
+
+        tokio::spawn(async move {
+            while let Some(command) = board_cmd_rx.recv().await {
+                match command {
+                    BoardCommand::QueryBzm2Noop {
+                        thread_index,
+                        asic,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        let _ = reply.send(Ok(crate::asic::bzm2::uart::NOOP_SIGNATURE));
+                    }
+                    BoardCommand::QueryBzm2Loopback {
+                        thread_index,
+                        asic,
+                        payload,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(payload, vec![0x01, 0x02, 0xaa, 0xbb]);
+                        let _ = reply.send(Ok(payload));
+                    }
+                    BoardCommand::ReadBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        count,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(count, 4);
+                        let _ = reply.send(Ok(vec![0x11, 0x22, 0x33, 0x44]));
+                    }
+                    BoardCommand::WriteBzm2Register {
+                        thread_index,
+                        asic,
+                        engine_address,
+                        offset,
+                        value,
+                        reply,
+                    } => {
+                        assert_eq!(thread_index, 0);
+                        assert_eq!(asic, 2);
+                        assert_eq!(engine_address, 0x0fff);
+                        assert_eq!(offset, 0x12);
+                        assert_eq!(value, vec![0xde, 0xad, 0xbe, 0xef]);
+                        let _ = reply.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (status, body) = post_json(
+            router.clone(),
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/noop",
+            &Bzm2NoopRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let noop: Bzm2NoopResponse = serde_json::from_str(&body).unwrap();
+        // Derived from the signature, not retyped: this asserts the endpoint
+        // hex-encodes what the chain returned, which is the only thing this
+        // test can honestly claim. What the right bytes ARE is pinned once, in
+        // the constant's own test.
+        let expected_hex: String = crate::asic::bzm2::uart::NOOP_SIGNATURE
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(noop.payload_hex, expected_hex);
+
+        let (status, body) = post_json(
+            router.clone(),
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/loopback",
+            &Bzm2LoopbackRequest {
+                thread_index: 0,
+                asic: 2,
+                payload_hex: "0102aabb".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let loopback: Bzm2LoopbackResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(loopback.payload_hex, "0102aabb");
+
+        let (status, body) = post_json(
+            router.clone(),
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let readback: Bzm2RegisterReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(readback.value_hex, "11223344");
+
+        let (status, body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/register-write",
+            &Bzm2RegisterWriteRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                value_hex: "deadbeef".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let write_ack: Bzm2RegisterWriteResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(write_ack.bytes_written, 4);
+    }
+
+    #[tokio::test]
+    async fn bzm2_chain_summary_endpoint_returns_live_layout() {
+        let (router, _telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2ChainSummary { reply }) = board_cmd_rx.recv().await {
+                let _ = reply.send(Ok(Bzm2ChainSummaryResponse {
+                    total_asics: 6,
+                    startup_path: Some(Bzm2StartupPath::SavedReplay),
+                    saved_operating_point_status: Some(Bzm2SavedOperatingPointStatus::Validated),
+                    buses: vec![
+                        Bzm2BusSummary {
+                            thread_index: 0,
+                            serial_path: "/dev/ttyUSB0".into(),
+                            asic_start: 0,
+                            asic_count: 2,
+                        },
+                        Bzm2BusSummary {
+                            thread_index: 1,
+                            serial_path: "/dev/ttyUSB1".into(),
+                            asic_start: 2,
+                            asic_count: 4,
+                        },
+                    ],
+                }));
+            }
+        });
+
+        let (status, body) = get(router, "/api/v0/boards/bzm2-test/bzm2/chain-summary").await;
+        assert_eq!(status, 200);
+        let summary: Bzm2ChainSummaryResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(summary.total_asics, 6);
+        assert_eq!(summary.startup_path, Some(Bzm2StartupPath::SavedReplay));
+        assert_eq!(
+            summary.saved_operating_point_status,
+            Some(Bzm2SavedOperatingPointStatus::Validated)
+        );
+        assert_eq!(summary.buses.len(), 2);
+        assert_eq!(summary.buses[1].serial_path, "/dev/ttyUSB1");
+        assert_eq!(summary.buses[1].asic_start, 2);
+        assert_eq!(summary.buses[1].asic_count, 4);
+    }
+
+    #[tokio::test]
+    async fn bzm2_clock_report_endpoint_returns_payload() {
+        let (router, _telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::QueryBzm2ClockReport {
+                thread_index,
+                asic,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                let _ = reply.send(Ok(Bzm2ClockReportResponse {
+                    asic,
+                    pll0: Bzm2PllClockStatus {
+                        enable_register: 0x0000_0005,
+                        misc_register: 0x0000_0012,
+                        enabled: true,
+                        locked: true,
+                    },
+                    pll1: Bzm2PllClockStatus {
+                        enable_register: 0x0000_0001,
+                        misc_register: 0x0000_001a,
+                        enabled: true,
+                        locked: false,
+                    },
+                    dll0: Bzm2DllClockStatus {
+                        control2: 0x04,
+                        control5: 0x07,
+                        coarsecon: 0x03,
+                        fincon: 0x9c,
+                        freeze_valid: false,
+                        locked: true,
+                        fincon_valid: true,
+                    },
+                    dll1: Bzm2DllClockStatus {
+                        control2: 0x06,
+                        control5: 0x03,
+                        coarsecon: 0x02,
+                        fincon: 0x10,
+                        freeze_valid: true,
+                        locked: true,
+                        fincon_valid: true,
+                    },
+                }));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/clock-report",
+            &Bzm2ClockReportRequest {
+                thread_index: 0,
+                asic: 2,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let report: Bzm2ClockReportResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(report.asic, 2);
+        assert_eq!(report.pll0.enable_register, 0x0000_0005);
+        assert!(report.pll0.locked);
+        assert!(!report.pll1.locked);
+        assert_eq!(report.dll0.fincon, 0x9c);
+        assert!(report.dll1.freeze_valid);
+    }
+
+    /// A log sink a test can read back. Installed per test thread, so parallel
+    /// tests do not see each other's lines.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            let log = Self::default();
+            let sink = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A FAILED BOARD COMMAND MUST LEAVE ITS REASON IN THE LOG.
+    ///
+    /// Every BZM2 handler matched `Ok(Ok(Ok(v)))` and answered anything else
+    /// with a bare 500, so the board's own error was dropped and the log said
+    /// only "response failed". One capture lost the reason
+    /// an engine discovery failed exactly this way -- the one failure that run
+    /// most needed explained.
+    #[tokio::test]
+    async fn a_failed_board_command_leaves_its_reason_in_the_log() {
+        let (log, _guard) = CapturedLog::install();
+        // CONTROL: the capture itself must work, or an empty log below would
+        // read as "no reason logged" when it meant "nothing captured".
+        tracing::warn!("capture-control");
+        assert!(
+            log.text().contains("capture-control"),
+            "the log capture is not capturing"
+        );
+        let (router, _telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+        tokio::spawn(async move {
+            if let Some(BoardCommand::DiscoverBzm2Engines { reply, .. }) = board_cmd_rx.recv().await
+            {
+                let _ = reply.send(Err(anyhow::anyhow!(
+                    "timed out waiting for asic 0 engine 0x0123 register reply"
+                )));
+            }
+        });
+
+        let (status, _body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/discover-engines",
+            &Bzm2EngineDiscoveryRequest {
+                thread_index: 0,
+                asic: 0,
+                tdm_prediv_raw: 0x0f,
+                tdm_counter: 16,
+                timeout_ms: Some(100),
+            },
+        )
+        .await;
+
+        assert_eq!(status, 500);
+        let text = log.text();
+        assert!(
+            text.contains("timed out waiting for asic 0 engine 0x0123 register reply"),
+            "the board's reason for failing is not in the log:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bzm2_engine_discovery_endpoint_returns_refreshed_board_state() {
+        let (router, telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+
+        // Clone for the task; the original must stay alive or the registry
+        // prunes the board before the handler's post-command re-read.
+        let telemetry_tx_for_command = telemetry_tx.clone();
+        tokio::spawn(async move {
+            if let Some(BoardCommand::DiscoverBzm2Engines {
+                thread_index,
+                asic,
+                tdm_prediv_raw,
+                tdm_counter,
+                timeout_ms,
+                reply,
+            }) = board_cmd_rx.recv().await
+            {
+                assert_eq!(thread_index, 0);
+                assert_eq!(asic, 2);
+                assert_eq!(tdm_prediv_raw, 0x0f);
+                assert_eq!(tdm_counter, 16);
+                assert_eq!(timeout_ms, Some(150));
+                telemetry_tx_for_command.send_modify(|state| {
+                    state.asics.push(AsicState {
+                        id: 2,
+                        thread_index: Some(0),
+                        serial_path: Some("/dev/ttyUSB0".into()),
+                        discovered_engine_count: Some(236),
+                        missing_engines: vec![
+                            EngineCoordinate { row: 3, col: 7 },
+                            EngineCoordinate { row: 5, col: 11 },
+                        ],
+                        ..Default::default()
+                    });
+                });
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/discover-engines",
+            &Bzm2EngineDiscoveryRequest {
+                thread_index: 0,
+                asic: 2,
+                tdm_prediv_raw: 0x0f,
+                tdm_counter: 16,
+                timeout_ms: Some(150),
+            },
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let board: BoardTelemetry = serde_json::from_str(&body).unwrap();
+        assert!(board.asics.iter().any(|asic| {
+            asic.id == 2
+                && asic.thread_index == Some(0)
+                && asic.discovered_engine_count == Some(236)
+                && asic.missing_engines
+                    == vec![
+                        EngineCoordinate { row: 3, col: 7 },
+                        EngineCoordinate { row: 5, col: 11 },
+                    ]
+        }));
+    }
+
+    /// RAW REGISTER ACCESS IS OFF BY DEFAULT.
+    ///
+    /// Reported by @j-kon in review of #117: these two endpoints drive
+    /// silicon directly, bypassing every higher-level guard (fan law,
+    /// calibration, thermal interlock), and had no access control of their
+    /// own -- anything that could reach the API's port could reach them.
+    /// `raw_registers_permitted: false` is what `build_router` computes
+    /// whenever `MUJINA_API_RAW_REGISTERS` is unset, so this is the
+    /// out-of-the-box behaviour, not an opt-in a caller could still miss.
+    #[tokio::test]
+    async fn raw_register_endpoints_refuse_when_not_permitted() {
+        let (router, _telemetry_tx, _board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, false);
+
+        let (status, _body) = post_json(
+            router.clone(),
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        let (status, _body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/register-write",
+            &Bzm2RegisterWriteRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                value_hex: "deadbeef".into(),
+            },
+        )
+        .await;
+        assert_eq!(status, 403);
+    }
+
+    /// The gate's other half: once permitted, the board is still asked and
+    /// still answers normally. A gate that also broke the allowed path would
+    /// pass the refusal test above while leaving raw diagnostics unusable
+    /// even for an operator who explicitly opted in.
+    #[tokio::test]
+    async fn raw_register_endpoints_answer_when_permitted() {
+        let (router, _telemetry_tx, mut board_cmd_rx, _miner_tx, _cmd_rx) =
+            build_bzm2_test_router(1, true);
+
+        tokio::spawn(async move {
+            if let Some(BoardCommand::ReadBzm2Register { reply, .. }) = board_cmd_rx.recv().await {
+                let _ = reply.send(Ok(vec![0x11, 0x22, 0x33, 0x44]));
+            }
+        });
+
+        let (status, body) = post_json(
+            router,
+            "POST",
+            "/api/v0/boards/bzm2-test/bzm2/register-read",
+            &Bzm2RegisterReadRequest {
+                thread_index: 0,
+                asic: 2,
+                engine_address: 0x0fff,
+                offset: 0x12,
+                count: 4,
+            },
+        )
+        .await;
+        assert_eq!(status, 200);
+        let readback: Bzm2RegisterReadResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(readback.value_hex, "11223344");
     }
 }

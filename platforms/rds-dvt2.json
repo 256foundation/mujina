@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "class": "rds-dvt2",
+  "title": "RDS 2.0 control board, DVT2 hashboards",
+  "provenance": "Slot counts and populations measured on hardware, not taken from a datasheet: 4 fans from hwmon0..3 paired with pwmchip0..3; 3 hashboard slots from the three 9-bit chain UARTs and three I2C adapters; 100 ASICs per hashboard from the device-initiated DTS/VS stream, where every one of 100 ids contributed exactly 5,429 frames over 27.8 s, measured on hardware.",
+
+  "slots": {
+    "fan": 4,
+    "hashboard": 3,
+    "asic_per_hashboard": 100
+  },
+
+  "default_variant": "air-3b",
+
+  "variants": {
+    "air-3b": {
+      "title": "air cooled, three hashboards",
+      "cooling": "air",
+      "fitted": { "fan": [0, 1, 2, 3], "hashboard": [0, 1, 2] }
+    },
+    "air-2b": {
+      "title": "air cooled, two hashboards",
+      "cooling": "air",
+      "fitted": { "fan": [0, 1, 2, 3], "hashboard": [0, 1] }
+    },
+    "air-1b": {
+      "title": "air cooled, one hashboard",
+      "cooling": "air",
+      "fitted": { "fan": [0, 1, 2, 3], "hashboard": [0] }
+    },
+    "air-0b": {
+      "title": "air cooled, control board only -- bring-up and harness work",
+      "cooling": "air",
+      "fitted": { "fan": [0, 1, 2, 3], "hashboard": [] }
+    },
+    "immersion-3b": {
+      "title": "immersion cooled, three hashboards",
+      "cooling": "immersion",
+      "fitted": { "fan": [], "hashboard": [0, 1, 2] }
+    },
+    "bench": {
+      "title": "not an RDS -- a workstation or CI host running the driver",
+      "cooling": "none",
+      "fitted": { "fan": [], "hashboard": [] }
+    }
+  },
+
+  "rules": [
+    {
+      "kind": "fan",
+      "when": { "cooling": "air" },
+      "absent": "block",
+      "failed": "block",
+      "why": "An air-cooled chassis must have every fan it was built with. The fans are the only thing moving heat, there is no redundancy declared for them, and a fan that will not turn is a mechanical or control fault -- not a degraded mode to run in. Free-run is NOT maximum on this chassis (5,430 rpm against 6,800 commanded), so 'do nothing' is not a safe default either."
+    },
+    {
+      "kind": "fan",
+      "when": { "cooling": "immersion" },
+      "absent": "note",
+      "failed": "note",
+      "why": "An immersion chassis has no fans by design. Their absence is the expected shape of the machine, and a tachometer that answers anyway is worth recording but decides nothing."
+    },
+    {
+      "kind": "hashboard",
+      "absent": "warn",
+      "failed": "warn",
+      "why": "The machine runs on two boards, or one, or none -- a control board with no hashboard is a legitimate configuration for bring-up and harness work. A fitted board that does not answer is a real finding and must be loud, but it is not a reason to refuse to start: the remaining boards are unaffected and the operator may be expecting it."
+    },
+    {
+      "kind": "asic",
+      "parent": "hashboard",
+      "absent": "warn",
+      "failed": "warn",
+      "why": "A missing device on a board we are driving changes the hashrate we should expect and may be the first sign of a chain fault, so it is loud. It does not block: 99 of 100 devices is a working board, and refusing would make one dead part cost a whole machine."
+    }
+  ],
+
+  "parent_not_fitted": {
+    "verdict": "note",
+    "why": "A component whose parent is not fitted in this variant cannot be a fault of this configuration. A failed ASIC on a hashboard we deliberately excluded is interesting -- it is worth knowing before that board is ever fitted -- but it is not actionable now and must never gate a start."
+  }
+}

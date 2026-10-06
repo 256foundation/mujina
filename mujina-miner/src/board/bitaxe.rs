@@ -190,6 +190,7 @@ async fn create_from_usb(device: UsbDeviceInfo, firmware: Firmware) -> Result<Ba
         threads,
         telemetry_rx,
         shutdown: Some(shutdown),
+        command_tx: None,
     })
 }
 
@@ -451,10 +452,12 @@ impl BitaxeMonitor {
                 TemperatureSensor {
                     name: "asic".into(),
                     temperature: asic_temp.map(Temperature::from_celsius),
+                    observed_at: Some(std::time::Instant::now()),
                 },
                 TemperatureSensor {
                     name: "vr".into(),
                     temperature: vr_temp.map(|t| Temperature::from_celsius(t as f32)),
+                    observed_at: Some(std::time::Instant::now()),
                 },
             ],
             powers: vec![
@@ -472,6 +475,7 @@ impl BitaxeMonitor {
                 },
             ],
             threads: Vec::new(), // TODO: populate from hash thread telemetry
+            ..Default::default()
         });
 
         // Periodic log

@@ -18,7 +18,9 @@
 use std::io;
 #[cfg(test)]
 use std::os::unix::io::FromRawFd;
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(test)]
+use std::os::unix::io::{IntoRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -47,6 +49,17 @@ pub struct SerialConfig {
     pub data_bits: u8,
     pub stop_bits: u8,
     pub parity: Parity,
+    /// Raw control-flag override, as `(mask_to_clear, bits_to_set)`.
+    ///
+    /// Escape hatch for a driver that does not take its line rate from the
+    /// standard fields. Some vendor drivers encode the rate as a private
+    /// constant inside the control flags and never read `c_ispeed`/`c_ospeed`
+    /// at all; against one of those, a portable speed API sets a field nobody
+    /// consults and the port runs at whatever the driver's fallback is.
+    ///
+    /// Applied LAST, after every portable setting, so it wins. Carrier
+    /// specific by nature: leave it `None` for an ordinary tty.
+    pub platform_cflag: Option<(u32, u32)>,
 }
 
 impl Default for SerialConfig {
@@ -56,6 +69,7 @@ impl Default for SerialConfig {
             data_bits: 8,
             stop_bits: 1,
             parity: Parity::None,
+            platform_cflag: None,
         }
     }
 }
@@ -102,8 +116,25 @@ pub struct SerialStream {
 }
 
 struct SerialInner {
-    /// File descriptor - immutable after creation
-    fd: AsyncFd<RawFd>,
+    /// File descriptor - immutable after creation.
+    ///
+    /// `OwnedFd`, NOT `RawFd`, and the difference is the whole point.
+    ///
+    /// This held `AsyncFd<RawFd>`, built from `OwnedFd::into_raw_fd()`. A
+    /// `RawFd` is an integer: `AsyncFd` deregisters it from the reactor on
+    /// drop and nothing ever closes it. So EVERY `SerialStream` this transport
+    /// ever dropped leaked its descriptor until the process exited.
+    ///
+    /// On most hardware that is a slow leak. On the RDS chain ports it is a
+    /// hard fault: the vendor tty driver refuses a second opener while its
+    /// per-port counter is raised, so a port that was opened, "closed" by
+    /// dropping, and opened again fails with EBUSY. Measured 2026-09-22 from
+    /// the driver's own open/close log -- the pre-calibration arming opened
+    /// tty9bit00 at 26566.153, the hash thread's open was refused at
+    /// 26566.699, and the arming's descriptor was released at 26620.790, when
+    /// the PROCESS was killed, 54 s after the function that opened it had
+    /// returned. The board never attached.
+    fd: AsyncFd<OwnedFd>,
 
     /// Current configuration - atomic for lock-free reads
     baud_rate: AtomicU32,
@@ -114,24 +145,126 @@ struct SerialInner {
     /// Lock only for actual reconfiguration
     reconfig_lock: RwLock<()>,
 
+    /// The platform control-flag override this port was opened with, if any.
+    ///
+    /// It lives on the port rather than at the open call because it is a
+    /// property of the carrier, and every later reconfiguration has to honour
+    /// it. Measured on an RDS 2.0: the override was applied correctly at open
+    /// and a `set_baud_rate` 31 ms later put the port back on the wrong
+    /// divisor, because the portable setter rewrites the very bits the
+    /// override exists to control. An override that only holds until the next
+    /// reconfiguration is not an override.
+    platform_cflag: Option<(u32, u32)>,
+
     /// Statistics (lock-free)
     bytes_read: AtomicU64,
     bytes_written: AtomicU64,
 }
 
 /// Reader half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialReader {
     inner: Arc<SerialInner>,
 }
 
 /// Writer half of a split serial stream.
+#[derive(Clone)]
 pub struct SerialWriter {
     inner: Arc<SerialInner>,
+    /// Optional veto on outbound frames, consulted before every write.
+    ///
+    /// Lives here, at the one point every byte passes through, because a guard
+    /// applied at call sites is a guard that the next call site forgets. The
+    /// transport knows nothing about what it is enforcing -- it asks the policy
+    /// and obeys the answer.
+    policy: Option<Arc<dyn OutboundFramePolicy>>,
+}
+
+/// A veto on outbound frames, installed by whoever knows what the bytes mean.
+///
+/// Implementations must be conservative: this exists to stop writes reaching
+/// hardware that must not be written to, so an implementation that cannot tell
+/// what a buffer is should refuse it rather than pass it.
+pub trait OutboundFramePolicy: Send + Sync + std::fmt::Debug {
+    /// Return `Err(reason)` to refuse the frame. The reason is logged and
+    /// surfaced to the caller as an error; nothing is written.
+    fn allow(&self, frame: &[u8]) -> Result<(), String>;
 }
 
 /// Control handle for a split serial stream.
+#[derive(Clone)]
 pub struct SerialControl {
     inner: Arc<SerialInner>,
+}
+
+/// Open a serial port for a carrier whose driver may need a control-flag
+/// override, read from `MUJINA_SERIAL_CFLAG` as `mask,value`.
+///
+/// # A portability note, recorded before it is needed
+///
+/// This code does not touch the modem control lines, and on the carrier it was
+/// written for that is correct: reset there is a GPIO, configured separately.
+///
+/// It will not stay correct everywhere. On a USB-UART bridge, DTR is commonly
+/// asserted by the driver when a port is opened, and boards in this space often
+/// wire that line to the ASIC reset -- the classic auto-reset. On such a
+/// carrier, **opening the port resets the chain**, before a single byte is
+/// sent, and nothing in this function would say so.
+///
+/// Not a defect today, and deliberately not fixed today: guarding against it
+/// would mean modem-line handling with no hardware to test it against. It is
+/// written down because the symptom -- a chain that mysteriously restarts when
+/// the miner attaches -- is expensive to diagnose and trivial to recognise if
+/// you have read this once.
+///
+/// Exists because the alternative is remembering at four call sites. Set it to
+/// the empty string, or leave it unset, for an ordinary tty.
+///
+/// The RDS control board wants `0x300F,0x2001`: its driver picks the baud
+/// divisor by exact match on a private constant inside the control flags and
+/// otherwise falls through to a divisor five times too slow. Not defaulted on,
+/// because it is wrong for any carrier that presents a normal tty, and a
+/// silently-applied override is how the next person loses a day.
+pub fn open_with_platform_cflag(path: &str, baud_rate: u32) -> Result<SerialStream, SerialError> {
+    let mut config = SerialConfig {
+        baud_rate,
+        ..Default::default()
+    };
+    if let Ok(spec) = std::env::var("MUJINA_SERIAL_CFLAG") {
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            let parse = |t: &str| -> Option<u32> {
+                let t = t.trim();
+                t.strip_prefix("0x")
+                    .map(|h| u32::from_str_radix(h, 16))
+                    .unwrap_or_else(|| t.parse::<u32>())
+                    .ok()
+            };
+            match spec
+                .split_once(',')
+                .and_then(|(m, v)| Some((parse(m)?, parse(v)?)))
+            {
+                Some(pair) => {
+                    tracing::info!(
+                        mask = format!("{:#x}", pair.0),
+                        value = format!("{:#x}", pair.1),
+                        "Applying platform control-flag override to {path}"
+                    );
+                    config.platform_cflag = Some(pair);
+                }
+                None => {
+                    // Refuse rather than guess. A malformed override that is
+                    // silently ignored leaves the port misconfigured and the
+                    // operator believing otherwise, which is the exact failure
+                    // this setting exists to end.
+                    return Err(SerialError::ConfigError(format!(
+                        "MUJINA_SERIAL_CFLAG is {spec:?}; expected mask,value such as 0x300F,0x2001"
+                    )));
+                }
+            }
+        }
+    }
+    SerialStream::with_config(path, config)
 }
 
 /// Apply serial configuration to a file descriptor.
@@ -141,7 +274,7 @@ pub struct SerialControl {
 fn apply_serial_config<Fd: rustix::fd::AsFd>(
     fd: &Fd,
     config: &SerialConfig,
-) -> Result<(), SerialError> {
+) -> Result<u32, SerialError> {
     // Get current termios settings
     let mut termios = tcgetattr(fd)
         .map_err(|e| SerialError::ConfigError(format!("Failed to get termios: {}", e)))?;
@@ -196,11 +329,67 @@ fn apply_serial_config<Fd: rustix::fd::AsFd>(
         }
     }
 
+    // Platform override, applied last so it survives everything above.
+    //
+    // Measured on an RDS control board: the vendor kernel driver selects its
+    // baud divisor by an EXACT match on a private constant inside the control
+    // flags, with a fall-through of "divisor 10". The constant sits outside the
+    // standard speed field, so no portable API can set it. The vendor stack got
+    // divisor 2; we got divisor 10, and sampled a 5 Mbaud wire at 1 Mbaud from
+    // the first byte -- which is why every frame we read was garbage and why no
+    // amount of draining or resynchronising helped.
+    //
+    // Only the masked bits are touched. The vendor's other control flags come
+    // from an uninitialised stack frame and differ between its own runs, so
+    // copying them wholesale would be copying noise.
+    if let Some((mask, value)) = config.platform_cflag {
+        let raw = termios.control_modes.bits() & !mask | value;
+        termios.control_modes = ControlModes::from_bits_retain(raw);
+    }
+
     // Apply configuration
     tcsetattr(fd, rustix::termios::OptionalActions::Now, &termios)
         .map_err(|e| SerialError::ConfigError(format!("Failed to apply termios: {}", e)))?;
 
-    Ok(())
+    // Read back what the driver actually applied.
+    //
+    // A successful tcsetattr does not mean the request was honoured. POSIX
+    // lets a driver accept the call and substitute settings it prefers, so a
+    // driver that clamps, rounds or silently ignores a rate is
+    // indistinguishable from one that obeys it. That is the worst kind of
+    // failure: every measurement taken over the link afterwards is real, and
+    // explained by the wrong number.
+    //
+    // Found on hardware. A request for 5 Mbaud on a vendor 9-bit tty returned
+    // success and produced no observable configuration at the driver, and we
+    // had no way to tell because we never looked. Ask, then check.
+    let applied = tcgetattr(fd)
+        .map_err(|e| SerialError::ConfigError(format!("Failed to read back termios: {}", e)))?;
+    let speed = applied.output_speed();
+    if config.platform_cflag.is_some() {
+        // With an override in play the read-back proves nothing about the rate.
+        // `output_speed()` reads `c_ospeed`, and a driver that takes its rate
+        // from the control flags never writes that field -- so the value comes
+        // back exactly as we set it whatever the hardware is doing. That closed
+        // loop is precisely how a port running five times slow was recorded as
+        // verified. The rate is confirmed from the driver's own log, not here.
+        tracing::info!(
+            cflag = format!("{:#x}", applied.control_modes.bits()),
+            requested = config.baud_rate,
+            "Serial port configured with a platform control-flag override; the rate is NOT \
+             verifiable from userspace on such a driver and must be confirmed at the driver"
+        );
+    } else if speed != config.baud_rate {
+        tracing::warn!(
+            requested = config.baud_rate,
+            applied = speed,
+            "Serial driver did not apply the requested baud rate"
+        );
+    } else {
+        tracing::debug!(baud = speed, "Serial baud rate confirmed by read-back");
+    }
+
+    Ok(speed)
 }
 
 impl SerialStream {
@@ -239,20 +428,21 @@ impl SerialStream {
         .map_err(|e| SerialError::OpenError(e.into()))?;
 
         // Apply serial configuration
-        apply_serial_config(&fd, &config)?;
+        let applied_baud = apply_serial_config(&fd, &config)?;
 
-        // Convert OwnedFd to RawFd for AsyncFd
-        let raw_fd = fd.into_raw_fd();
-        let async_fd = AsyncFd::new(raw_fd).map_err(SerialError::IoError)?;
+        // KEEP OWNERSHIP. Handing AsyncFd a bare RawFd is what leaked every
+        // descriptor this transport ever opened: see `SerialInner::fd`.
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
                 fd: async_fd,
-                baud_rate: AtomicU32::new(config.baud_rate),
+                baud_rate: AtomicU32::new(applied_baud),
                 data_bits: AtomicU8::new(config.data_bits),
                 stop_bits: AtomicU8::new(config.stop_bits),
                 parity: AtomicU8::new(config.parity as u8),
                 reconfig_lock: RwLock::new(()),
+                platform_cflag: config.platform_cflag,
                 bytes_read: AtomicU64::new(0),
                 bytes_written: AtomicU64::new(0),
             }),
@@ -263,6 +453,20 @@ impl SerialStream {
     ///
     /// This allows concurrent reading and writing while maintaining the ability
     /// to reconfigure the port.
+    /// Split, installing a veto on everything this port will ever send.
+    ///
+    /// Separate from `split` so that guarding is a deliberate act with a
+    /// visible call site, rather than a default someone can forget to override
+    /// -- and so a reader of the call site can see that this port is guarded.
+    pub fn split_guarded(
+        self,
+        policy: Arc<dyn OutboundFramePolicy>,
+    ) -> (SerialReader, SerialWriter, SerialControl) {
+        let (r, mut w, c) = self.split();
+        w.policy = Some(policy);
+        (r, w, c)
+    }
+
     pub fn split(self) -> (SerialReader, SerialWriter, SerialControl) {
         (
             SerialReader {
@@ -270,6 +474,7 @@ impl SerialStream {
             },
             SerialWriter {
                 inner: self.inner.clone(),
+                policy: None,
             },
             SerialControl {
                 inner: self.inner.clone(),
@@ -286,7 +491,7 @@ impl SerialStream {
         let fd = unsafe { rustix::fd::OwnedFd::from_raw_fd(fd) };
 
         // Apply serial configuration
-        apply_serial_config(&fd, &config)?;
+        let applied_baud = apply_serial_config(&fd, &config)?;
 
         // Make the fd non-blocking
         use rustix::fs::{fcntl_getfl, fcntl_setfl};
@@ -295,16 +500,17 @@ impl SerialStream {
         fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
             .map_err(|e| SerialError::ConfigError(format!("Failed to set fd flags: {}", e)))?;
 
-        let async_fd = AsyncFd::new(fd.into_raw_fd()).map_err(SerialError::IoError)?;
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
                 fd: async_fd,
-                baud_rate: AtomicU32::new(config.baud_rate),
+                baud_rate: AtomicU32::new(applied_baud),
                 data_bits: AtomicU8::new(config.data_bits),
                 stop_bits: AtomicU8::new(config.stop_bits),
                 parity: AtomicU8::new(config.parity as u8),
                 reconfig_lock: RwLock::new(()),
+                platform_cflag: config.platform_cflag,
                 bytes_read: AtomicU64::new(0),
                 bytes_written: AtomicU64::new(0),
             }),
@@ -365,6 +571,16 @@ impl AsyncWrite for SerialWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(policy) = self.policy.as_ref()
+            && let Err(reason) = policy.allow(buf)
+        {
+            tracing::warn!(
+                bytes = buf.len(),
+                %reason,
+                "outbound frame REFUSED by policy; nothing was written"
+            );
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::PermissionDenied, reason)));
+        }
         loop {
             let mut guard = ready!(self.inner.fd.poll_write_ready(cx))?;
 
@@ -458,12 +674,49 @@ impl SerialControl {
             .set_speed(baud_rate)
             .map_err(|e| SerialError::ConfigError(format!("Failed to set baud rate: {}", e)))?;
 
+        // Re-apply the carrier's override LAST, exactly as at open. `set_speed`
+        // rewrites the control-flag bits the override exists to control, so
+        // without this the port silently reverts to the driver's fall-through
+        // on the next rate change -- measured on an RDS 2.0, 31 ms after a
+        // correct open.
+        if let Some((mask, value)) = self.inner.platform_cflag {
+            let raw = termios.control_modes.bits() & !mask | value;
+            termios.control_modes = ControlModes::from_bits_retain(raw);
+        }
+
         // Apply changes after output buffer drains (critical for baud rate changes)
         tcsetattr(fd_ref, rustix::termios::OptionalActions::Drain, &termios)
             .map_err(|e| SerialError::ConfigError(format!("Failed to apply termios: {}", e)))?;
 
-        // Update atomic with release ordering to ensure termios changes are visible
-        self.inner.baud_rate.store(baud_rate, Ordering::Release);
+        // Read back, for the same reason as at open: a successful tcsetattr
+        // does not mean the driver took the rate we asked for. This path is
+        // the one chips use to switch rate mid-session, where a silently
+        // ignored change turns every subsequent byte into garbage that looks
+        // like a protocol fault rather than a configuration one.
+        let applied = tcgetattr(fd_ref)
+            .map_err(|e| SerialError::ConfigError(format!("Failed to read back termios: {}", e)))?;
+        let speed = applied.output_speed();
+        if self.inner.platform_cflag.is_some() {
+            // The read-back proves nothing on such a carrier: the driver picks
+            // its rate from control-flag bits and never writes back through the
+            // field this reads, so it returns our own request. Say so rather
+            // than print a comparison that can only agree with itself.
+            tracing::debug!(
+                requested = baud_rate,
+                "Baud rate re-applied under a platform control-flag override; not verifiable from userspace, confirm at the driver"
+            );
+        } else if speed != baud_rate {
+            tracing::warn!(
+                requested = baud_rate,
+                applied = speed,
+                "Serial driver did not apply the requested baud rate"
+            );
+        }
+
+        // Store what the port IS, not what was asked for. Everything that
+        // reads this back -- statistics, diagnostics, a later comparison --
+        // should see the truth, and there should be one copy of it.
+        self.inner.baud_rate.store(speed, Ordering::Release);
 
         Ok(())
     }
@@ -500,6 +753,7 @@ impl SerialControl {
             data_bits: self.current_data_bits(),
             stop_bits: self.current_stop_bits(),
             parity: self.current_parity(),
+            platform_cflag: None,
         }
     }
 
@@ -525,6 +779,67 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// A DROPPED STREAM MUST CLOSE ITS DESCRIPTOR.
+    ///
+    /// It did not. The fd was handed to `AsyncFd` as a bare `RawFd`, which is
+    /// an integer with no `Drop`, so every stream this transport ever dropped
+    /// leaked its descriptor until process exit. On the RDS chain ports the
+    /// vendor driver refuses a second opener while its counter is raised, so a
+    /// port opened, dropped and reopened failed with EBUSY and the board never
+    /// attached -- measured from the driver's own open/close log, where the
+    /// dropped stream's close appeared only when the process was killed.
+    #[tokio::test]
+    async fn dropping_a_stream_closes_its_descriptor() {
+        use nix::pty::openpty;
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+        use rustix::io::Errno;
+        use std::os::unix::io::FromRawFd;
+
+        // Observed from the FAR side of the pty, not by probing the descriptor
+        // number. The first form of this test asked whether the number was
+        // still open, and failed under the full suite: another test thread
+        // reused the freed number before it looked. A closed master is visible
+        // on the slave as a hangup, and nothing another thread opens can fake
+        // that.
+        fn slave_read(slave: &OwnedFd) -> Result<usize, Errno> {
+            let flags = fcntl_getfl(slave).unwrap();
+            fcntl_setfl(slave, flags | OFlags::NONBLOCK).unwrap();
+            rustix::io::read(slave, &mut [0u8; 1])
+        }
+
+        // CONTROL: a master deliberately left open. The check below means
+        // something only if it can tell this apart from a close.
+        let leaked = openpty(None, None).unwrap();
+        let leaked_master: RawFd = leaked.master.into_raw_fd();
+        assert_eq!(
+            slave_read(&leaked.slave),
+            Err(Errno::AGAIN),
+            "a live master"
+        );
+
+        let pty = openpty(None, None).unwrap();
+        let stream =
+            SerialStream::from_fd(pty.master.into_raw_fd(), SerialConfig::default()).unwrap();
+        assert_eq!(
+            slave_read(&pty.slave),
+            Err(Errno::AGAIN),
+            "open while the stream holds it"
+        );
+        drop(stream);
+        let after = slave_read(&pty.slave);
+        assert_ne!(
+            after,
+            Err(Errno::AGAIN),
+            "the master outlived its stream: the slave still sees a live master"
+        );
+        assert!(
+            matches!(after, Err(Errno::IO) | Ok(0)),
+            "a hung-up slave reads EIO or end-of-file, got {after:?}"
+        );
+
+        drop(unsafe { OwnedFd::from_raw_fd(leaked_master) });
+    }
+
     #[test]
     fn test_apply_serial_config_validation() {
         use nix::pty::openpty;
@@ -546,6 +861,7 @@ mod tests {
                 data_bits: 7,
                 stop_bits: 2,
                 parity: Parity::Even,
+                platform_cflag: None,
             };
             let result = apply_serial_config(&pty.master, &config);
             assert!(result.is_ok(), "Custom valid config should work");
@@ -891,6 +1207,7 @@ mod tests {
             data_bits: 7,
             stop_bits: 2,
             parity: Parity::Even,
+            platform_cflag: None,
         };
         assert_eq!(config.data_bits, 7);
         assert_eq!(config.stop_bits, 2);
@@ -1003,5 +1320,41 @@ mod tests {
             .unwrap_or(0);
         // We should have read something, but not the full 1MB
         assert!(bytes_read < 1_000_000);
+    }
+
+    /// The override must survive a later reconfiguration, not only the open.
+    /// It did not, once: the port came up correctly and a `set_baud_rate` 31 ms
+    /// later put it back on the driver's fall-through divisor, because the
+    /// portable setter rewrites the very bits the override controls. Measured
+    /// on an RDS 2.0 before this test existed.
+    #[tokio::test]
+    #[cfg_attr(
+        feature = "skip-pty-tests",
+        ignore = "PTY-based test, skipped in this environment"
+    )]
+    async fn platform_cflag_survives_a_later_baud_change() {
+        use nix::pty::openpty;
+        let Ok(pty) = openpty(None, None) else { return };
+        let master_fd = pty.master.into_raw_fd();
+        let config = SerialConfig {
+            baud_rate: 5_000_000,
+            platform_cflag: Some((0x300F, 0x2001)),
+            ..Default::default()
+        };
+        let stream = SerialStream::from_fd(master_fd, config).unwrap();
+        let (_r, _w, control) = stream.split();
+
+        let masked = || {
+            let fd = unsafe { BorrowedFd::borrow_raw(master_fd) };
+            tcgetattr(fd).unwrap().control_modes.bits() & 0x300F
+        };
+        assert_eq!(masked(), 0x2001, "override not applied at open");
+
+        control.set_baud_rate(5_000_000).unwrap();
+        assert_eq!(
+            masked(),
+            0x2001,
+            "a baud change cleared the platform override"
+        );
     }
 }

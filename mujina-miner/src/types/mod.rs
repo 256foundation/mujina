@@ -7,9 +7,11 @@
 mod bitcoin_impls;
 mod debounced_alarm;
 mod difficulty;
+mod efficiency;
 mod frequency;
 mod hash_rate;
 mod hashrate_estimator;
+mod log_budget;
 mod ratio;
 mod share_rate;
 mod temperature;
@@ -22,9 +24,14 @@ pub use bitcoin::block::Header as BlockHeader;
 pub use bitcoin::{Amount, BlockHash, Network, Target, Transaction, TxOut, Work};
 pub use debounced_alarm::{AlarmStatus, DebouncedAlarm};
 pub use difficulty::Difficulty;
+pub use efficiency::{
+    DomainEfficiency, EFFICIENCY_WINDOWS, Efficiency, EfficiencyHistory, EfficiencySample,
+    EfficiencyTracker, PowerDomain, PowerProvenance, PowerReading,
+};
 pub use frequency::Frequency;
 pub use hash_rate::HashRate;
 pub use hashrate_estimator::HashrateEstimator;
+pub use log_budget::{LogBudget, LogVerdict};
 pub use ratio::Ratio;
 pub use share_rate::ShareRate;
 pub use temperature::Temperature;
