@@ -497,7 +497,9 @@ impl Scheduler {
             return;
         };
 
-        for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
+        let (assigned_threads, excess_threads) = eligible.split_at(usable_count);
+
+        for (&thread_id, en2_range) in assigned_threads.iter().zip(en2_slices) {
             let starting_en2 = en2_range.iter().next();
             let entry = self
                 .threads
@@ -537,6 +539,27 @@ impl Scheduler {
                     thread_id,
                 });
                 share_channels.insert(task_id, ReceiverStream::new(share_rx));
+            }
+        }
+
+        if matches!(mode, AssignMode::Replace) {
+            for &thread_id in excess_threads {
+                let Some(entry) = self.threads.get_mut(thread_id) else {
+                    error!(
+                        source = %source_name,
+                        thread_id = ?thread_id,
+                        "Eligible thread missing when idling excess thread"
+                    );
+                    continue;
+                };
+                if let Err(e) = entry.thread.go_idle().await {
+                    error!(
+                        source = %source_name,
+                        thread = %entry.thread.name(),
+                        error = %e,
+                        "Failed to idle excess thread"
+                    );
+                }
             }
         }
     }
@@ -1566,5 +1589,237 @@ mod tests {
             assert_eq!(range.min, i as u64);
             assert_eq!(range.max, i as u64);
         }
+    }
+
+    fn make_test_job_with_range(
+        id: &str,
+        en2_range: crate::job_source::Extranonce2Range,
+    ) -> JobTemplate {
+        let mut job = make_test_job(en2_range.size);
+        job.id = id.into();
+        match &mut job.merkle_root {
+            MerkleRootKind::Computed(template) => {
+                template.extranonce2_range = en2_range;
+            }
+            MerkleRootKind::Fixed(_) => unreachable!(),
+        }
+        job
+    }
+
+    fn setup_scheduler_with_cpu_threads(
+        thread_count: usize,
+    ) -> (Scheduler, SourceId, ShareStream, Vec<ThreadId>) {
+        use crate::cpu_miner::CpuHashThread;
+
+        let mut scheduler = Scheduler::new();
+        let share_channels = ShareStream::new();
+
+        let thread_ids: Vec<ThreadId> = (0..thread_count)
+            .map(|i| {
+                scheduler.threads.insert(ThreadEntry {
+                    thread: Box::new(CpuHashThread::new(format!("cpu-{i}"), 100)),
+                    hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+                    expected: Some(HashRate::from_megahashes(1.0)),
+                })
+            })
+            .collect();
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let source_id = scheduler.sources.insert(SourceEntry {
+            name: "test".into(),
+            url: None,
+            command_tx,
+            last_job: None,
+            difficulty_alarm: DebouncedAlarm::new(HIGH_DIFFICULTY_DEBOUNCE),
+        });
+
+        (scheduler, source_id, share_channels, thread_ids)
+    }
+
+    #[tokio::test]
+    async fn replace_job_excess_threads_transition_to_idle() {
+        use crate::job_source::Extranonce2Range;
+
+        let (mut scheduler, source_id, mut share_channels, thread_ids) =
+            setup_scheduler_with_cpu_threads(3);
+
+        // 1. Initial job where all 3 threads receive work
+        let job_a = make_test_job(1);
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_a, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 3);
+        for &id in &thread_ids {
+            assert!(
+                scheduler.threads[id].thread.status().is_active,
+                "all threads should be active on initial job"
+            );
+        }
+
+        // 2. Replacement job with EN2 capacity for only 2 threads
+        let job_b =
+            make_test_job_with_range("job-2", Extranonce2Range::new_range(0, 1, 1).unwrap());
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_b, &mut share_channels)
+            .await;
+
+        // Verify all 3 properties for excess thread:
+        // 1. scheduler TaskEntry removed
+        assert_eq!(scheduler.tasks.len(), 2);
+        assert!(
+            !scheduler
+                .tasks
+                .values()
+                .any(|t| t.thread_id == thread_ids[2]),
+            "excess thread must not have an active task in scheduler bookkeeping"
+        );
+        assert!(scheduler.threads[thread_ids[0]].thread.status().is_active);
+        assert!(scheduler.threads[thread_ids[1]].thread.status().is_active);
+
+        // 2. HashThread is_active == false
+        let excess_entry = scheduler.threads.get_mut(thread_ids[2]).unwrap();
+        assert!(
+            !excess_entry.thread.status().is_active,
+            "excess thread must be marked inactive"
+        );
+
+        // 3. old HashTask is no longer running
+        let stale_task = excess_entry.thread.go_idle().await.unwrap();
+        assert!(
+            stale_task.is_none(),
+            "excess thread must not retain old task"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_job_several_excess_threads_transition_to_idle() {
+        use crate::job_source::Extranonce2Range;
+
+        let (mut scheduler, source_id, mut share_channels, thread_ids) =
+            setup_scheduler_with_cpu_threads(5);
+
+        // Initial job assigns to all 5 threads
+        let job_a = make_test_job(1);
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_a, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 5);
+
+        // Replacement job only supports 2 threads (leaving 3 excess threads)
+        let job_b =
+            make_test_job_with_range("job-2", Extranonce2Range::new_range(0, 1, 1).unwrap());
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_b, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 2);
+        assert!(scheduler.threads[thread_ids[0]].thread.status().is_active);
+        assert!(scheduler.threads[thread_ids[1]].thread.status().is_active);
+
+        for &id in &thread_ids[2..] {
+            // 1. scheduler TaskEntry removed
+            assert!(
+                !scheduler.tasks.values().any(|t| t.thread_id == id),
+                "excess thread must not have an active task in scheduler bookkeeping"
+            );
+
+            // 2. HashThread is_active == false
+            let entry = scheduler.threads.get_mut(id).unwrap();
+            assert!(
+                !entry.thread.status().is_active,
+                "excess thread must be marked inactive"
+            );
+
+            // 3. old HashTask is no longer running
+            let stale_task = entry.thread.go_idle().await.unwrap();
+            assert!(
+                stale_task.is_none(),
+                "excess thread must not retain old task"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_job_transition_smaller_to_larger_capacity() {
+        use crate::job_source::Extranonce2Range;
+
+        let (mut scheduler, source_id, mut share_channels, thread_ids) =
+            setup_scheduler_with_cpu_threads(3);
+
+        // Job 1 only supports 2 threads (thread 2 remains idle)
+        let job_1 =
+            make_test_job_with_range("job-1", Extranonce2Range::new_range(0, 1, 1).unwrap());
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_1, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 2);
+        assert!(scheduler.threads[thread_ids[0]].thread.status().is_active);
+        assert!(scheduler.threads[thread_ids[1]].thread.status().is_active);
+        assert!(!scheduler.threads[thread_ids[2]].thread.status().is_active);
+
+        // Job 2 has full 1-byte capacity (256 values), so all 3 threads get work
+        let job_2 = make_test_job(1);
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_2, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 3);
+        for &id in &thread_ids {
+            assert!(
+                scheduler.threads[id].thread.status().is_active,
+                "all threads should be active after expanding capacity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_job_excess_threads_retain_existing_work() {
+        use crate::job_source::Extranonce2Range;
+
+        let (mut scheduler, source_id, mut share_channels, thread_ids) =
+            setup_scheduler_with_cpu_threads(3);
+
+        // Initial job where all 3 threads receive work
+        let job_a = make_test_job(1);
+        scheduler
+            .assign_job_to_threads(AssignMode::Replace, source_id, job_a, &mut share_channels)
+            .await;
+
+        assert_eq!(scheduler.tasks.len(), 3);
+
+        // UpdateJob with EN2 capacity of only 2 threads
+        let job_b =
+            make_test_job_with_range("job-update", Extranonce2Range::new_range(0, 1, 1).unwrap());
+        scheduler
+            .assign_job_to_threads(AssignMode::Update, source_id, job_b, &mut share_channels)
+            .await;
+
+        // In Update mode, old tasks are not invalidated, so all 3 tasks remain
+        assert_eq!(scheduler.tasks.len(), 5); // 3 from initial job + 2 updated
+
+        // Threads 0 and 1 are active with the new task
+        assert!(scheduler.threads[thread_ids[0]].thread.status().is_active);
+        assert!(scheduler.threads[thread_ids[1]].thread.status().is_active);
+
+        // Thread 2 was excess for the update, but in Update mode it must retain its
+        // existing work and NOT be idled!
+        let thread_2 = &mut scheduler.threads.get_mut(thread_ids[2]).unwrap().thread;
+        assert!(
+            thread_2.status().is_active,
+            "excess thread in Update mode must remain active on its existing work"
+        );
+        let retained_task = thread_2.go_idle().await.unwrap();
+        assert!(
+            retained_task.is_some(),
+            "excess thread in Update mode should have retained its existing task"
+        );
+        assert_eq!(
+            retained_task.unwrap().template.id,
+            "job-1",
+            "retained task must be the original job"
+        );
     }
 }
