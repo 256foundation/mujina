@@ -20,6 +20,7 @@ use super::{
     v0,
 };
 use crate::api_client::types::MinerTelemetry;
+use crate::config::Config;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub(crate) struct SharedState {
     pub miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     pub board_registry: Arc<Mutex<BoardRegistry>>,
     pub scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    pub config: Arc<Config>,
 }
 
 impl SharedState {
@@ -65,6 +67,7 @@ pub async fn serve(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     mut board_reg_rx: mpsc::Receiver<BoardRegistration>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    config_tree: Config,
 ) -> Result<()> {
     let board_registry = Arc::new(Mutex::new(BoardRegistry::new()));
 
@@ -79,7 +82,12 @@ pub async fn serve(
         }
     });
 
-    let app = build_router(miner_telemetry_rx, board_registry, scheduler_cmd_tx);
+    let app = build_router(
+        miner_telemetry_rx,
+        board_registry,
+        scheduler_cmd_tx,
+        Arc::new(config_tree),
+    );
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     let actual_addr = listener.local_addr()?;
@@ -110,11 +118,13 @@ pub(crate) fn build_router(
     miner_telemetry_rx: watch::Receiver<MinerTelemetry>,
     board_registry: Arc<Mutex<BoardRegistry>>,
     scheduler_cmd_tx: mpsc::Sender<SchedulerCommand>,
+    config: Arc<Config>,
 ) -> Router {
     let state = SharedState {
         miner_telemetry_rx,
         board_registry,
         scheduler_cmd_tx,
+        config,
     };
 
     let (router, api) = OpenApiRouter::new()
@@ -143,6 +153,8 @@ mod tests {
     use crate::api::commands::SchedulerCommand;
     use crate::api::registry::BoardRegistration;
     use crate::api_client::types::{BoardTelemetry, SourceTelemetry};
+    use crate::config::{SourceConfig, SourceKind};
+    use crate::stratum_v1::StratumV1PoolConfig;
 
     /// Test fixtures returned by the router builder.
     struct TestFixtures {
@@ -158,6 +170,7 @@ mod tests {
     fn build_test_router(
         miner_state: MinerTelemetry,
         board_states: Vec<BoardTelemetry>,
+        config: Config,
     ) -> TestFixtures {
         let (miner_tx, miner_rx) = watch::channel(miner_state);
         let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(16);
@@ -171,7 +184,12 @@ mod tests {
         }
 
         TestFixtures {
-            router: build_router(miner_rx, Arc::new(Mutex::new(registry)), cmd_tx),
+            router: build_router(
+                miner_rx,
+                Arc::new(Mutex::new(registry)),
+                cmd_tx,
+                Arc::new(config),
+            ),
             _board_senders: board_senders,
             _miner_tx: miner_tx,
             _cmd_rx: cmd_rx,
@@ -191,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_ok() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], Config::default());
         let (status, body) = get(fixtures.router.clone(), "/api/v0/health").await;
         assert_eq!(status, 200);
         assert_eq!(body, "OK");
@@ -215,7 +233,7 @@ mod tests {
             model: "TestModel".into(),
             ..Default::default()
         };
-        let fixtures = build_test_router(miner_state, vec![board]);
+        let fixtures = build_test_router(miner_state, vec![board], Config::default());
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/miner").await;
         assert_eq!(status, 200);
@@ -244,7 +262,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let fixtures = build_test_router(MinerTelemetry::default(), boards);
+        let fixtures = build_test_router(MinerTelemetry::default(), boards, Config::default());
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards").await;
         assert_eq!(status, 200);
@@ -263,7 +281,7 @@ mod tests {
             serial: Some("abc123".into()),
             ..Default::default()
         };
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![board]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![board], Config::default());
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/boards/bitaxe-abc123").await;
         assert_eq!(status, 200);
@@ -275,90 +293,107 @@ mod tests {
 
     #[tokio::test]
     async fn board_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], Config::default());
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/boards/nonexistent").await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
-    async fn sources_returns_list() {
-        let miner_state = MinerTelemetry {
-            sources: vec![
-                SourceTelemetry {
-                    name: "pool-a".into(),
-                    url: Some("stratum+tcp://a:3333".into()),
+    async fn config_returns_configured_sources() {
+        let config = Config {
+            sources: vec![SourceConfig {
+                name: "a".into(),
+                kind: SourceKind::StratumV1(StratumV1PoolConfig {
+                    url: "stratum+tcp://pool.example:3333".into(),
+                    username: "alice.worker1".into(),
+                    password: Some("hunter2".into()),
                     ..Default::default()
-                },
-                SourceTelemetry {
-                    name: "pool-b".into(),
-                    url: None,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
+                }),
+            }],
         };
-        let fixtures = build_test_router(miner_state, vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], config);
+
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/config").await;
+        assert_eq!(status, 200);
+
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["sources"][0]["name"], "a");
+        assert_eq!(json["sources"][0]["kind"], "stratum_v1");
+        assert_eq!(json["sources"][0]["url"], "stratum+tcp://pool.example:3333");
+        assert_eq!(json["sources"][0]["username"], "alice.worker1");
+        assert_eq!(json["sources"][0]["password"], "hunter2");
+    }
+
+    #[tokio::test]
+    async fn sources_returns_configured_sources() {
+        let config = Config {
+            sources: vec![SourceConfig {
+                name: "a".into(),
+                kind: SourceKind::StratumV1(StratumV1PoolConfig {
+                    url: "stratum+tcp://pool.example:3333".into(),
+                    username: "alice.worker1".into(),
+                    password: None,
+                    ..Default::default()
+                }),
+            }],
+        };
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], config);
 
         let (status, body) = get(fixtures.router.clone(), "/api/v0/sources").await;
         assert_eq!(status, 200);
 
-        let sources: Vec<SourceTelemetry> = serde_json::from_str(&body).unwrap();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].name, "pool-a");
-        assert_eq!(sources[0].url.as_deref(), Some("stratum+tcp://a:3333"));
-        assert_eq!(sources[1].name, "pool-b");
-        assert_eq!(sources[1].url, None);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let sources = json.as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["name"], "a");
+        assert_eq!(sources[0]["kind"], "stratum_v1");
+        assert_eq!(sources[0]["url"], "stratum+tcp://pool.example:3333");
+        assert_eq!(sources[0]["username"], "alice.worker1");
+        assert!(sources[0]["password"].is_null());
+    }
+
+    #[tokio::test]
+    async fn sources_returns_empty_when_no_pools_configured() {
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], Config::default());
+
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/sources").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "[]");
     }
 
     #[tokio::test]
     async fn source_by_name_returns_match() {
-        let miner_state = MinerTelemetry {
-            sources: vec![SourceTelemetry {
-                name: "my-pool".into(),
-                url: Some("stratum+tcp://pool:3333".into()),
-                ..Default::default()
+        let config = Config {
+            sources: vec![SourceConfig {
+                name: "a".into(),
+                kind: SourceKind::StratumV1(StratumV1PoolConfig {
+                    url: "stratum+tcp://pool.example:3333".into(),
+                    username: "alice.worker1".into(),
+                    password: None,
+                    ..Default::default()
+                }),
             }],
-            ..Default::default()
         };
-        let fixtures = build_test_router(miner_state, vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], config);
 
-        let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/my-pool").await;
+        let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/a").await;
         assert_eq!(status, 200);
 
-        let source: SourceTelemetry = serde_json::from_str(&body).unwrap();
-        assert_eq!(source.name, "my-pool");
-        assert_eq!(source.url.as_deref(), Some("stratum+tcp://pool:3333"));
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["name"], "a");
+        assert_eq!(json["url"], "stratum+tcp://pool.example:3333");
     }
 
     #[tokio::test]
     async fn source_by_name_returns_404_when_missing() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], Config::default());
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/sources/nonexistent").await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
-    async fn source_difficulty_serializes_as_f64() {
-        let miner_state = MinerTelemetry {
-            sources: vec![SourceTelemetry {
-                name: "pool".into(),
-                difficulty: Some(2048.5),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let fixtures = build_test_router(miner_state, vec![]);
-
-        let (status, body) = get(fixtures.router.clone(), "/api/v0/sources/pool").await;
-        assert_eq!(status, 200);
-
-        let source: SourceTelemetry = serde_json::from_str(&body).unwrap();
-        assert_eq!(source.difficulty, Some(2048.5));
-    }
-
-    #[tokio::test]
     async fn unknown_route_returns_404() {
-        let fixtures = build_test_router(MinerTelemetry::default(), vec![]);
+        let fixtures = build_test_router(MinerTelemetry::default(), vec![], Config::default());
         let (status, _body) = get(fixtures.router.clone(), "/api/v0/nope").await;
         assert_eq!(status, 404);
     }

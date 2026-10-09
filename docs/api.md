@@ -69,9 +69,9 @@ Percentage fields (`percent`, `target_percent`) are integers
 
 ### Naming
 
-Boards and sources are identified by a URL-friendly `name` field
-(e.g. `bitaxe-e2f56f9b`). These names appear in URL paths for
-single-resource endpoints like `/api/v0/boards/{name}`.
+Boards and sources are identified by a URL-friendly `name`
+field (e.g. `bitaxe-e2f56f9b`). These names appear in URL paths
+for single-resource endpoints like `/api/v0/boards/{name}`.
 
 ## Endpoints
 
@@ -92,12 +92,38 @@ table is a summary and may not be exhaustive.
 | GET    | `/boards`         | List connected boards |
 | GET    | `/boards/{name}`  | Single board detail   |
 
+### Config
+
+| Method | Path      | Description             |
+|--------|-----------|--------------------------|
+| GET    | `/config` | Full configuration tree |
+
+Includes each pool's password in plaintext -- there is no
+redaction. The API has no authentication, so anyone who can
+reach it can read it.
+
 ### Sources
 
-| Method | Path              | Description          |
-|--------|-------------------|----------------------|
-| GET    | `/sources`        | List job sources     |
-| GET    | `/sources/{name}` | Single source detail |
+| Method | Path              | Description                  |
+|--------|-------------------|-------------------------------|
+| GET    | `/sources`        | List configured job sources  |
+| GET    | `/sources/{name}` | Single source detail         |
+
+Same data as the `sources` field of `/config`, addressable by
+`name`. Each entry carries a `kind` field identifying what kind
+of source it is; `"stratum_v1"` is the only kind today, with
+fields matching a Stratum pool (`url`, `username`, `password`).
+"Source" is the term the rest of the codebase already uses for
+this concept, and it covers more than pool connections -- the
+dummy source used when none is configured, and, over time,
+other protocols (Stratum v2 and beyond). `kind` exists so a
+client can tell sources apart, and so adding a source kind
+later is additive rather than a breaking change to this
+endpoint.
+
+A source's `name` is assigned automatically today (`a`, `b`,
+`c`, ... by position) since there's no way to name one
+explicitly yet.
 
 ### Health
 
@@ -109,8 +135,15 @@ All paths are relative to `/api/v0`.
 
 ## Types
 
-The request and response types are defined in Rust in the
+Most request and response types are defined in Rust in the
 `api_client::types` module
 (`mujina-miner/src/api_client/types.rs`). These types are the
 shared contract between the server and its clients (CLI, TUI).
 The OpenAPI schema is derived from them automatically.
+
+`/config` and `/sources` are the exception: they serialize
+`config::Config`, `config::SourceConfig`
+(`mujina-miner/src/config.rs`), and
+`stratum_v1::StratumV1PoolConfig`
+(`mujina-miner/src/stratum_v1/client.rs`) directly, rather than a
+separate view type.

@@ -21,10 +21,10 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use stratum_v1::{StratumV1Client, ClientEvent, PoolConfig};
+//! use stratum_v1::{StratumV1Client, ClientEvent, StratumV1PoolConfig};
 //!
 //! let (event_tx, mut event_rx) = mpsc::channel(100);
-//! let config = PoolConfig {
+//! let config = StratumV1PoolConfig {
 //!     url: "stratum+tcp://pool.example.com:3333".to_string(),
 //!     username: "worker".to_string(),
 //!     password: "x".to_string(),
@@ -47,7 +47,7 @@ mod connection;
 mod error;
 mod messages;
 
-pub use client::{PoolConfig, StratumV1Client};
+pub use client::{StratumV1Client, StratumV1PoolConfig};
 pub use connection::{Connector, TcpConnector, Transport};
 #[cfg(test)]
 pub(crate) use connection::{MockConnector, MockTransport, MockTransportHandle};
