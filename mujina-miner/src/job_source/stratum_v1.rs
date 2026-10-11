@@ -779,10 +779,10 @@ mod tests {
     /// Helper to convert extranonce bytes to Extranonce type.
     fn extranonce_from_bytes(bytes: &[u8]) -> Extranonce {
         let size = bytes.len() as u8;
-        // Pad to 8 bytes for u64 conversion (little-endian)
+        // Pad to 8 bytes for u64 conversion (big-endian)
         let mut padded = [0u8; 8];
-        padded[..bytes.len()].copy_from_slice(bytes);
-        let value = u64::from_le_bytes(padded);
+        padded[8 - bytes.len()..].copy_from_slice(bytes);
+        let value = u64::from_be_bytes(padded);
         Extranonce::new(value, size).unwrap()
     }
 

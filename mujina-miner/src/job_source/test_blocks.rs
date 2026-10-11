@@ -202,7 +202,7 @@ pub mod block_881423 {
     /// Extranonce as an `Extranonce`.
     pub static EXTRANONCE: LazyLock<Extranonce> = LazyLock::new(|| {
         let bytes = extranonce_bytes();
-        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+        let value = u32::from_be_bytes(bytes.try_into().unwrap());
         Extranonce::new(value as u64, bytes.len() as u8).unwrap()
     });
 

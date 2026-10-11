@@ -39,7 +39,9 @@ pub enum ExtranonceError {
 ///
 /// This is an immutable value type representing a single extranonce that will be
 /// serialized into a coinbase transaction or stored in a share. The value is stored
-/// as a u64 but serializes to the specified number of bytes (1-8).
+/// as a u64 but serializes to the specified number of bytes (1-8), most significant
+/// byte first. Successive values then differ in their last bytes on the wire, and
+/// splitting a range fixes the leading bytes, as Stratum V2 subdivides an extranonce.
 ///
 /// Use `ExtranonceRange::iter()` to generate sequences of these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,16 +87,19 @@ impl Extranonce {
         }
     }
 
-    /// Extend a vector with the serialized bytes of this extranonce.
+    /// Appends the serialized bytes of this extranonce to a vector.
     pub fn extend_vec(&self, vec: &mut Vec<u8>) {
-        vec.extend_from_slice(&self.value.to_le_bytes()[..self.size as usize]);
+        let bytes = self.value.to_be_bytes();
+        vec.extend_from_slice(&bytes[8 - self.size as usize..]);
     }
 }
 
 impl From<Extranonce> for Vec<u8> {
-    /// Convert to little-endian bytes for inclusion in coinbase transaction.
+    /// Converts to the bytes that go into the coinbase transaction.
     fn from(ext: Extranonce) -> Vec<u8> {
-        ext.value.to_le_bytes()[..ext.size as usize].to_vec()
+        let mut vec = Vec::with_capacity(ext.size as usize);
+        ext.extend_vec(&mut vec);
+        vec
     }
 }
 
@@ -300,7 +305,7 @@ mod tests {
         assert_eq!(Vec::<u8>::from(ext), vec![0, 0, 0, 0]);
 
         let ext = Extranonce::new(0x1234, 4).unwrap();
-        assert_eq!(Vec::<u8>::from(ext), vec![0x34, 0x12, 0, 0]); // Little-endian
+        assert_eq!(Vec::<u8>::from(ext), vec![0, 0, 0x12, 0x34]); // Big-endian
 
         let ext = Extranonce::new(0xab, 1).unwrap();
         assert_eq!(Vec::<u8>::from(ext), vec![0xab]);
@@ -364,6 +369,27 @@ mod tests {
         assert_eq!(splits[0].len(), 4);
         assert_eq!(splits[1].len(), 3);
         assert_eq!(splits[2].len(), 3);
+    }
+
+    #[test]
+    fn test_split_fixes_leading_bytes() {
+        let range = ExtranonceRange::new(4).unwrap();
+        let splits = range.split(4).unwrap();
+
+        // Each part's values share their first byte, the way a Stratum V2
+        // upstream gives each downstream a longer prefix.
+        for (i, part) in splits.iter().enumerate() {
+            let first = Vec::<u8>::from(part.iter().next().unwrap());
+            assert_eq!(first, vec![(i as u8) << 6, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn test_iter_rolls_trailing_bytes() {
+        let range = ExtranonceRange::new(4).unwrap();
+        let bytes: Vec<Vec<u8>> = range.iter().skip(255).take(2).map(Vec::from).collect();
+
+        assert_eq!(bytes, vec![vec![0, 0, 0, 0xff], vec![0, 0, 1, 0]]);
     }
 
     // ExtranonceIter tests
