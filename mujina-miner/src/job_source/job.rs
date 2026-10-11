@@ -4,12 +4,12 @@ use bitcoin::block::Version;
 use bitcoin::hash_types::BlockHash;
 use bitcoin::pow::{CompactTarget, Target};
 
-use super::{Extranonce2, MerkleRootKind, VersionTemplate};
+use super::{Extranonce, MerkleRootKind, VersionTemplate};
 
 /// Template for mining jobs from any source.
 ///
 /// A job template contains all the information needed to generate block headers
-/// for mining. It includes templates for version rolling, extranonce2 rolling,
+/// for mining. It includes templates for version rolling, extranonce rolling,
 /// and merkle root computation. The scheduler uses this template to generate
 /// many `HeaderTemplate` instances for distribution to hardware.
 ///
@@ -50,16 +50,16 @@ impl JobTemplate {
         Target::from(self.bits)
     }
 
-    /// Compute merkle root for the given extranonce2.
+    /// Compute merkle root for the given extranonce.
     ///
     /// Returns an error if this is a fixed merkle root (header-only job)
     /// or if merkle computation fails.
     pub fn compute_merkle_root(
         &self,
-        en2: &Extranonce2,
+        extranonce: &Extranonce,
     ) -> anyhow::Result<bitcoin::hash_types::TxMerkleNode> {
         match &self.merkle_root {
-            MerkleRootKind::Computed(template) => template.compute_merkle_root(en2),
+            MerkleRootKind::Computed(template) => template.compute_merkle_root(extranonce),
             MerkleRootKind::Fixed(_) => {
                 anyhow::bail!("Cannot compute merkle root for header-only job")
             }
@@ -82,6 +82,6 @@ pub struct Share {
     /// Version bits
     pub version: Version,
 
-    /// Extranonce2
-    pub extranonce2: Option<Extranonce2>,
+    /// Extranonce
+    pub extranonce: Option<Extranonce>,
 }

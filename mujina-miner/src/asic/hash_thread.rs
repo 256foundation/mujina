@@ -36,7 +36,7 @@ use bitcoin::block::Version;
 use bitcoin::pow::Target;
 use tokio::sync::mpsc;
 
-use crate::job_source::{Extranonce2, Extranonce2Range, JobTemplate};
+use crate::job_source::{Extranonce, ExtranonceRange, JobTemplate};
 use crate::types::HashRate;
 use bitcoin::pow::Work;
 
@@ -51,7 +51,7 @@ pub struct HashThreadCapabilities {
     // pub version_roll_bits: u32,
     // pub can_roll_ntime: bool,
     // pub ntime_range: Option<std::ops::Range<u32>>,
-    // pub can_iterate_extranonce2: bool,
+    // pub can_iterate_extranonce: bool,
 }
 
 /// Current runtime status of a HashThread.
@@ -95,8 +95,8 @@ pub enum HashThreadEvent {
 
     /// Work completely exhausted
     WorkExhausted {
-        /// Number of EN2 values searched
-        en2_searched: u64,
+        /// Number of extranonce values searched
+        extranonce_searched: u64,
     },
 
     /// Periodic status update
@@ -177,7 +177,7 @@ pub trait HashThread: Send {
 
 /// Work assignment from scheduler to hash thread.
 ///
-/// Contains the job template, allocated extranonce2 range, and a channel for
+/// Contains the job template, allocated extranonce range, and a channel for
 /// returning shares. The scheduler creates a channel for each task; shares
 /// sent on that channel implicitly route back to the correct source.
 ///
@@ -187,19 +187,19 @@ pub struct HashTask {
     /// Job template (block header fields, merkle info, etc.)
     pub template: Arc<JobTemplate>,
 
-    /// Extranonce2 range allocated to this thread.
+    /// Extranonce range allocated to this thread.
     ///
     /// None for header-only mining (Stratum v2). Current HashThread
-    /// implementations require EN2 iteration, so None will cause errors
+    /// implementations require extranonce iteration, so None will cause errors
     /// until header-only support is added.
-    pub en2_range: Option<Extranonce2Range>,
+    pub extranonce_range: Option<ExtranonceRange>,
 
-    /// Extranonce2 value.
+    /// Extranonce value.
     ///
-    /// When scheduler assigns work: starting EN2.
-    /// When stored as snapshot: the EN2 value that was used.
+    /// When scheduler assigns work: starting extranonce.
+    /// When stored as snapshot: the extranonce value that was used.
     /// None for header-only mining (Stratum v2).
-    pub en2: Option<Extranonce2>,
+    pub extranonce: Option<Extranonce>,
 
     /// Share target for thread-to-scheduler submission threshold.
     ///
@@ -224,8 +224,8 @@ impl fmt::Debug for HashTask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HashTask")
             .field("template", &self.template)
-            .field("en2_range", &self.en2_range)
-            .field("en2", &self.en2)
+            .field("extranonce_range", &self.extranonce_range)
+            .field("extranonce", &self.extranonce)
             .field("share_target", &self.share_target)
             .field("ntime", &self.ntime)
             .field("share_tx", &"<channel>")
@@ -254,8 +254,8 @@ pub struct Share {
     /// Block timestamp
     pub ntime: u32,
 
-    /// Extranonce2 value used (None for header-only mining in Stratum v2)
-    pub extranonce2: Option<Extranonce2>,
+    /// Extranonce value used (None for header-only mining in Stratum v2)
+    pub extranonce: Option<Extranonce>,
 
     /// Expected work this share represents for hashrate calculation.
     ///
@@ -273,7 +273,7 @@ impl From<(Share, String)> for crate::job_source::Share {
             nonce: share.nonce,
             time: share.ntime,
             version: share.version,
-            extranonce2: share.extranonce2,
+            extranonce: share.extranonce,
         }
     }
 }

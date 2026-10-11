@@ -285,8 +285,8 @@ fn compute_merkle_root(task: &HashTask) -> Option<bitcoin::TxMerkleNode> {
     match &template.merkle_root {
         MerkleRootKind::Fixed(mr) => Some(*mr),
         MerkleRootKind::Computed(_) => {
-            let en2 = task.en2.as_ref()?;
-            template.compute_merkle_root(en2).ok()
+            let extranonce = task.extranonce.as_ref()?;
+            template.compute_merkle_root(extranonce).ok()
         }
     }
 }
@@ -312,7 +312,7 @@ fn try_nonce(task: &HashTask, merkle_root: bitcoin::TxMerkleNode, nonce: u32) ->
             hash,
             version: template.version.base(),
             ntime: task.ntime,
-            extranonce2: task.en2,
+            extranonce: task.extranonce,
             expected_work: task.share_target.to_work(),
         })
     } else {
@@ -364,8 +364,8 @@ mod tests {
 
         HashTask {
             template,
-            en2_range: None,
-            en2: None,
+            extranonce_range: None,
+            extranonce: None,
             share_target: easy_target,
             ntime: 1234567890,
             share_tx,
@@ -414,21 +414,18 @@ mod tests {
     #[test]
     fn test_try_nonce_with_computed_merkle_root() {
         use crate::job_source::{
-            Extranonce2, Extranonce2Range, MerkleRootTemplate, test_blocks::block_881423,
+            Extranonce, ExtranonceRange, MerkleRootTemplate, test_blocks::block_881423,
         };
 
         // Use block 881423 test data (same as dummy source)
-        let extranonce2_bytes = block_881423::extranonce2_bytes();
-        let extranonce2_actual = u32::from_le_bytes(extranonce2_bytes.try_into().unwrap());
+        let extranonce_bytes = block_881423::extranonce_bytes();
+        let extranonce_actual = u32::from_le_bytes(extranonce_bytes.try_into().unwrap());
 
-        let extranonce2_range = Extranonce2Range::new_range(
-            extranonce2_actual as u64,
-            extranonce2_actual as u64 + 100,
-            4,
-        )
-        .unwrap();
+        let extranonce_range =
+            ExtranonceRange::new_range(extranonce_actual as u64, extranonce_actual as u64 + 100, 4)
+                .unwrap();
 
-        let en2 = Extranonce2::new(extranonce2_actual as u64, 4).unwrap();
+        let extranonce = Extranonce::new(extranonce_actual as u64, 4).unwrap();
 
         // Use an easy target for quick testing
         let easy_target = Target::from_be_bytes([
@@ -453,10 +450,10 @@ mod tests {
             share_target: easy_target,
             time: block_881423::TIME,
             merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
-                coinbase1: block_881423::coinbase1_bytes().to_vec(),
-                extranonce1: block_881423::extranonce1_bytes().to_vec(),
-                extranonce2_range,
-                coinbase2: block_881423::coinbase2_bytes().to_vec(),
+                coinbase_prefix: block_881423::coinbase_prefix_bytes().to_vec(),
+                extranonce_prefix: block_881423::extranonce_prefix_bytes().to_vec(),
+                extranonce_range,
+                coinbase_suffix: block_881423::coinbase_suffix_bytes().to_vec(),
                 merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
             }),
         });
@@ -465,8 +462,8 @@ mod tests {
 
         let task = HashTask {
             template,
-            en2_range: None,
-            en2: Some(en2),
+            extranonce_range: None,
+            extranonce: Some(extranonce),
             share_target: easy_target,
             ntime: block_881423::TIME,
             share_tx,

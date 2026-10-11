@@ -1,7 +1,7 @@
 //! Dummy job source for testing and development.
 //!
 //! This source generates JobTemplates based on real block data from block 881,423.
-//! It uses authentic coinbase transaction parts and merkle branches, with extranonce2
+//! It uses authentic coinbase transaction parts and merkle branches, with extranonce
 //! initialized to the actual winning value. This gives mining hardware a high
 //! probability of finding the real block hash quickly, making it an excellent test
 //! of the complete mining stack.
@@ -17,14 +17,14 @@ use crate::types::{HashRate, ShareRate};
 
 use super::test_blocks::block_881423;
 use super::{
-    Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate,
+    ExtranonceRange, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate,
     SourceCommand, SourceEvent, VersionTemplate,
 };
 
 /// Dummy job source that generates work from test block data.
 ///
 /// Emits JobTemplates on a fixed interval using authentic data from block 881,423.
-/// The job is configured with the actual winning extranonce2 and version, giving
+/// The job is configured with the actual winning extranonce and version, giving
 /// hardware an excellent chance of finding the real block hash.
 pub struct DummySource {
     /// Where to send events to scheduler
@@ -47,7 +47,7 @@ impl DummySource {
     /// Create a new dummy source.
     ///
     /// Builds a JobTemplate from block 881,423 with authentic coinbase parts,
-    /// merkle branches, and the winning extranonce2/version values. This creates
+    /// merkle branches, and the winning extranonce/version values. This creates
     /// a job that hardware can solve almost immediately, validating the entire
     /// mining stack.
     pub fn new(
@@ -56,16 +56,16 @@ impl DummySource {
         shutdown: CancellationToken,
         interval: Duration,
     ) -> Result<Self> {
-        // Extract the actual extranonce2 from the winning block
-        let extranonce2_bytes = block_881423::extranonce2_bytes();
-        let extranonce2_actual = u32::from_le_bytes(extranonce2_bytes.try_into().expect("4 bytes"));
+        // Extract the actual extranonce from the winning block
+        let extranonce_bytes = block_881423::extranonce_bytes();
+        let extranonce_actual = u32::from_le_bytes(extranonce_bytes.try_into().expect("4 bytes"));
 
-        // Create extranonce2 range around the winning value
+        // Create extranonce range around the winning value
         // This gives hardware high probability of hitting the real block hash
-        let extranonce2_range = Extranonce2Range::new_range(
-            extranonce2_actual as u64,
-            extranonce2_actual as u64 + 100, // Small range for quick testing
-            4,                               // 4 bytes
+        let extranonce_range = ExtranonceRange::new_range(
+            extranonce_actual as u64,
+            extranonce_actual as u64 + 100, // Small range for quick testing
+            4,                              // 4 bytes
         )?;
 
         // Get merkle branches as typed TxMerkleNode
@@ -93,10 +93,10 @@ impl DummySource {
 
             // Use computed merkle root with authentic coinbase parts
             merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
-                coinbase1: block_881423::coinbase1_bytes().to_vec(),
-                extranonce1: block_881423::extranonce1_bytes().to_vec(),
-                extranonce2_range,
-                coinbase2: block_881423::coinbase2_bytes().to_vec(),
+                coinbase_prefix: block_881423::coinbase_prefix_bytes().to_vec(),
+                extranonce_prefix: block_881423::extranonce_prefix_bytes().to_vec(),
+                extranonce_range,
+                coinbase_suffix: block_881423::coinbase_suffix_bytes().to_vec(),
                 merkle_branches,
             }),
         };
@@ -191,7 +191,7 @@ mod tests {
             nonce: block_881423::NONCE,
             time: block_881423::TIME,
             version: *block_881423::VERSION,
-            extranonce2: None,
+            extranonce: None,
         };
         command_tx
             .send(SourceCommand::SubmitShare(share))
@@ -218,9 +218,9 @@ mod tests {
             _ => panic!("Expected computed merkle root"),
         };
 
-        // Compute merkle root with the golden extranonce2
+        // Compute merkle root with the golden extranonce
         let computed_merkle_root = merkle_template
-            .compute_merkle_root(&block_881423::EXTRANONCE2)
+            .compute_merkle_root(&block_881423::EXTRANONCE)
             .expect("valid merkle root computation");
 
         // Build block header with golden values

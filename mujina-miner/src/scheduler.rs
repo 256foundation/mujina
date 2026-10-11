@@ -395,9 +395,9 @@ impl Scheduler {
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Extract EN2 range (only supported for computed merkle roots)
-        let full_en2_range = match &job_template.merkle_root {
-            MerkleRootKind::Computed(template) => template.extranonce2_range.clone(),
+        // Extract extranonce range (only supported for computed merkle roots)
+        let full_extranonce_range = match &job_template.merkle_root {
+            MerkleRootKind::Computed(template) => template.extranonce_range.clone(),
             MerkleRootKind::Fixed(_) => {
                 error!(job_id = %job_template.id, "Header-only jobs not supported");
                 return;
@@ -456,9 +456,9 @@ impl Scheduler {
             self.remove_tasks_where(share_channels, |e| e.source_id == source_id);
         }
 
-        // Split the EN2 range evenly across the currently-eligible threads.
+        // Split the extranonce range evenly across the currently-eligible threads.
         //
-        // TODO: A thread that becomes eligible later is handed the full EN2
+        // TODO: A thread that becomes eligible later is handed the full extranonce
         // range on its first report, overlapping these slices until the next
         // job re-splits.
         let eligible: Vec<ThreadId> = self.eligible_thread_ids().collect();
@@ -466,12 +466,12 @@ impl Scheduler {
             debug!(source = %source_name, "No eligible threads yet, job cached for later");
             return;
         }
-        let en2_slices = full_en2_range
+        let extranonce_slices = full_extranonce_range
             .split(eligible.len())
-            .expect("Failed to split EN2 range among threads");
+            .expect("Failed to split extranonce range among threads");
 
-        for (thread_id, en2_range) in eligible.into_iter().zip(en2_slices) {
-            let starting_en2 = en2_range.iter().next();
+        for (thread_id, extranonce_range) in eligible.into_iter().zip(extranonce_slices) {
+            let starting_extranonce = extranonce_range.iter().next();
             let entry = self
                 .threads
                 .get_mut(thread_id)
@@ -489,8 +489,8 @@ impl Scheduler {
 
             let hash_task = HashTask {
                 template: template.clone(),
-                en2_range: Some(en2_range),
-                en2: starting_en2,
+                extranonce_range: Some(extranonce_range),
+                extranonce: starting_extranonce,
                 share_target,
                 ntime: template.time,
                 share_tx,
@@ -613,8 +613,10 @@ impl Scheduler {
             .unwrap_or("unknown");
 
         match event {
-            HashThreadEvent::WorkExhausted { en2_searched } => {
-                info!(thread = %thread_name, en2_searched, "Work exhausted");
+            HashThreadEvent::WorkExhausted {
+                extranonce_searched,
+            } => {
+                info!(thread = %thread_name, extranonce_searched, "Work exhausted");
                 // TODO: Assign new work to this thread
             }
 
@@ -707,7 +709,7 @@ impl Scheduler {
     /// Assign each source's cached job to a newly-eligible thread.
     ///
     /// Called from the thread's first ExpectedHashRate report. The thread takes
-    /// the full EN2 range for each source, overlapping the other threads until
+    /// the full extranonce range for each source, overlapping the other threads until
     /// the next job resplits the range.
     async fn assign_cached_jobs_to_thread(
         &mut self,
@@ -732,9 +734,9 @@ impl Scheduler {
                 continue;
             };
 
-            // Extract full EN2 range (new thread overlaps with others)
-            let full_en2_range = match &template.merkle_root {
-                MerkleRootKind::Computed(t) => t.extranonce2_range.clone(),
+            // Extract full extranonce range (new thread overlaps with others)
+            let full_extranonce_range = match &template.merkle_root {
+                MerkleRootKind::Computed(t) => t.extranonce_range.clone(),
                 MerkleRootKind::Fixed(_) => continue,
             };
 
@@ -744,8 +746,8 @@ impl Scheduler {
             let (share_tx, share_rx) = mpsc::channel(32);
             let hash_task = HashTask {
                 template: template.clone(),
-                en2_range: Some(full_en2_range.clone()),
-                en2: full_en2_range.iter().next(),
+                extranonce_range: Some(full_extranonce_range.clone()),
+                extranonce: full_extranonce_range.iter().next(),
                 share_target,
                 ntime: template.time,
                 share_tx,

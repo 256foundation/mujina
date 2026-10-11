@@ -24,7 +24,7 @@ pub mod block_881423 {
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
 
-    use crate::job_source::Extranonce2;
+    use crate::job_source::Extranonce;
 
     // Ground truth field values: These typed constants represent the authoritative
     // field values from block 881,423, parsed from the blockchain. They provide
@@ -135,13 +135,14 @@ pub mod block_881423 {
         &HEADER_BYTES[76..80]
     }
 
-    // Coinbase transaction and Stratum mining job components extracted from the actual
+    // Coinbase transaction and mining job components extracted from the actual
     // block as mined. The block contained 1,514 transactions.
 
     /// Complete coinbase transaction as it appears in the block (SegWit format)
     ///
     /// This is the ground truth coinbase transaction. It should be reconstructible
-    /// from the Stratum components (COINBASE1 + extranonces + COINBASE2).
+    /// from the job components (coinbase prefix + extranonce prefix + extranonce +
+    /// coinbase suffix).
     ///
     /// For merkle tree computation, use Transaction::compute_txid() which internally
     /// hashes the legacy format (without witness data). For the witness commitment,
@@ -165,50 +166,44 @@ pub mod block_881423 {
         0x00,
     ];
 
-    // Stratum v1 split points for the coinbase transaction.
+    // Split points for the coinbase transaction.
     //
     // The extranonce space starts at byte 54 of COINBASE_TX and spans 8 bytes (4 for
-    // extranonce1, 4 for extranonce2). This split is our interpretation based on the
-    // transaction structure - other pools might split differently.
+    // the pool's extranonce prefix, 4 for the miner's extranonce). This split is our
+    // interpretation based on the transaction structure; other pools might split
+    // differently.
 
-    /// Coinbase transaction prefix (coinbase1 in Stratum v1)
+    /// Coinbase transaction prefix.
     ///
     /// Everything before the extranonce space: version + witness flag + input count +
     /// prev output + prev index + scriptsig length + first part of scriptsig.
-    pub fn coinbase1_bytes() -> &'static [u8] {
+    pub fn coinbase_prefix_bytes() -> &'static [u8] {
         &COINBASE_TX[0..54]
     }
 
-    /// Extranonce1 (pool-assigned) as used in this block
-    pub fn extranonce1_bytes() -> &'static [u8] {
+    /// Extranonce prefix (pool-assigned) as used in this block.
+    pub fn extranonce_prefix_bytes() -> &'static [u8] {
         &COINBASE_TX[54..58]
     }
 
-    /// Extranonce2 (miner-chosen) as used in this block
-    pub fn extranonce2_bytes() -> &'static [u8] {
+    /// Extranonce (miner-chosen) as used in this block.
+    pub fn extranonce_bytes() -> &'static [u8] {
         &COINBASE_TX[58..62]
     }
 
-    /// Coinbase transaction suffix (coinbase2 in Stratum v1)
+    /// Coinbase transaction suffix.
     ///
     /// Everything after the extranonce space: rest of scriptsig + sequence + outputs +
     /// witness + locktime.
-    pub fn coinbase2_bytes() -> &'static [u8] {
+    pub fn coinbase_suffix_bytes() -> &'static [u8] {
         &COINBASE_TX[62..]
     }
 
-    /// Extranonce1 as Extranonce2 type
-    pub static EXTRANONCE1: LazyLock<Extranonce2> = LazyLock::new(|| {
-        let bytes = extranonce1_bytes();
+    /// Extranonce as an `Extranonce`.
+    pub static EXTRANONCE: LazyLock<Extranonce> = LazyLock::new(|| {
+        let bytes = extranonce_bytes();
         let value = u32::from_le_bytes(bytes.try_into().unwrap());
-        Extranonce2::new(value as u64, bytes.len() as u8).unwrap()
-    });
-
-    /// Extranonce2 as Extranonce2 type
-    pub static EXTRANONCE2: LazyLock<Extranonce2> = LazyLock::new(|| {
-        let bytes = extranonce2_bytes();
-        let value = u32::from_le_bytes(bytes.try_into().unwrap());
-        Extranonce2::new(value as u64, bytes.len() as u8).unwrap()
+        Extranonce::new(value as u64, bytes.len() as u8).unwrap()
     });
 
     /// Merkle branches as raw byte arrays
@@ -339,18 +334,18 @@ pub mod block_881423 {
         }
 
         #[test]
-        fn test_coinbase_reconstruction_from_stratum() {
-            // Reconstruct coinbase transaction from Stratum components
+        fn test_coinbase_reconstruction_from_components() {
+            // Reconstruct coinbase transaction from job components
             let mut reconstructed = Vec::new();
-            reconstructed.extend_from_slice(coinbase1_bytes());
-            reconstructed.extend_from_slice(extranonce1_bytes());
-            reconstructed.extend_from_slice(extranonce2_bytes());
-            reconstructed.extend_from_slice(coinbase2_bytes());
+            reconstructed.extend_from_slice(coinbase_prefix_bytes());
+            reconstructed.extend_from_slice(extranonce_prefix_bytes());
+            reconstructed.extend_from_slice(extranonce_bytes());
+            reconstructed.extend_from_slice(coinbase_suffix_bytes());
 
             assert_eq!(
                 reconstructed.as_slice(),
                 COINBASE_TX,
-                "Reconstructed coinbase from Stratum components doesn't match the coinbase"
+                "Reconstructed coinbase from job components doesn't match the coinbase"
             );
         }
 
