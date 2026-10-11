@@ -21,7 +21,7 @@ use crate::tracing::prelude::*;
 use crate::types::{Difficulty, HashRate, ShareRate};
 
 use super::{
-    Extranonce2Range, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
+    ExtranonceRange, GeneralPurposeBits, JobTemplate, MerkleRootKind, MerkleRootTemplate, Share,
     SourceCommand, SourceEvent, VersionTemplate,
 };
 
@@ -227,8 +227,8 @@ impl StratumV1Source {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No protocol state (not subscribed)"))?;
 
-        // Create extranonce2 range (full range for the given size)
-        let extranonce2_range = Extranonce2Range::new(state.extranonce2_size as u8)?;
+        // Create extranonce range (full range for the given size)
+        let extranonce_range = ExtranonceRange::new(state.extranonce2_size as u8)?;
 
         // Convert version to VersionTemplate
         // Use authorized mask from pool (or none if pool didn't authorize version rolling)
@@ -251,10 +251,10 @@ impl StratumV1Source {
             share_target,
             time: job.ntime,
             merkle_root: MerkleRootKind::Computed(MerkleRootTemplate {
-                coinbase1: job.coinbase1,
-                extranonce1: state.extranonce1.clone(),
-                extranonce2_range,
-                coinbase2: job.coinbase2,
+                coinbase_prefix: job.coinbase1,
+                extranonce_prefix: state.extranonce1.clone(),
+                extranonce_range,
+                coinbase_suffix: job.coinbase2,
                 merkle_branches: job.merkle_branches,
             }),
         })
@@ -392,7 +392,7 @@ impl StratumV1Source {
 
         // Extract extranonce2 from share (if present)
         let extranonce2 = share
-            .extranonce2
+            .extranonce
             .map(Vec::from)
             .unwrap_or_else(|| vec![0; state.extranonce2_size]);
 
@@ -758,7 +758,7 @@ mod tests {
         notify, submit,
     };
     use crate::asic::bm13xx::test_data::stratum_json;
-    use crate::job_source::Extranonce2;
+    use crate::job_source::Extranonce;
     use crate::stratum_v1::{
         JobNotification, JsonRpcMessage, MockConnector, MockTransport, MockTransportHandle,
         StratumResult, Transport,
@@ -776,14 +776,14 @@ mod tests {
         }
     }
 
-    /// Helper to convert extranonce2 bytes to Extranonce2 type.
-    fn extranonce2_from_bytes(bytes: &[u8]) -> Extranonce2 {
+    /// Helper to convert extranonce bytes to Extranonce type.
+    fn extranonce_from_bytes(bytes: &[u8]) -> Extranonce {
         let size = bytes.len() as u8;
         // Pad to 8 bytes for u64 conversion (little-endian)
         let mut padded = [0u8; 8];
         padded[..bytes.len()].copy_from_slice(bytes);
         let value = u64::from_le_bytes(padded);
-        Extranonce2::new(value, size).unwrap()
+        Extranonce::new(value, size).unwrap()
     }
 
     /// Helper to create a StratumV1Source with protocol state for testing.
@@ -885,15 +885,18 @@ mod tests {
         match &template.merkle_root {
             MerkleRootKind::Computed(mrt) => {
                 assert_eq!(
-                    mrt.coinbase1,
+                    mrt.coinbase_prefix,
                     hex::decode(notify::COINBASE1).unwrap(),
-                    "coinbase1 mismatch"
+                    "coinbase prefix mismatch"
                 );
-                assert_eq!(mrt.extranonce1, extranonce1, "extranonce1 mismatch");
                 assert_eq!(
-                    mrt.coinbase2,
+                    mrt.extranonce_prefix, extranonce1,
+                    "extranonce prefix mismatch"
+                );
+                assert_eq!(
+                    mrt.coinbase_suffix,
                     hex::decode(notify::COINBASE2).unwrap(),
-                    "coinbase2 mismatch"
+                    "coinbase suffix mismatch"
                 );
                 assert_eq!(
                     mrt.merkle_branches.len(),
@@ -1011,7 +1014,7 @@ mod tests {
             nonce: *submit::NONCE,
             time: *submit::NTIME,
             version: full_version,
-            extranonce2: Some(extranonce2_from_bytes(&*submit::EXTRANONCE2)),
+            extranonce: Some(extranonce_from_bytes(&*submit::EXTRANONCE2)),
         };
 
         // Convert to SubmitParams
@@ -1065,7 +1068,7 @@ mod tests {
             nonce: 0x12345678,
             time: 0x65432100,
             version: Version::from_consensus(0x20000000),
-            extranonce2: Some(extranonce2_from_bytes(&[0xde, 0xad, 0xbe, 0xef])),
+            extranonce: Some(extranonce_from_bytes(&[0xde, 0xad, 0xbe, 0xef])),
         };
 
         let params = source.share_to_submit_params(share).unwrap();
@@ -1093,7 +1096,7 @@ mod tests {
             nonce: 0x12345678,
             time: 0x65432100,
             version: Version::from_consensus(0x20000000),
-            extranonce2: None, // Not provided
+            extranonce: None, // Not provided
         };
 
         let params = source.share_to_submit_params(share).unwrap();
@@ -1128,7 +1131,7 @@ mod tests {
             nonce: *submit::NONCE,
             time: *submit::NTIME,
             version: full_version,
-            extranonce2: Some(extranonce2_from_bytes(&*submit::EXTRANONCE2)),
+            extranonce: Some(extranonce_from_bytes(&*submit::EXTRANONCE2)),
         };
 
         // Convert to SubmitParams and then to JSON
@@ -1176,9 +1179,9 @@ mod tests {
         let template = source.job_to_template(job).unwrap();
 
         // Compute merkle root using the extranonce2 from the capture
-        let en2 = extranonce2_from_bytes(&*submit::EXTRANONCE2);
+        let extranonce = extranonce_from_bytes(&*submit::EXTRANONCE2);
         let merkle_root = template
-            .compute_merkle_root(&en2)
+            .compute_merkle_root(&extranonce)
             .expect("Merkle root computation failed");
 
         // This should match the merkle root in the wire capture

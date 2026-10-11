@@ -23,11 +23,11 @@
 //!
 //! 1. **[`JobTemplate`]** (from pool/source) - Contains all templates:
 //!    - Version rolling mask ([`VersionTemplate`])
-//!    - Extranonce2 space ([`Extranonce2Range`])
+//!    - Extranonce space ([`ExtranonceRange`])
 //!    - Merkle root specification ([`MerkleRootKind`])
 //!
 //! 2. **`HeaderTemplate`** (to hardware) - Partially instantiated:
-//!    - Specific extranonce2 value selected
+//!    - Specific extranonce value selected
 //!    - Nonce = 0 (hardware will roll)
 //!    - Version bits may be rolled by hardware
 //!
@@ -36,7 +36,7 @@
 //!    - Meets chip difficulty target
 //!
 //! The scheduler generates many `HeaderTemplate` instances from each
-//! `JobTemplate` by allocating extranonce2 space and rolling extranonce2 and
+//! `JobTemplate` by allocating extranonce space and rolling extranonce and
 //! ntime. Hardware then searches for valid nonces within each header template.
 //!
 //! ## Share Difficulty
@@ -52,7 +52,7 @@
 
 // Submodules
 pub mod dummy;
-mod extranonce2;
+mod extranonce;
 pub mod forced_rate;
 pub(crate) mod job;
 mod merkle;
@@ -62,7 +62,7 @@ pub mod test_blocks;
 mod version;
 
 // Re-export types from submodules
-pub use extranonce2::{Extranonce2, Extranonce2Error, Extranonce2Iter, Extranonce2Range};
+pub use extranonce::{Extranonce, ExtranonceError, ExtranonceIter, ExtranonceRange};
 pub use job::{JobTemplate, Share};
 pub use merkle::{MerkleRootKind, MerkleRootTemplate};
 pub use messages::{SourceCommand, SourceEvent, SourceHandle};

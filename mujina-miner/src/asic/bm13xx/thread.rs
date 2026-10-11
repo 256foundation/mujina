@@ -826,11 +826,11 @@ where
             // Reconstruct full version from rolling field
             let full_version = version.apply_to_version(template.version.base());
 
-            // Compute merkle root for this task's EN2
+            // Compute merkle root for this task's extranonce
             match task
-                .en2
+                .extranonce
                 .as_ref()
-                .and_then(|en2| template.compute_merkle_root(en2).ok())
+                .and_then(|extranonce| template.compute_merkle_root(extranonce).ok())
             {
                 Some(merkle_root) => {
                     // Build block header
@@ -860,7 +860,7 @@ where
                             hash,
                             version: full_version,
                             ntime: task.ntime,
-                            extranonce2: task.en2,
+                            extranonce: task.extranonce,
                             expected_work,
                         };
 
@@ -940,7 +940,7 @@ where
 ///
 /// BM13xx chips use 4-bit job IDs. This tracker maintains snapshots of
 /// HashTasks sent to the chip so we can match nonce responses back to the
-/// correct task context (EN2, ntime, etc.).
+/// correct task context (extranonce, ntime, etc.).
 struct ChipJobTracker {
     tasks: [Option<HashTask>; 16],
     next_id: u8,
@@ -975,7 +975,7 @@ impl ChipJobTracker {
 /// Convert HashTask to JobFullFormat for chip hardware.
 ///
 /// Extracts or computes the merkle root, then builds a JobFullFormat with all
-/// block header fields. For computed merkle roots, requires EN2. For fixed merkle
+/// block header fields. For computed merkle roots, requires extranonce. For fixed merkle
 /// roots (Stratum v2 header-only), uses the template's fixed value directly.
 fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     use crate::job_source::MerkleRootKind;
@@ -985,15 +985,15 @@ fn task_to_job_full(task: &HashTask, chip_job_id: u8) -> Result<JobFullFormat> {
     // Get merkle root (computed or fixed)
     let merkle_root = match &template.merkle_root {
         MerkleRootKind::Computed(_) => {
-            // Extract EN2 (required for computed merkle roots)
-            let en2 = task
-                .en2
+            // Extract extranonce (required for computed merkle roots)
+            let extranonce = task
+                .extranonce
                 .as_ref()
-                .ok_or_else(|| anyhow!("EN2 required for computed merkle root"))?;
+                .ok_or_else(|| anyhow!("extranonce required for computed merkle root"))?;
 
-            // Compute merkle root for this EN2
+            // Compute merkle root for this extranonce
             template
-                .compute_merkle_root(en2)
+                .compute_merkle_root(extranonce)
                 .context("merkle root computation failed")?
         }
         MerkleRootKind::Fixed(merkle_root) => *merkle_root,
@@ -1092,7 +1092,7 @@ mod tests {
     fn test_task_to_job_full_converts_high_level_types() {
         use crate::asic::bm13xx::test_data::esp_miner_job;
         use crate::job_source::{
-            Extranonce2, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
+            Extranonce, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
         };
 
         // Create a JobTemplate with test data values
@@ -1111,16 +1111,16 @@ mod tests {
             merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
         });
 
-        // Dummy EN2 (doesn't matter since we're using Fixed merkle root)
-        let dummy_en2 = Extranonce2::new(0, 1).unwrap();
+        // Dummy extranonce (doesn't matter since we're using Fixed merkle root)
+        let dummy_extranonce = Extranonce::new(0, 1).unwrap();
 
         // Create dummy channel (not used in this test, just for struct construction)
         let (share_tx, _share_rx) = mpsc::channel(1);
 
         let task = HashTask {
             template,
-            en2_range: None,
-            en2: Some(dummy_en2),
+            extranonce_range: None,
+            extranonce: Some(dummy_extranonce),
             share_target: crate::types::Difficulty::from(100_u64).to_target(),
             ntime: *esp_miner_job::wire_tx::NTIME,
             share_tx,
@@ -1311,7 +1311,7 @@ mod tests {
     fn test_task() -> HashTask {
         use crate::asic::bm13xx::test_data::esp_miner_job;
         use crate::job_source::{
-            Extranonce2, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
+            Extranonce, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
         };
 
         let template = Arc::new(JobTemplate {
@@ -1331,8 +1331,8 @@ mod tests {
 
         HashTask {
             template,
-            en2_range: None,
-            en2: Some(Extranonce2::new(0, 1).unwrap()),
+            extranonce_range: None,
+            extranonce: Some(Extranonce::new(0, 1).unwrap()),
             share_target: crate::types::Difficulty::from(100_u64).to_target(),
             ntime: *esp_miner_job::wire_tx::NTIME,
             share_tx,
