@@ -31,7 +31,7 @@
 //! hex a pool logs.
 
 use std::fmt;
-use std::iter;
+use std::iter::{self, FusedIterator};
 
 use thiserror::Error;
 
@@ -249,8 +249,28 @@ impl ExtranonceIter {
     fn remaining(&self) -> u128 {
         self.next.map_or(0, |next| u128::from(self.last - next) + 1)
     }
+
+    /// Counts the extranonces left. Deprecated, because a range can hold
+    /// more extranonces than `usize` can count.
+    ///
+    /// `Iterator` gives all iterators `count()`, and an impl cannot remove or
+    /// deprecate it. This inherent method hides it in a direct call, so that
+    /// the call warns. Generic code and adapters still reach the trait's
+    /// version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `usize::MAX` extranonces remain, as
+    /// `RangeInclusive::count()` does. A range can hold up to 2^64
+    /// extranonces, more than `usize` can count on any target.
+    #[deprecated(note = "a range can hold more extranonces than `usize` can count")]
+    pub fn count(self) -> usize {
+        Iterator::count(self)
+    }
 }
 
+// The methods past `next()` answer from the bounds, because the defaults
+// step through the range one value at a time, and a range can hold 2^64.
 impl Iterator for ExtranonceIter {
     type Item = Extranonce;
 
@@ -264,7 +284,70 @@ impl Iterator for ExtranonceIter {
         let exact = usize::try_from(self.remaining()).ok();
         (exact.unwrap_or(usize::MAX), exact)
     }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let next = self.next?;
+        match next.checked_add(n as u64).filter(|&c| c <= self.last) {
+            Some(counter) => {
+                self.next = Some(counter);
+                self.next()
+            }
+            None => {
+                self.next = None;
+                None
+            }
+        }
+    }
+
+    /// Returns the number of extranonces left, without stepping through
+    /// them.
+    ///
+    /// A direct call reaches the deprecated inherent `count()` instead.
+    /// Generic code, adapters, and `Iterator::count(iter)` reach this one.
+    /// It replaces the default, which steps through the values one at a time
+    /// and, on a large range, would never return.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `usize::MAX` extranonces remain, as
+    /// `RangeInclusive::count()` does.
+    fn count(self) -> usize {
+        usize::try_from(self.remaining()).expect("count overflowed usize")
+    }
+
+    fn last(self) -> Option<Self::Item> {
+        self.next.map(|_| self.extranonce(self.last))
+    }
 }
+
+impl DoubleEndedIterator for ExtranonceIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let next = self.next?;
+        let counter = self.last;
+        if counter == next {
+            self.next = None;
+        } else {
+            self.last -= 1;
+        }
+        Some(self.extranonce(counter))
+    }
+
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        let next = self.next?;
+        match self.last.checked_sub(n as u64).filter(|&c| c >= next) {
+            Some(counter) => {
+                self.last = counter;
+                self.next_back()
+            }
+            None => {
+                self.next = None;
+                None
+            }
+        }
+    }
+}
+
+impl FusedIterator for ExtranonceIter {}
 
 /// Errors from creating extranonce types.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -512,5 +595,79 @@ mod tests {
     fn iter_size_hint_has_no_upper_bound_past_usize() {
         let iter = through(USIZE_MAX).iter();
         assert_eq!(iter.size_hint(), (usize::MAX, None));
+    }
+
+    #[test]
+    fn iter_nth_jumps_without_walking() {
+        let mut iter = through(USIZE_MAX).iter();
+        let last = USIZE_MAX.to_be_bytes().to_vec();
+        assert_eq!(iter.nth(usize::MAX).map(bytes), Some(last));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn iter_nth_past_the_end_exhausts() {
+        let mut iter = run(&[0], 3).iter();
+        assert_eq!(iter.nth(3), None);
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn iter_nth_back_jumps_without_walking() {
+        let mut iter = through(USIZE_MAX).iter();
+        assert_eq!(iter.nth_back(usize::MAX).map(bytes), Some(vec![0; 8]));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn iter_nth_back_stops_at_the_front() {
+        let mut iter = run(&[0], 3).iter();
+        iter.next();
+        assert_eq!(iter.nth_back(1).map(bytes), Some(vec![1]));
+        assert_eq!(iter.next(), None);
+
+        let mut iter = run(&[0], 3).iter();
+        assert_eq!(iter.nth_back(3), None);
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn iter_count_answers_from_the_bounds() {
+        let iter = through(USIZE_MAX - 1).iter();
+        assert_eq!(Iterator::count(iter), usize::MAX);
+
+        let mut iter = run(&[0], 10).iter();
+        iter.next();
+        iter.next_back();
+        assert_eq!(Iterator::count(iter), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "count overflowed usize")]
+    fn iter_count_past_usize_panics() {
+        Iterator::count(through(USIZE_MAX).iter());
+    }
+
+    #[test]
+    fn iter_last_of_a_full_counter() {
+        let iter = ExtranonceRange::full(8).unwrap().iter();
+        assert_eq!(iter.last().map(bytes), Some(vec![0xff; 8]));
+    }
+
+    #[test]
+    fn iter_runs_from_both_ends() {
+        let mut iter = run(&[0], 3).iter();
+        assert_eq!(iter.next_back().map(bytes), Some(vec![2]));
+        assert_eq!(iter.next().map(bytes), Some(vec![0]));
+        assert_eq!(iter.next_back().map(bytes), Some(vec![1]));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn iter_rev_starts_at_the_end_of_the_slot() {
+        let range = ExtranonceRange::full(1).unwrap();
+        let values: Vec<_> = range.iter().rev().take(2).map(bytes).collect();
+        assert_eq!(values, vec![vec![0xff], vec![0xfe]]);
     }
 }
