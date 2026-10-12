@@ -107,13 +107,13 @@ mod tests {
 
     #[test]
     fn test_compute_merkle_root_with_block_881423() {
-        let extranonce = *block_881423::EXTRANONCE;
+        let extranonce = block_881423::EXTRANONCE;
 
         // Construct a template from golden values
         let template = MerkleRootTemplate {
             coinbase_prefix: block_881423::coinbase_prefix_bytes().to_vec(),
             extranonce_prefix: block_881423::extranonce_prefix_bytes().to_vec(),
-            extranonce_range: ExtranonceRange::new(extranonce.size()).unwrap(),
+            extranonce_range: ExtranonceRange::full(extranonce.width()).unwrap(),
             coinbase_suffix: block_881423::coinbase_suffix_bytes().to_vec(),
             merkle_branches: block_881423::MERKLE_BRANCHES.clone(),
         };

@@ -797,7 +797,7 @@ impl StratumV1Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job_source::Extranonce;
+    use crate::job_source::ExtranonceRange;
     use bitcoin::hashes::Hash;
     use tokio::time::{Duration, timeout};
 
@@ -983,7 +983,7 @@ mod tests {
                     println!("  Extranonce2 size: {} bytes", extranonce2_size);
                     assert!(!extranonce1.is_empty(), "extranonce1 should not be empty");
                     assert!(
-                        Extranonce::new(0, *extranonce2_size as u8).is_ok(),
+                        ExtranonceRange::full(*extranonce2_size).is_ok(),
                         "pool returned invalid extranonce2_size: {}",
                         extranonce2_size
                     );

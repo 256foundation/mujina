@@ -397,7 +397,7 @@ impl Scheduler {
 
         // Extract extranonce range (only supported for computed merkle roots)
         let full_extranonce_range = match &job_template.merkle_root {
-            MerkleRootKind::Computed(template) => template.extranonce_range.clone(),
+            MerkleRootKind::Computed(template) => template.extranonce_range,
             MerkleRootKind::Fixed(_) => {
                 error!(job_id = %job_template.id, "Header-only jobs not supported");
                 return;
@@ -471,7 +471,7 @@ impl Scheduler {
             .expect("Failed to split extranonce range among threads");
 
         for (thread_id, extranonce_range) in eligible.into_iter().zip(extranonce_slices) {
-            let starting_extranonce = extranonce_range.iter().next();
+            let starting_extranonce = Some(extranonce_range.start());
             let entry = self
                 .threads
                 .get_mut(thread_id)
@@ -736,7 +736,7 @@ impl Scheduler {
 
             // Extract full extranonce range (new thread overlaps with others)
             let full_extranonce_range = match &template.merkle_root {
-                MerkleRootKind::Computed(t) => t.extranonce_range.clone(),
+                MerkleRootKind::Computed(t) => t.extranonce_range,
                 MerkleRootKind::Fixed(_) => continue,
             };
 
@@ -746,8 +746,8 @@ impl Scheduler {
             let (share_tx, share_rx) = mpsc::channel(32);
             let hash_task = HashTask {
                 template: template.clone(),
-                extranonce_range: Some(full_extranonce_range.clone()),
-                extranonce: full_extranonce_range.iter().next(),
+                extranonce_range: Some(full_extranonce_range),
+                extranonce: Some(full_extranonce_range.start()),
                 share_target,
                 ntime: template.time,
                 share_tx,

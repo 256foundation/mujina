@@ -1091,9 +1091,7 @@ mod tests {
     #[test]
     fn test_task_to_job_full_converts_high_level_types() {
         use crate::asic::bm13xx::test_data::esp_miner_job;
-        use crate::job_source::{
-            Extranonce, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
-        };
+        use crate::job_source::{GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate};
 
         // Create a JobTemplate with test data values
         // Use MerkleRootKind::Fixed with the exact merkle_root from capture
@@ -1111,16 +1109,13 @@ mod tests {
             merkle_root: MerkleRootKind::Fixed(*esp_miner_job::wire_tx::MERKLE_ROOT),
         });
 
-        // Dummy extranonce (doesn't matter since we're using Fixed merkle root)
-        let dummy_extranonce = Extranonce::new(0, 1).unwrap();
-
         // Create dummy channel (not used in this test, just for struct construction)
         let (share_tx, _share_rx) = mpsc::channel(1);
 
         let task = HashTask {
             template,
             extranonce_range: None,
-            extranonce: Some(dummy_extranonce),
+            extranonce: None,
             share_target: crate::types::Difficulty::from(100_u64).to_target(),
             ntime: *esp_miner_job::wire_tx::NTIME,
             share_tx,
@@ -1310,9 +1305,7 @@ mod tests {
     /// Builds a minimal task for driving the actor.
     fn test_task() -> HashTask {
         use crate::asic::bm13xx::test_data::esp_miner_job;
-        use crate::job_source::{
-            Extranonce, GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate,
-        };
+        use crate::job_source::{GeneralPurposeBits, JobTemplate, MerkleRootKind, VersionTemplate};
 
         let template = Arc::new(JobTemplate {
             id: "test".into(),
@@ -1332,7 +1325,7 @@ mod tests {
         HashTask {
             template,
             extranonce_range: None,
-            extranonce: Some(Extranonce::new(0, 1).unwrap()),
+            extranonce: None,
             share_target: crate::types::Difficulty::from(100_u64).to_target(),
             ntime: *esp_miner_job::wire_tx::NTIME,
             share_tx,
