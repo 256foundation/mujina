@@ -27,8 +27,12 @@
 //! holds 2^44 extranonces, which last a 1 EH/s miner 21 hours. A fixed-size
 //! integer keeps the types `Copy` and the arithmetic native.
 //!
-//! Values print as hex in wire order (`00001234`), so a log line matches the
-//! hex a pool logs.
+//! Values print as hex in wire order. Slots of up to 8 bytes print in full
+//! (`00001234`), so a log line matches the hex a pool logs, and the number
+//! of digits gives the width. Wider slots replace the longest run of zero
+//! bytes with `::`, as IPv6 addresses do, and append the width in bytes
+//! (`::1234/32`). A range prints its first value and its length, in the
+//! shape of a Rust struct (`{ start: 40000000, len: 2^30 }`).
 
 use std::fmt;
 use std::iter::{self, FusedIterator};
@@ -43,7 +47,7 @@ const COUNTER_WIDTH: usize = size_of::<u64>();
 /// An immutable value that goes into a coinbase transaction or a share.
 /// Obtain one from an `ExtranonceRange`, from bytes with `from_bytes()`, or
 /// from a fixed-size array with `from_array()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Extranonce {
     counter: u64,
     width: u8,
@@ -125,7 +129,19 @@ impl From<Extranonce> for Vec<u8> {
 
 impl fmt::Display for Extranonce {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.bytes().try_for_each(|b| write!(f, "{b:02x}"))
+        let bytes = Vec::from(*self);
+        if self.width() <= COUNTER_WIDTH {
+            write_bytes(f, &bytes)
+        } else {
+            write_compressed(f, &bytes)?;
+            write!(f, "/{}", self.width)
+        }
+    }
+}
+
+impl fmt::Debug for Extranonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Extranonce({self})")
     }
 }
 
@@ -135,7 +151,7 @@ impl fmt::Display for Extranonce {
 /// the rest of a slot from a known extranonce with `starting_at()`, then
 /// divide it with `split()`. Call `iter()` to roll through the extranonces
 /// in a range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtranonceRange {
     first: u64,
     last: u64,
@@ -225,6 +241,20 @@ impl ExtranonceRange {
             counter: self.first,
             width: self.width,
         }
+    }
+}
+
+impl fmt::Display for ExtranonceRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ start: {}, len: ", self.start())?;
+        write_count(f, self.len())?;
+        f.write_str(" }")
+    }
+}
+
+impl fmt::Debug for ExtranonceRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ExtranonceRange {self}")
     }
 }
 
@@ -375,6 +405,47 @@ fn max_counter(width: u8) -> u64 {
     }
 }
 
+/// Writes a count of extranonces, as a power of two when it is a large one.
+///
+/// Splitting a slot evenly gives powers of two, and 2^30 reads more easily
+/// than 1073741824.
+fn write_count(f: &mut fmt::Formatter<'_>, count: u128) -> fmt::Result {
+    if count.is_power_of_two() && count >= 1 << 10 {
+        write!(f, "2^{}", count.trailing_zeros())
+    } else {
+        write!(f, "{count}")
+    }
+}
+
+/// Writes bytes as hex with the longest run of two or more zero bytes
+/// replaced by `::`, choosing the leftmost run on a tie, as RFC 5952 does for
+/// IPv6 addresses.
+fn write_compressed(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    let mut best = 0..0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] == 0 {
+            i += 1;
+        }
+        if i - start > best.len() {
+            best = start..i;
+        }
+        i += 1;
+    }
+
+    if best.len() < 2 {
+        return write_bytes(f, bytes);
+    }
+    write_bytes(f, &bytes[..best.start])?;
+    f.write_str("::")?;
+    write_bytes(f, &bytes[best.end..])
+}
+
+fn write_bytes(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,10 +526,36 @@ mod tests {
     }
 
     #[test]
-    fn display_prints_wire_bytes_as_hex() {
+    fn display_prints_short_slots_in_full() {
         assert_eq!(ext(&[0, 0, 0x12, 0x34]).to_string(), "00001234");
         assert_eq!(ext(&[0xab]).to_string(), "ab");
         assert_eq!(ext(&[0; 8]).to_string(), "0000000000000000");
+    }
+
+    #[test]
+    fn display_compresses_wide_slots_and_shows_width() {
+        let mut wire = [0u8; 32];
+        wire[30..].copy_from_slice(&[0x12, 0x34]);
+        assert_eq!(ext(&wire).to_string(), "::1234/32");
+        assert_eq!(ext(&[0; 32]).to_string(), "::/32");
+    }
+
+    #[test]
+    fn compression_takes_the_longest_run_of_zeros() {
+        let wire = [0, 0, 0x12, 0, 0, 0, 0x34, 0, 0];
+        assert_eq!(ext(&wire).to_string(), "000012::340000/9");
+    }
+
+    #[test]
+    fn compression_takes_the_leftmost_of_equal_runs() {
+        let wire = [0, 0, 1, 0, 0, 2, 3, 4, 5];
+        assert_eq!(ext(&wire).to_string(), "::01000002030405/9");
+    }
+
+    #[test]
+    fn compression_skips_a_lone_zero_byte() {
+        let wire = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(ext(&wire).to_string(), "000102030405060708/9");
     }
 
     // ExtranonceRange tests
@@ -554,6 +651,40 @@ mod tests {
         let range = ExtranonceRange::full(8).unwrap();
         let parts = range.split(3).unwrap();
         assert_eq!(parts.iter().map(|r| r.len()).sum::<u128>(), 1 << 64);
+    }
+
+    #[test]
+    fn range_display_gives_start_and_len() {
+        let parts = ExtranonceRange::full(4).unwrap().split(4).unwrap();
+        assert_eq!(parts[1].to_string(), "{ start: 40000000, len: 2^30 }");
+
+        let parts = ExtranonceRange::full(4).unwrap().split(3).unwrap();
+        assert_eq!(parts[0].to_string(), "{ start: 00000000, len: 1431655766 }");
+    }
+
+    #[test]
+    fn range_display_writes_small_lengths_in_decimal() {
+        let range = run(&[0x22, 0x0c, 0xf1, 0xad], 101);
+        assert_eq!(range.to_string(), "{ start: 220cf1ad, len: 101 }");
+
+        let range = run(&[0, 0], 512);
+        assert_eq!(range.to_string(), "{ start: 0000, len: 512 }");
+    }
+
+    #[test]
+    fn range_display_shows_width_of_wide_slots() {
+        let range = ExtranonceRange::full(32).unwrap();
+        assert_eq!(range.to_string(), "{ start: ::/32, len: 2^64 }");
+    }
+
+    #[test]
+    fn debug_names_the_type() {
+        assert_eq!(format!("{:?}", ext(&[0xab])), "Extranonce(ab)");
+        let range = ExtranonceRange::full(1).unwrap();
+        assert_eq!(
+            format!("{range:?}"),
+            "ExtranonceRange { start: 00, len: 256 }"
+        );
     }
 
     // ExtranonceIter tests
