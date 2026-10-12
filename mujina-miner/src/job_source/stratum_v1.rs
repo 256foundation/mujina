@@ -228,7 +228,7 @@ impl StratumV1Source {
             .ok_or_else(|| anyhow::anyhow!("No protocol state (not subscribed)"))?;
 
         // Create extranonce range (full range for the given size)
-        let extranonce_range = ExtranonceRange::new(state.extranonce2_size as u8)?;
+        let extranonce_range = ExtranonceRange::full(state.extranonce2_size)?;
 
         // Convert version to VersionTemplate
         // Use authorized mask from pool (or none if pool didn't authorize version rolling)
@@ -776,16 +776,6 @@ mod tests {
         }
     }
 
-    /// Helper to convert extranonce bytes to Extranonce type.
-    fn extranonce_from_bytes(bytes: &[u8]) -> Extranonce {
-        let size = bytes.len() as u8;
-        // Pad to 8 bytes for u64 conversion (big-endian)
-        let mut padded = [0u8; 8];
-        padded[8 - bytes.len()..].copy_from_slice(bytes);
-        let value = u64::from_be_bytes(padded);
-        Extranonce::new(value, size).unwrap()
-    }
-
     /// Helper to create a StratumV1Source with protocol state for testing.
     fn source_with_state(
         extranonce1: Vec<u8>,
@@ -1014,7 +1004,7 @@ mod tests {
             nonce: *submit::NONCE,
             time: *submit::NTIME,
             version: full_version,
-            extranonce: Some(extranonce_from_bytes(&*submit::EXTRANONCE2)),
+            extranonce: Some(Extranonce::from_array(*submit::EXTRANONCE2)),
         };
 
         // Convert to SubmitParams
@@ -1068,7 +1058,7 @@ mod tests {
             nonce: 0x12345678,
             time: 0x65432100,
             version: Version::from_consensus(0x20000000),
-            extranonce: Some(extranonce_from_bytes(&[0xde, 0xad, 0xbe, 0xef])),
+            extranonce: Some(Extranonce::from_bytes(&[0xde, 0xad, 0xbe, 0xef]).unwrap()),
         };
 
         let params = source.share_to_submit_params(share).unwrap();
@@ -1131,7 +1121,7 @@ mod tests {
             nonce: *submit::NONCE,
             time: *submit::NTIME,
             version: full_version,
-            extranonce: Some(extranonce_from_bytes(&*submit::EXTRANONCE2)),
+            extranonce: Some(Extranonce::from_array(*submit::EXTRANONCE2)),
         };
 
         // Convert to SubmitParams and then to JSON
@@ -1179,7 +1169,7 @@ mod tests {
         let template = source.job_to_template(job).unwrap();
 
         // Compute merkle root using the extranonce2 from the capture
-        let extranonce = extranonce_from_bytes(&*submit::EXTRANONCE2);
+        let extranonce = Extranonce::from_array(*submit::EXTRANONCE2);
         let merkle_root = template
             .compute_merkle_root(&extranonce)
             .expect("Merkle root computation failed");

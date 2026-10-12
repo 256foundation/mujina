@@ -413,19 +413,12 @@ mod tests {
 
     #[test]
     fn test_try_nonce_with_computed_merkle_root() {
-        use crate::job_source::{
-            Extranonce, ExtranonceRange, MerkleRootTemplate, test_blocks::block_881423,
-        };
+        use crate::job_source::{ExtranonceRange, MerkleRootTemplate, test_blocks::block_881423};
 
-        // Use block 881423 test data (same as dummy source)
-        let extranonce_bytes = block_881423::extranonce_bytes();
-        let extranonce_actual = u32::from_be_bytes(extranonce_bytes.try_into().unwrap());
-
-        let extranonce_range =
-            ExtranonceRange::new_range(extranonce_actual as u64, extranonce_actual as u64 + 100, 4)
-                .unwrap();
-
-        let extranonce = Extranonce::new(extranonce_actual as u64, 4).unwrap();
+        // Use block 881423 test data (same as dummy source). The hasher reads
+        // only the task's extranonce, so the template's range is the full slot.
+        let extranonce = block_881423::EXTRANONCE;
+        let extranonce_range = ExtranonceRange::full(extranonce.width()).unwrap();
 
         // Use an easy target for quick testing
         let easy_target = Target::from_be_bytes([

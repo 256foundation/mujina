@@ -191,6 +191,14 @@ pub mod block_881423 {
         &COINBASE_TX[58..62]
     }
 
+    /// Extranonce (miner-chosen) as used in this block, as an `Extranonce`.
+    pub const EXTRANONCE: Extranonce = Extranonce::from_array([
+        COINBASE_TX[58],
+        COINBASE_TX[59],
+        COINBASE_TX[60],
+        COINBASE_TX[61],
+    ]);
+
     /// Coinbase transaction suffix.
     ///
     /// Everything after the extranonce space: rest of scriptsig + sequence + outputs +
@@ -198,13 +206,6 @@ pub mod block_881423 {
     pub fn coinbase_suffix_bytes() -> &'static [u8] {
         &COINBASE_TX[62..]
     }
-
-    /// Extranonce as an `Extranonce`.
-    pub static EXTRANONCE: LazyLock<Extranonce> = LazyLock::new(|| {
-        let bytes = extranonce_bytes();
-        let value = u32::from_be_bytes(bytes.try_into().unwrap());
-        Extranonce::new(value as u64, bytes.len() as u8).unwrap()
-    });
 
     /// Merkle branches as raw byte arrays
     ///
@@ -320,6 +321,11 @@ pub mod block_881423 {
         #[test]
         fn test_nonce_consistency() {
             assert_eq!(u32::from_le_bytes(nonce_bytes().try_into().unwrap()), NONCE);
+        }
+
+        #[test]
+        fn test_extranonce_consistency() {
+            assert_eq!(Vec::from(EXTRANONCE), extranonce_bytes());
         }
 
         #[test]

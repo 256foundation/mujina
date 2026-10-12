@@ -56,17 +56,9 @@ impl DummySource {
         shutdown: CancellationToken,
         interval: Duration,
     ) -> Result<Self> {
-        // Extract the actual extranonce from the winning block
-        let extranonce_bytes = block_881423::extranonce_bytes();
-        let extranonce_actual = u32::from_be_bytes(extranonce_bytes.try_into().expect("4 bytes"));
-
-        // Create extranonce range around the winning value
-        // This gives hardware high probability of hitting the real block hash
-        let extranonce_range = ExtranonceRange::new_range(
-            extranonce_actual as u64,
-            extranonce_actual as u64 + 100, // Small range for quick testing
-            4,                              // 4 bytes
-        )?;
+        // Start the extranonce range at the winning block's extranonce, so
+        // the first thread can find the real block hash.
+        let extranonce_range = ExtranonceRange::starting_at(block_881423::EXTRANONCE);
 
         // Get merkle branches as typed TxMerkleNode
         let merkle_branches = block_881423::MERKLE_BRANCHES.clone();
