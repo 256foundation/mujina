@@ -213,6 +213,7 @@ impl ExtranonceRange {
         ExtranonceIter {
             range: self.clone(),
             current: self.min,
+            exhausted: false,
         }
     }
 }
@@ -225,6 +226,9 @@ impl ExtranonceRange {
 pub struct ExtranonceIter {
     range: ExtranonceRange,
     current: u64,
+    // Set after yielding `range.max`. Advancing past it would overflow when
+    // the range ends at `u64::MAX`, as an 8-byte range does.
+    exhausted: bool,
 }
 
 impl ExtranonceIter {
@@ -236,6 +240,7 @@ impl ExtranonceIter {
     /// Reset to the beginning of the range.
     pub fn reset(&mut self) {
         self.current = self.range.min;
+        self.exhausted = false;
     }
 }
 
@@ -243,20 +248,27 @@ impl Iterator for ExtranonceIter {
     type Item = Extranonce;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current > self.range.max {
+        if self.exhausted {
             return None;
         }
         let val = Extranonce::new(self.current, self.range.size).ok()?;
-        self.current += 1;
+        if self.current == self.range.max {
+            self.exhausted = true;
+        } else {
+            self.current += 1;
+        }
         Some(val)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.current > self.range.max {
-            (0, Some(0))
-        } else {
-            let remaining = (self.range.max - self.current + 1).min(usize::MAX as u64) as usize;
-            (remaining, Some(remaining))
+        if self.exhausted {
+            return (0, Some(0));
+        }
+        // A full 8-byte range holds 2^64 values, one more than a u64 counts.
+        let remaining = u128::from(self.range.max - self.current) + 1;
+        match usize::try_from(remaining) {
+            Ok(n) => (n, Some(n)),
+            Err(_) => (usize::MAX, None),
         }
     }
 }
@@ -442,6 +454,23 @@ mod tests {
         let range = ExtranonceRange::new(8).unwrap();
         // len() would be 2^64 but that doesn't fit in u64, so saturates to MAX
         assert_eq!(range.len(), u64::MAX);
+    }
+
+    #[test]
+    fn test_iter_stops_at_end_of_full_counter() {
+        let range = ExtranonceRange::new_range(u64::MAX - 1, u64::MAX, 8).unwrap();
+        let mut iter = range.iter();
+
+        assert_eq!(iter.next().unwrap().value(), u64::MAX - 1);
+        assert_eq!(iter.next().unwrap().value(), u64::MAX);
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_iter_size_hint_of_full_counter() {
+        let iter = ExtranonceRange::new(8).unwrap().iter();
+        assert_eq!(iter.size_hint(), (usize::MAX, None));
     }
 
     #[test]
