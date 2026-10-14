@@ -1544,6 +1544,15 @@ mod tests {
     /// Shared prefix for tests that need to diverge at the authorize
     /// or suggest_difficulty step.
     async fn do_configure_and_subscribe(handle: &mut MockTransportHandle) {
+        do_configure_and_subscribe_with(handle, 4).await;
+    }
+
+    /// Like [`do_configure_and_subscribe`], but the subscribe response
+    /// offers the given extranonce2 size.
+    async fn do_configure_and_subscribe_with(
+        handle: &mut MockTransportHandle,
+        extranonce2_size: usize,
+    ) {
         // mining.configure
         let msg = handle.recv().await;
         assert_eq!(msg.method(), Some("mining.configure"));
@@ -1561,7 +1570,7 @@ mod tests {
         assert_eq!(msg.method(), Some("mining.subscribe"));
         handle.send(JsonRpcMessage::Response {
             id: msg.id().unwrap(),
-            result: Some(json!([[], "aabb", 4])),
+            result: Some(json!([[], "aabb", extranonce2_size])),
             error: None,
         });
     }
@@ -1572,7 +1581,13 @@ mod tests {
     /// and mining.suggest_difficulty. After this returns, the client is
     /// in its main event loop, ready for notifications.
     async fn do_handshake(handle: &mut MockTransportHandle) {
-        do_configure_and_subscribe(handle).await;
+        do_handshake_with(handle, 4).await;
+    }
+
+    /// Like [`do_handshake`], but the subscribe response offers the
+    /// given extranonce2 size.
+    async fn do_handshake_with(handle: &mut MockTransportHandle, extranonce2_size: usize) {
+        do_configure_and_subscribe_with(handle, extranonce2_size).await;
 
         // mining.authorize
         let msg = handle.recv().await;
@@ -1787,6 +1802,63 @@ mod tests {
         assert!(
             event_rx.try_recv().is_err(),
             "connection recycled despite a fresh job",
+        );
+
+        shutdown.cancel();
+        source_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic] // known bug: unusable jobs reset the job-gap watchdog
+    async fn unusable_jobs_do_not_defer_recycling() {
+        let (source, mut event_rx, command_tx, mock_tx, shutdown) = source_with_mock_transports();
+
+        let (transport1, mut handle1) = MockTransport::pair();
+        let (transport2, mut handle2) = MockTransport::pair();
+        mock_tx.send(transport1).await.unwrap();
+        mock_tx.send(transport2).await.unwrap();
+
+        let source_handle = tokio::spawn(source.run());
+
+        command_tx
+            .send(SourceCommand::UpdateHashRate(HashRate::from_gigahashes(
+                500.0,
+            )))
+            .await
+            .unwrap();
+
+        // An extranonce2 size of 0 leaves nothing to roll, so every
+        // job on this connection fails conversion and never reaches
+        // the scheduler.
+        do_handshake_with(&mut handle1, 0).await;
+
+        // The pool keeps sending jobs, none of them usable, the last
+        // one well before the deadline.
+        for i in 0..4 {
+            time::advance(MAX_JOB_GAP / 5).await;
+            handle1.send(job_notification(&format!("job-{i}")));
+        }
+
+        // Past the deadline, the source has recycled the connection.
+        time::advance(MAX_JOB_GAP / 2).await;
+        let event = time::timeout(Duration::from_secs(1), event_rx.recv()).await;
+        assert!(
+            matches!(event, Ok(Some(SourceEvent::ClearJobs))),
+            "expected ClearJobs with no usable job in the gap, got {event:?}",
+        );
+
+        // Advance past the first backoff; jitter caps it at
+        // INITIAL_RECONNECT_DELAY.
+        time::advance(INITIAL_RECONNECT_DELAY * 2).await;
+
+        // Second connection: a usable job gets through.
+        do_handshake(&mut handle2).await;
+        handle2.send(job_notification("job-ok"));
+
+        let event = event_rx.recv().await.unwrap();
+        assert!(
+            matches!(event, SourceEvent::ReplaceJob(ref t) if t.id == "job-ok"),
+            "expected ReplaceJob(job-ok) on the new connection, got {event:?}",
         );
 
         shutdown.cancel();
