@@ -276,12 +276,16 @@ impl ExtranonceIter {
         }
     }
 
-    fn remaining(&self) -> u128 {
+    /// Returns the number of extranonces left.
+    ///
+    /// The count is a `u128` because a range can hold 2^64 extranonces.
+    /// Use this rather than `count()`, whose `usize` result cannot hold every
+    /// count, and which consumes the iterator.
+    pub fn remaining(&self) -> u128 {
         self.next.map_or(0, |next| u128::from(self.last - next) + 1)
     }
 
-    /// Counts the extranonces left. Deprecated, because a range can hold
-    /// more extranonces than `usize` can count.
+    /// Counts the extranonces left. Deprecated in favor of `remaining()`.
     ///
     /// `Iterator` gives all iterators `count()`, and an impl cannot remove or
     /// deprecate it. This inherent method hides it in a direct call, so that
@@ -293,7 +297,7 @@ impl ExtranonceIter {
     /// Panics if more than `usize::MAX` extranonces remain, as
     /// `RangeInclusive::count()` does. A range can hold up to 2^64
     /// extranonces, more than `usize` can count on any target.
-    #[deprecated(note = "a range can hold more extranonces than `usize` can count")]
+    #[deprecated(note = "use `remaining()`, which returns any count exactly")]
     pub fn count(self) -> usize {
         Iterator::count(self)
     }
@@ -330,7 +334,7 @@ impl Iterator for ExtranonceIter {
     }
 
     /// Returns the number of extranonces left, without stepping through
-    /// them.
+    /// them. Prefer `remaining()`, which returns any count exactly.
     ///
     /// A direct call reaches the deprecated inherent `count()` instead.
     /// Generic code, adapters, and `Iterator::count(iter)` reach this one.
@@ -760,6 +764,20 @@ mod tests {
         let mut iter = run(&[0], 3).iter();
         assert_eq!(iter.nth_back(3), None);
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn iter_remaining_counts_a_full_counter() {
+        let mut iter = ExtranonceRange::full(8).unwrap().iter();
+        assert_eq!(iter.remaining(), 1 << 64);
+
+        iter.next();
+        iter.next_back();
+        assert_eq!(iter.remaining(), (1 << 64) - 2);
+
+        let mut iter = run(&[0], 3).iter();
+        iter.nth(2);
+        assert_eq!(iter.remaining(), 0);
     }
 
     #[test]
