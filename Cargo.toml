@@ -28,6 +28,7 @@ num_enum = "0.7"
 nusb = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serialport = { version = "4.9", default-features = false }
 test-case = "3.3.1"
 thiserror = "2.0"
 time = { version = "0.3", features = ["macros"] }

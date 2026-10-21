@@ -35,11 +35,16 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as platform;
 
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use windows as platform;
+
 // On unsupported platforms, serial port discovery is a stub so the
 // miner still compiles (e.g., for CPU mining). If this is ever
 // called, something has gone wrong because a board matched a USB
 // device on a platform where we can't find its serial ports.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod platform {
     use anyhow::{Result, bail};
     use nusb::DeviceInfo;

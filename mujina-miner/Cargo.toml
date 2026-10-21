@@ -56,6 +56,16 @@ udev = { workspace = true }
 nix = { workspace = true }
 rustix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Enable UsbPortInfo.interface so Windows serial discovery can order COM
+# ports by USB interface number (interface 0 = control). See
+# transport/usb/windows.rs.
+serialport = { workspace = true, features = ["usbportinfo-interface"] }
+# nusb's Windows backend offloads blocking USB syscalls to the async runtime,
+# so it needs the `tokio` feature to be awaited (Linux uses native async and
+# does not require this).
+nusb = { workspace = true, features = ["tokio"] }
+
 [[bin]]
 name = "mujina-minerd"
 path = "src/bin/minerd.rs"
