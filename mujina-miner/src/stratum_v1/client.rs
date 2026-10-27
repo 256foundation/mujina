@@ -15,8 +15,11 @@ use tokio_util::sync::CancellationToken;
 /// Pool connection configuration.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
-    /// Pool URL (stratum+tcp://host:port or host:port)
-    pub url: String,
+    /// Pool host name or IP address
+    pub host: String,
+
+    /// Pool TCP port
+    pub port: u16,
 
     /// Worker username
     pub username: String,
@@ -31,7 +34,8 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            url: String::new(),
+            host: String::new(),
+            port: 0,
             username: String::new(),
             password: String::new(),
             user_agent: "mujina-miner/0.1.0-alpha".to_string(),
@@ -651,7 +655,7 @@ impl StratumV1Client {
     /// Establishes a TCP connection then delegates to
     /// [`run_with_transport`](Self::run_with_transport).
     pub async fn run(self) -> StratumResult<()> {
-        let conn = Connection::connect(&self.config.url).await?;
+        let conn = Connection::connect(&self.config.host, self.config.port).await?;
         self.run_with_transport(conn).await
     }
 
@@ -768,9 +772,9 @@ impl StratumV1Client {
                 } => {
                     match cmd {
                         ClientCommand::SubmitShare(params) => {
-                            debug!(pool = %self.config.url, job_id = %params.job_id, "Submitting share");
+                            debug!(host = %self.config.host, job_id = %params.job_id, "Submitting share");
                             if let Err(e) = self.submit(&mut conn, params).await {
-                                warn!(pool = %self.config.url, error = %e, "Share submission failed; disconnecting");
+                                warn!(host = %self.config.host, error = %e, "Share submission failed; disconnecting");
                                 return Err(e);
                             }
                             // Acceptance/rejection emitted via ShareAccepted/ShareRejected events
@@ -825,7 +829,8 @@ mod tests {
     #[ignore]
     async fn test_integration_public_pool() {
         test_pool_integration(
-            "public-pool.io:21496",
+            "public-pool.io",
+            21496,
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test",
         )
         .await;
@@ -840,7 +845,8 @@ mod tests {
     #[ignore]
     async fn test_integration_ckpool() {
         test_pool_integration(
-            "solo.ckpool.org:3333",
+            "solo.ckpool.org",
+            3333,
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test",
         )
         .await;
@@ -855,7 +861,8 @@ mod tests {
     #[ignore]
     async fn test_integration_ocean() {
         test_pool_integration(
-            "mine.ocean.xyz:3334",
+            "mine.ocean.xyz",
+            3334,
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test",
         )
         .await;
@@ -868,7 +875,8 @@ mod tests {
     #[ignore]
     async fn test_integration_256foundation() {
         test_pool_integration(
-            "pool.256foundation.org:3333",
+            "pool.256foundation.org",
+            3333,
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test",
         )
         .await;
@@ -908,14 +916,17 @@ mod tests {
             "bc1qce93hy5rhg02s6aeu7mfdvxg76x66pqqtrvzs3.mujina-integration-test".to_string()
         });
 
-        // Strip stratum+tcp:// prefix if present for test_pool_integration
-        let url_without_scheme = pool_url.strip_prefix("stratum+tcp://").unwrap_or(&pool_url);
+        let host_port = pool_url.strip_prefix("stratum+tcp://").unwrap_or(&pool_url);
+        let (host, port) = host_port
+            .rsplit_once(':')
+            .expect("MUJINA_POOL_URL has no port");
+        let port = port.parse().expect("MUJINA_POOL_URL has an invalid port");
 
         println!("\n=== Testing custom pool configuration ===");
         println!("Pool: {}", pool_url);
         println!("Username: {}", username);
 
-        test_pool_integration(url_without_scheme, &username).await;
+        test_pool_integration(host, port, &username).await;
     }
 
     /// Common integration test logic for pool connections.
@@ -933,7 +944,7 @@ mod tests {
     /// that reject our configuration after the initial handshake. For example,
     /// Ocean disconnects clients that send `mining.suggest_difficulty` as a
     /// notification but tolerates it as a request (see the Ocean test).
-    async fn test_pool_integration(pool_url: &str, username: &str) {
+    async fn test_pool_integration(host: &str, port: u16, username: &str) {
         use tracing_subscriber::{EnvFilter, fmt};
 
         // Initialize logging for the test
@@ -947,13 +958,14 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let config = PoolConfig {
-            url: format!("stratum+tcp://{}", pool_url),
+            host: host.to_string(),
+            port,
             username: username.to_string(),
             password: "x".to_string(),
             user_agent: "mujina-miner/0.1.0-test".to_string(),
         };
 
-        println!("\n=== Connecting to {} ===", pool_url);
+        println!("\n=== Connecting to {}:{} ===", host, port);
 
         let client = StratumV1Client::new(config, event_tx, shutdown.clone());
 
@@ -1109,7 +1121,8 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let config = PoolConfig {
-            url: "test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             username: "test".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),
@@ -1416,7 +1429,8 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (command_tx, command_rx) = mpsc::channel(10);
         let config = PoolConfig {
-            url: "test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             username: "test".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),

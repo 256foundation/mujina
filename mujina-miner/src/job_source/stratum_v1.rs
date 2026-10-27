@@ -132,15 +132,10 @@ impl StratumV1Source {
         }
     }
 
-    /// Human-readable name derived from pool URL (e.g., "solo.ckpool.org:3333").
+    /// Returns a human-readable name built from the pool's host and port
+    /// (e.g., "solo.ckpool.org:3333").
     pub fn name(&self) -> String {
-        self.config
-            .url
-            .strip_prefix("stratum+tcp://")
-            .or_else(|| self.config.url.strip_prefix("stratum://"))
-            .or_else(|| self.config.url.strip_prefix("tcp://"))
-            .unwrap_or(&self.config.url)
-            .to_string()
+        format!("{}:{}", self.config.host, self.config.port)
     }
 
     /// Convert Stratum JobNotification to JobTemplate.
@@ -216,7 +211,7 @@ impl StratumV1Source {
                 extranonce2_size,
             } => {
                 info!(
-                    pool = %self.config.url,
+                    host = %self.config.host,
                     user = %self.config.username,
                     "Subscribed."
                 );
@@ -269,7 +264,7 @@ impl StratumV1Source {
                 if !self.first_share_logged {
                     self.first_share_logged = true;
                     info!(
-                        pool = %self.config.url,
+                        host = %self.config.host,
                         user = %self.config.username,
                         nonce = format!("{:#x}", nonce),
                         job_id = %job_id,
@@ -277,7 +272,7 @@ impl StratumV1Source {
                     );
                 } else {
                     debug!(
-                        pool = %self.config.url,
+                        host = %self.config.host,
                         user = %self.config.username,
                         nonce = format!("{:#x}", nonce),
                         job_id = %job_id,
@@ -434,7 +429,7 @@ impl StratumV1Source {
     /// has a meaningful value at connect time. Reconnects automatically with
     /// exponential backoff when the connection drops.
     pub async fn run(mut self) -> Result<()> {
-        info!(pool = %self.config.url, "Waiting for hash threads before connecting");
+        info!(host = %self.config.host, "Waiting for hash threads before connecting");
 
         // Phase 1: wait until hash threads are available before connecting.
         let Some(rate) = wait_for_hash_rate(&mut self.command_rx, &self.shutdown).await else {
@@ -450,7 +445,7 @@ impl StratumV1Source {
             self.state = None;
             self.first_share_logged = false;
 
-            info!(pool = %self.config.url, "Connecting to pool");
+            info!(host = %self.config.host, port = self.config.port, "Connecting to pool");
 
             reconnect.attempt();
             match self.connect_and_run().await {
@@ -661,7 +656,8 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             username: "testworker".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),
@@ -1092,7 +1088,8 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             ..Default::default()
         };
 
@@ -1151,7 +1148,8 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             ..Default::default()
         };
         StratumV1Source::new(
@@ -1262,7 +1260,8 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             ..Default::default()
         };
 
@@ -1295,7 +1294,8 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             ..Default::default()
         };
 
@@ -1330,7 +1330,8 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             ..Default::default()
         };
 
@@ -1441,7 +1442,8 @@ mod tests {
         let (mock_tx, mock_rx) = mpsc::channel(10);
 
         let config = PoolConfig {
-            url: "stratum+tcp://test:3333".to_string(),
+            host: "test".to_string(),
+            port: 3333,
             username: "testworker".to_string(),
             password: "x".to_string(),
             user_agent: "test".to_string(),
