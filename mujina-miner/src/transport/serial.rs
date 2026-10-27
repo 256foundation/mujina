@@ -16,9 +16,7 @@
 //! after it has been split for concurrent I/O operations.
 
 use std::io;
-#[cfg(test)]
-use std::os::unix::io::FromRawFd;
-use std::os::unix::io::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -103,7 +101,7 @@ pub struct SerialStream {
 
 struct SerialInner {
     /// File descriptor - immutable after creation
-    fd: AsyncFd<RawFd>,
+    fd: AsyncFd<OwnedFd>,
 
     /// Current configuration - atomic for lock-free reads
     baud_rate: AtomicU32,
@@ -241,9 +239,7 @@ impl SerialStream {
         // Apply serial configuration
         apply_serial_config(&fd, &config)?;
 
-        // Convert OwnedFd to RawFd for AsyncFd
-        let raw_fd = fd.into_raw_fd();
-        let async_fd = AsyncFd::new(raw_fd).map_err(SerialError::IoError)?;
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
@@ -281,10 +277,7 @@ impl SerialStream {
     ///
     /// This is primarily used for testing with virtual serial ports.
     #[cfg(test)]
-    pub(crate) fn from_fd(fd: RawFd, config: SerialConfig) -> Result<Self, SerialError> {
-        // Convert raw fd to OwnedFd
-        let fd = unsafe { rustix::fd::OwnedFd::from_raw_fd(fd) };
-
+    pub(crate) fn from_fd(fd: OwnedFd, config: SerialConfig) -> Result<Self, SerialError> {
         // Apply serial configuration
         apply_serial_config(&fd, &config)?;
 
@@ -295,7 +288,7 @@ impl SerialStream {
         fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
             .map_err(|e| SerialError::ConfigError(format!("Failed to set fd flags: {}", e)))?;
 
-        let async_fd = AsyncFd::new(fd.into_raw_fd()).map_err(SerialError::IoError)?;
+        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
@@ -610,13 +603,8 @@ mod tests {
             let OpenptyResult { master, slave } = openpty(None, None)
                 .map_err(|e| SerialError::ConfigError(format!("Failed to open pty: {}", e)))?;
 
-            // Convert OwnedFd to RawFd
-            let master_fd = master.into_raw_fd();
-            let slave_fd = slave.into_raw_fd();
-
-            // Create streams from file descriptors
-            let master_stream = SerialStream::from_fd(master_fd, SerialConfig::default())?;
-            let slave_stream = SerialStream::from_fd(slave_fd, SerialConfig::default())?;
+            let master_stream = SerialStream::from_fd(master, SerialConfig::default())?;
+            let slave_stream = SerialStream::from_fd(slave, SerialConfig::default())?;
 
             Ok((master_stream, slave_stream))
         }
@@ -873,6 +861,34 @@ mod tests {
         assert_eq!(stats.bytes_written, 0);
     }
 
+    // On Linux, a read from a pty master returns EIO once no open fd
+    // refers to the slave, and EAGAIN while one still does.
+    #[tokio::test]
+    #[cfg_attr(
+        feature = "skip-pty-tests",
+        ignore = "PTY tests skipped via feature flag"
+    )]
+    async fn test_drop_closes_port() {
+        use nix::pty::openpty;
+        use rustix::fs::{fcntl_getfl, fcntl_setfl};
+
+        let pty = openpty(None, None).unwrap();
+        fcntl_setfl(
+            &pty.master,
+            fcntl_getfl(&pty.master).unwrap() | OFlags::NONBLOCK,
+        )
+        .unwrap();
+        let stream = SerialStream::from_fd(pty.slave, SerialConfig::default()).unwrap();
+
+        drop(stream);
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            rustix::io::read(&pty.master, &mut buf),
+            Err(rustix::io::Errno::IO)
+        );
+    }
+
     #[test]
     fn test_invalid_configurations() {
         // Since we can't easily test with real device paths,
@@ -904,14 +920,12 @@ mod tests {
         // Create a PTY pair for testing
         let result = openpty(None, None);
         if let Ok(pty) = result {
-            let master_fd = pty.master.into_raw_fd();
-
             // Test invalid data bits
             let config = SerialConfig {
                 data_bits: 9,
                 ..Default::default()
             };
-            let result = SerialStream::from_fd(master_fd, config);
+            let result = SerialStream::from_fd(pty.master, config);
             assert!(result.is_err());
             if let Err(SerialError::ConfigError(msg)) = result {
                 assert!(msg.contains("Invalid data bits: 9"));
@@ -919,14 +933,13 @@ mod tests {
 
             // We need a new fd since the previous one was consumed
             let result = openpty(None, None).unwrap();
-            let master_fd = result.master.into_raw_fd();
 
             // Test invalid stop bits
             let config = SerialConfig {
                 stop_bits: 3,
                 ..Default::default()
             };
-            let result = SerialStream::from_fd(master_fd, config);
+            let result = SerialStream::from_fd(result.master, config);
             assert!(result.is_err());
             if let Err(SerialError::ConfigError(msg)) = result {
                 assert!(msg.contains("Invalid stop bits: 3"));
