@@ -47,6 +47,6 @@ reqwest = { version = "0.12", features = ["json"] }
 rustix = { version = "0.38", features = ["fs", "termios"] }
 slotmap = "1.0"
 udev = "0.9"
-utoipa = "5.4"
-utoipa-axum = "0.2"
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa = "6.0"
+utoipa-axum = "0.3"
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
