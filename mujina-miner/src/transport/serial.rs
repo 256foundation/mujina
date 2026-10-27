@@ -16,7 +16,7 @@
 //! after it has been split for concurrent I/O operations.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::OwnedFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -315,12 +315,9 @@ impl AsyncRead for SerialReader {
             let mut guard = ready!(self.inner.fd.poll_read_ready(cx))?;
 
             match guard.try_io(|inner| {
-                let fd = inner.as_raw_fd();
                 let slice = buf.initialize_unfilled();
 
-                // Direct read syscall
-                let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
-                match rustix::io::read(fd_ref, slice) {
+                match rustix::io::read(inner.get_ref(), slice) {
                     Ok(n) => {
                         buf.advance(n);
                         if n > 0 {
@@ -362,11 +359,7 @@ impl AsyncWrite for SerialWriter {
             let mut guard = ready!(self.inner.fd.poll_write_ready(cx))?;
 
             match guard.try_io(|inner| {
-                let fd = inner.as_raw_fd();
-
-                // Direct write syscall
-                let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
-                match rustix::io::write(fd_ref, buf) {
+                match rustix::io::write(inner.get_ref(), buf) {
                     Ok(n) => {
                         if n > 0 {
                             self.inner
@@ -439,11 +432,8 @@ impl SerialControl {
             }
         };
 
-        // Get current termios
-        let fd = self.inner.fd.as_raw_fd();
-        // Temporarily create a borrowed fd for the termios calls
-        let fd_ref = unsafe { BorrowedFd::borrow_raw(fd) };
-        let mut termios = tcgetattr(fd_ref)
+        let fd = self.inner.fd.get_ref();
+        let mut termios = tcgetattr(fd)
             .map_err(|e| SerialError::ConfigError(format!("Failed to get termios: {}", e)))?;
 
         // Update baud rate
@@ -452,7 +442,7 @@ impl SerialControl {
             .map_err(|e| SerialError::ConfigError(format!("Failed to set baud rate: {}", e)))?;
 
         // Apply changes after output buffer drains (critical for baud rate changes)
-        tcsetattr(fd_ref, rustix::termios::OptionalActions::Drain, &termios)
+        tcsetattr(fd, rustix::termios::OptionalActions::Drain, &termios)
             .map_err(|e| SerialError::ConfigError(format!("Failed to apply termios: {}", e)))?;
 
         // Update atomic with release ordering to ensure termios changes are visible
