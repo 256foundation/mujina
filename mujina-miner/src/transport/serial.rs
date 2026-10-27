@@ -236,10 +236,19 @@ impl SerialStream {
         )
         .map_err(|e| SerialError::OpenError(e.into()))?;
 
-        // Apply serial configuration
+        Self::from_nonblocking_fd(fd, config)
+    }
+
+    /// Configure a non-blocking fd and register it with the runtime.
+    fn from_nonblocking_fd(fd: OwnedFd, config: SerialConfig) -> Result<Self, SerialError> {
         apply_serial_config(&fd, &config)?;
 
-        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
+        // SAFETY: The AsyncFd takes sole ownership of the fd. The stream
+        // lends out only shared borrows of it, so nothing can close or
+        // replace the fd while it is registered, and the AsyncFd
+        // deregisters the fd on drop before closing it.
+        let async_fd =
+            unsafe { AsyncFd::register(fd) }.map_err(|e| SerialError::IoError(e.into()))?;
 
         Ok(Self {
             inner: Arc::new(SerialInner {
@@ -278,30 +287,13 @@ impl SerialStream {
     /// This is primarily used for testing with virtual serial ports.
     #[cfg(test)]
     pub(crate) fn from_fd(fd: OwnedFd, config: SerialConfig) -> Result<Self, SerialError> {
-        // Apply serial configuration
-        apply_serial_config(&fd, &config)?;
-
-        // Make the fd non-blocking
         use rustix::fs::{fcntl_getfl, fcntl_setfl};
         let flags = fcntl_getfl(&fd)
             .map_err(|e| SerialError::ConfigError(format!("Failed to get fd flags: {}", e)))?;
         fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
             .map_err(|e| SerialError::ConfigError(format!("Failed to set fd flags: {}", e)))?;
 
-        let async_fd = AsyncFd::new(fd).map_err(SerialError::IoError)?;
-
-        Ok(Self {
-            inner: Arc::new(SerialInner {
-                fd: async_fd,
-                baud_rate: AtomicU32::new(config.baud_rate),
-                data_bits: AtomicU8::new(config.data_bits),
-                stop_bits: AtomicU8::new(config.stop_bits),
-                parity: AtomicU8::new(config.parity as u8),
-                reconfig_lock: RwLock::new(()),
-                bytes_read: AtomicU64::new(0),
-                bytes_written: AtomicU64::new(0),
-            }),
-        })
+        Self::from_nonblocking_fd(fd, config)
     }
 }
 
