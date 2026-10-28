@@ -127,6 +127,19 @@ impl PoolConfig {
         }
         Ok(())
     }
+
+    /// Returns a copy of this configuration that connects to `host:port`.
+    ///
+    /// Every other field is kept, the authority public key included, so a
+    /// pool can move the miner between its own servers but never to a server
+    /// outside its authority.
+    pub(crate) fn with_endpoint(&self, host: String, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            ..self.clone()
+        }
+    }
 }
 
 /// Commands sent to the SV2 client from the consumer.
@@ -910,6 +923,23 @@ mod tests {
         assert_eq!(
             reconnect_endpoint(&config, &make_reconnect("backup.example.com", 0)),
             ("backup.example.com".to_string(), 3333)
+        );
+    }
+
+    /// Contract: moving a configuration to another endpoint keeps the
+    /// authority key, so a Reconnect cannot send the miner to a server
+    /// outside the pool's authority.
+    #[test]
+    fn with_endpoint_keeps_the_authority_key() {
+        let config = make_config();
+
+        let moved = config.with_endpoint("backup.example.com".to_string(), 4444);
+
+        assert_eq!(moved.host, "backup.example.com");
+        assert_eq!(moved.port, 4444);
+        assert_eq!(
+            format!("{:?}", moved.authority_key),
+            format!("{:?}", config.authority_key)
         );
     }
 
