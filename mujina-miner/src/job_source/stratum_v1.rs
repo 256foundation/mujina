@@ -15,7 +15,7 @@ use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::stratum_v1::{
-    ClientCommand, ClientEvent, Connector, JobNotification, PoolConfig, StratumV1Client,
+    ClientCommand, ClientEvent, Connector, JobNotification, StratumV1Client, StratumV1PoolConfig,
 };
 use crate::tracing::prelude::*;
 use crate::types::{Difficulty, HashRate, ShareRate};
@@ -140,7 +140,7 @@ enum ConnectOutcome {
 /// messages to JobTemplates and outgoing Share submissions to Stratum format.
 pub struct StratumV1Source {
     /// Pool configuration
-    config: PoolConfig,
+    config: StratumV1PoolConfig,
 
     /// Where to send events to scheduler
     event_tx: mpsc::Sender<SourceEvent>,
@@ -189,7 +189,7 @@ struct ProtocolState {
 impl StratumV1Source {
     /// Create a new Stratum v1 source.
     pub fn new(
-        config: PoolConfig,
+        config: StratumV1PoolConfig,
         command_rx: mpsc::Receiver<SourceCommand>,
         event_tx: mpsc::Sender<SourceEvent>,
         shutdown: CancellationToken,
@@ -787,10 +787,10 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             username: "testworker".to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "test".to_string(),
             ..Default::default()
         };
@@ -1218,7 +1218,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             ..Default::default()
         };
@@ -1277,7 +1277,7 @@ mod tests {
     fn throttle_test_source() -> StratumV1Source {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             ..Default::default()
         };
@@ -1388,7 +1388,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             ..Default::default()
         };
@@ -1421,7 +1421,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             ..Default::default()
         };
@@ -1456,7 +1456,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (_command_tx, command_rx) = mpsc::channel(10);
         let shutdown = CancellationToken::new();
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             ..Default::default()
         };
@@ -1619,10 +1619,10 @@ mod tests {
         let shutdown = CancellationToken::new();
         let (mock_tx, mock_rx) = mpsc::channel(10);
 
-        let config = PoolConfig {
+        let config = StratumV1PoolConfig {
             url: "stratum+tcp://test:3333".to_string(),
             username: "testworker".to_string(),
-            password: "x".to_string(),
+            password: Some("x".to_string()),
             user_agent: "test".to_string(),
             ..Default::default()
         };
