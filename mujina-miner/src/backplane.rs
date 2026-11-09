@@ -79,8 +79,8 @@ impl Backplane {
         }
     }
 
-    /// Runs the backplane until every transport closes or shutdown is
-    /// requested, then stops all boards.
+    /// Runs the backplane until shutdown is requested, then stops all
+    /// boards.
     pub async fn run(mut self, shutdown: CancellationToken) {
         tokio::select! {
             result = self.route_events() => {
@@ -91,6 +91,9 @@ impl Backplane {
             _ = shutdown.cancelled() => {}
         }
 
+        // Boards outlive their transports: the CPU miner's closes as
+        // soon as its board is up. Stop them only on shutdown.
+        shutdown.cancelled().await;
         self.shutdown_all_boards().await;
     }
 
@@ -336,7 +339,6 @@ mod tests {
     use crate::api_client::types::BoardTelemetry;
 
     #[tokio::test(start_paused = true)]
-    #[should_panic(expected = "backplane exited before shutdown")] // known bug: #137
     async fn boards_run_until_shutdown_after_transports_close() {
         // A transport that closes once its board is up, as the CPU
         // miner's does.
