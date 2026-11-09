@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
+use tokio_util::sync::CancellationToken;
 
 use futures::future::BoxFuture;
 
@@ -78,8 +79,26 @@ impl Backplane {
         }
     }
 
-    /// Run the backplane event loop.
-    pub async fn run(&mut self) -> Result<()> {
+    /// Runs the backplane until shutdown is requested, then stops all
+    /// boards.
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        tokio::select! {
+            result = self.route_events() => {
+                if let Err(e) = result {
+                    error!("Backplane error: {}", e);
+                }
+            }
+            _ = shutdown.cancelled() => {}
+        }
+
+        // Boards outlive their transports: the CPU miner's closes as
+        // soon as its board is up. Stop them only on shutdown.
+        shutdown.cancelled().await;
+        self.shutdown_all_boards().await;
+    }
+
+    /// Routes transport events until every transport closes.
+    async fn route_events(&mut self) -> Result<()> {
         // Multiplex the per-transport receivers. The number of transports is
         // how many initial-enumeration completions to wait for.
         let mut streams: StreamMap<usize, ReceiverStream<TransportEvent>> = StreamMap::new();
@@ -118,7 +137,7 @@ impl Backplane {
     }
 
     /// Shutdown all boards managed by this backplane.
-    pub async fn shutdown_all_boards(&mut self) {
+    async fn shutdown_all_boards(&mut self) {
         let board_ids: Vec<String> = self.boards.keys().cloned().collect();
 
         for board_id in board_ids {
@@ -305,5 +324,66 @@ impl ActiveBoard {
         if let Some(fut) = self.shutdown.take() {
             fut.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::{sync::watch, time};
+
+    use super::*;
+    use crate::api_client::types::BoardTelemetry;
+
+    #[tokio::test(start_paused = true)]
+    async fn boards_run_until_shutdown_after_transports_close() {
+        // A transport that closes once its board is up, as the CPU
+        // miner's does.
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        drop(transport_tx);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (_telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry::default());
+        let conn = BackplaneConnector {
+            info: BoardInfo {
+                model: "Test Board".into(),
+                firmware_version: None,
+                serial_number: None,
+            },
+            threads: Vec::new(),
+            telemetry_rx,
+            shutdown: Some(Box::pin({
+                let stopped = stopped.clone();
+                async move { stopped.store(true, Ordering::SeqCst) }
+            })),
+        };
+        backplane.start_board("test-board".into(), conn).await;
+
+        let shutdown = CancellationToken::new();
+        let mut run = tokio::spawn(backplane.run(shutdown.clone()));
+
+        // Time is paused, so the runtime skips straight to the timeout
+        // once the backplane goes idle.
+        let finished_early = time::timeout(Duration::from_secs(3600), &mut run)
+            .await
+            .is_ok();
+        assert!(!finished_early, "backplane exited before shutdown");
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "board stopped before shutdown"
+        );
+
+        shutdown.cancel();
+        run.await.unwrap();
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "board not stopped on shutdown"
+        );
     }
 }
