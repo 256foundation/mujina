@@ -93,22 +93,8 @@ impl Daemon {
         let (board_reg_tx, board_reg_rx) = mpsc::channel(10);
 
         // Create and start backplane
-        let mut backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
-        self.tracker.spawn({
-            let shutdown = self.shutdown.clone();
-            async move {
-                tokio::select! {
-                    result = backplane.run() => {
-                        if let Err(e) = result {
-                            error!("Backplane error: {}", e);
-                        }
-                    }
-                    _ = shutdown.cancelled() => {}
-                }
-
-                backplane.shutdown_all_boards().await;
-            }
-        });
+        let backplane = Backplane::new(transport_rxs, thread_tx, board_reg_tx);
+        self.tracker.spawn(backplane.run(self.shutdown.clone()));
 
         // Create job source (Stratum v1 or Dummy)
         // Controlled by environment variables:

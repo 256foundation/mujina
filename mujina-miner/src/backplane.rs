@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
+use tokio_util::sync::CancellationToken;
 
 use futures::future::BoxFuture;
 
@@ -78,8 +79,23 @@ impl Backplane {
         }
     }
 
-    /// Run the backplane event loop.
-    pub async fn run(&mut self) -> Result<()> {
+    /// Runs the backplane until every transport closes or shutdown is
+    /// requested, then stops all boards.
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        tokio::select! {
+            result = self.route_events() => {
+                if let Err(e) = result {
+                    error!("Backplane error: {}", e);
+                }
+            }
+            _ = shutdown.cancelled() => {}
+        }
+
+        self.shutdown_all_boards().await;
+    }
+
+    /// Routes transport events until every transport closes.
+    async fn route_events(&mut self) -> Result<()> {
         // Multiplex the per-transport receivers. The number of transports is
         // how many initial-enumeration completions to wait for.
         let mut streams: StreamMap<usize, ReceiverStream<TransportEvent>> = StreamMap::new();
@@ -118,7 +134,7 @@ impl Backplane {
     }
 
     /// Shutdown all boards managed by this backplane.
-    pub async fn shutdown_all_boards(&mut self) {
+    async fn shutdown_all_boards(&mut self) {
         let board_ids: Vec<String> = self.boards.keys().cloned().collect();
 
         for board_id in board_ids {
