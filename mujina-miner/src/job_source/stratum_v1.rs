@@ -628,11 +628,14 @@ impl StratumV1Source {
                 event_opt = client_event_rx.recv() => {
                     match event_opt {
                         Some(event) => {
-                            if matches!(event, ClientEvent::NewJob(_)) {
-                                gap_start = Instant::now();
-                            }
-                            if let Err(e) = self.handle_client_event(event).await {
-                                warn!(error = %e, "Error handling client event");
+                            let is_job = matches!(event, ClientEvent::NewJob(_));
+                            match self.handle_client_event(event).await {
+                                // Only a job the scheduler can use counts as
+                                // fresh work. A pool that sends nothing but
+                                // unusable jobs is as stuck as a silent one.
+                                Ok(()) if is_job => gap_start = Instant::now(),
+                                Ok(()) => {}
+                                Err(e) => warn!(error = %e, "Error handling client event"),
                             }
                         }
                         None => {
@@ -1792,7 +1795,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[should_panic(expected = "expected ClearJobs")] // known bug: unusable jobs reset the job gap
     async fn unusable_job_does_not_defer_recycling() {
         let (source, mut event_rx, command_tx, mock_tx, shutdown) = source_with_mock_transports();
 
