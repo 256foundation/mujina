@@ -628,11 +628,14 @@ impl StratumV1Source {
                 event_opt = client_event_rx.recv() => {
                     match event_opt {
                         Some(event) => {
-                            if matches!(event, ClientEvent::NewJob(_)) {
-                                gap_start = Instant::now();
-                            }
-                            if let Err(e) = self.handle_client_event(event).await {
-                                warn!(error = %e, "Error handling client event");
+                            let is_job = matches!(event, ClientEvent::NewJob(_));
+                            match self.handle_client_event(event).await {
+                                // Only a job the scheduler can use counts as
+                                // fresh work. A pool that sends nothing but
+                                // unusable jobs is as stuck as a silent one.
+                                Ok(()) if is_job => gap_start = Instant::now(),
+                                Ok(()) => {}
+                                Err(e) => warn!(error = %e, "Error handling client event"),
                             }
                         }
                         None => {
@@ -1588,6 +1591,11 @@ mod tests {
 
     /// Build a minimal mining.notify notification.
     fn job_notification(job_id: &str) -> JsonRpcMessage {
+        job_notification_with_version(job_id, "20000000")
+    }
+
+    /// Like [`job_notification`], but with the given block version.
+    fn job_notification_with_version(job_id: &str, version: &str) -> JsonRpcMessage {
         JsonRpcMessage::notification(
             "mining.notify",
             json!([
@@ -1596,7 +1604,7 @@ mod tests {
                 "aa",
                 "bb",
                 [],
-                "20000000",
+                version,
                 "1d00ffff",
                 "5a5a5a5a",
                 true
@@ -1780,6 +1788,43 @@ mod tests {
         assert!(
             event_rx.try_recv().is_err(),
             "connection recycled despite a fresh job",
+        );
+
+        shutdown.cancel();
+        source_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unusable_job_does_not_defer_recycling() {
+        let (source, mut event_rx, command_tx, mock_tx, shutdown) = source_with_mock_transports();
+
+        let (transport1, mut handle1) = MockTransport::pair();
+        mock_tx.send(transport1).await.unwrap();
+
+        let source_handle = tokio::spawn(source.run());
+
+        command_tx
+            .send(SourceCommand::UpdateHashRate(HashRate::from_gigahashes(
+                500.0,
+            )))
+            .await
+            .unwrap();
+
+        do_handshake(&mut handle1).await;
+
+        // A job three quarters of the way to the deadline, but its
+        // version sets general-purpose bits, so it fails conversion
+        // and never reaches the scheduler.
+        time::advance(MAX_JOB_GAP * 3 / 4).await;
+        handle1.send(job_notification_with_version("job-1", "20002000"));
+
+        // Half a gap later the original deadline has passed. The job
+        // gave the scheduler no work, so the connection is recycled.
+        time::advance(MAX_JOB_GAP / 2).await;
+        let event = time::timeout(Duration::from_secs(1), event_rx.recv()).await;
+        assert!(
+            matches!(event, Ok(Some(SourceEvent::ClearJobs))),
+            "expected ClearJobs despite an unusable job, got {event:?}",
         );
 
         shutdown.cancel();
