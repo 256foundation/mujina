@@ -323,3 +323,65 @@ impl ActiveBoard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use tokio::{sync::watch, time};
+
+    use super::*;
+    use crate::api_client::types::BoardTelemetry;
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "backplane exited before shutdown")] // known bug: #137
+    async fn boards_run_until_shutdown_after_transports_close() {
+        // A transport that closes once its board is up, as the CPU
+        // miner's does.
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        drop(transport_tx);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (_telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry::default());
+        let conn = BackplaneConnector {
+            info: BoardInfo {
+                model: "Test Board".into(),
+                firmware_version: None,
+                serial_number: None,
+            },
+            threads: Vec::new(),
+            telemetry_rx,
+            shutdown: Some(Box::pin({
+                let stopped = stopped.clone();
+                async move { stopped.store(true, Ordering::SeqCst) }
+            })),
+        };
+        backplane.start_board("test-board".into(), conn).await;
+
+        let shutdown = CancellationToken::new();
+        let mut run = tokio::spawn(backplane.run(shutdown.clone()));
+
+        // Time is paused, so the runtime skips straight to the timeout
+        // once the backplane goes idle.
+        let finished_early = time::timeout(Duration::from_secs(3600), &mut run)
+            .await
+            .is_ok();
+        assert!(!finished_early, "backplane exited before shutdown");
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "board stopped before shutdown"
+        );
+
+        shutdown.cancel();
+        run.await.unwrap();
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "board not stopped on shutdown"
+        );
+    }
+}
