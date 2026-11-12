@@ -79,6 +79,10 @@ pub mod regs {
     pub const EXTERNAL_TEMP_LIMIT_HIGH: u8 = 0x07;
     /// External temperature high limit low byte
     pub const EXTERNAL_TEMP_LIMIT_LOW: u8 = 0x13;
+    /// External diode ideality factor
+    pub const EXTERNAL_IDEALITY: u8 = 0x17;
+    /// External diode beta compensation
+    pub const BETA_COMPENSATION: u8 = 0x18;
     /// Fan configuration register
     pub const FAN_CONFIG: u8 = 0x4A;
     /// Fan spin-up configuration
@@ -113,10 +117,27 @@ pub mod regs {
     pub const REVISION: u8 = 0xFF;
 }
 
+/// External diode calibration. The chip keeps it until it loses power, so
+/// `init` always writes it.
+#[derive(Debug, Clone, Copy)]
+pub enum DiodeCalibration {
+    /// The datasheet defaults: ideality 0x12 and automatic beta (0x08).
+    Uncalibrated,
+    /// Raw ideality (0x17) and beta (0x18) register values.
+    Registers { ideality: u8, beta: u8 },
+}
+
+/// EMC2101 configuration parameters
+#[derive(Debug, Clone)]
+pub struct Emc2101Config {
+    pub diode_calibration: DiodeCalibration,
+}
+
 /// EMC2101 driver
 pub struct Emc2101<I: I2c> {
     i2c: I,
     address: u8,
+    config: Emc2101Config,
 }
 
 impl<I: I2c> Emc2101<I> {
@@ -124,16 +145,21 @@ impl<I: I2c> Emc2101<I> {
     const PWM_MAX: u8 = 63;
 
     /// Create a new EMC2101 driver with default address
-    pub fn new(i2c: I) -> Self {
+    pub fn new(i2c: I, config: Emc2101Config) -> Self {
         Self {
             i2c,
             address: DEFAULT_ADDRESS,
+            config,
         }
     }
 
     /// Create a new EMC2101 driver with custom address
-    pub fn new_with_address(i2c: I, address: u8) -> Self {
-        Self { i2c, address }
+    pub fn new_with_address(i2c: I, address: u8, config: Emc2101Config) -> Self {
+        Self {
+            i2c,
+            address,
+            config,
+        }
     }
 
     /// Initialize the EMC2101 for basic operation
@@ -194,6 +220,19 @@ impl<I: I2c> Emc2101<I> {
         const FAN_CONFIG_PWM_MODE: u8 = 0x23;
         self.write_register(regs::FAN_CONFIG, FAN_CONFIG_PWM_MODE)
             .await?;
+
+        let (ideality, beta) = match self.config.diode_calibration {
+            DiodeCalibration::Uncalibrated => (0x12, 0x08),
+            DiodeCalibration::Registers { ideality, beta } => (ideality, beta),
+        };
+        self.write_register(regs::EXTERNAL_IDEALITY, ideality)
+            .await?;
+        self.write_register(regs::BETA_COMPENSATION, beta).await?;
+        debug!(
+            ideality = format!("{:#04x}", ideality),
+            beta = format!("{:#04x}", beta),
+            "Set external diode calibration"
+        );
 
         Ok(())
     }
@@ -305,5 +344,105 @@ impl<I: I2c> Emc2101<I> {
 
     async fn write_register(&mut self, reg: u8, value: u8) -> Result<()> {
         self.i2c.write(self.address, &[reg, value]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+
+    /// Mock I2C bus backed by a table of registers.
+    ///
+    /// Reads of registers not in the table fail, and every register
+    /// write is recorded.
+    struct RegisterTable {
+        registers: HashMap<u8, u8>,
+        writes: Vec<(u8, u8)>,
+    }
+
+    impl RegisterTable {
+        fn new(registers: &[(u8, u8)]) -> Self {
+            Self {
+                registers: registers.iter().copied().collect(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl I2c for RegisterTable {
+        async fn write(&mut self, _addr: u8, data: &[u8]) -> Result<()> {
+            self.writes.push((data[0], data[1]));
+            Ok(())
+        }
+
+        async fn read(&mut self, _addr: u8, _buffer: &mut [u8]) -> Result<()> {
+            Err(HwError::NotSupported("plain read".into()))
+        }
+
+        async fn write_read(&mut self, _addr: u8, write: &[u8], read: &mut [u8]) -> Result<()> {
+            let reg = write[0];
+            read[0] = *self
+                .registers
+                .get(&reg)
+                .ok_or_else(|| HwError::Other(format!("no register 0x{reg:02x}")))?;
+            Ok(())
+        }
+
+        async fn set_frequency(&mut self, _hz: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `init` on an EMC2101 and returns its writes to the ideality
+    /// and beta registers.
+    async fn init_calibration(diode_calibration: DiodeCalibration) -> Vec<(u8, u8)> {
+        let table = RegisterTable::new(&[
+            (regs::MFG_ID, 0x5D),
+            (regs::PRODUCT_ID, 0x16),
+            (regs::REVISION, 0x01),
+            (regs::CONFIG, 0x00),
+        ]);
+        let mut emc = Emc2101::new(table, Emc2101Config { diode_calibration });
+
+        emc.init().await.expect("init succeeds");
+
+        emc.i2c
+            .writes
+            .into_iter()
+            .filter(|(reg, _)| [regs::EXTERNAL_IDEALITY, regs::BETA_COMPENSATION].contains(reg))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn init_writes_the_diode_calibration() {
+        let writes = init_calibration(DiodeCalibration::Registers {
+            ideality: 0x24,
+            beta: 0x00,
+        })
+        .await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (regs::EXTERNAL_IDEALITY, 0x24),
+                (regs::BETA_COMPENSATION, 0x00)
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncalibrated_init_writes_the_datasheet_defaults() {
+        let writes = init_calibration(DiodeCalibration::Uncalibrated).await;
+
+        assert_eq!(
+            writes,
+            vec![
+                (regs::EXTERNAL_IDEALITY, 0x12),
+                (regs::BETA_COMPENSATION, 0x08)
+            ]
+        );
     }
 }

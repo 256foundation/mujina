@@ -44,7 +44,7 @@ use crate::{
         },
     },
     peripheral::{
-        emc2101::{Emc2101, Percent},
+        emc2101::{DiodeCalibration, Emc2101, Emc2101Config, Percent},
         tps546::{Tps546, Tps546Config, Tps546Regulator},
     },
     tracing::prelude::*,
@@ -521,7 +521,14 @@ impl BitaxeMonitor {
 }
 
 async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Emc2101<BitaxeRawI2c>> {
-    let mut fan = Emc2101::new(i2c);
+    let config = Emc2101Config {
+        // Calibration from esp-miner
+        diode_calibration: DiodeCalibration::Registers {
+            ideality: 0x24,
+            beta: 0x00,
+        },
+    };
+    let mut fan = Emc2101::new(i2c, config);
     fan.init().await.context("EMC2101 init failed")?;
     fan.set_fan_speed(Percent::FULL)
         .await
