@@ -522,7 +522,11 @@ impl BitaxeMonitor {
 
 async fn init_fan_controller(i2c: BitaxeRawI2c) -> Result<Emc2101<BitaxeRawI2c>> {
     let config = Emc2101Config {
-        diode_calibration: DiodeCalibration::Uncalibrated,
+        // Calibration from esp-miner
+        diode_calibration: DiodeCalibration::Registers {
+            ideality: 0x24,
+            beta: 0x00,
+        },
     };
     let mut fan = Emc2101::new(i2c, config);
     fan.init().await.context("EMC2101 init failed")?;
