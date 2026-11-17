@@ -337,19 +337,11 @@ mod tests {
     use super::*;
     use crate::api_client::types::BoardTelemetry;
 
-    #[tokio::test(start_paused = true)]
-    async fn boards_run_until_shutdown_after_transports_close() {
-        // A transport that closes once its board is up, as the CPU
-        // miner's does.
-        let (transport_tx, transport_rx) = mpsc::channel(1);
-        drop(transport_tx);
-        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
-        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
-        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
-
-        let stopped = Arc::new(AtomicBool::new(false));
+    /// A board with no threads that sets `stopped` when the
+    /// backplane stops it.
+    fn test_board(stopped: &Arc<AtomicBool>) -> BackplaneConnector {
         let (_telemetry_tx, telemetry_rx) = watch::channel(BoardTelemetry::default());
-        let conn = BackplaneConnector {
+        BackplaneConnector {
             info: BoardInfo {
                 model: "Test Board".into(),
                 firmware_version: None,
@@ -361,8 +353,23 @@ mod tests {
                 let stopped = stopped.clone();
                 async move { stopped.store(true, Ordering::SeqCst) }
             })),
-        };
-        backplane.start_board("test-board".into(), conn).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boards_run_until_shutdown_after_transports_close() {
+        // A transport that closes once its board is up, as the CPU
+        // miner's does.
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        drop(transport_tx);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        backplane
+            .start_board("test-board".into(), test_board(&stopped))
+            .await;
 
         let shutdown = CancellationToken::new();
         let mut run = tokio::spawn(backplane.run(shutdown.clone()));
@@ -376,6 +383,47 @@ mod tests {
         assert!(
             !stopped.load(Ordering::SeqCst),
             "board stopped before shutdown"
+        );
+
+        shutdown.cancel();
+        run.await.unwrap();
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "board not stopped on shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "unrelated removal")] // known bug: any USB removal stops a board
+    async fn unrelated_usb_removal_leaves_boards_running() {
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        backplane
+            .start_board("test-board".into(), test_board(&stopped))
+            .await;
+
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(backplane.run(shutdown.clone()));
+
+        // Some other USB device, such as a keyboard, is unplugged.
+        let removal = UsbTransportEvent::UsbDeviceDisconnected {
+            device_path: "/sys/devices/some-other-device".into(),
+        };
+        transport_tx
+            .send(TransportEvent::Usb(removal))
+            .await
+            .unwrap();
+
+        // The clock is paused, so this returns once the backplane
+        // has handled the event and gone idle.
+        time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !stopped.load(Ordering::SeqCst),
+            "board stopped by an unrelated removal"
         );
 
         shutdown.cancel();
