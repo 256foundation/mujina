@@ -83,11 +83,7 @@ impl Backplane {
     /// boards.
     pub async fn run(mut self, shutdown: CancellationToken) {
         tokio::select! {
-            result = self.route_events() => {
-                if let Err(e) = result {
-                    error!("Backplane error: {}", e);
-                }
-            }
+            _ = self.route_events() => {}
             _ = shutdown.cancelled() => {}
         }
 
@@ -97,8 +93,9 @@ impl Backplane {
         self.shutdown_all_boards().await;
     }
 
-    /// Routes transport events until every transport closes.
-    async fn route_events(&mut self) -> Result<()> {
+    /// Routes transport events until every transport closes. An
+    /// event that fails is logged, and routing goes on to the next.
+    async fn route_events(&mut self) {
         // Multiplex the per-transport receivers. The number of transports is
         // how many initial-enumeration completions to wait for.
         let mut streams: StreamMap<usize, ReceiverStream<TransportEvent>> = StreamMap::new();
@@ -118,10 +115,14 @@ impl Backplane {
         while let Some((transport, event)) = streams.next().await {
             match event {
                 TransportEvent::Usb(usb_event) => {
-                    self.handle_usb_event(usb_event).await?;
+                    if let Err(e) = self.handle_usb_event(usb_event).await {
+                        error!(error = %e, "Failed to handle USB event");
+                    }
                 }
                 TransportEvent::Cpu(cpu_event) => {
-                    self.handle_cpu_event(cpu_event).await?;
+                    if let Err(e) = self.handle_cpu_event(cpu_event).await {
+                        error!(error = %e, "Failed to handle CPU miner event");
+                    }
                 }
                 TransportEvent::InitialEnumerationComplete => {
                     completed.insert(transport);
@@ -132,8 +133,6 @@ impl Backplane {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Shutdown all boards managed by this backplane.
