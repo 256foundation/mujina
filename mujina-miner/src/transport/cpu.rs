@@ -1,8 +1,8 @@
 //! CPU miner virtual transport.
 //!
-//! Provides transport events for the CPU mining backend. Unlike USB transport,
-//! these events are synthesized at startup based on environment configuration
-//! rather than discovered from hardware.
+//! Describes the virtual devices of the CPU mining backend. Unlike USB
+//! devices, these are synthesized at startup based on environment
+//! configuration rather than discovered from hardware.
 
 use std::fmt;
 
@@ -29,16 +29,6 @@ impl fmt::Display for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// Transport events for CPU miner virtual devices.
-#[derive(Debug)]
-pub enum TransportEvent {
-    /// A CPU miner "device" was connected (enabled via environment).
-    CpuDeviceConnected(CpuDeviceInfo),
-
-    /// A CPU miner "device" was disconnected.
-    CpuDeviceDisconnected { device_id: DeviceId },
 }
 
 /// Information about a CPU miner virtual device.

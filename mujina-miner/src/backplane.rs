@@ -19,10 +19,7 @@ use crate::{
     board::{BackplaneConnector, BoardDescriptor, BoardInfo, VirtualBoardRegistry},
     scheduler::ThreadRegistration,
     tracing::prelude::*,
-    transport::{
-        TransportEvent, UsbDeviceInfo, cpu::TransportEvent as CpuTransportEvent,
-        usb::TransportEvent as UsbTransportEvent,
-    },
+    transport::{Device, DeviceKey, TransportEvent, UsbDeviceInfo},
 };
 
 /// Board registry that uses inventory to find registered boards.
@@ -114,14 +111,14 @@ impl Backplane {
 
         while let Some((transport, event)) = streams.next().await {
             match event {
-                TransportEvent::Usb(usb_event) => {
-                    if let Err(e) = self.handle_usb_event(usb_event).await {
-                        error!(error = %e, "Failed to handle USB event");
+                TransportEvent::Connected(device) => {
+                    if let Err(e) = self.handle_connected(device).await {
+                        error!(error = %e, "Failed to handle a connected device");
                     }
                 }
-                TransportEvent::Cpu(cpu_event) => {
-                    if let Err(e) = self.handle_cpu_event(cpu_event).await {
-                        error!(error = %e, "Failed to handle CPU miner event");
+                TransportEvent::Disconnected(key) => {
+                    if let Err(e) = self.handle_disconnected(key).await {
+                        error!(error = %e, "Failed to handle a disconnected device");
                     }
                 }
                 TransportEvent::InitialEnumerationComplete => {
@@ -208,10 +205,10 @@ impl Backplane {
         }
     }
 
-    /// Handle USB transport events.
-    async fn handle_usb_event(&mut self, event: UsbTransportEvent) -> Result<()> {
-        match event {
-            UsbTransportEvent::UsbDeviceConnected(device_info) => {
+    /// Starts a board for a connected device, if the device is one.
+    async fn handle_connected(&mut self, device: Device) -> Result<()> {
+        match device {
+            Device::Usb(device_info) => {
                 let Some(descriptor) = self.registry.find_descriptor(&device_info) else {
                     return Ok(());
                 };
@@ -246,33 +243,7 @@ impl Backplane {
 
                 self.start_board(board_id, conn).await;
             }
-            UsbTransportEvent::UsbDeviceDisconnected { device_path: _ } => {
-                // Find and shutdown the board
-                // Note: Current design uses serial number as key, but we get device_path
-                // in disconnect event. For single-board setups this works fine.
-                // TODO: Maintain device_path -> board_id mapping for multi-board support
-                let board_ids: Vec<String> = self.boards.keys().cloned().collect();
-                for board_id in board_ids {
-                    if let Some(mut board) = self.boards.remove(&board_id) {
-                        board.shutdown().await;
-                        info!(
-                            board = %board.info.model,
-                            serial = %board_id,
-                            "Board disconnected"
-                        );
-                        break; // For now, assume one board per device
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle CPU miner transport events.
-    async fn handle_cpu_event(&mut self, event: CpuTransportEvent) -> Result<()> {
-        match event {
-            CpuTransportEvent::CpuDeviceConnected(device_info) => {
+            Device::Cpu(device_info) => {
                 let Some(descriptor) = self.virtual_registry.find("cpu_miner") else {
                     error!("No virtual board descriptor found for cpu_miner");
                     return Ok(());
@@ -300,7 +271,33 @@ impl Backplane {
                 let board_id = device_info.device_id.to_string();
                 self.start_board(board_id, conn).await;
             }
-            CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
+        }
+
+        Ok(())
+    }
+
+    /// Stops the board of a disconnected device.
+    async fn handle_disconnected(&mut self, key: DeviceKey) -> Result<()> {
+        match key {
+            DeviceKey::Usb(_) => {
+                // Find and shutdown the board
+                // Note: Current design uses serial number as key, but we get device_path
+                // in disconnect event. For single-board setups this works fine.
+                // TODO: Maintain device_path -> board_id mapping for multi-board support
+                let board_ids: Vec<String> = self.boards.keys().cloned().collect();
+                for board_id in board_ids {
+                    if let Some(mut board) = self.boards.remove(&board_id) {
+                        board.shutdown().await;
+                        info!(
+                            board = %board.info.model,
+                            serial = %board_id,
+                            "Board disconnected"
+                        );
+                        break; // For now, assume one board per device
+                    }
+                }
+            }
+            DeviceKey::Cpu(device_id) => {
                 if let Some(mut board) = self.boards.remove(device_id.as_str()) {
                     board.shutdown().await;
                     info!(board = %board.info.model, serial = %device_id, "Board disconnected");
@@ -411,11 +408,9 @@ mod tests {
         let run = tokio::spawn(backplane.run(shutdown.clone()));
 
         // Some other USB device, such as a keyboard, is unplugged.
-        let removal = UsbTransportEvent::UsbDeviceDisconnected {
-            device_path: DevicePath::new("/sys/devices/some-other-device"),
-        };
+        let removed = DeviceKey::Usb(DevicePath::new("/sys/devices/some-other-device"));
         transport_tx
-            .send(TransportEvent::Usb(removal))
+            .send(TransportEvent::Disconnected(removed))
             .await
             .unwrap();
 
