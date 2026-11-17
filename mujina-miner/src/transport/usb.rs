@@ -21,7 +21,7 @@ use nusb::{DeviceId, DeviceInfo};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::TransportEvent as OuterTransportEvent;
+use super::{Device, DeviceKey, TransportEvent};
 
 // Platform-specific serial port discovery, aliased to a common name
 // so call sites are platform-independent.
@@ -120,24 +120,14 @@ impl UsbDeviceInfo {
     }
 }
 
-/// Transport event emitted when devices are discovered or disconnected.
-#[derive(Debug)]
-pub enum TransportEvent {
-    /// A USB device was connected
-    UsbDeviceConnected(UsbDeviceInfo),
-
-    /// A USB device was disconnected
-    UsbDeviceDisconnected { device_path: DevicePath },
-}
-
 /// USB transport discovery.
 pub struct UsbTransport {
-    event_tx: mpsc::Sender<OuterTransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
 }
 
 impl UsbTransport {
     /// Create a new USB transport.
-    pub fn new(event_tx: mpsc::Sender<OuterTransportEvent>) -> Self {
+    pub fn new(event_tx: mpsc::Sender<TransportEvent>) -> Self {
         Self { event_tx }
     }
 
@@ -168,7 +158,7 @@ impl UsbTransport {
 /// in both the enumeration results and as a Connected event), which
 /// are filtered out via the known_devices map.
 async fn monitor(
-    event_tx: mpsc::Sender<OuterTransportEvent>,
+    event_tx: mpsc::Sender<TransportEvent>,
     shutdown: CancellationToken,
     mut hotplug: HotplugWatch,
 ) -> Result<()> {
@@ -190,7 +180,7 @@ async fn monitor(
 
         known_devices.insert(device.id(), info.device_path.clone());
 
-        let event = OuterTransportEvent::Usb(TransportEvent::UsbDeviceConnected(info));
+        let event = TransportEvent::Connected(Device::Usb(info));
         if event_tx.send(event).await.is_err() {
             debug!("Event receiver dropped during enumeration");
             return Ok(());
@@ -199,7 +189,7 @@ async fn monitor(
 
     // Signal that the initial scan is done, before watching for hotplug.
     if event_tx
-        .send(OuterTransportEvent::InitialEnumerationComplete)
+        .send(TransportEvent::InitialEnumerationComplete)
         .await
         .is_err()
     {
@@ -216,7 +206,7 @@ async fn monitor(
                     return Ok(());
                 };
 
-                let transport_event = match event {
+                let event = match event {
                     HotplugEvent::Connected(device) => {
                         // Deduplicate: a race between the hotplug
                         // watch and initial enumeration can deliver
@@ -234,7 +224,7 @@ async fn monitor(
                             "USB device added"
                         );
                         known_devices.insert(device.id(), info.device_path.clone());
-                        TransportEvent::UsbDeviceConnected(info)
+                        TransportEvent::Connected(Device::Usb(info))
                     }
                     HotplugEvent::Disconnected(id) => {
                         let Some(device_path) = known_devices.remove(&id) else {
@@ -242,11 +232,10 @@ async fn monitor(
                             continue;
                         };
                         trace!(%device_path, "USB device removed");
-                        TransportEvent::UsbDeviceDisconnected { device_path }
+                        TransportEvent::Disconnected(DeviceKey::Usb(device_path))
                     }
                 };
 
-                let event = OuterTransportEvent::Usb(transport_event);
                 if event_tx.send(event).await.is_err() {
                     debug!("Event receiver dropped, exiting USB monitor");
                     return Ok(());

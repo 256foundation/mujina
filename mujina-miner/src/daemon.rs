@@ -23,7 +23,7 @@ use crate::{
     },
     scheduler::{self, SourceRegistration, ThreadRegistration},
     stratum_v1::{PoolConfig as StratumPoolConfig, TcpConnector},
-    transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
+    transport::{CpuDeviceInfo, Device, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
 /// The main daemon.
@@ -70,16 +70,14 @@ impl Daemon {
                 "CPU miner enabled"
             );
             let (cpu_tx, cpu_rx) = mpsc::channel::<TransportEvent>(100);
-            let device = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
-                CpuDeviceInfo {
-                    device_id: cpu_transport::DeviceId::new(format!(
-                        "cpu-{}x{}%",
-                        config.thread_count, config.duty_percent
-                    )),
-                    thread_count: config.thread_count,
-                    duty_percent: config.duty_percent,
-                },
-            ));
+            let device = TransportEvent::Connected(Device::Cpu(CpuDeviceInfo {
+                device_id: cpu_transport::DeviceId::new(format!(
+                    "cpu-{}x{}%",
+                    config.thread_count, config.duty_percent
+                )),
+                thread_count: config.thread_count,
+                duty_percent: config.duty_percent,
+            }));
             // Send the device and its enumeration completion, then drop the
             // sender; the CPU transport has no further events.
             if let Err(e) = cpu_tx.send(device).await {

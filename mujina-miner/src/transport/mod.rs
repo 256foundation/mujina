@@ -2,8 +2,8 @@
 //!
 //! This module handles discovery of mining boards across different
 //! physical transports (USB, PCIe, Ethernet, etc). Each transport
-//! implementation provides device discovery and emits transport-specific
-//! events when devices are connected or disconnected.
+//! implementation provides device discovery and reports each device
+//! that is connected or disconnected.
 
 use anyhow::Result;
 
@@ -19,14 +19,37 @@ pub use serial::{
 };
 pub use usb::{UsbDeviceInfo, UsbTransport};
 
-/// Generic transport event that can represent different transport types.
+/// A device that a transport has found.
+#[derive(Debug)]
+pub enum Device {
+    /// A USB device.
+    Usb(UsbDeviceInfo),
+
+    /// A CPU miner virtual device.
+    Cpu(CpuDeviceInfo),
+}
+
+/// Identifies a device for as long as it is connected.
+///
+/// A transport reports the same key when the device connects and when
+/// it disconnects.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DeviceKey {
+    /// A USB device, by where it is attached.
+    Usb(usb::DevicePath),
+
+    /// A CPU miner virtual device.
+    Cpu(cpu::DeviceId),
+}
+
+/// An event from a transport.
 #[derive(Debug)]
 pub enum TransportEvent {
-    /// USB device event
-    Usb(usb::TransportEvent),
+    /// A device was connected.
+    Connected(Device),
 
-    /// CPU miner virtual device event
-    Cpu(cpu::TransportEvent),
+    /// A device was disconnected.
+    Disconnected(DeviceKey),
 
     /// The transport finished its initial device scan.
     ///
