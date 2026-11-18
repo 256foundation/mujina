@@ -1717,7 +1717,6 @@ dependencies = [
  "axum",
  "bitcoin",
  "bitflags 2.13.1",
- "bitvec",
  "bytes",
  "clap",
  "core-foundation 0.10.1",

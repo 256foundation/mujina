@@ -6,7 +6,6 @@
 //! types rather than one combined enum.
 
 use bitcoin::hashes::Hash;
-use bitvec::prelude::*;
 use bytes::{BufMut, BytesMut};
 use futures::sink::Sink;
 
@@ -342,11 +341,9 @@ struct TypeFlags {
 
 impl TypeFlags {
     fn encode(&self, dst: &mut BytesMut) {
-        let mut byte = 0u8;
-        let field = byte.view_bits_mut::<Lsb0>();
-        field[5..7].store(self.kind as u8);
-        field[4..5].store(self.broadcast as u8);
-        field[0..4].store(self.cmd as u8);
+        let byte = ((self.kind as u8 & 0x03) << 5)
+            | ((self.broadcast as u8) << 4)
+            | (self.cmd as u8 & 0x0f);
         dst.put_u8(byte);
     }
 }
