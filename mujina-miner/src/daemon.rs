@@ -72,7 +72,10 @@ impl Daemon {
             let (cpu_tx, cpu_rx) = mpsc::channel::<TransportEvent>(100);
             let device = TransportEvent::Cpu(cpu_transport::TransportEvent::CpuDeviceConnected(
                 CpuDeviceInfo {
-                    device_id: format!("cpu-{}x{}%", config.thread_count, config.duty_percent),
+                    device_id: cpu_transport::DeviceId::new(format!(
+                        "cpu-{}x{}%",
+                        config.thread_count, config.duty_percent
+                    )),
                     thread_count: config.thread_count,
                     duty_percent: config.duty_percent,
                 },

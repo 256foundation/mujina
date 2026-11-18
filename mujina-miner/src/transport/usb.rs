@@ -11,6 +11,7 @@
 //! - **macOS**: nusb (enumeration/hotplug) + IOKit (serial port lookup)
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::tracing::prelude::*;
 use anyhow::Result;
@@ -53,6 +54,33 @@ mod platform {
     }
 }
 
+/// Where a USB device is attached, in the platform's terms.
+///
+/// On Linux this is the sysfs path (e.g.,
+/// "/sys/devices/pci0000:00/..."); on macOS it encodes the IOKit
+/// location ID (e.g., "IOKit:0x14200000"). The transport reports the
+/// same path when a device connects and when it disconnects.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DevicePath(String);
+
+impl DevicePath {
+    /// Creates a device path from the platform's text for it.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
+    /// Returns the path as the platform wrote it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DevicePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Information about a discovered USB device.
 #[derive(Debug)]
 pub struct UsbDeviceInfo {
@@ -69,11 +97,9 @@ pub struct UsbDeviceInfo {
     pub manufacturer: Option<String>,
     /// Product string (if available)
     pub product: Option<String>,
-    /// Platform-specific device path used for serial port discovery
-    /// and disconnect correlation. On Linux this is the sysfs path
-    /// (e.g., "/sys/devices/pci0000:00/..."); on macOS it encodes the
-    /// IOKit location ID (e.g., "IOKit:0x14200000").
-    pub device_path: String,
+    /// Where the device is attached, used for serial port discovery
+    /// and disconnect correlation.
+    pub device_path: DevicePath,
 }
 
 impl UsbDeviceInfo {
@@ -90,7 +116,7 @@ impl UsbDeviceInfo {
     /// since the retry logic makes it expensive for devices that
     /// don't.
     pub async fn get_serial_ports(&self, expected: usize) -> Result<Vec<String>> {
-        platform::get_serial_ports(&self.device_path, expected).await
+        platform::get_serial_ports(self.device_path.as_str(), expected).await
     }
 }
 
@@ -101,7 +127,7 @@ pub enum TransportEvent {
     UsbDeviceConnected(UsbDeviceInfo),
 
     /// A USB device was disconnected
-    UsbDeviceDisconnected { device_path: String },
+    UsbDeviceDisconnected { device_path: DevicePath },
 }
 
 /// USB transport discovery.
@@ -148,7 +174,7 @@ async fn monitor(
 ) -> Result<()> {
     // Track device_path by DeviceId so disconnect events can report
     // the same device_path that was sent on connect.
-    let mut known_devices: HashMap<DeviceId, String> = HashMap::new();
+    let mut known_devices: HashMap<DeviceId, DevicePath> = HashMap::new();
 
     // Initial enumeration
     for device in nusb::list_devices().await? {
@@ -242,7 +268,7 @@ fn build_device_info(device: &DeviceInfo) -> UsbDeviceInfo {
         serial_number: device.serial_number().map(str::to_string),
         manufacturer: device.manufacturer_string().map(str::to_string),
         product: device.product_string().map(str::to_string),
-        device_path: platform::device_path(device),
+        device_path: DevicePath::new(platform::device_path(device)),
     }
 }
 
@@ -256,7 +282,7 @@ impl Default for UsbDeviceInfo {
             serial_number: None,
             manufacturer: None,
             product: None,
-            device_path: String::new(),
+            device_path: DevicePath::new(""),
         }
     }
 }

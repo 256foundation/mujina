@@ -297,11 +297,11 @@ impl Backplane {
                     }
                 };
 
-                let board_id = device_info.device_id.clone();
+                let board_id = device_info.device_id.to_string();
                 self.start_board(board_id, conn).await;
             }
             CpuTransportEvent::CpuDeviceDisconnected { device_id } => {
-                if let Some(mut board) = self.boards.remove(&device_id) {
+                if let Some(mut board) = self.boards.remove(device_id.as_str()) {
                     board.shutdown().await;
                     info!(board = %board.info.model, serial = %device_id, "Board disconnected");
                 }
@@ -336,6 +336,7 @@ mod tests {
 
     use super::*;
     use crate::api_client::types::BoardTelemetry;
+    use crate::transport::usb::DevicePath;
 
     /// A board with no threads that sets `stopped` when the
     /// backplane stops it.
@@ -411,7 +412,7 @@ mod tests {
 
         // Some other USB device, such as a keyboard, is unplugged.
         let removal = UsbTransportEvent::UsbDeviceDisconnected {
-            device_path: "/sys/devices/some-other-device".into(),
+            device_path: DevicePath::new("/sys/devices/some-other-device"),
         };
         transport_tx
             .send(TransportEvent::Usb(removal))

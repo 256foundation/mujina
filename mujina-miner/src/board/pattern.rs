@@ -284,6 +284,7 @@ impl BoardPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::usb::DevicePath;
 
     fn make_device(
         vid: u16,
@@ -298,7 +299,7 @@ mod tests {
             serial_number: serial.map(|s| s.to_string()),
             manufacturer: manufacturer.map(|s| s.to_string()),
             product: product.map(|s| s.to_string()),
-            device_path: "/sys/devices/test".to_string(),
+            device_path: DevicePath::new("/sys/devices/test"),
             ..Default::default()
         }
     }
@@ -574,7 +575,7 @@ mod tests {
             serial_number: serial.map(|s| s.to_string()),
             manufacturer: manufacturer.map(|s| s.to_string()),
             product: product.map(|s| s.to_string()),
-            device_path: "/sys/devices/test".to_string(),
+            device_path: DevicePath::new("/sys/devices/test"),
             ..Default::default()
         }
     }
