@@ -4,8 +4,6 @@
 //! devices, these are synthesized at startup based on environment
 //! configuration rather than discovered from hardware.
 
-use std::fmt;
-
 /// Identifies a CPU miner virtual device.
 ///
 /// The transport reports the same ID when a device connects and when
@@ -17,17 +15,6 @@ impl DeviceId {
     /// Creates an ID from its text.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
-    }
-
-    /// Returns the ID as text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for DeviceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 

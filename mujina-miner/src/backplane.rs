@@ -48,8 +48,8 @@ impl BoardRegistry {
 pub struct Backplane {
     registry: BoardRegistry,
     virtual_registry: VirtualBoardRegistry,
-    /// Active boards managed by the backplane
-    boards: HashMap<String, ActiveBoard>,
+    /// Active boards, each under the key of the device it runs on
+    boards: HashMap<DeviceKey, ActiveBoard>,
     /// One event receiver per transport; the count sets how many initial
     /// enumeration completions to wait for.
     event_rxs: Vec<mpsc::Receiver<TransportEvent>>,
@@ -134,22 +134,34 @@ impl Backplane {
 
     /// Shutdown all boards managed by this backplane.
     async fn shutdown_all_boards(&mut self) {
-        let board_ids: Vec<String> = self.boards.keys().cloned().collect();
+        let keys: Vec<DeviceKey> = self.boards.keys().cloned().collect();
 
-        for board_id in board_ids {
-            if let Some(mut board) = self.boards.remove(&board_id) {
+        for key in keys {
+            if let Some(mut board) = self.boards.remove(&key) {
                 board.shutdown().await;
                 info!(
                     board = %board.info.model,
-                    serial = %board_id,
+                    serial = %board.serial(),
                     "Board stopped"
                 );
             }
         }
     }
 
-    /// Route a board connection's parts to where they belong.
-    async fn start_board(&mut self, board_id: String, conn: BackplaneConnector) {
+    /// Routes a board connection's parts to where they belong.
+    ///
+    /// The board is kept under the key of the device it runs on. A
+    /// board already under that key is stopped first.
+    async fn start_board(&mut self, key: DeviceKey, conn: BackplaneConnector) {
+        if let Some(mut replaced) = self.boards.remove(&key) {
+            warn!(
+                board = %replaced.info.model,
+                serial = %replaced.serial(),
+                "Board replaced by another on the same device"
+            );
+            replaced.shutdown().await;
+        }
+
         let BackplaneConnector {
             info,
             threads,
@@ -166,9 +178,10 @@ impl Backplane {
             );
         }
 
+        let board = ActiveBoard { info, shutdown };
         info!(
-            board = %info.model,
-            serial = %board_id,
+            board = %board.info.model,
+            serial = %board.serial(),
             threads = threads.len(),
             "Board started."
         );
@@ -180,7 +193,7 @@ impl Backplane {
                 .await
             {
                 error!(
-                    board = %info.model,
+                    board = %board.info.model,
                     error = %e,
                     "Failed to send thread to scheduler"
                 );
@@ -188,7 +201,7 @@ impl Backplane {
             }
         }
 
-        self.boards.insert(board_id, ActiveBoard { info, shutdown });
+        self.boards.insert(key, board);
     }
 
     /// Tell the scheduler that startup enumeration across all transports is
@@ -207,6 +220,8 @@ impl Backplane {
 
     /// Starts a board for a connected device, if the device is one.
     async fn handle_connected(&mut self, device: Device) -> Result<()> {
+        let key = device.key();
+
         match device {
             Device::Usb(device_info) => {
                 let Some(descriptor) = self.registry.find_descriptor(&device_info) else {
@@ -235,13 +250,7 @@ impl Backplane {
                     }
                 };
 
-                let board_id = conn
-                    .info
-                    .serial_number
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                self.start_board(board_id, conn).await;
+                self.start_board(key, conn).await;
             }
             Device::Cpu(device_info) => {
                 let Some(descriptor) = self.virtual_registry.find("cpu_miner") else {
@@ -268,41 +277,25 @@ impl Backplane {
                     }
                 };
 
-                let board_id = device_info.device_id.to_string();
-                self.start_board(board_id, conn).await;
+                self.start_board(key, conn).await;
             }
         }
 
         Ok(())
     }
 
-    /// Stops the board of a disconnected device.
+    /// Stops the board on a disconnected device.
+    ///
+    /// Most devices that a transport reports are not boards, and their
+    /// removal changes nothing here.
     async fn handle_disconnected(&mut self, key: DeviceKey) -> Result<()> {
-        match key {
-            DeviceKey::Usb(_) => {
-                // Find and shutdown the board
-                // Note: Current design uses serial number as key, but we get device_path
-                // in disconnect event. For single-board setups this works fine.
-                // TODO: Maintain device_path -> board_id mapping for multi-board support
-                let board_ids: Vec<String> = self.boards.keys().cloned().collect();
-                for board_id in board_ids {
-                    if let Some(mut board) = self.boards.remove(&board_id) {
-                        board.shutdown().await;
-                        info!(
-                            board = %board.info.model,
-                            serial = %board_id,
-                            "Board disconnected"
-                        );
-                        break; // For now, assume one board per device
-                    }
-                }
-            }
-            DeviceKey::Cpu(device_id) => {
-                if let Some(mut board) = self.boards.remove(device_id.as_str()) {
-                    board.shutdown().await;
-                    info!(board = %board.info.model, serial = %device_id, "Board disconnected");
-                }
-            }
+        if let Some(mut board) = self.boards.remove(&key) {
+            board.shutdown().await;
+            info!(
+                board = %board.info.model,
+                serial = %board.serial(),
+                "Board disconnected"
+            );
         }
 
         Ok(())
@@ -316,6 +309,11 @@ struct ActiveBoard {
 }
 
 impl ActiveBoard {
+    /// Returns the board's serial number for a log entry.
+    fn serial(&self) -> &str {
+        self.info.serial_number.as_deref().unwrap_or("unknown")
+    }
+
     async fn shutdown(&mut self) {
         if let Some(fut) = self.shutdown.take() {
             fut.await;
@@ -333,7 +331,7 @@ mod tests {
 
     use super::*;
     use crate::api_client::types::BoardTelemetry;
-    use crate::transport::usb::DevicePath;
+    use crate::transport::{cpu, usb::DevicePath};
 
     /// A board with no threads that sets `stopped` when the
     /// backplane stops it.
@@ -365,9 +363,8 @@ mod tests {
         let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
 
         let stopped = Arc::new(AtomicBool::new(false));
-        backplane
-            .start_board("test-board".into(), test_board(&stopped))
-            .await;
+        let key = DeviceKey::Cpu(cpu::DeviceId::new("test-board"));
+        backplane.start_board(key, test_board(&stopped)).await;
 
         let shutdown = CancellationToken::new();
         let mut run = tokio::spawn(backplane.run(shutdown.clone()));
@@ -392,7 +389,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[should_panic(expected = "unrelated removal")] // known bug: any USB removal stops a board
     async fn unrelated_usb_removal_leaves_boards_running() {
         let (transport_tx, transport_rx) = mpsc::channel(1);
         let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
@@ -400,9 +396,8 @@ mod tests {
         let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
 
         let stopped = Arc::new(AtomicBool::new(false));
-        backplane
-            .start_board("test-board".into(), test_board(&stopped))
-            .await;
+        let key = DeviceKey::Usb(DevicePath::new("/sys/devices/test-board"));
+        backplane.start_board(key, test_board(&stopped)).await;
 
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(backplane.run(shutdown.clone()));
@@ -428,5 +423,64 @@ mod tests {
             stopped.load(Ordering::SeqCst),
             "board not stopped on shutdown"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usb_removal_stops_only_the_board_on_that_device() {
+        let (transport_tx, transport_rx) = mpsc::channel(1);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let removed = Arc::new(AtomicBool::new(false));
+        let removed_key = DeviceKey::Usb(DevicePath::new("/sys/devices/removed-board"));
+        backplane
+            .start_board(removed_key.clone(), test_board(&removed))
+            .await;
+
+        let kept = Arc::new(AtomicBool::new(false));
+        let kept_key = DeviceKey::Usb(DevicePath::new("/sys/devices/kept-board"));
+        backplane.start_board(kept_key, test_board(&kept)).await;
+
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(backplane.run(shutdown.clone()));
+
+        transport_tx
+            .send(TransportEvent::Disconnected(removed_key))
+            .await
+            .unwrap();
+
+        // The clock is paused, so this returns once the backplane
+        // has handled the event and gone idle.
+        time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            removed.load(Ordering::SeqCst),
+            "board not stopped when its device was removed"
+        );
+        assert!(
+            !kept.load(Ordering::SeqCst),
+            "board stopped by another board's removal"
+        );
+
+        shutdown.cancel();
+        run.await.unwrap();
+        assert!(kept.load(Ordering::SeqCst), "board not stopped on shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_second_board_on_a_device_stops_the_first() {
+        let (_transport_tx, transport_rx) = mpsc::channel(1);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(10);
+        let (board_reg_tx, _board_reg_rx) = mpsc::channel(10);
+        let mut backplane = Backplane::new(vec![transport_rx], scheduler_tx, board_reg_tx);
+
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let key = DeviceKey::Usb(DevicePath::new("/sys/devices/test-board"));
+        backplane.start_board(key.clone(), test_board(&first)).await;
+        backplane.start_board(key, test_board(&second)).await;
+
+        assert!(first.load(Ordering::SeqCst), "replaced board not stopped");
+        assert!(!second.load(Ordering::SeqCst), "new board stopped");
     }
 }
