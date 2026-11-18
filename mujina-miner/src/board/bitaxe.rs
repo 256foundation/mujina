@@ -60,6 +60,9 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
+mod fan_controller;
+use fan_controller::{FanController, FanControllerConfig};
+
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
@@ -276,6 +279,7 @@ impl BitaxeDevice {
             board_serial: self.serial_number.clone(),
             bad_thermal_count: 0,
             reset_line: self.reset_line.clone(),
+            fan_controller: FanController::new(FanControllerConfig::default()),
         };
         tokio::spawn(monitor.run(telemetry_tx, cancel))
     }
@@ -298,11 +302,16 @@ struct BitaxeMonitor {
     /// above emergency threshold). Triggers emergency shutdown.
     bad_thermal_count: u32,
     reset_line: BitaxeResetLine,
+    /// PI fan speed controller.
+    fan_controller: FanController,
 }
 
 impl BitaxeMonitor {
+    /// The fan controller's gains are tuned for this interval.
+    const TICK_INTERVAL: Duration = Duration::from_secs(2);
+
     async fn run(mut self, telemetry_tx: watch::Sender<BoardTelemetry>, cancel: CancellationToken) {
-        let mut tick = time::interval(Duration::from_secs(2));
+        let mut tick = time::interval(Self::TICK_INTERVAL);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_log = Instant::now();
 
@@ -436,6 +445,27 @@ impl BitaxeMonitor {
             );
         }
 
+        // Fail safe with full fan when the temperature is in doubt. The
+        // controller still sees valid readings so it resumes from
+        // current state when the override ends.
+        let fan_target = match asic_temp {
+            Some(t) => {
+                let speed = self.fan_controller.update_speed(t, Self::TICK_INTERVAL);
+                Some(if t >= EMERGENCY_TEMP_C {
+                    Percent::FULL
+                } else {
+                    speed
+                })
+            }
+            None if diode_ready => Some(Percent::FULL),
+            None => None,
+        };
+        if let Some(speed) = fan_target
+            && let Err(e) = self.emc2101.lock().await.set_fan_speed(speed).await
+        {
+            warn!("Failed to set fan speed: {}", e);
+        }
+
         // Publish telemetry
         let _ = tx.send(BoardTelemetry {
             name: self.board_name.clone(),
@@ -445,7 +475,7 @@ impl BitaxeMonitor {
                 name: "fan".into(),
                 rpm: fan_rpm,
                 percent: fan_percent,
-                target_percent: None,
+                target_percent: fan_target.map(u8::from),
             }],
             temperatures: vec![
                 TemperatureSensor {
