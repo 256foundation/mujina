@@ -29,6 +29,16 @@ pub enum Device {
     Cpu(CpuDeviceInfo),
 }
 
+impl Device {
+    /// Returns the key that the device's transport reports for it.
+    pub fn key(&self) -> DeviceKey {
+        match self {
+            Self::Usb(device) => DeviceKey::Usb(device.device_path.clone()),
+            Self::Cpu(device) => DeviceKey::Cpu(device.device_id.clone()),
+        }
+    }
+}
+
 /// Identifies a device for as long as it is connected.
 ///
 /// A transport reports the same key when the device connects and when
