@@ -137,6 +137,16 @@ cargo run --bin mujina-minerd
 `MUJINA_POOL_USER` defaults to `mujina-testing` and `MUJINA_POOL_PASS`
 defaults to `x`, so only `MUJINA_POOL_URL` is strictly required.
 
+For a Stratum V2 pool, end a `stratum2+tcp://` URL with the pool's
+authority public key, which authenticates the pool in the encrypted
+handshake. `MUJINA_POOL_PASS` does not apply:
+
+```bash
+MUJINA_POOL_URL="stratum2+tcp://pool.example.com:3336/<authority-key>" \
+MUJINA_POOL_USER="your-address.worker" \
+cargo run --bin mujina-minerd
+```
+
 ### Testing without a pool
 
 Omit `MUJINA_POOL_URL` to use a dummy job source that generates

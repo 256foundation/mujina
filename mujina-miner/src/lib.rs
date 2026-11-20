@@ -13,6 +13,7 @@ pub mod mgmt_protocol;
 pub mod peripheral;
 pub mod scheduler;
 pub mod stratum_v1;
+pub mod stratum_v2;
 #[cfg(test)]
 mod testing;
 pub mod tracing;

@@ -17,6 +17,7 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "GPL-3.0-or-later",
+    "ISC",
     "MIT",
     "MITNFA",
     "MPL-2.0",

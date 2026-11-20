@@ -57,8 +57,11 @@ pub mod forced_rate;
 pub(crate) mod job;
 mod merkle;
 mod messages;
+mod reconnect;
 pub mod stratum_v1;
+pub mod stratum_v2;
 pub mod test_blocks;
+pub mod upstream;
 mod version;
 
 // Re-export types from submodules

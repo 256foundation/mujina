@@ -563,6 +563,17 @@ impl Scheduler {
             entry.hashrate.record(share.expected_work);
         }
 
+        // A share that meets the network target is a block, whatever the
+        // protocol of the source that will submit it.
+        if task_entry.template.target().is_met_by(hash) {
+            info!(
+                source = %self.sources.get(task_entry.source_id).map(|s| s.name.as_str()).unwrap_or("unknown"),
+                job_id = %task_entry.template.id,
+                hash = %hash,
+                "Block found"
+            );
+        }
+
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
             self.stats.shares_submitted += 1;

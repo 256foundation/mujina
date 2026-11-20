@@ -25,7 +25,8 @@
 //!
 //! let (event_tx, mut event_rx) = mpsc::channel(100);
 //! let config = PoolConfig {
-//!     url: "stratum+tcp://pool.example.com:3333".to_string(),
+//!     host: "pool.example.com".to_string(),
+//!     port: 3333,
 //!     username: "worker".to_string(),
 //!     password: "x".to_string(),
 //! };

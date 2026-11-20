@@ -74,21 +74,12 @@ impl Connection {
         }
     }
 
-    /// Connect to a Stratum pool.
-    ///
-    /// Parses the URL, establishes TCP connection, and wraps it in a buffered
-    /// connection. Supports both `stratum+tcp://` and plain `tcp://` schemes.
-    pub async fn connect(url: &str) -> StratumResult<Self> {
-        // Parse URL
-        let url = url
-            .strip_prefix("stratum+tcp://")
-            .or_else(|| url.strip_prefix("tcp://"))
-            .unwrap_or(url);
-
-        debug!(url = %url, "Connecting to pool");
+    /// Connects to a Stratum pool at `host` and `port`.
+    pub async fn connect(host: &str, port: u16) -> StratumResult<Self> {
+        debug!(%host, port, "Connecting to pool");
 
         // Connect
-        let stream = TcpStream::connect(url)
+        let stream = TcpStream::connect((host, port))
             .await
             .map_err(|e| StratumError::ConnectionFailed(e.to_string()))?;
 
@@ -179,19 +170,20 @@ pub trait Connector: Send {
 
 /// Connects to a Stratum pool over TCP.
 pub struct TcpConnector {
-    url: String,
+    host: String,
+    port: u16,
 }
 
 impl TcpConnector {
-    pub fn new(url: String) -> Self {
-        Self { url }
+    pub fn new(host: String, port: u16) -> Self {
+        Self { host, port }
     }
 }
 
 #[async_trait]
 impl Connector for TcpConnector {
     async fn connect(&mut self) -> StratumResult<Box<dyn Transport>> {
-        let conn = Connection::connect(&self.url).await?;
+        let conn = Connection::connect(&self.host, self.port).await?;
         Ok(Box::new(conn))
     }
 }
