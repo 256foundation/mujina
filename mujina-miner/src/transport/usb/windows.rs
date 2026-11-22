@@ -95,7 +95,7 @@ fn matching_ports(device_path: &str, expected: usize) -> Result<Vec<String>> {
         && let Some((vid, pid)) = parse_vid_pid(device_path)
     {
         let candidates: Vec<(Option<u8>, String)> = usb_ports()
-            .filter(|(usb, _)| usb.vid == vid && usb.pid == pid)
+            .filter(|(usb, _)| usb.vid == vid && usb.pid == pid && usb.serial_number.is_none())
             .map(|(usb, name)| (usb.interface, name))
             .collect();
         let mut interfaces: Vec<Option<u8>> = candidates.iter().map(|(i, _)| *i).collect();
