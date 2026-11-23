@@ -60,14 +60,29 @@ use super::{
     pattern::{Match, StringMatch},
 };
 
+/// Match a USB string reported by the Bitaxe firmware.
+///
+/// Windows reports the CDC ACM driver's generic strings (e.g.
+/// "Microsoft") rather than the device's own, so there the
+/// descriptors fall back to matching on VID:PID alone.
+const fn usb_string(expected: &'static str) -> Match<StringMatch> {
+    if cfg!(windows) {
+        Match::Any
+    } else {
+        Match::Specific(StringMatch::Exact(expected))
+    }
+}
+
 inventory::submit! {
     crate::board::BoardDescriptor {
         pattern: crate::board::pattern::BoardPattern {
-            vid: Match::Any,
-            pid: Match::Any,
+            // Without strings to go on, Windows needs the bitaxe-raw
+            // VID:PID to tell the board apart from other USB devices.
+            vid: if cfg!(windows) { Match::Specific(0xc0de) } else { Match::Any },
+            pid: if cfg!(windows) { Match::Specific(0xcafe) } else { Match::Any },
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe")),
+            manufacturer: usb_string("OSMU"),
+            product: usb_string("Bitaxe"),
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
@@ -82,8 +97,8 @@ inventory::submit! {
             vid: Match::Specific(0x1209),
             pid: Match::Specific(0x6102),
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("OSMU")),
-            product: Match::Specific(StringMatch::Exact("Bitaxe Gamma RHAP-D")),
+            manufacturer: usb_string("OSMU"),
+            product: usb_string("Bitaxe Gamma RHAP-D"),
             serial_pattern: Match::Any,
         },
         name: "Bitaxe Gamma",
@@ -715,12 +730,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn registry_ignores_other_osmu_products() {
         let device = osmu_device(0x1209, 0x6102, "Bitaxe Ultra");
         assert!(BoardRegistry.find_descriptor(&device).is_none());
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn registry_ignores_rhapd_string_on_foreign_ids() {
         let device = osmu_device(0xc0de, 0xcafe, "Bitaxe Gamma RHAP-D");
         assert!(BoardRegistry.find_descriptor(&device).is_none());
