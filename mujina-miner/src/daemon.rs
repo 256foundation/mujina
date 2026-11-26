@@ -3,7 +3,7 @@
 //! This module handles the core daemon functionality including initialization,
 //! task management, signal handling, and graceful shutdown.
 
-use std::env;
+use std::{env, net::Ipv6Addr};
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -296,10 +296,18 @@ fn api_bind_addr(listen: Option<&str>) -> String {
     // ASCII 'M' (77) + 'U' (85) = 7785
     const API_PORT: u16 = 7785;
 
-    match listen {
-        Some(addr) if addr.contains(':') => addr.to_owned(),
-        Some(addr) => format!("{addr}:{API_PORT}"),
-        None => format!("127.0.0.1:{API_PORT}"),
+    let addr = listen.unwrap_or("127.0.0.1");
+    let host = addr
+        .strip_prefix('[')
+        .and_then(|addr| addr.strip_suffix(']'))
+        .unwrap_or(addr);
+
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{API_PORT}")
+    } else if addr.contains(':') {
+        addr.to_owned()
+    } else {
+        format!("{addr}:{API_PORT}")
     }
 }
 
@@ -308,13 +316,11 @@ mod tests {
     use super::api_bind_addr;
 
     #[test]
-    #[should_panic] // known bug: IPv6 bypasses the default port
     fn api_bind_addr_defaults_port_for_bare_ipv6() {
         assert_eq!(api_bind_addr(Some("::1")), "[::1]:7785");
     }
 
     #[test]
-    #[should_panic] // known bug: IPv6 bypasses the default port
     fn api_bind_addr_defaults_port_for_bracketed_ipv6() {
         assert_eq!(api_bind_addr(Some("[::1]")), "[::1]:7785");
     }
