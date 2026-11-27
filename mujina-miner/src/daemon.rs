@@ -3,7 +3,7 @@
 //! This module handles the core daemon functionality including initialization,
 //! task management, signal handling, and graceful shutdown.
 
-use std::env;
+use std::{env, net::Ipv6Addr};
 
 use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::{mpsc, watch};
@@ -240,14 +240,7 @@ impl Daemon {
         self.tracker.spawn({
             let shutdown = self.shutdown.clone();
             async move {
-                // ASCII 'M' (77) + 'U' (85) = 7785
-                const API_PORT: u16 = 7785;
-
-                let bind_addr = match env::var("MUJINA_API_LISTEN") {
-                    Ok(addr) if addr.contains(':') => addr,
-                    Ok(addr) => format!("{addr}:{API_PORT}"),
-                    Err(_) => format!("127.0.0.1:{API_PORT}"),
-                };
+                let bind_addr = api_bind_addr(env::var("MUJINA_API_LISTEN").ok().as_deref());
                 let config = ApiConfig { bind_addr };
                 if let Err(e) = api::serve(
                     config,
@@ -296,5 +289,53 @@ impl Daemon {
 impl Default for Daemon {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn api_bind_addr(listen: Option<&str>) -> String {
+    // ASCII 'M' (77) + 'U' (85) = 7785
+    const API_PORT: u16 = 7785;
+
+    let addr = listen.unwrap_or("127.0.0.1");
+    let host = addr
+        .strip_prefix('[')
+        .and_then(|addr| addr.strip_suffix(']'))
+        .unwrap_or(addr);
+
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{API_PORT}")
+    } else if addr.contains(':') {
+        addr.to_owned()
+    } else {
+        format!("{addr}:{API_PORT}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_bind_addr;
+
+    #[test]
+    fn api_bind_addr_defaults_port_for_bare_ipv6() {
+        assert_eq!(api_bind_addr(Some("::1")), "[::1]:7785");
+    }
+
+    #[test]
+    fn api_bind_addr_defaults_port_for_bracketed_ipv6() {
+        assert_eq!(api_bind_addr(Some("[::1]")), "[::1]:7785");
+    }
+
+    #[test]
+    fn api_bind_addr_handles_default_host_and_explicit_ports() {
+        for (listen, expected) in [
+            (None, "127.0.0.1:7785"),
+            (Some("localhost"), "localhost:7785"),
+            (Some("127.0.0.1"), "127.0.0.1:7785"),
+            (Some("localhost:9000"), "localhost:9000"),
+            (Some("127.0.0.1:9000"), "127.0.0.1:9000"),
+            (Some("[::1]:9000"), "[::1]:9000"),
+        ] {
+            assert_eq!(api_bind_addr(listen), expected);
+        }
     }
 }
