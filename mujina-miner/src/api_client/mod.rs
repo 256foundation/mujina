@@ -34,7 +34,7 @@ impl Client {
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             http: HttpClient::new(),
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_owned(),
         }
     }
 
@@ -82,5 +82,29 @@ impl Client {
 impl Default for Client {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, Router, routing::get};
+    use tokio::net::TcpListener;
+
+    use super::Client;
+
+    #[tokio::test]
+    async fn base_url_accepts_a_trailing_slash() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/mujina/api/v0/miner", get(|| async { Json("ok") }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for suffix in ["", "/"] {
+            let client = Client::with_base_url(format!("http://{addr}/mujina{suffix}"));
+            assert_eq!(client.get_json::<String>("miner").await.unwrap(), "ok");
+            assert_eq!(client.get_raw("miner").await.unwrap(), r#""ok""#);
+        }
+
+        server.abort();
     }
 }
