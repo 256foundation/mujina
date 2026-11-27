@@ -34,7 +34,7 @@ impl Client {
     pub fn with_base_url(base_url: String) -> Self {
         Self {
             http: HttpClient::new(),
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_owned(),
         }
     }
 
@@ -93,8 +93,6 @@ mod tests {
     use super::Client;
 
     #[tokio::test]
-    // Known bug: the trailing slash adds an empty path segment.
-    #[should_panic(expected = "API request failed: 404 Not Found")]
     async fn base_url_accepts_a_trailing_slash() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
