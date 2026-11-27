@@ -84,3 +84,29 @@ impl Default for Client {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::{Json, Router, routing::get};
+    use tokio::net::TcpListener;
+
+    use super::Client;
+
+    #[tokio::test]
+    // Known bug: the trailing slash adds an empty path segment.
+    #[should_panic(expected = "API request failed: 404 Not Found")]
+    async fn base_url_accepts_a_trailing_slash() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/mujina/api/v0/miner", get(|| async { Json("ok") }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for suffix in ["", "/"] {
+            let client = Client::with_base_url(format!("http://{addr}/mujina{suffix}"));
+            assert_eq!(client.get_json::<String>("miner").await.unwrap(), "ok");
+            assert_eq!(client.get_raw("miner").await.unwrap(), r#""ok""#);
+        }
+
+        server.abort();
+    }
+}
