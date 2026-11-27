@@ -11,6 +11,10 @@ MUJINA_API_LISTEN="0.0.0.0" cargo run
 The port defaults to 7785 if not specified, or you can
 override it with `MUJINA_API_LISTEN="0.0.0.0:9000"`.
 
+For IPv6, use `MUJINA_API_LISTEN="::1"` for the default port or
+`MUJINA_API_LISTEN="[::1]:9000"` to set an explicit port. Put the
+IPv6 address in brackets when you include a port.
+
 The API currently has no authentication or encryption, so
 binding to a non-localhost address exposes it to the network
 without access control. These will be addressed later.
